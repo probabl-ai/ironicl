@@ -1,0 +1,39 @@
+[package]
+name = "ironicl"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "A cache-aware CPU inference engine for TabICLv2"
+
+[lib]
+name = "ironicl"
+path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "ironicl"
+path = "src/main.rs"
+
+[features]
+default = ["checkpoint"]
+checkpoint = ["dep:candle-core", "dep:zip"]
+profile = []
+
+[dependencies]
+bytemuck = "=1.25.2"
+candle-core = { version = "=0.9.1", optional = true }
+libm = "=0.2.16"
+memmap2 = "=0.9.11"
+rayon = "=1.12.0"
+sha2 = "=0.11.0"
+zip = { version = "=1.1.4", default-features = false, optional = true }
+
+[dev-dependencies]
+tempfile = "=3.27.0"
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
