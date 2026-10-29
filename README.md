@@ -45,6 +45,57 @@ model. `run --checkpoint` creates or reuses a content-addressed model cache,
 loads the bundle, and executes the portable FP32 classifier. `--no-cache` is
 not available for execution because it does not create an artifact.
 
+## Python Preprocessing
+
+The standalone preprocessing package requires Python 3.12+, NumPy, scikit-learn,
+and its SciPy dependency. It does not depend on TabICL or PyTorch:
+
+```bash
+python -m pip install .
+```
+
+```python
+from ironicl.preprocessing import ClassifierPreprocessor
+
+preprocessor = ClassifierPreprocessor(n_estimators=8, random_state=42)
+training_groups = preprocessor.fit_transform(X_train, y_train)
+training_labels = preprocessor.encode_labels(y_train)
+query_groups = preprocessor.transform(X_query)
+```
+
+Each returned group is one contiguous FP32 matrix `[rows, filtered_features]`.
+`group_names_` records normalization order. `ensemble_groups_` maps ensemble
+members to those matrices; `feature_permutations_` and `class_permutations_`
+provide their feature and encoded-label mappings. The API does not expand
+features or labels per ensemble. `n_estimators_` records the actual ensemble
+count, which can be smaller than requested.
+
+This initial implementation supports finite dense numeric inputs, 2–10 classes,
+and the default `none`/`power` transforms with Latin feature and cyclic class
+permutations. It removes constant features and rejects all-constant training
+data. Categorical inputs, missing values, and sparse matrices are not supported.
+Numeric DataFrames must have unique string column names in the same order at
+prediction time. Preprocessing is fitted on training data only, retains no
+training rows, and does not require `PYTHONHASHSEED` configuration. It preserves
+upstream's power-transform fallback, including its batch-wide clipping when a
+transform raises a domain error.
+
+**This is a preprocessing-only Python package, not yet a Python classifier.**
+PyO3 bindings and Rust training-context construction remain to be implemented.
+Upstream oracle and dataset-export tools still require TabICL/PyTorch.
+The current pure-Python build backend will be replaced by maturin when the
+native extension is added.
+
+Run the Python checks after installation:
+
+```bash
+python -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+The checked-in preprocessing oracle runs without upstream dependencies. The
+supported scikit-learn 1.9.x / SciPy 1.18.x combination preserves its power-fit
+behavior; older float32 solvers produce different results. NumPy 2.x is required.
+
 ## Benchmarking
 
 Build the release binary and benchmark a resident imported model:
@@ -82,6 +133,9 @@ Start with [`docs/README.md`](docs/README.md). The key decisions are:
 
 ## Upstream
 
-Ironicl is a new implementation informed by the BSD-3-Clause TabICL project.
+The Rust engine is a new implementation informed by the BSD-3-Clause TabICL
+project. Python preprocessing adapts the upstream algorithms; its source records
+provenance and distributions include the applicable license in `LICENSES/`.
 See [`docs/references.md`](docs/references.md) before copying or distributing
-upstream code or model artifacts.
+upstream code or model artifacts. The project-wide license is still undecided;
+the third-party notice does not license the rest of Ironicl.

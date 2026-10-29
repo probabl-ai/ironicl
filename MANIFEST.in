@@ -1,0 +1,2 @@
+recursive-include tests *.py *.json
+include tools/export_static_context.py

@@ -84,5 +84,21 @@ Before copying upstream code:
 3. include the applicable license in distributions;
 4. verify the model checkpoint license and deployment terms independently.
 
-The current Ironicl skeleton contains a fresh implementation and references
-upstream behavior. Add a project license before public distribution.
+The Rust engine contains a fresh implementation and references upstream behavior.
+`python/ironicl/preprocessing.py` adapts scaling, outlier handling, and ensemble
+algorithms from `src/tabicl/_sklearn/preprocessing.py` at TabICL commit
+`bd030d47ff7d9f987f0f33431d743a3003bfe0d3` (version 2.1.1). Changes include a
+numeric-only classifier interface, grouped FP32 output, deterministic group
+ordering, iterative Latin-square construction, and removal of retained training
+arrays. It uses public scikit-learn APIs rather than copying upstream's sklearn
+compatibility module. No forecast code is included.
+
+The upstream BSD-3-Clause notice is retained in
+[`../LICENSES/TabICL-BSD-3-Clause.txt`](../LICENSES/TabICL-BSD-3-Clause.txt) and
+included in Python distributions. The checked-in preprocessing oracle records
+its upstream commit and dependency versions in
+`tests/fixtures/preprocessing.json`. It contains generated numeric data, not
+model weights or user data.
+
+Add a project license before public distribution. The upstream notice covers
+the adapted code, not the rest of Ironicl.
