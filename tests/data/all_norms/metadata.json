@@ -1,0 +1,25 @@
+{
+  "tabicl_version": "2.2.0",
+  "sklearn_version": "1.9.1",
+  "checkpoint": "tabicl-classifier-v2-20260212.ckpt",
+  "random_state": 42,
+  "n_classes": 3,
+  "norm_methods_used": [
+    "none",
+    "power",
+    "quantile",
+    "quantile_rtdl",
+    "robust"
+  ],
+  "n_estimators": 8,
+  "norm_methods": [
+    "none",
+    "power",
+    "quantile",
+    "quantile_rtdl",
+    "robust"
+  ],
+  "feat_shuffle_method": "latin",
+  "class_shuffle_method": "shift",
+  "outlier_threshold": 3.0
+}

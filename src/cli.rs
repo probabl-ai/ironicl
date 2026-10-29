@@ -5,7 +5,7 @@ use crate::{
     error::{Error, Result},
 };
 
-/// A parsed Ironicl command.
+/// A parsed `IronICL` command.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Help(Option<HelpTopic>),
@@ -15,6 +15,7 @@ pub enum Command {
     Import(ImportArgs),
     Run(RunArgs),
     Benchmark(BenchmarkArgs),
+    BuildContext(BuildContextArgs),
 }
 
 /// Command-specific help pages.
@@ -26,6 +27,7 @@ pub enum HelpTopic {
     Import,
     Run,
     Benchmark,
+    BuildContext,
 }
 
 /// A model source accepted by commands that can read checkpoints or artifacts.
@@ -44,6 +46,17 @@ impl ModelSource {
     }
 }
 
+/// Arguments for native static-context construction from an `IRINPUT` bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuildContextArgs {
+    pub model: PathBuf,
+    pub input: PathBuf,
+    pub output: PathBuf,
+    pub kv_dtype: crate::KvDtype,
+    pub pack_keys: bool,
+    pub index_clusters: Option<usize>,
+}
+
 /// Arguments for the memory and execution planner.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PlanArgs {
@@ -57,7 +70,7 @@ pub struct InspectArgs {
     pub source: ModelSource,
 }
 
-/// Arguments for converting a `PyTorch` checkpoint into an Ironicl artifact.
+/// Arguments for converting a `PyTorch` checkpoint into an `IronICL` artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportArgs {
     pub checkpoint: PathBuf,
@@ -108,6 +121,7 @@ pub fn parse_cli(args: &[String]) -> Result<Command> {
     match command.as_str() {
         "help" | "--help" | "-h" => parse_help(rest),
         "platform" => parse_no_args(rest, HelpTopic::Platform, Command::Platform),
+        "build-context" => parse_build_context(rest),
         "plan" => parse_plan(rest),
         "inspect" => parse_inspect(rest),
         "import" => parse_import(rest),
@@ -135,6 +149,7 @@ fn parse_help_topic(value: &str) -> Result<HelpTopic> {
         "import" => Ok(HelpTopic::Import),
         "run" => Ok(HelpTopic::Run),
         "benchmark" => Ok(HelpTopic::Benchmark),
+        "build-context" => Ok(HelpTopic::BuildContext),
         _ => Err(Error::InvalidArgument(format!("unknown help topic '{value}'"))),
     }
 }
@@ -258,6 +273,59 @@ fn parse_import(args: &[String]) -> Result<Command> {
     Ok(Command::Import(ImportArgs {
         checkpoint: required(checkpoint, "--checkpoint", "import")?,
         output: required(output, "--output", "import")?,
+    }))
+}
+
+fn parse_build_context(args: &[String]) -> Result<Command> {
+    if is_help(args) {
+        return Ok(Command::Help(Some(HelpTopic::BuildContext)));
+    }
+
+    let mut model = None;
+    let mut input = None;
+    let mut output = None;
+    let mut kv_dtype = None;
+    let mut pack_keys = false;
+    let mut index_clusters = None;
+    let mut index = 0;
+    while index < args.len() {
+        let flag = &args[index];
+        if flag == "--pack-keys" {
+            pack_keys = true;
+            index += 1;
+            continue;
+        }
+        let value = option_value(args, &mut index)?;
+        match flag.as_str() {
+            "--model" => set_once(&mut model, PathBuf::from(value), flag)?,
+            "--input" => set_once(&mut input, PathBuf::from(value), flag)?,
+            "--output" => set_once(&mut output, PathBuf::from(value), flag)?,
+            "--kv-dtype" => set_once(&mut kv_dtype, value.parse::<crate::KvDtype>()?, flag)?,
+            "--index-clusters" => {
+                let clusters = usize::try_from(parse_u64(flag, value)?)
+                    .map_err(|_| Error::InvalidArgument("--index-clusters exceeds usize".into()))?;
+                if clusters < 2 {
+                    return Err(Error::InvalidArgument(
+                        "--index-clusters must be at least 2".into(),
+                    ));
+                }
+                set_once(&mut index_clusters, clusters, flag)?;
+            }
+            _ => {
+                return Err(Error::InvalidArgument(format!(
+                    "unknown option '{flag}' for build-context"
+                )));
+            }
+        }
+    }
+
+    Ok(Command::BuildContext(BuildContextArgs {
+        model: required(model, "--model", "build-context")?,
+        input: required(input, "--input", "build-context")?,
+        output: required(output, "--output", "build-context")?,
+        kv_dtype: kv_dtype.unwrap_or_default(),
+        pack_keys,
+        index_clusters,
     }))
 }
 
@@ -507,6 +575,86 @@ mod tests {
             Ok(Command::Inspect(InspectArgs {
                 source: ModelSource::Checkpoint(PathBuf::from("model.ckpt")),
             }))
+        );
+    }
+
+    #[test]
+    fn parses_build_context() {
+        assert_eq!(
+            parse_cli(&args(&[
+                "build-context",
+                "--model",
+                "m.ironicl",
+                "--input",
+                "train.irinput",
+                "--output",
+                "ctx.ironiclctx",
+                "--kv-dtype",
+                "bf16-v",
+                "--pack-keys",
+                "--index-clusters",
+                "16",
+            ])),
+            Ok(Command::BuildContext(BuildContextArgs {
+                model: PathBuf::from("m.ironicl"),
+                input: PathBuf::from("train.irinput"),
+                output: PathBuf::from("ctx.ironiclctx"),
+                kv_dtype: crate::KvDtype::Bf16Value,
+                pack_keys: true,
+                index_clusters: Some(16),
+            }))
+        );
+        assert_eq!(
+            parse_cli(&args(&[
+                "build-context",
+                "--model",
+                "m.ironicl",
+                "--input",
+                "train.irinput",
+                "--output",
+                "ctx.ironiclctx",
+            ])),
+            Ok(Command::BuildContext(BuildContextArgs {
+                model: PathBuf::from("m.ironicl"),
+                input: PathBuf::from("train.irinput"),
+                output: PathBuf::from("ctx.ironiclctx"),
+                kv_dtype: crate::KvDtype::Fp32,
+                pack_keys: false,
+                index_clusters: None,
+            }))
+        );
+        assert!(parse_cli(&args(&["build-context", "--model", "m.ironicl"])).is_err());
+        assert!(
+            parse_cli(&args(&[
+                "build-context",
+                "--model",
+                "m.ironicl",
+                "--input",
+                "a",
+                "--output",
+                "b",
+                "--kv-dtype",
+                "bf16-k",
+            ]))
+            .is_err()
+        );
+        assert!(
+            parse_cli(&args(&[
+                "build-context",
+                "--model",
+                "m.ironicl",
+                "--input",
+                "a",
+                "--output",
+                "b",
+                "--index-clusters",
+                "1",
+            ]))
+            .is_err()
+        );
+        assert_eq!(
+            parse_cli(&args(&["build-context", "--help"])),
+            Ok(Command::Help(Some(HelpTopic::BuildContext)))
         );
     }
 

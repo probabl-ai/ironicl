@@ -1,6 +1,6 @@
 use std::fmt;
 
-/// Runtime CPU capabilities relevant to Ironicl kernels.
+/// Runtime CPU capabilities relevant to `IronICL` kernels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct CpuCapabilities {

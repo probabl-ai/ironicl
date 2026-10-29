@@ -5,9 +5,15 @@
 //! trailing SHA-256 digest. Version 1 stores FP32. Version 2 adds explicit FP32
 //! and BF16 tensor dtypes. Version 3 adds source-tile, dimension-major ICL K.
 
-use std::{collections::BTreeMap, fs::File, path::Path, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    fs::{self, File},
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::Arc,
+};
 
-use memmap2::{Mmap, MmapOptions};
+use memmap2::{Mmap, MmapMut, MmapOptions};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
@@ -37,6 +43,70 @@ const MAX_ENSEMBLE_COUNT: usize = 4096;
 const MAX_TRAINING_ROWS: usize = 1_000_000;
 const MAX_FEATURE_COUNT: usize = 65_536;
 const MAX_CLASS_COUNT: usize = 4096;
+const COLUMN_LAYERS: usize = 3;
+const ICL_LAYERS: usize = 12;
+const HEADS: usize = 8;
+const INDUCING: usize = 128;
+const COLUMN_HEAD_DIM: usize = 16;
+const ICL_HEAD_DIM: usize = 64;
+const RESERVED_STREAMS: usize = 4;
+const PACKED_KEY_TILE_ROWS: usize = 128;
+const SPARSE_INDEX_NAMES: [&str; 4] = [
+    "icl.index.centroids",
+    "icl.index.members",
+    "icl.index.offsets",
+    "icl.index.radii",
+];
+
+/// Storage precision of the ICL key/value tensors in a written static context.
+///
+/// Column tensors always stay FP32; computation always stays FP32. These are
+/// the combinations the cached executor's attention kernels serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KvDtype {
+    #[default]
+    Fp32,
+    Bf16,
+    Bf16Value,
+}
+
+impl KvDtype {
+    /// Accepted spellings, in the order the Python package documents them.
+    pub const NAMES: [&'static str; 3] = ["fp32", "bf16", "bf16-v"];
+
+    /// The spelling used on the command line and in Python.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Fp32 => "fp32",
+            Self::Bf16 => "bf16",
+            Self::Bf16Value => "bf16-v",
+        }
+    }
+
+    const fn key_is_bf16(self) -> bool {
+        matches!(self, Self::Bf16)
+    }
+
+    const fn value_is_bf16(self) -> bool {
+        matches!(self, Self::Bf16 | Self::Bf16Value)
+    }
+}
+
+impl FromStr for KvDtype {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "fp32" => Ok(Self::Fp32),
+            "bf16" => Ok(Self::Bf16),
+            "bf16-v" => Ok(Self::Bf16Value),
+            other => Err(Error::InvalidArgument(format!(
+                "unsupported K/V dtype '{other}'; expected one of fp32, bf16, bf16-v"
+            ))),
+        }
+    }
+}
 
 /// Metadata that identifies and describes one static training context.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -753,58 +823,13 @@ impl StaticContextArtifact {
             .and_then(|size| size.checked_add(CHECKSUM_BYTES))
             .ok_or_else(|| artifact_error("static context length overflows usize"))?;
         let mut bytes = Vec::with_capacity(capacity);
-        bytes.extend_from_slice(&STATIC_CONTEXT_MAGIC);
-        write_u32(&mut bytes, STATIC_CONTEXT_FP32_VERSION);
-        write_u32(&mut bytes, STATIC_CONTEXT_KIND);
-        bytes.extend_from_slice(&self.metadata.model_sha256);
-        bytes.extend_from_slice(&self.metadata.context_sha256);
-        for value in [
-            self.metadata.ensemble_count,
-            self.metadata.training_rows,
-            self.metadata.feature_count,
-            self.metadata.class_count,
-        ] {
-            write_u64(
-                &mut bytes,
-                u64::try_from(value).map_err(|_| artifact_error("metadata value exceeds u64"))?,
-            );
-        }
-        for value in [3_u32, 12, 8, 16, 64] {
-            write_u32(&mut bytes, value);
-        }
-        write_u32(
-            &mut bytes,
-            u32::try_from(self.tensors.len()).map_err(|_| artifact_error("tensor count exceeds u32"))?,
-        );
-        write_u32(
-            &mut bytes,
-            u32::try_from(self.metadata.class_permutations.len())
-                .map_err(|_| artifact_error("class permutation count exceeds u32"))?,
-        );
-        write_u32(
-            &mut bytes,
-            u32::try_from(self.metadata.feature_permutations.len())
-                .map_err(|_| artifact_error("feature permutation count exceeds u32"))?,
-        );
-        write_u64(
-            &mut bytes,
-            u64::try_from(directory.len()).map_err(|_| artifact_error("directory length exceeds u64"))?,
-        );
-        write_u64(
-            &mut bytes,
-            u64::try_from(payload.len()).map_err(|_| artifact_error("payload length exceeds u64"))?,
-        );
-        write_u32(&mut bytes, 0);
-        debug_assert_eq!(bytes.len(), HEADER_BYTES);
-        for value in self
-            .metadata
-            .class_permutations
-            .iter()
-            .chain(&self.metadata.feature_permutations)
-        {
-            write_u64(&mut bytes, *value);
-        }
-        bytes.extend_from_slice(&directory);
+        bytes.extend_from_slice(&encode_prefix(
+            STATIC_CONTEXT_FP32_VERSION,
+            &self.metadata,
+            self.tensors.len(),
+            &directory,
+            payload.len(),
+        )?);
         pad_to_alignment(&mut bytes, TENSOR_ALIGNMENT)?;
         bytes.extend_from_slice(&payload);
         bytes.extend_from_slice(&sha256(&bytes));
@@ -899,7 +924,7 @@ fn validate_metadata(metadata: &StaticContextMetadata) -> Result<()> {
     )
 }
 
-fn validate_estimator_permutations(
+pub(crate) fn validate_estimator_permutations(
     values: &[u64],
     ensemble_count: usize,
     width: usize,
@@ -1065,9 +1090,860 @@ impl<'a> ByteReader<'a> {
     }
 }
 
+/// Encode the header, permutations, and directory of a static context; the
+/// result ends where the aligned tensor payload begins.
+fn encode_prefix(
+    version: u32,
+    metadata: &StaticContextMetadata,
+    tensor_count: usize,
+    directory: &[u8],
+    payload_length: usize,
+) -> Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(HEADER_BYTES + directory.len() + TENSOR_ALIGNMENT);
+    bytes.extend_from_slice(&STATIC_CONTEXT_MAGIC);
+    write_u32(&mut bytes, version);
+    write_u32(&mut bytes, STATIC_CONTEXT_KIND);
+    bytes.extend_from_slice(&metadata.model_sha256);
+    bytes.extend_from_slice(&metadata.context_sha256);
+    for value in [
+        metadata.ensemble_count,
+        metadata.training_rows,
+        metadata.feature_count,
+        metadata.class_count,
+    ] {
+        write_u64(
+            &mut bytes,
+            u64::try_from(value).map_err(|_| artifact_error("metadata value exceeds u64"))?,
+        );
+    }
+    for value in [3_u32, 12, 8, 16, 64] {
+        write_u32(&mut bytes, value);
+    }
+    write_u32(
+        &mut bytes,
+        u32::try_from(tensor_count).map_err(|_| artifact_error("tensor count exceeds u32"))?,
+    );
+    write_u32(
+        &mut bytes,
+        u32::try_from(metadata.class_permutations.len())
+            .map_err(|_| artifact_error("class permutation count exceeds u32"))?,
+    );
+    write_u32(
+        &mut bytes,
+        u32::try_from(metadata.feature_permutations.len())
+            .map_err(|_| artifact_error("feature permutation count exceeds u32"))?,
+    );
+    write_u64(
+        &mut bytes,
+        u64::try_from(directory.len()).map_err(|_| artifact_error("directory length exceeds u64"))?,
+    );
+    write_u64(
+        &mut bytes,
+        u64::try_from(payload_length).map_err(|_| artifact_error("payload length exceeds u64"))?,
+    );
+    write_u32(&mut bytes, 0);
+    debug_assert_eq!(bytes.len(), HEADER_BYTES);
+    for value in metadata
+        .class_permutations
+        .iter()
+        .chain(&metadata.feature_permutations)
+    {
+        write_u64(&mut bytes, *value);
+    }
+    bytes.extend_from_slice(directory);
+    Ok(bytes)
+}
+
+#[derive(Debug, Clone)]
+struct LayoutEntry {
+    dtype: u16,
+    offset: usize,
+    byte_length: usize,
+}
+
+impl LayoutEntry {
+    fn elements(&self) -> usize {
+        self.byte_length / usize::from(self.element_bytes())
+    }
+
+    const fn element_bytes(&self) -> u8 {
+        if self.dtype == TENSOR_DTYPE_BF16 { 2 } else { 4 }
+    }
+}
+
+/// The tensor directory of a static context to be written: names, shapes,
+/// storage dtypes, and aligned payload offsets, fixed before any value exists.
+#[derive(Debug, Clone)]
+pub struct StaticContextLayout {
+    version: u32,
+    ensemble_count: usize,
+    training_rows: usize,
+    feature_count: usize,
+    clusters: Option<usize>,
+    pack_keys: bool,
+    entries: BTreeMap<String, LayoutEntry>,
+    directory: Vec<u8>,
+    payload_length: usize,
+}
+
+impl StaticContextLayout {
+    /// Lay out the cache tensors of `ensemble_count` estimators over
+    /// `training_rows` rows and `feature_count` features, plus an optional
+    /// coarse ICL key index with `sparse_index_clusters` clusters per head.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Artifact`] when the dimensions or the resulting file
+    /// exceed the format's resource limits.
+    #[allow(clippy::too_many_lines)]
+    pub fn new(
+        ensemble_count: usize,
+        training_rows: usize,
+        feature_count: usize,
+        kv_dtype: KvDtype,
+        pack_keys: bool,
+        sparse_index_clusters: Option<usize>,
+    ) -> Result<Self> {
+        if ensemble_count == 0
+            || ensemble_count > MAX_ENSEMBLE_COUNT
+            || training_rows == 0
+            || training_rows > MAX_TRAINING_ROWS
+            || feature_count == 0
+            || feature_count > MAX_FEATURE_COUNT
+        {
+            return Err(artifact_error(
+                "static context dimensions are outside the resource limits",
+            ));
+        }
+        if let Some(clusters) = sparse_index_clusters
+            && !(2..=training_rows).contains(&clusters)
+        {
+            return Err(artifact_error(
+                "sparse index requires 2..=N clusters per attention head",
+            ));
+        }
+        let version = if pack_keys {
+            STATIC_CONTEXT_VERSION
+        } else if kv_dtype == KvDtype::Fp32 {
+            STATIC_CONTEXT_FP32_VERSION
+        } else {
+            STATIC_CONTEXT_BF16_VERSION
+        };
+        let (b, n, h) = (ensemble_count as u64, training_rows as u64, feature_count as u64);
+        let mut shapes: Vec<(String, Vec<u64>, u16)> = Vec::new();
+        for layer in 0..COLUMN_LAYERS {
+            for kind in ["key", "value"] {
+                shapes.push((
+                    format!("column.{layer}.{kind}"),
+                    vec![
+                        b,
+                        h + RESERVED_STREAMS as u64,
+                        HEADS as u64,
+                        INDUCING as u64,
+                        COLUMN_HEAD_DIM as u64,
+                    ],
+                    TENSOR_DTYPE_FP32,
+                ));
+            }
+        }
+        for layer in 0..ICL_LAYERS {
+            for (kind, bf16) in [
+                ("key", kv_dtype.key_is_bf16()),
+                ("value", kv_dtype.value_is_bf16()),
+            ] {
+                shapes.push((
+                    format!("icl.{layer}.{kind}"),
+                    vec![b, HEADS as u64, n, ICL_HEAD_DIM as u64],
+                    if bf16 {
+                        TENSOR_DTYPE_BF16
+                    } else {
+                        TENSOR_DTYPE_FP32
+                    },
+                ));
+            }
+        }
+        if let Some(clusters) = sparse_index_clusters {
+            let (k, layers, heads) = (clusters as u64, ICL_LAYERS as u64, HEADS as u64);
+            shapes.push((
+                "icl.index.centroids".into(),
+                vec![b, layers, heads, k, ICL_HEAD_DIM as u64],
+                TENSOR_DTYPE_FP32,
+            ));
+            shapes.push((
+                "icl.index.radii".into(),
+                vec![b, layers, heads, k],
+                TENSOR_DTYPE_FP32,
+            ));
+            shapes.push((
+                "icl.index.offsets".into(),
+                vec![b, layers, heads, k + 1],
+                TENSOR_DTYPE_FP32,
+            ));
+            shapes.push((
+                "icl.index.members".into(),
+                vec![b, layers, heads, n],
+                TENSOR_DTYPE_FP32,
+            ));
+        }
+        shapes.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut entries = BTreeMap::new();
+        let mut directory = Vec::new();
+        let mut payload_length = 0_usize;
+        for (name, dimensions, dtype) in shapes {
+            let elements = checked_elements(&dimensions)?;
+            let byte_length = elements
+                .checked_mul(if dtype == TENSOR_DTYPE_BF16 { 2 } else { 4 })
+                .ok_or_else(|| artifact_error("tensor byte length overflows usize"))?;
+            if byte_length > MAX_TENSOR_BYTES {
+                return Err(artifact_error(format!(
+                    "static context tensor '{name}' exceeds the resource limit"
+                )));
+            }
+            let offset = align_up(payload_length, TENSOR_ALIGNMENT)?;
+            payload_length = offset
+                .checked_add(byte_length)
+                .ok_or_else(|| artifact_error("payload length overflows usize"))?;
+            write_u32(
+                &mut directory,
+                u32::try_from(name.len()).map_err(|_| artifact_error("tensor name length exceeds u32"))?,
+            );
+            write_u16(
+                &mut directory,
+                u16::try_from(dimensions.len()).map_err(|_| artifact_error("tensor rank exceeds u16"))?,
+            );
+            write_u16(
+                &mut directory,
+                if version == STATIC_CONTEXT_FP32_VERSION {
+                    0
+                } else {
+                    dtype
+                },
+            );
+            write_u64(
+                &mut directory,
+                u64::try_from(offset).map_err(|_| artifact_error("tensor offset exceeds u64"))?,
+            );
+            write_u64(
+                &mut directory,
+                u64::try_from(byte_length).map_err(|_| artifact_error("tensor byte length exceeds u64"))?,
+            );
+            for dimension in &dimensions {
+                write_u64(&mut directory, *dimension);
+            }
+            directory.extend_from_slice(name.as_bytes());
+            entries.insert(
+                name,
+                LayoutEntry {
+                    dtype,
+                    offset,
+                    byte_length,
+                },
+            );
+        }
+        if payload_length > MAX_TOTAL_TENSOR_BYTES || directory.len() > MAX_DIRECTORY_BYTES {
+            return Err(artifact_error(
+                "static context section exceeds the resource limit",
+            ));
+        }
+        Ok(Self {
+            version,
+            ensemble_count,
+            training_rows,
+            feature_count,
+            clusters: sparse_index_clusters,
+            pack_keys,
+            entries,
+            directory,
+            payload_length,
+        })
+    }
+
+    /// The format version the layout will be written as (1 FP32, 2 BF16, 3 packed keys).
+    #[must_use]
+    pub const fn version(&self) -> u32 {
+        self.version
+    }
+
+    /// Whether ICL keys are stored in source-tile, dimension-major packed order.
+    #[must_use]
+    pub const fn packs_keys(&self) -> bool {
+        self.pack_keys
+    }
+
+    /// Clusters per attention head of the coarse ICL key index, if any.
+    #[must_use]
+    pub const fn sparse_index_clusters(&self) -> Option<usize> {
+        self.clusters
+    }
+
+    /// Byte length of the complete artifact, including the checksum.
+    fn file_length(&self, metadata: &StaticContextMetadata) -> Result<usize> {
+        let permutations = (metadata.class_permutations.len() + metadata.feature_permutations.len())
+            .checked_mul(8)
+            .ok_or_else(|| artifact_error("permutation length overflows usize"))?;
+        let payload_start = align_up(
+            HEADER_BYTES + permutations + self.directory.len(),
+            TENSOR_ALIGNMENT,
+        )?;
+        let length = payload_start
+            .checked_add(self.payload_length)
+            .and_then(|length| length.checked_add(CHECKSUM_BYTES))
+            .ok_or_else(|| artifact_error("static context length overflows usize"))?;
+        if length > MAX_ARTIFACT_BYTES {
+            return Err(artifact_error("static context exceeds the resource limit"));
+        }
+        Ok(length)
+    }
+}
+
+/// Description of a static context file that [`StaticContextWriter::finish`] produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticContextFileSummary {
+    pub version: u32,
+    pub file_bytes: u64,
+    pub file_sha256: [u8; 32],
+}
+
+/// Streams cache tensors into a memory-mapped static-context file one chunk at
+/// a time, then seals it with the whole-file checksum and an atomic rename.
+///
+/// Tensor chunks may arrive in any order; every element must be written exactly
+/// once before [`Self::finish`]. The temporary file is removed if the writer is
+/// dropped without finishing.
+pub struct StaticContextWriter {
+    layout: StaticContextLayout,
+    path: PathBuf,
+    temporary: PathBuf,
+    file: Option<File>,
+    mapping: Option<MmapMut>,
+    payload_start: usize,
+    written: BTreeMap<String, usize>,
+}
+
+impl std::fmt::Debug for StaticContextWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StaticContextWriter")
+            .field("path", &self.path)
+            .field("version", &self.layout.version)
+            .finish_non_exhaustive()
+    }
+}
+
+impl StaticContextWriter {
+    /// Create the temporary output file with `layout` and write its header,
+    /// permutations, and tensor directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Artifact`] when `metadata` is invalid or does not match
+    /// `layout`, or when the file cannot be created.
+    #[allow(unsafe_code)]
+    pub fn create(
+        path: &Path,
+        metadata: &StaticContextMetadata,
+        layout: StaticContextLayout,
+    ) -> Result<Self> {
+        validate_metadata(metadata)?;
+        if metadata.ensemble_count != layout.ensemble_count
+            || metadata.training_rows != layout.training_rows
+            || metadata.feature_count != layout.feature_count
+        {
+            return Err(artifact_error(
+                "static context metadata does not match the tensor layout",
+            ));
+        }
+        let length = layout.file_length(metadata)?;
+        let prefix = encode_prefix(
+            layout.version,
+            metadata,
+            layout.entries.len(),
+            &layout.directory,
+            layout.payload_length,
+        )?;
+        let payload_start = align_up(prefix.len(), TENSOR_ALIGNMENT)?;
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| artifact_error("static context path has no file name"))?;
+        let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).map_err(artifact_error)?;
+        }
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&temporary)
+            .map_err(artifact_error)?;
+        let mut writer = Self {
+            written: layout.entries.keys().map(|name| (name.clone(), 0)).collect(),
+            layout,
+            path: path.to_path_buf(),
+            temporary,
+            file: None,
+            mapping: None,
+            payload_start,
+        };
+        file.set_len(length as u64).map_err(artifact_error)?;
+        // SAFETY: the mapping is private to this writer, which is the only
+        // writer of the temporary file until it is renamed into place.
+        let mut mapping = unsafe { MmapOptions::new().map_mut(&file) }.map_err(artifact_error)?;
+        mapping[..prefix.len()].copy_from_slice(&prefix);
+        writer.file = Some(file);
+        writer.mapping = Some(mapping);
+        Ok(writer)
+    }
+
+    /// The layout being written.
+    #[must_use]
+    pub const fn layout(&self) -> &StaticContextLayout {
+        &self.layout
+    }
+
+    /// Store one column stream's `[8, 128, 16]` key or value cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Artifact`] when the chunk is out of range or non-finite.
+    pub fn write_column(
+        &mut self,
+        layer: usize,
+        kind: &str,
+        ensemble: usize,
+        stream: usize,
+        values: &[f32],
+    ) -> Result<()> {
+        let streams = self.layout.feature_count + RESERVED_STREAMS;
+        if layer >= COLUMN_LAYERS || ensemble >= self.layout.ensemble_count || stream >= streams {
+            return Err(artifact_error("column cache chunk index is out of range"));
+        }
+        let chunk = HEADS * INDUCING * COLUMN_HEAD_DIM;
+        if values.len() != chunk {
+            return Err(artifact_error("column cache chunk has the wrong length"));
+        }
+        self.write_elements(
+            &format!("column.{layer}.{kind}"),
+            (ensemble * streams + stream) * chunk,
+            values,
+        )
+    }
+
+    /// Store one estimator's `[8, N, 64]` ICL key or value cache for `layer`,
+    /// packing keys and rounding to BF16 as the layout requires.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Artifact`] when the chunk is out of range or non-finite.
+    pub fn write_icl(&mut self, layer: usize, kind: &str, ensemble: usize, values: &[f32]) -> Result<()> {
+        if layer >= ICL_LAYERS || ensemble >= self.layout.ensemble_count {
+            return Err(artifact_error("ICL cache chunk index is out of range"));
+        }
+        let n = self.layout.training_rows;
+        let chunk = HEADS * n * ICL_HEAD_DIM;
+        if values.len() != chunk {
+            return Err(artifact_error("ICL cache chunk has the wrong length"));
+        }
+        let name = format!("icl.{layer}.{kind}");
+        if kind == "key" && self.layout.pack_keys {
+            let packed = pack_icl_keys(values, n);
+            self.write_elements(&name, ensemble * chunk, &packed)
+        } else {
+            self.write_elements(&name, ensemble * chunk, values)
+        }
+    }
+
+    /// Store one attention head's slice of a coarse ICL key index tensor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Artifact`] when the layout has no index or the chunk is invalid.
+    pub fn write_index(
+        &mut self,
+        name: &str,
+        ensemble: usize,
+        layer: usize,
+        head: usize,
+        values: &[f32],
+    ) -> Result<()> {
+        let Some(clusters) = self.layout.clusters else {
+            return Err(artifact_error("static context layout has no sparse index"));
+        };
+        let per_head = match name {
+            "icl.index.centroids" => clusters * ICL_HEAD_DIM,
+            "icl.index.radii" => clusters,
+            "icl.index.offsets" => clusters + 1,
+            "icl.index.members" => self.layout.training_rows,
+            _ => return Err(artifact_error(format!("unknown sparse index tensor '{name}'"))),
+        };
+        if ensemble >= self.layout.ensemble_count || layer >= ICL_LAYERS || head >= HEADS {
+            return Err(artifact_error("sparse index chunk index is out of range"));
+        }
+        if values.len() != per_head {
+            return Err(artifact_error("sparse index chunk has the wrong length"));
+        }
+        let group = (ensemble * ICL_LAYERS + layer) * HEADS + head;
+        self.write_elements(name, group * per_head, values)
+    }
+
+    fn write_elements(&mut self, name: &str, element_offset: usize, values: &[f32]) -> Result<()> {
+        let entry = self
+            .layout
+            .entries
+            .get(name)
+            .ok_or_else(|| artifact_error(format!("static context layout has no tensor '{name}'")))?;
+        let end = element_offset
+            .checked_add(values.len())
+            .filter(|end| *end <= entry.elements())
+            .ok_or_else(|| artifact_error(format!("tensor '{name}' chunk is out of range")))?;
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(artifact_error(format!(
+                "tensor '{name}' contains a non-finite value"
+            )));
+        }
+        let element_bytes = usize::from(entry.element_bytes());
+        let start = self.payload_start + entry.offset + element_offset * element_bytes;
+        let mapping = self
+            .mapping
+            .as_mut()
+            .ok_or_else(|| artifact_error("static context writer is finished"))?;
+        let target = &mut mapping[start..start + values.len() * element_bytes];
+        if entry.dtype == TENSOR_DTYPE_BF16 {
+            for (slot, value) in target.chunks_exact_mut(2).zip(values) {
+                slot.copy_from_slice(&crate::kernels::native::f32_to_bf16_rne(*value).to_le_bytes());
+            }
+        } else {
+            for (slot, value) in target.chunks_exact_mut(4).zip(values) {
+                slot.copy_from_slice(&value.to_le_bytes());
+            }
+        }
+        let _ = end;
+        *self
+            .written
+            .get_mut(name)
+            .expect("written counters cover every layout tensor") += values.len();
+        Ok(())
+    }
+
+    /// Verify that every tensor is complete, append the SHA-256 trailer, flush,
+    /// and rename the file into place.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Artifact`] when a tensor is incomplete or the file
+    /// cannot be sealed.
+    pub fn finish(mut self) -> Result<StaticContextFileSummary> {
+        for (name, entry) in &self.layout.entries {
+            if self.written.get(name).copied() != Some(entry.elements()) {
+                return Err(artifact_error(format!(
+                    "static context tensor '{name}' was not completely written"
+                )));
+            }
+        }
+        let mut mapping = self
+            .mapping
+            .take()
+            .ok_or_else(|| artifact_error("static context writer is finished"))?;
+        let checksum_offset = mapping.len() - CHECKSUM_BYTES;
+        let digest = sha256(&mapping[..checksum_offset]);
+        mapping[checksum_offset..].copy_from_slice(&digest);
+        mapping.flush().map_err(artifact_error)?;
+        let file_bytes = mapping.len() as u64;
+        drop(mapping);
+        let file = self
+            .file
+            .take()
+            .ok_or_else(|| artifact_error("static context writer is finished"))?;
+        file.sync_all().map_err(artifact_error)?;
+        drop(file);
+        fs::rename(&self.temporary, &self.path).map_err(artifact_error)?;
+        Ok(StaticContextFileSummary {
+            version: self.layout.version,
+            file_bytes,
+            file_sha256: sha256_file(&self.path)?,
+        })
+    }
+}
+
+impl Drop for StaticContextWriter {
+    fn drop(&mut self) {
+        if self.mapping.is_some() || self.file.is_some() {
+            self.mapping = None;
+            self.file = None;
+            let _ = fs::remove_file(&self.temporary);
+        }
+    }
+}
+
+fn sha256_file(path: &Path) -> Result<[u8; 32]> {
+    use std::io::Read as _;
+    let mut file = File::open(path).map_err(artifact_error)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 1 << 20];
+    loop {
+        let read = file.read(&mut buffer).map_err(artifact_error)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().into())
+}
+
+/// Reorder one estimator's `[8, N, 64]` ICL keys into 128-row source tiles
+/// stored dimension-major, the layout the source-lane score kernel reads.
+#[must_use]
+pub fn pack_icl_keys(keys: &[f32], training_rows: usize) -> Vec<f32> {
+    let mut packed = vec![0.0; keys.len()];
+    for head in 0..HEADS {
+        for start in (0..training_rows).step_by(PACKED_KEY_TILE_ROWS) {
+            let rows = (training_rows - start).min(PACKED_KEY_TILE_ROWS);
+            let base = (head * training_rows + start) * ICL_HEAD_DIM;
+            for dimension in 0..ICL_HEAD_DIM {
+                for row in 0..rows {
+                    packed[base + dimension * rows + row] =
+                        keys[(head * training_rows + start + row) * ICL_HEAD_DIM + dimension];
+                }
+            }
+        }
+    }
+    packed
+}
+
+/// Names of the optional coarse ICL key index tensors.
+#[must_use]
+pub const fn sparse_index_names() -> [&'static str; 4] {
+    SPARSE_INDEX_NAMES
+}
+
 #[cfg(test)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::case_sensitive_file_extension_comparisons,
+    clippy::float_cmp
+)]
 mod tests {
     use super::*;
+
+    #[allow(clippy::cast_precision_loss)]
+    fn synthetic_cache(b: usize, n: usize, h: usize) -> Vec<StaticContextTensor> {
+        let mut tensors = Vec::new();
+        let mut seed = 0_usize;
+        let mut values = |count: usize| {
+            let out = (0..count)
+                .map(|index| ((index + seed) % 977) as f32 * 0.01 - 4.0)
+                .collect::<Vec<_>>();
+            seed += 131;
+            out
+        };
+        let streams = h + RESERVED_STREAMS;
+        for layer in 0..COLUMN_LAYERS {
+            for kind in ["key", "value"] {
+                tensors.push(StaticContextTensor {
+                    name: format!("column.{layer}.{kind}"),
+                    dimensions: vec![b as u64, streams as u64, 8, 128, 16],
+                    values: values(b * streams * 8 * 128 * 16),
+                });
+            }
+        }
+        for layer in 0..ICL_LAYERS {
+            for kind in ["key", "value"] {
+                tensors.push(StaticContextTensor {
+                    name: format!("icl.{layer}.{kind}"),
+                    dimensions: vec![b as u64, 8, n as u64, 64],
+                    values: values(b * 8 * n * 64),
+                });
+            }
+        }
+        tensors
+    }
+
+    fn synthetic_metadata(b: usize, n: usize, h: usize) -> StaticContextMetadata {
+        StaticContextMetadata {
+            model_sha256: [1; 32],
+            context_sha256: [2; 32],
+            ensemble_count: b,
+            training_rows: n,
+            feature_count: h,
+            class_count: 2,
+            class_permutations: (0..b).flat_map(|_| [1, 0]).collect(),
+            feature_permutations: (0..b).flat_map(|_| (0..h as u64).rev()).collect(),
+        }
+    }
+
+    fn write_synthetic(
+        path: &Path,
+        b: usize,
+        n: usize,
+        h: usize,
+        kv_dtype: KvDtype,
+        pack_keys: bool,
+    ) -> (Vec<StaticContextTensor>, StaticContextFileSummary) {
+        let tensors = synthetic_cache(b, n, h);
+        let layout = StaticContextLayout::new(b, n, h, kv_dtype, pack_keys, None).expect("layout");
+        let mut writer =
+            StaticContextWriter::create(path, &synthetic_metadata(b, n, h), layout).expect("writer");
+        let streams = h + RESERVED_STREAMS;
+        for tensor in &tensors {
+            let parts = tensor.name.split('.').collect::<Vec<_>>();
+            let layer = parts[1].parse::<usize>().expect("layer");
+            if parts[0] == "column" {
+                let chunk = 8 * 128 * 16;
+                for ensemble in 0..b {
+                    for stream in 0..streams {
+                        let offset = (ensemble * streams + stream) * chunk;
+                        writer
+                            .write_column(
+                                layer,
+                                parts[2],
+                                ensemble,
+                                stream,
+                                &tensor.values[offset..][..chunk],
+                            )
+                            .expect("column chunk");
+                    }
+                }
+            } else {
+                let chunk = 8 * n * 64;
+                for ensemble in 0..b {
+                    writer
+                        .write_icl(
+                            layer,
+                            parts[2],
+                            ensemble,
+                            &tensor.values[ensemble * chunk..][..chunk],
+                        )
+                        .expect("ICL chunk");
+                }
+            }
+        }
+        let summary = writer.finish().expect("finish");
+        (tensors, summary)
+    }
+
+    #[test]
+    fn writer_fp32_file_matches_owned_encoding_byte_for_byte() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("context.ironiclctx");
+        let (tensors, summary) = write_synthetic(&path, 2, 5, 3, KvDtype::Fp32, false);
+        assert_eq!(summary.version, STATIC_CONTEXT_FP32_VERSION);
+        let owned = StaticContextArtifact::new(synthetic_metadata(2, 5, 3), tensors).expect("owned");
+        let bytes = fs::read(&path).expect("read written file");
+        assert_eq!(bytes, owned.to_bytes().expect("encode"));
+        assert_eq!(summary.file_bytes as usize, bytes.len());
+        assert_eq!(summary.file_sha256, sha256(&bytes));
+        assert_eq!(StaticContextArtifact::read_mapped(&path).expect("map"), owned);
+        assert_eq!(StaticContextArtifact::from_bytes(&bytes).expect("own"), owned);
+        assert!(
+            !path
+                .with_file_name(format!(".context.ironiclctx.{}.tmp", std::process::id()))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn writer_rounds_icl_tensors_to_bf16_per_kv_dtype() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        for (kv_dtype, key_bf16, value_bf16) in
+            [(KvDtype::Bf16, true, true), (KvDtype::Bf16Value, false, true)]
+        {
+            let path = directory.path().join(format!("{}.ironiclctx", kv_dtype.name()));
+            let (tensors, summary) = write_synthetic(&path, 1, 7, 2, kv_dtype, false);
+            assert_eq!(summary.version, STATIC_CONTEXT_BF16_VERSION);
+            let mapped = StaticContextArtifact::read_mapped(&path).expect("map");
+            assert!(!mapped.has_packed_icl_keys());
+            for tensor in &tensors {
+                let stored = mapped.tensor(&tensor.name).expect("tensor");
+                assert_eq!(stored.dimensions, tensor.dimensions.as_slice());
+                let bf16 = tensor.name.starts_with("icl.")
+                    && ((tensor.name.ends_with(".key") && key_bf16)
+                        || (tensor.name.ends_with(".value") && value_bf16));
+                match stored.data {
+                    StaticContextTensorData::Fp32(values) => {
+                        assert!(!bf16, "{} should be BF16", tensor.name);
+                        assert_eq!(values, tensor.values.as_slice());
+                    }
+                    StaticContextTensorData::Bf16(values) => {
+                        assert!(bf16, "{} should be FP32", tensor.name);
+                        let expected = tensor
+                            .values
+                            .iter()
+                            .map(|value| crate::kernels::native::f32_to_bf16_rne(*value))
+                            .collect::<Vec<_>>();
+                        assert_eq!(values, expected.as_slice());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn writer_packs_icl_keys_in_version_three() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("packed.ironiclctx");
+        let (n, b) = (300, 2);
+        let (tensors, summary) = write_synthetic(&path, b, n, 2, KvDtype::Fp32, true);
+        assert_eq!(summary.version, STATIC_CONTEXT_VERSION);
+        let mapped = StaticContextArtifact::read_mapped(&path).expect("map");
+        assert!(mapped.has_packed_icl_keys());
+        for tensor in &tensors {
+            let stored = mapped
+                .tensor(&tensor.name)
+                .expect("tensor")
+                .fp32_values()
+                .expect("fp32");
+            if tensor.name.starts_with("icl.") && tensor.name.ends_with(".key") {
+                let chunk = 8 * n * 64;
+                let expected = (0..b)
+                    .flat_map(|ensemble| pack_icl_keys(&tensor.values[ensemble * chunk..][..chunk], n))
+                    .collect::<Vec<_>>();
+                assert_eq!(stored, expected.as_slice());
+            } else {
+                assert_eq!(stored, tensor.values.as_slice());
+            }
+        }
+    }
+
+    #[test]
+    fn pack_icl_keys_uses_dimension_major_tiles() {
+        let n = 130;
+        let keys = (0..8 * n * 64).map(|index| index as f32).collect::<Vec<_>>();
+        let packed = pack_icl_keys(&keys, n);
+        // Head 0, tile 0 (128 rows): element [dimension, row] at dimension * 128 + row.
+        assert_eq!(packed[0], keys[0]);
+        assert_eq!(packed[1], keys[64]);
+        assert_eq!(packed[128], keys[1]);
+        // Head 0, tile 1 (2 rows) starts at 128 * 64.
+        assert_eq!(packed[128 * 64], keys[128 * 64]);
+        assert_eq!(packed[128 * 64 + 1], keys[129 * 64]);
+        assert_eq!(packed[128 * 64 + 2], keys[128 * 64 + 1]);
+    }
+
+    #[test]
+    fn writer_refuses_incomplete_and_out_of_range_chunks() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("incomplete.ironiclctx");
+        let layout = StaticContextLayout::new(1, 3, 2, KvDtype::Fp32, false, Some(2)).expect("layout");
+        assert_eq!(layout.sparse_index_clusters(), Some(2));
+        let mut writer =
+            StaticContextWriter::create(&path, &synthetic_metadata(1, 3, 2), layout).expect("writer");
+        let column = vec![0.0; 8 * 128 * 16];
+        assert!(writer.write_column(3, "key", 0, 0, &column).is_err());
+        assert!(writer.write_column(0, "key", 0, 6, &column).is_err());
+        assert!(writer.write_icl(0, "key", 1, &[0.0; 8 * 3 * 64]).is_err());
+        assert!(writer.write_icl(0, "key", 0, &[f32::NAN; 8 * 3 * 64]).is_err());
+        assert!(writer.write_index("icl.index.radii", 0, 0, 0, &[0.0; 3]).is_err());
+        assert!(writer.write_index("icl.index.radii", 0, 0, 0, &[0.0; 2]).is_ok());
+        assert!(writer.finish().is_err());
+        assert!(!path.exists());
+        assert!(StaticContextLayout::new(1, 3, 2, KvDtype::Fp32, false, Some(4)).is_err());
+        assert_eq!("bf16-v".parse::<KvDtype>().expect("dtype"), KvDtype::Bf16Value);
+        assert!("bf16-k".parse::<KvDtype>().is_err());
+        assert!("int8".parse::<KvDtype>().is_err());
+    }
 
     fn fixture() -> StaticContextArtifact {
         StaticContextArtifact::new(

@@ -1,0 +1,12 @@
+{
+  "tabicl_version": "2.2.0",
+  "sklearn_version": "1.9.1",
+  "checkpoint": "tabicl-classifier-v2-20260212.ckpt",
+  "random_state": 42,
+  "n_classes": 4,
+  "norm_methods_used": [
+    "none",
+    "power"
+  ],
+  "n_estimators": 2
+}

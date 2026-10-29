@@ -124,7 +124,7 @@ pub(crate) fn checkpoint_sha256(path: &Path) -> Result<String> {
     Ok(digest)
 }
 
-/// Import a validated checkpoint into the portable Ironicl model format.
+/// Import a validated checkpoint into the portable `IronICL` model format.
 ///
 /// # Errors
 ///

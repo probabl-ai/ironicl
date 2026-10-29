@@ -1,9 +1,10 @@
 [package]
-name = "ironicl"
+name = "ironicl-engine"
 version = "0.1.0"
 edition = "2024"
+license = "BSD-3-Clause"
 publish = false
-description = "A cache-aware CPU inference engine for TabICLv2"
+description = "Cache-aware CPU inference engine for TabICLv2; the compiled core of the ironicl Python package"
 
 [lib]
 name = "ironicl"
@@ -18,12 +19,15 @@ path = "src/main.rs"
 default = ["checkpoint"]
 checkpoint = ["dep:candle-core", "dep:zip"]
 profile = []
+python = ["dep:pyo3", "dep:numpy"]
 
 [dependencies]
 bytemuck = "=1.25.2"
 candle-core = { version = "=0.9.1", optional = true }
 libm = "=0.2.16"
 memmap2 = "=0.9.11"
+numpy = { version = "=0.30.0", optional = true }
+pyo3 = { version = "=0.30.1", optional = true, features = ["extension-module", "abi3-py310"] }
 rayon = "=1.12.0"
 sha2 = "=0.11.0"
 zip = { version = "=1.1.4", default-features = false, optional = true }

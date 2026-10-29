@@ -8,9 +8,10 @@ use std::{
 };
 
 use ironicl::{
-    CheckpointCacheOptions, CheckpointProfile, ClassifierExecutor, ClassifierInputBundle, PreparedCheckpoint,
-    TaskKind, import_checkpoint, inspect_checkpoint, inspect_model_artifact, load_model_artifact,
-    prepare_checkpoint,
+    CheckpointCacheOptions, CheckpointProfile, ClassifierExecutor, ClassifierInputBundle,
+    ClassifierQueryRequest, KvDtype, PreparedCheckpoint, StaticClassifierExecutor, StaticContextArtifact,
+    StaticContextOptions, StaticContextRequest, TaskKind, build_static_context, build_static_context_file,
+    import_checkpoint, inspect_checkpoint, inspect_model_artifact, load_model_artifact, prepare_checkpoint,
 };
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -178,7 +179,7 @@ fn matches_python_classifier_oracle_when_fixtures_are_available() {
     for (index, (actual, expected)) in actual.values().iter().zip(&expected.values).enumerate() {
         assert!(
             actual.is_finite(),
-            "Ironicl logit {index} is not finite: {actual}"
+            "IronICL logit {index} is not finite: {actual}"
         );
         let abs = (actual - expected).abs();
         let rel = if *expected == 0.0 {
@@ -194,6 +195,132 @@ fn matches_python_classifier_oracle_when_fixtures_are_available() {
         );
     }
     println!("Python oracle parity: max_abs={max_abs:.9e}, max_rel={max_rel:.9e}");
+}
+
+#[test]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::too_many_lines,
+    clippy::many_single_char_names
+)]
+fn native_static_context_matches_uncached_executor() {
+    let Some(model_path) = fixture("tabicl-classifier-v2.ironicl") else {
+        return;
+    };
+    let executor =
+        ClassifierExecutor::new(load_model_artifact(&model_path).expect("load official classifier"));
+    let (b, n, q, h, c) = (2_usize, 40_usize, 6_usize, 5_usize, 3_usize);
+    let t = n + q;
+    let mut state = 12_345_u32;
+    let mut next = || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (state >> 8) as f32 / (1_u32 << 24) as f32 * 4.0 - 2.0
+    };
+    let x = (0..b * t * h).map(|_| next()).collect::<Vec<_>>();
+    let y = (0..b * n).map(|index| (index % c) as f32).collect::<Vec<_>>();
+    let bundle = ClassifierInputBundle::new(b, t, h, n, x.clone(), y.clone()).expect("synthetic bundle");
+    let expected = executor
+        .predict_logits(bundle.request())
+        .expect("uncached logits");
+    assert_eq!(expected.shape(), [b, q, c]);
+
+    let class_permutations = (0..b).flat_map(|_| 0..c as u64).collect::<Vec<_>>();
+    let feature_permutations = (0..b).flat_map(|_| 0..h as u64).collect::<Vec<_>>();
+    let request = StaticContextRequest::new(
+        b,
+        n,
+        t,
+        h,
+        &x,
+        &y,
+        &class_permutations,
+        &feature_permutations,
+        [7; 32],
+    )
+    .expect("static context request");
+    let mut queries = Vec::with_capacity(b * q * h);
+    for ensemble in 0..b {
+        queries.extend_from_slice(&x[(ensemble * t + n) * h..][..q * h]);
+    }
+    let directory = tempdir().expect("temporary directory");
+    let fp32_path = directory.path().join("fp32.ironiclctx");
+    let cases = [
+        ("fp32", StaticContextOptions::default(), 1e-5_f32),
+        (
+            "packed",
+            StaticContextOptions {
+                pack_keys: true,
+                ..StaticContextOptions::default()
+            },
+            1e-5,
+        ),
+        (
+            "indexed",
+            StaticContextOptions {
+                sparse_index_clusters: Some(8),
+                ..StaticContextOptions::default()
+            },
+            1e-5,
+        ),
+        (
+            "bf16",
+            StaticContextOptions {
+                kv_dtype: KvDtype::Bf16,
+                ..StaticContextOptions::default()
+            },
+            5e-2,
+        ),
+    ];
+    for (name, options, tolerance) in cases {
+        let path = if name == "fp32" {
+            fp32_path.clone()
+        } else {
+            directory.path().join(format!("{name}.ironiclctx"))
+        };
+        let summary = build_static_context_file(&executor, &request, &options, &path).expect("build context");
+        assert_eq!(
+            summary.file_bytes,
+            fs::metadata(&path).expect("context file").len()
+        );
+        let context = StaticContextArtifact::read_mapped(&path).expect("map built context");
+        assert_eq!(context.metadata().training_rows, n);
+        assert_eq!(context.has_packed_icl_keys(), options.pack_keys);
+        let cached = StaticClassifierExecutor::new(
+            load_model_artifact(&model_path).expect("reload official classifier"),
+            context,
+        )
+        .expect("cached executor");
+        let actual = cached
+            .predict_logits(ClassifierQueryRequest::new(b, q, h, &queries).expect("query request"))
+            .expect("cached logits");
+        assert_eq!(actual.shape(), expected.shape());
+        let mut max_abs = 0.0_f32;
+        for (index, (actual, expected)) in actual.values().iter().zip(expected.values()).enumerate() {
+            let abs = (actual - expected).abs();
+            max_abs = max_abs.max(abs);
+            assert!(
+                abs <= tolerance + tolerance * expected.abs(),
+                "{name}: logit {index} differs: actual={actual}, expected={expected}, abs={abs}"
+            );
+        }
+        println!("native static context ({name}): max_abs={max_abs:.3e}");
+        if name == "bf16" {
+            for (actual, expected) in actual.values().chunks(c).zip(expected.values().chunks(c)) {
+                let argmax = |row: &[f32]| {
+                    row.iter()
+                        .enumerate()
+                        .max_by(|a, b| a.1.total_cmp(b.1))
+                        .map(|(index, _)| index)
+                };
+                assert_eq!(argmax(actual), argmax(expected));
+            }
+        }
+    }
+    let owned = build_static_context(&executor, &request).expect("in-memory context");
+    assert_eq!(
+        owned,
+        StaticContextArtifact::read(&fp32_path).expect("read fp32 context")
+    );
 }
 
 #[test]
@@ -220,18 +347,14 @@ fn no_cache_validates_without_writing() {
 }
 
 fn fixture(name: &str) -> Option<PathBuf> {
-    if let Some(directory) = std::env::var_os("IRONICL_CHECKPOINT_FIXTURES") {
-        let path = Path::new(&directory).join(name);
-        assert!(
-            path.is_file(),
-            "checkpoint fixture is missing: {}",
-            path.display()
-        );
-        return Some(path);
-    }
-
-    let path = Path::new("/var/folders/j1/kv9f5d_54c93f3qry1pw9xh00000gn/T/opencode").join(name);
-    path.is_file().then_some(path)
+    let directory = std::env::var_os("IRONICL_CHECKPOINT_DIR")?;
+    let path = Path::new(&directory).join(name);
+    assert!(
+        path.is_file(),
+        "checkpoint fixture is missing: {}",
+        path.display()
+    );
+    Some(path)
 }
 
 struct OracleFixtures {
@@ -240,25 +363,12 @@ struct OracleFixtures {
 }
 
 fn oracle_fixtures() -> Option<OracleFixtures> {
-    let explicitly_configured = std::env::var_os("IRONICL_ORACLE_FIXTURES");
-    let directory = explicitly_configured.as_deref().map_or_else(
-        || PathBuf::from("/var/folders/j1/kv9f5d_54c93f3qry1pw9xh00000gn/T/opencode/ironicl-oracle"),
-        PathBuf::from,
-    );
+    let directory = PathBuf::from(std::env::var_os("IRONICL_CHECKPOINT_DIR")?).join("oracle");
     let fixtures = OracleFixtures {
         input: directory.join("input.irinput"),
         logits: directory.join("logits.irlogits"),
     };
-    if fixtures.input.is_file() && fixtures.logits.is_file() {
-        return Some(fixtures);
-    }
-    assert!(
-        explicitly_configured.is_none(),
-        "oracle fixtures are missing: {} and {}",
-        fixtures.input.display(),
-        fixtures.logits.display()
-    );
-    None
+    (fixtures.input.is_file() && fixtures.logits.is_file()).then_some(fixtures)
 }
 
 struct OracleLogits {
