@@ -1,9 +1,9 @@
 use std::{env, process, time::Instant};
 
 use ironicl::{
-    BenchmarkArgs, BenchmarkStats, ClassifierExecutor, ClassifierInputBundle, Command, CpuCapabilities,
-    HelpTopic, ImportArgs, InspectArgs, ModelSource, PlanArgs, RunArgs, StaticClassifierExecutor,
-    StaticContextArtifact, StaticQueryBundle,
+    BenchmarkArgs, BenchmarkStats, BuildContextArgs, ClassifierExecutor, ClassifierInputBundle, Command,
+    CpuCapabilities, HelpTopic, ImportArgs, InspectArgs, ModelSource, PlanArgs, RunArgs,
+    StaticClassifierExecutor, StaticContextArtifact, StaticQueryBundle,
     cache::ByteSize,
     error::{Error, Result},
     estimate_memory, parse_cli, resolve_backend,
@@ -26,13 +26,14 @@ fn run() -> Result<()> {
         Command::Import(args) => import(&args)?,
         Command::Run(args) => run_model(args)?,
         Command::Benchmark(args) => benchmark(&args)?,
+        Command::BuildContext(args) => build_context(&args)?,
     }
     Ok(())
 }
 
 fn print_platform() {
     let host = CpuCapabilities::detect();
-    println!("Ironicl host capabilities\n{host}");
+    println!("IronICL host capabilities\n{host}");
     println!(
         "zen5 base:       {}",
         if host.supports_zen5_base() { "yes" } else { "no" }
@@ -46,7 +47,7 @@ fn print_plan(args: PlanArgs) -> Result<()> {
     let selected_backend = resolve_backend(config, &host)?;
     let memory = estimate_memory(config)?;
 
-    println!("Ironicl execution plan");
+    println!("IronICL execution plan");
     println!("task:             {}", config.model.task);
     println!("training rows:    {}", workload.training_rows);
     println!("features:         {}", workload.features);
@@ -89,7 +90,7 @@ fn inspect(args: InspectArgs) -> Result<()> {
 
 fn inspect_model_file(path: &std::path::Path) -> Result<()> {
     let summary = ironicl::inspect_model_artifact(path)?;
-    println!("Ironicl model inspection");
+    println!("IronICL model inspection");
     println!("path:          {}", path.display());
     println!("source sha256: {}", summary.source_sha256);
     println!("profile:       {}", summary.profile);
@@ -126,7 +127,7 @@ fn inspect_model_file(path: &std::path::Path) -> Result<()> {
 #[cfg(feature = "checkpoint")]
 fn inspect_checkpoint_file(path: &std::path::Path) -> Result<()> {
     let summary = ironicl::inspect_checkpoint(path)?;
-    println!("Ironicl checkpoint inspection");
+    println!("IronICL checkpoint inspection");
     println!("path:          {}", path.display());
     println!("sha256:        {}", summary.source_sha256);
     println!("profile:       {}", summary.profile);
@@ -170,7 +171,7 @@ fn optional_display<T: std::fmt::Display>(value: Option<T>) -> String {
 #[cfg(feature = "checkpoint")]
 fn import(args: &ImportArgs) -> Result<()> {
     let summary = ironicl::import_checkpoint(&args.checkpoint, &args.output)?;
-    println!("Imported Ironicl model");
+    println!("Imported IronICL model");
     println!("checkpoint:    {}", args.checkpoint.display());
     println!("model:         {}", args.output.display());
     println!("source sha256: {}", summary.source_sha256);
@@ -186,6 +187,59 @@ fn import(_args: &ImportArgs) -> Result<()> {
     Err(Error::NotImplemented(
         "checkpoint import is disabled; rebuild with the 'checkpoint' feature".into(),
     ))
+}
+
+fn build_context(args: &BuildContextArgs) -> Result<()> {
+    let input = ClassifierInputBundle::read(&args.input)?;
+    let request = input.request();
+    let (b, t, h, n) = (
+        request.ensemble_count(),
+        request.total_rows(),
+        request.feature_count(),
+        request.training_rows(),
+    );
+    let class_count = ironicl::StaticContextRequest::class_count_of(request.y_train(), b, n)?;
+    let class_permutations = (0..b).flat_map(|_| 0..class_count as u64).collect::<Vec<_>>();
+    let feature_permutations = (0..b).flat_map(|_| 0..h as u64).collect::<Vec<_>>();
+    let context_sha256 = ironicl::decode_sha256(&input.sha256())?;
+    let context_request = ironicl::StaticContextRequest::new(
+        b,
+        n,
+        t,
+        h,
+        request.x(),
+        request.y_train(),
+        &class_permutations,
+        &feature_permutations,
+        context_sha256,
+    )?;
+    let options = ironicl::StaticContextOptions {
+        kv_dtype: args.kv_dtype,
+        pack_keys: args.pack_keys,
+        sparse_index_clusters: args.index_clusters,
+    };
+    let start = Instant::now();
+    let executor = ClassifierExecutor::new(ironicl::load_model_artifact(&args.model)?);
+    let summary = ironicl::build_static_context_file(&executor, &context_request, &options, &args.output)?;
+    println!("Built IronICL static context");
+    println!("model:          {}", args.model.display());
+    println!("input:          {}", args.input.display());
+    println!("context:        {}", args.output.display());
+    println!("estimators:     {}", summary.ensemble_count);
+    println!("training rows:  {}", summary.training_rows);
+    println!("features:       {}", summary.feature_count);
+    println!("classes:        {}", summary.class_count);
+    println!("version:        {}", summary.version);
+    println!("kv dtype:       {}", summary.kv_dtype.name());
+    println!("packed keys:    {}", summary.packed_icl_keys);
+    println!(
+        "index clusters: {}",
+        optional_display(summary.sparse_index_clusters)
+    );
+    println!("file bytes:     {}", ByteSize(summary.file_bytes));
+    println!("file sha256:    {}", ironicl::encode_sha256(&summary.file_sha256));
+    println!("build seconds:  {:.3}", start.elapsed().as_secs_f64());
+    Ok(())
 }
 
 fn run_model(args: RunArgs) -> Result<()> {
@@ -442,24 +496,25 @@ fn print_probabilities(probabilities: &ironicl::ClassifierProbabilities) {
 fn print_help(topic: Option<HelpTopic>) {
     let text = match topic {
         None => {
-            "Ironicl\n\n\
+            "IronICL\n\n\
              Usage:\n\
                ironicl platform\n\
                ironicl plan [options]\n\
                ironicl inspect (--checkpoint FILE | --model FILE)\n\
                ironicl import --checkpoint FILE --output FILE\n\
                ironicl run (--checkpoint FILE | --model FILE) --input FILE [options]\n\
-               ironicl benchmark --model FILE --input FILE [--context FILE] [--warmup N] [--iterations N]\n\n\
+               ironicl benchmark --model FILE --input FILE [--context FILE] [--warmup N] [--iterations N]\n\
+               ironicl build-context --model FILE --input FILE --output FILE [options]\n\n\
              Use 'ironicl help COMMAND' for command-specific help."
         }
         Some(HelpTopic::Platform) => "Usage: ironicl platform",
         Some(HelpTopic::Inspect) => {
             "Usage: ironicl inspect (--checkpoint FILE | --model FILE)\n\n\
-             Inspect a PyTorch checkpoint or an imported Ironicl model."
+             Inspect a PyTorch checkpoint or an imported IronICL model."
         }
         Some(HelpTopic::Import) => {
             "Usage: ironicl import --checkpoint FILE --output FILE\n\n\
-             Convert a PyTorch checkpoint to a portable Ironicl model."
+             Convert a PyTorch checkpoint to a portable IronICL model."
         }
         Some(HelpTopic::Run) => {
             "Usage: ironicl run (--checkpoint FILE | --model FILE) --input FILE [--context FILE] [options]\n\n\
@@ -479,13 +534,25 @@ fn print_help(topic: Option<HelpTopic>) {
             "Usage: ironicl benchmark --model FILE --input FILE [--context FILE] [--probabilities] [--warmup N] [--iterations N]\n\n\
              Benchmark resident model-only inference. Checkpoints are not accepted, so import and conversion remain outside comparable timing.\n\n\
              Options:\n\
-               --model FILE      imported Ironicl model artifact\n\
+               --model FILE      imported IronICL model artifact\n\
                --input FILE      IRINPUT, or IRQUERY when --context is set\n\
                 --context FILE    full-K/V static-context artifact\n\
                 --probabilities   time final cached predict_proba output\n\
                 --warmup N        untimed inferences, 0..=1000 (default: 2)\n\
                --iterations N    timed inferences, 1..=10000 (default: 10)\n\n\
              Latency percentiles use nearest-rank: ceil(percentile * iterations)."
+        }
+        Some(HelpTopic::BuildContext) => {
+            "Usage: ironicl build-context --model FILE --input FILE --output FILE [options]\n\n\
+             Build a full-K/V static context from the training rows of an IRINPUT bundle, natively.\n\
+             The bundle's query rows are ignored; class and feature permutations are the identity.\n\n\
+             Options:\n\
+               --model FILE          imported IronICL model artifact\n\
+               --input FILE          IRINPUT bundle with the preprocessed training table\n\
+               --output FILE         static-context artifact to write (.ironiclctx)\n\
+               --kv-dtype DTYPE      fp32|bf16|bf16-v ICL K/V storage (default: fp32)\n\
+               --pack-keys           store ICL keys in source-tile packed order (format version 3)\n\
+               --index-clusters N    add a coarse ICL key index with N clusters per head"
         }
         Some(HelpTopic::Plan) => {
             "Usage: ironicl plan [options]\n\n\

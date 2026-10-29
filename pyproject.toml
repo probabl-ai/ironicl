@@ -1,0 +1,77 @@
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "ironicl"
+description = "Cache-aware CPU inference for TabICLv2 with a scikit-learn interface"
+readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
+requires-python = ">=3.10"
+keywords = ["tabular data", "foundation model", "TabICL", "in-context learning", "scikit-learn"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Rust",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "numpy>=1.26",
+    "scikit-learn>=1.6",
+    "huggingface_hub>=0.23",
+]
+dynamic = ["version"]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pandas"]
+dev = ["ironicl[test]", "ruff", "mypy", "maturin>=1.8,<2.0", "pre-commit", "skrub", "skore"]
+
+[tool.maturin]
+module-name = "ironicl._ironicl"
+features = ["python"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+src = ["."]
+
+[tool.ruff.lint]
+select = ["B", "C4", "T10", "T20", "SIM", "I", "PERF", "E", "D", "F", "UP", "RUF010", "RUF015"]
+ignore = ["PERF203"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D", "T20"]
+"benchmarks/*" = ["D", "T20"]
+"examples/*" = ["D", "T20", "E402"]
+
+[tool.mypy]
+python_version = "3.10"
+files = ["ironicl"]
+warn_unused_configs = true
+warn_redundant_casts = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+xfail_strict = true
+log_cli_level = "INFO"
+markers = [
+    "slow: needs the official TabICLv2 checkpoint (downloaded or IRONICL_CHECKPOINT_DIR)",
+]
+filterwarnings = [
+    "error",
+]

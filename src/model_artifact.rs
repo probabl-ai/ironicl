@@ -179,7 +179,7 @@ pub(crate) struct ModelArtifactData {
     pub tensors: Vec<ModelTensor>,
 }
 
-/// Verified metadata for a portable Ironicl model artifact.
+/// Verified metadata for a portable `IronICL` model artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelArtifactSummary {
     pub source_sha256: String,
@@ -333,7 +333,7 @@ struct ParsedModelArtifact {
     tensors: Vec<ParsedTensor>,
 }
 
-/// Read and verify a portable Ironicl model artifact.
+/// Read and verify a portable `IronICL` model artifact.
 ///
 /// # Errors
 ///
@@ -974,13 +974,40 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
-pub(crate) fn encode_sha256(digest: &[u8; 32]) -> String {
+/// Encode a SHA-256 digest as 64 lowercase hexadecimal characters.
+#[must_use]
+pub fn encode_sha256(digest: &[u8; 32]) -> String {
     let mut encoded = String::with_capacity(64);
     for byte in digest {
         encoded.push(char::from(HEX[usize::from(byte >> 4)]));
         encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
     }
     encoded
+}
+
+/// Decode a 64-character hexadecimal SHA-256 digest.
+///
+/// # Errors
+///
+/// Returns [`Error::Artifact`] when `encoded` is not 64 hexadecimal characters.
+pub fn decode_sha256(encoded: &str) -> Result<[u8; 32]> {
+    let bytes = encoded.as_bytes();
+    if bytes.len() != 64 {
+        return Err(artifact_error(
+            "SHA-256 digest must have 64 hexadecimal characters",
+        ));
+    }
+    let mut digest = [0_u8; 32];
+    for (index, pair) in bytes.chunks_exact(2).enumerate() {
+        let nibble = |byte: u8| match byte {
+            b'0'..=b'9' => Ok(byte - b'0'),
+            b'a'..=b'f' => Ok(byte - b'a' + 10),
+            b'A'..=b'F' => Ok(byte - b'A' + 10),
+            _ => Err(artifact_error("SHA-256 digest is not hexadecimal")),
+        };
+        digest[index] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    }
+    Ok(digest)
 }
 
 fn artifact_error(error: impl fmt::Display) -> Error {

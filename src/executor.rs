@@ -41,11 +41,11 @@ use crate::{
     profile::{self, Category},
 };
 
-const COLUMN_DIM: usize = 128;
-const ICL_DIM: usize = 512;
-const HEADS: usize = 8;
-const INDUCING: usize = 128;
-const RESERVED: usize = 4;
+pub(crate) const COLUMN_DIM: usize = 128;
+pub(crate) const ICL_DIM: usize = 512;
+pub(crate) const HEADS: usize = 8;
+pub(crate) const INDUCING: usize = 128;
+pub(crate) const RESERVED: usize = 4;
 const ATTENTION_QUERY_BLOCK_ROWS: usize = 16;
 const ATTENTION_KEY_TILE_ROWS: usize = 128;
 const CLASSIFIER_SOFTMAX_TEMPERATURE: f32 = 0.9;
@@ -546,7 +546,7 @@ impl ClassifierExecutor {
         )
     }
 
-    fn row_embeddings(&self, columns: &[f32], t: usize, streams: usize) -> Result<Vec<f32>> {
+    pub(crate) fn row_embeddings(&self, columns: &[f32], t: usize, streams: usize) -> Result<Vec<f32>> {
         let _profile = profile::scope(Category::Row);
         let cls = self.tensor("row_interactor.cls_tokens")?;
         let workers = executor_threads().min(t);
@@ -683,7 +683,7 @@ impl ClassifierExecutor {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn block(
+    pub(crate) fn block(
         &self,
         q: &[f32],
         k: &[f32],
@@ -700,15 +700,6 @@ impl ClassifierExecutor {
         let norm_bias = self.tensor(&format!("{prefix}.norm1.bias"))?;
         let mut q_norm = vec![0.0; q.len()];
         layer_norm_f32(q, q_rows, dim, norm_weight, Some(norm_bias), &mut q_norm)?;
-        let mut k_norm = vec![0.0; k.len()];
-        layer_norm_f32(k, source_rows, dim, norm_weight, Some(norm_bias), &mut k_norm)?;
-        let v_norm = if std::ptr::eq(k.as_ptr(), v.as_ptr()) {
-            k_norm.clone()
-        } else {
-            let mut x = vec![0.0; v.len()];
-            layer_norm_f32(v, source_rows, dim, norm_weight, Some(norm_bias), &mut x)?;
-            x
-        };
         let attn_prefix = format!("{prefix}.attn");
         let weight = self.tensor(&format!("{attn_prefix}.in_proj_weight"))?;
         let bias = self.tensor(&format!("{attn_prefix}.in_proj_bias"))?;
@@ -722,31 +713,41 @@ impl ClassifierExecutor {
             dim,
             &mut q_proj,
         )?;
-        let mut k_proj = vec![0.0; k.len()];
-        affine_f32(
-            &k_norm,
-            source_rows,
-            dim,
-            &weight[dim * dim..2 * dim * dim],
-            Some(&bias[dim..2 * dim]),
-            dim,
-            &mut k_proj,
-        )?;
-        let mut v_proj = vec![0.0; v.len()];
-        affine_f32(
-            &v_norm,
-            source_rows,
-            dim,
-            &weight[2 * dim * dim..],
-            Some(&bias[2 * dim..]),
-            dim,
-            &mut v_proj,
-        )?;
         let heads = HEADS;
         let head_dim = dim / heads;
         let mut q_heads = tokens_to_heads(&q_proj, q_rows, dim, heads);
-        let mut k_heads = tokens_to_heads(&k_proj, source_rows, dim, heads);
-        let v_heads = tokens_to_heads(&v_proj, source_rows, dim, heads);
+        let (mut k_heads, v_heads) = if std::ptr::eq(k.as_ptr(), v.as_ptr()) {
+            self.project_source_kv(k, source_rows, dim, prefix)?
+        } else {
+            let mut k_norm = vec![0.0; k.len()];
+            layer_norm_f32(k, source_rows, dim, norm_weight, Some(norm_bias), &mut k_norm)?;
+            let mut v_norm = vec![0.0; v.len()];
+            layer_norm_f32(v, source_rows, dim, norm_weight, Some(norm_bias), &mut v_norm)?;
+            let mut k_proj = vec![0.0; k.len()];
+            affine_f32(
+                &k_norm,
+                source_rows,
+                dim,
+                &weight[dim * dim..2 * dim * dim],
+                Some(&bias[dim..2 * dim]),
+                dim,
+                &mut k_proj,
+            )?;
+            let mut v_proj = vec![0.0; v.len()];
+            affine_f32(
+                &v_norm,
+                source_rows,
+                dim,
+                &weight[2 * dim * dim..],
+                Some(&bias[2 * dim..]),
+                dim,
+                &mut v_proj,
+            )?;
+            (
+                tokens_to_heads(&k_proj, source_rows, dim, heads),
+                tokens_to_heads(&v_proj, source_rows, dim, heads),
+            )
+        };
         if qass {
             let original = q_heads.clone();
             self.qass(
@@ -876,8 +877,57 @@ impl ClassifierExecutor {
         Ok(residual)
     }
 
+    /// Layer-normalise `source` rows with this block's `norm1` and project them to
+    /// head-major `[heads, rows, head_dim]` keys and values, exactly as the block's
+    /// attention consumes them and as a static context stores them.
+    pub(crate) fn project_source_kv(
+        &self,
+        source: &[f32],
+        rows: usize,
+        dim: usize,
+        prefix: &str,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let norm_weight = self.tensor(&format!("{prefix}.norm1.weight"))?;
+        let norm_bias = self.tensor(&format!("{prefix}.norm1.bias"))?;
+        let mut normalized = vec![0.0; source.len()];
+        layer_norm_f32(source, rows, dim, norm_weight, Some(norm_bias), &mut normalized)?;
+        let attn_prefix = format!("{prefix}.attn");
+        let weight = self.tensor(&format!("{attn_prefix}.in_proj_weight"))?;
+        let bias = self.tensor(&format!("{attn_prefix}.in_proj_bias"))?;
+        let mut k_proj = vec![0.0; source.len()];
+        affine_f32(
+            &normalized,
+            rows,
+            dim,
+            &weight[dim * dim..2 * dim * dim],
+            Some(&bias[dim..2 * dim]),
+            dim,
+            &mut k_proj,
+        )?;
+        let mut v_proj = vec![0.0; source.len()];
+        affine_f32(
+            &normalized,
+            rows,
+            dim,
+            &weight[2 * dim * dim..],
+            Some(&bias[2 * dim..]),
+            dim,
+            &mut v_proj,
+        )?;
+        Ok((
+            tokens_to_heads(&k_proj, rows, dim, HEADS),
+            tokens_to_heads(&v_proj, rows, dim, HEADS),
+        ))
+    }
+
+    /// The imported model this executor runs.
+    #[must_use]
+    pub fn model(&self) -> &ModelArtifact {
+        &self.model
+    }
+
     #[allow(clippy::cast_precision_loss)]
-    fn qass(
+    pub(crate) fn qass(
         &self,
         prefix: &str,
         input: &[f32],
@@ -915,7 +965,7 @@ impl ClassifierExecutor {
         )
     }
 
-    fn tensor(&self, name: &str) -> Result<&[f32]> {
+    pub(crate) fn tensor(&self, name: &str) -> Result<&[f32]> {
         Ok(self.model.tensor_f32(name)?.values())
     }
 }
@@ -2874,7 +2924,7 @@ fn validate_static_cache_contract(context: &StaticContextArtifact) -> Result<()>
     validate_sparse_index_contract(context)
 }
 
-fn executor_threads() -> usize {
+pub(crate) fn executor_threads() -> usize {
     *EXECUTOR_THREADS.get_or_init(|| {
         if let Some(value) = std::env::var_os("IRONICL_THREADS") {
             return value
@@ -3100,7 +3150,7 @@ fn sparse_max_omitted_mass() -> f32 {
     })
 }
 
-fn parallel_cached_attention(
+pub(crate) fn parallel_cached_attention(
     backend: crate::kernels::native::AttentionBackend,
     query: &[f32],
     query_rows: usize,
@@ -3428,7 +3478,7 @@ fn parallel_cached_attention_f32_key_bf16_value(
     })
 }
 
-fn validate_labels(labels: &[f32], b: usize, n: usize) -> Result<usize> {
+pub(crate) fn validate_labels(labels: &[f32], b: usize, n: usize) -> Result<usize> {
     let mut expected_classes = None;
     for ensemble in 0..b {
         let mut present = [false; 10];
@@ -3453,7 +3503,7 @@ fn validate_labels(labels: &[f32], b: usize, n: usize) -> Result<usize> {
     expected_classes.ok_or_else(|| Error::InvalidArgument("labels are empty".into()))
 }
 
-fn checked_product(values: &[usize], name: &'static str) -> Result<usize> {
+pub(crate) fn checked_product(values: &[usize], name: &'static str) -> Result<usize> {
     values.iter().try_fold(1_usize, |result, value| {
         result.checked_mul(*value).ok_or(Error::ArithmeticOverflow(name))
     })
@@ -3601,7 +3651,7 @@ fn attention_scratch_elements() -> Result<usize> {
     )
 }
 
-fn label_indices(labels: &[f32]) -> Result<Vec<usize>> {
+pub(crate) fn label_indices(labels: &[f32]) -> Result<Vec<usize>> {
     labels.iter().copied().map(label_index).collect()
 }
 
@@ -3621,7 +3671,7 @@ fn label_index(value: f32) -> Result<usize> {
     }
 }
 
-fn tokens_to_heads(input: &[f32], rows: usize, dim: usize, heads: usize) -> Vec<f32> {
+pub(crate) fn tokens_to_heads(input: &[f32], rows: usize, dim: usize, heads: usize) -> Vec<f32> {
     let mut output = vec![0.0; input.len()];
     tokens_to_heads_into(input, rows, dim, heads, &mut output);
     output
@@ -3728,7 +3778,7 @@ fn validate_sparse_index_contract(context: &StaticContextArtifact) -> Result<()>
     }
     Ok(())
 }
-fn heads_to_tokens(input: &[f32], rows: usize, dim: usize, heads: usize) -> Vec<f32> {
+pub(crate) fn heads_to_tokens(input: &[f32], rows: usize, dim: usize, heads: usize) -> Vec<f32> {
     let mut output = vec![0.0; input.len()];
     heads_to_tokens_into(input, rows, dim, heads, &mut output);
     output

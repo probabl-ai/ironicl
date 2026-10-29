@@ -270,7 +270,7 @@ const fn packed_bf16_affine_supported_for_target() -> bool {
     false
 }
 
-fn f32_to_bf16_rne(value: f32) -> u16 {
+pub(crate) fn f32_to_bf16_rne(value: f32) -> u16 {
     let bits = value.to_bits();
     let rounding_bias = 0x7fff + ((bits >> 16) & 1);
     u16::try_from(bits.wrapping_add(rounding_bias) >> 16).expect("rounded BF16 bits fit u16")

@@ -1,6 +1,6 @@
 use std::fmt;
 
-/// Errors produced while validating or planning an Ironicl execution.
+/// Errors produced while validating or planning an `IronICL` execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     InvalidConfig(String),
