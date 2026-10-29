@@ -5,13 +5,17 @@ The checked-in oracle always runs without upstream dependencies.
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 import pickle
+import struct
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 from numpy.testing import assert_allclose, assert_array_equal
@@ -281,6 +285,48 @@ assert not any(name.split(".")[0] in {"torch", "tabicl"} for name in sys.modules
             )
         self.assertEqual(results[0], results[1])
         self.assertEqual(results[1], results[2])
+
+    def test_real_dataset_export_uses_standalone_preprocessing(self):
+        path = Path(__file__).parents[1] / "tools" / "prepare_real_dataset.py"
+        spec = importlib.util.spec_from_file_location("prepare_real_dataset", path)
+        exporter = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(exporter)
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "input.irinput"
+            argv = [
+                str(path),
+                "--dataset",
+                "covertype",
+                "--train-rows",
+                "25",
+                "--test-rows",
+                "9",
+                "--estimators",
+                "8",
+                "--output",
+                str(output),
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(exporter, "load_dataset", return_value=(self.x, self.y, "fixture")),
+                patch("builtins.print"),
+            ):
+                exporter.main()
+            metadata = json.loads(output.with_suffix(".json").read_text())
+            self.assertEqual(metadata["normalization_methods"], ["none", "power"])
+            self.assertEqual(metadata["shape"], [8, 34, 4])
+            encoded = output.read_bytes()
+        header = struct.unpack_from("<8sIIQQQQQQQQ", encoded)
+        self.assertEqual(header[:3], (b"IRINPUT\0", 1, 1))
+        x_train, x_test, y_train, _ = exporter.stratified_rows(self.x, self.y, 25, 9, 42)
+        p = ClassifierPreprocessor(random_state=42).fit(x_train, y_train)
+        train, query = p.transform(x_train), p.transform(x_test)
+        x_values = np.frombuffer(encoded, dtype="<f4", count=header[7], offset=80).reshape(8, 34, 4)
+        y_values = np.frombuffer(encoded, dtype="<f4", count=header[8], offset=80 + header[9]).reshape(8, 25)
+        for ensemble, group in enumerate(p.ensemble_groups_):
+            assert_array_equal(x_values[ensemble, :25], train[group][:, p.feature_permutations_[ensemble]])
+            assert_array_equal(x_values[ensemble, 25:], query[group][:, p.feature_permutations_[ensemble]])
+            assert_array_equal(y_values[ensemble], p.class_permutations_[ensemble][p.encode_labels(y_train)])
 
 
 if __name__ == "__main__":

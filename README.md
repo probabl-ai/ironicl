@@ -82,7 +82,9 @@ transform raises a domain error.
 
 **This is a preprocessing-only Python package, not yet a Python classifier.**
 PyO3 bindings and Rust training-context construction remain to be implemented.
-Upstream oracle and dataset-export tools still require TabICL/PyTorch.
+`tools/prepare_real_dataset.py` now uses this package without `--tabicl-root`;
+it expands ensembles only when writing the existing IRINPUT file format.
+Other upstream oracle and context-export tools still require TabICL/PyTorch.
 The current pure-Python build backend will be replaced by maturin when the
 native extension is added.
 

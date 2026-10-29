@@ -1,2 +1,3 @@
 recursive-include tests *.py *.json
 include tools/export_static_context.py
+include tools/prepare_real_dataset.py
