@@ -1,6 +1,7 @@
 """Standalone preprocessing tests; TabICL/PyTorch are not required.
 
-The checked-in oracle always runs without upstream dependencies.
+The checked-in oracle always runs without upstream dependencies. Explicit live
+comparisons belong in tests/parity; see docs/validation.md for setup.
 """
 
 from __future__ import annotations

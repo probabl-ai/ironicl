@@ -97,6 +97,20 @@ python -m unittest discover -s tests -p 'test_*.py' -v
 The checked-in preprocessing oracle runs without upstream dependencies. The
 supported scikit-learn 1.9.x / SciPy 1.18.x combination preserves its power-fit
 behavior; older float32 solvers produce different results. NumPy 2.x is required.
+Run live comparisons separately, in an environment with both projects installed
+and an unmodified TabICL checkout at commit
+`bd030d47ff7d9f987f0f33431d743a3003bfe0d3`:
+
+```bash
+IRONICL_TABICL_SOURCE=/path/to/tabicl/src \
+  python -m unittest discover -s tests/parity -p 'test_*.py' -v
+```
+
+This dedicated suite compares independently fitted preprocessing chains, using
+synthetic inputs and bundled scikit-learn datasets. Missing prerequisites fail
+rather than skip. It tests preprocessing, not classifier predictions; see
+[`docs/validation.md`](docs/validation.md#python-preprocessing-parity) for setup,
+coverage, and numerical requirements.
 
 ## Benchmarking
 
