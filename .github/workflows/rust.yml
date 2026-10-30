@@ -38,11 +38,6 @@ jobs:
           echo 'Model and oracle fixtures are not provisioned; fixture-backed tests return early when files are absent.' >> "$GITHUB_STEP_SUMMARY"
           echo 'Hardware-gated kernels may also be skipped. This is not upstream model parity or Zen 5 validation.' >> "$GITHUB_STEP_SUMMARY"
       - name: Check formatting and Clippy
-        run: |
-          cargo fmt --all -- --check
-          cargo clippy --locked --all-targets -- -D warnings
-          cargo clippy --locked --all-targets --no-default-features -- -D warnings
+        run: make lint-rust
       - name: Run unit and integration tests
-        run: |
-          cargo test --locked
-          cargo test --locked --no-default-features
+        run: make test-rust

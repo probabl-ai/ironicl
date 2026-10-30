@@ -21,6 +21,9 @@ validated binary classifier input bundle and prints classifier logits.
 
 ## Quick Start
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, local checks, and
+CI coverage limits.
+
 ```bash
 cargo test
 cargo run -- platform
