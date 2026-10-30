@@ -1,0 +1,76 @@
+name: Python preprocessing
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  standalone:
+    name: Standalone package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Build sdist and wheel
+        run: |
+          python -m pip install build
+          # The default build creates the wheel from the sdist, not the checkout.
+          python -m build
+      - name: Verify upstream notice in both distributions
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import tarfile
+          import zipfile
+
+          notice_path = "LICENSES/TabICL-BSD-3-Clause.txt"
+          notice = Path(notice_path).read_bytes()
+          sdist, = Path("dist").glob("*.tar.gz")
+          wheel, = Path("dist").glob("*.whl")
+          with tarfile.open(sdist) as archive:
+              member = f"{sdist.name.removesuffix('.tar.gz')}/{notice_path}"
+              assert archive.extractfile(member).read() == notice, "sdist notice differs"
+          with zipfile.ZipFile(wheel) as archive:
+              member, = [name for name in archive.namelist() if name.endswith(f"/licenses/{notice_path}")]
+              assert archive.read(member) == notice, "wheel notice differs"
+          PY
+      - name: Create isolated test environment
+        run: |
+          python -m venv "$RUNNER_TEMP/standalone"
+          echo "$RUNNER_TEMP/standalone/bin" >> "$GITHUB_PATH"
+      - name: Install and test the wheel without upstream dependencies
+        env:
+          PYTHONPATH: ""
+        run: |
+          python -m pip install dist/*.whl
+          python - <<'PY'
+          from importlib.util import find_spec
+          from pathlib import Path
+          import sys
+          import ironicl
+
+          assert Path(ironicl.__file__).resolve().is_relative_to(Path(sys.prefix).resolve()), "not testing the installed package"
+          for name in ("tabicl", "torch"):
+              assert find_spec(name) is None, f"unexpected standalone dependency: {name}"
+          PY
+          python -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Upload tested wheel
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-wheel
+          path: dist/*.whl
+          if-no-files-found: error
+          retention-days: 7

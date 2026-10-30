@@ -25,11 +25,27 @@ OpenCode fixture directory is detected automatically during development.
 
 ### Python Preprocessing Parity
 
-Python preprocessing has two test layers. Run the standalone checks after
-installing Ironicl; they require neither TabICL nor PyTorch:
+Python preprocessing has two test layers. The standalone checks require neither
+TabICL nor PyTorch. The [Python preprocessing workflow](../.github/workflows/python.yml)
+runs on pull requests and pushes to `main`, using Linux and Python 3.12.
+
+Its `standalone` job builds an sdist and then builds a wheel from that sdist,
+verifies the upstream license notice in both distributions, and installs the wheel
+in a clean environment. It checks that imports resolve to the installed package
+and that neither TabICL nor PyTorch is available before running the standalone suite.
+
+To reproduce the build and standalone tests, run these commands from the repository
+root. The temporary directories keep build tools and test dependencies separate:
 
 ```sh
-python -m unittest discover -s tests -p 'test_*.py' -v
+checks=$(mktemp -d)
+python3.12 -m venv "$checks/build"
+"$checks/build/bin/python" -m pip install build
+"$checks/build/bin/python" -m build --outdir "$checks/dist"
+python3.12 -m venv "$checks/standalone"
+"$checks/standalone/bin/python" -m pip install "$checks"/dist/*.whl
+env -u PYTHONPATH "$checks/standalone/bin/python" \
+  -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
 `tests/test_preprocessing.py` covers validation, grouped storage, labels,
