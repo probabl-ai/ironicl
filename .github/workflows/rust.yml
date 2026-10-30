@@ -1,0 +1,48 @@
+name: Rust checks
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: Rust (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install pinned toolchain
+        run: rustup toolchain install --no-self-update
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: Explain validation scope
+        run: |
+          echo '## Rust validation scope' >> "$GITHUB_STEP_SUMMARY"
+          echo 'This job runs formatting, Clippy, and tests with and without default features.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Model and oracle fixtures are not provisioned; fixture-backed tests return early when files are absent.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Hardware-gated kernels may also be skipped. This is not upstream model parity or Zen 5 validation.' >> "$GITHUB_STEP_SUMMARY"
+      - name: Check formatting and Clippy
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo clippy --locked --all-targets --no-default-features -- -D warnings
+      - name: Run unit and integration tests
+        run: |
+          cargo test --locked
+          cargo test --locked --no-default-features
