@@ -74,3 +74,39 @@ jobs:
           path: dist/*.whl
           if-no-files-found: error
           retention-days: 7
+
+  tabicl-parity:
+    name: Live TabICL parity
+    needs: standalone
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: soda-inria/tabicl
+          ref: bd030d47ff7d9f987f0f33431d743a3003bfe0d3
+          path: upstream-tabicl
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-wheel
+          path: dist
+      - name: Create isolated parity environment
+        run: |
+          python -m venv "$RUNNER_TEMP/parity"
+          echo "$RUNNER_TEMP/parity/bin" >> "$GITHUB_PATH"
+      - name: Install tested wheel and upstream dependencies
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install dist/*.whl ./upstream-tabicl
+      - name: Compare directly with pinned TabICL
+        env:
+          PYTHONPATH: ""
+          IRONICL_TABICL_SOURCE: ${{ github.workspace }}/upstream-tabicl/src
+        run: python -m unittest discover -s tests/parity -p 'test_*.py' -v

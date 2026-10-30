@@ -53,15 +53,24 @@ serialization, dependency isolation, and the checked-in upstream oracle in
 `tests/fixtures/preprocessing.json`. The frozen numeric oracle uses
 `rtol=2e-6, atol=2e-6`; metadata comparisons are exact.
 
-Run live comparisons explicitly from the repository root. Use a separate
-Python 3.12+ environment and a TabICL checkout at commit
+The `tabicl-parity` CI job downloads the wheel tested by `standalone` and installs
+it in a separate environment with CPU-only PyTorch and the pinned TabICL checkout.
+It runs the live suite against that wheel, not an editable Ironicl checkout.
+TabICL and PyTorch are installed only for this job, never as Ironicl dependencies.
+
+To reproduce the live tests, reuse `$checks` and the wheel built above. From the
+repository root, create an upstream checkout at commit
 `bd030d47ff7d9f987f0f33431d743a3003bfe0d3` (version 2.1.1):
 
 ```sh
-python -m venv /tmp/ironicl-parity
-/tmp/ironicl-parity/bin/python -m pip install . /path/to/tabicl
-IRONICL_TABICL_SOURCE=/path/to/tabicl/src \
-  /tmp/ironicl-parity/bin/python -m unittest discover -s tests/parity -p 'test_*.py' -v
+git clone https://github.com/soda-inria/tabicl.git "$checks/tabicl"
+git -C "$checks/tabicl" checkout --detach bd030d47ff7d9f987f0f33431d743a3003bfe0d3
+python3.12 -m venv "$checks/parity"
+# On Linux, install CPU-only PyTorch before installing TabICL:
+# "$checks/parity/bin/python" -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+"$checks/parity/bin/python" -m pip install "$checks"/dist/*.whl "$checks/tabicl"
+env -u PYTHONPATH IRONICL_TABICL_SOURCE="$checks/tabicl/src" \
+  "$checks/parity/bin/python" -m unittest discover -s tests/parity -p 'test_*.py' -v
 ```
 
 The suite verifies the checkout revision, rejects changes under `src/tabicl`,
