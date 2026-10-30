@@ -66,7 +66,7 @@ jobs:
           for name in ("tabicl", "torch"):
               assert find_spec(name) is None, f"unexpected standalone dependency: {name}"
           PY
-          python -m unittest discover -s tests -p 'test_*.py' -v
+          make test-python PYTHON=python
       - name: Upload tested wheel
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -109,4 +109,4 @@ jobs:
         env:
           PYTHONPATH: ""
           IRONICL_TABICL_SOURCE: ${{ github.workspace }}/upstream-tabicl/src
-        run: python -m unittest discover -s tests/parity -p 'test_*.py' -v
+        run: make test-parity PYTHON=python
