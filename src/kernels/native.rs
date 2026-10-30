@@ -660,6 +660,10 @@ unsafe fn bf16_to_f32_avx512(input: &[u16], output: &mut [f32]) {
     unsafe {
         let end = input.len() / 16 * 16;
         for offset in (0..end).step_by(16) {
+            #[expect(
+                clippy::cast_ptr_alignment,
+                reason = "This intrinsic accepts unaligned pointers."
+            )]
             let packed = _mm256_loadu_si256(input.as_ptr().add(offset).cast::<__m256i>());
             let expanded = _mm512_slli_epi32::<16>(_mm512_cvtepu16_epi32(packed));
             _mm512_storeu_ps(output.as_mut_ptr().add(offset), _mm512_castsi512_ps(expanded));
@@ -694,6 +698,10 @@ unsafe fn convert_f32_to_bf16_avx512(input: &[f32], output: &mut [u16]) {
         for offset in (0..end).step_by(16) {
             let packed: __m256i =
                 core::mem::transmute(_mm512_cvtneps_pbh(_mm512_loadu_ps(input.as_ptr().add(offset))));
+            #[expect(
+                clippy::cast_ptr_alignment,
+                reason = "This intrinsic accepts unaligned pointers."
+            )]
             _mm256_storeu_si256(output.as_mut_ptr().add(offset).cast::<__m256i>(), packed);
         }
         for offset in end..input.len() {
@@ -1392,6 +1400,10 @@ unsafe fn attention_score_tile_bf16_avx512(
             let key = key.as_ptr().add(source * head_dim);
             let mut accumulators = [_mm512_setzero_ps(); MAX_PACKED_ATTENTION_QUERY_ROWS];
             for dimension in (0..head_dim).step_by(16) {
+                #[expect(
+                    clippy::cast_ptr_alignment,
+                    reason = "This intrinsic accepts unaligned pointers."
+                )]
                 let packed = _mm256_loadu_si256(key.add(dimension).cast::<__m256i>());
                 let key = _mm512_castsi512_ps(_mm512_slli_epi32::<16>(_mm512_cvtepu16_epi32(packed)));
                 for row in 0..query_rows {
@@ -1566,6 +1578,10 @@ unsafe fn attention_score_packed_key_bf16_tile_avx512(
         for source in (0..source_rows).step_by(16) {
             let mut accumulators = [_mm512_setzero_ps(); 8];
             for dimension in 0..head_dim {
+                #[expect(
+                    clippy::cast_ptr_alignment,
+                    reason = "This intrinsic accepts unaligned pointers."
+                )]
                 let packed = _mm256_loadu_si256(
                     packed_key
                         .as_ptr()
@@ -1662,6 +1678,10 @@ unsafe fn attention_value_tile_bf16_fma_avx512(
                         _mm512_loadu_ps(output.as_ptr().add((row_start + row) * head_dim + dimension));
                 }
                 for source in 0..source_rows {
+                    #[expect(
+                        clippy::cast_ptr_alignment,
+                        reason = "This intrinsic accepts unaligned pointers."
+                    )]
                     let packed = _mm256_loadu_si256(
                         value
                             .as_ptr()
@@ -1708,6 +1728,10 @@ unsafe fn attention_value_tile_bf16_fma_avx512_rows<const QUERY_ROWS: usize>(
                 accumulators[row] = _mm512_loadu_ps(output.as_ptr().add(row * head_dim + dimension));
             }
             for source in 0..source_rows {
+                #[expect(
+                    clippy::cast_ptr_alignment,
+                    reason = "This intrinsic accepts unaligned pointers."
+                )]
                 let packed = _mm256_loadu_si256(
                     value
                         .as_ptr()
@@ -3297,10 +3321,6 @@ mod tests {
             AttentionBackend, attention_value_packed_bf16_dot_f32, attention_value_tile_bf16_fma_f32,
         };
 
-        if !std::is_x86_feature_detected!("avx512bf16") {
-            eprintln!("skipped: AVX512_BF16 is unavailable");
-            return;
-        }
         fn measure(mut operation: impl FnMut(), iterations: usize) -> u64 {
             for _ in 0..64 {
                 operation();
@@ -3318,6 +3338,11 @@ mod tests {
             }
             samples.sort_unstable();
             samples[samples.len() / 2]
+        }
+
+        if !std::is_x86_feature_detected!("avx512bf16") {
+            eprintln!("skipped: AVX512_BF16 is unavailable");
+            return;
         }
 
         let (rows, source_rows, head_dim) = (8, 128, 64);
@@ -3438,11 +3463,6 @@ mod tests {
         use std::hint::black_box;
         use std::time::Instant;
 
-        if !std::is_x86_feature_detected!("avx512f") {
-            eprintln!("skipped: AVX512F is unavailable");
-            return;
-        }
-
         fn measure(mut operation: impl FnMut(), iterations: usize) -> u64 {
             for _ in 0..8 {
                 operation();
@@ -3458,6 +3478,11 @@ mod tests {
             }
             samples.sort_unstable();
             samples[samples.len() / 2]
+        }
+
+        if !std::is_x86_feature_detected!("avx512f") {
+            eprintln!("skipped: AVX512F is unavailable");
+            return;
         }
 
         for (rows, input_dim, output_dim, iterations) in [
@@ -3640,11 +3665,6 @@ mod tests {
 
         use super::convert_f32_to_bf16;
 
-        if !std::is_x86_feature_detected!("avx512bf16") {
-            eprintln!("skipped: AVX512_BF16 is unavailable");
-            return;
-        }
-
         fn measure(mut operation: impl FnMut(), iterations: usize) -> (u64, u64) {
             for _ in 0..128 {
                 operation();
@@ -3660,6 +3680,11 @@ mod tests {
             }
             samples.sort_unstable();
             (samples[samples.len() / 2], samples[samples.len() * 95 / 100])
+        }
+
+        if !std::is_x86_feature_detected!("avx512bf16") {
+            eprintln!("skipped: AVX512_BF16 is unavailable");
+            return;
         }
 
         let (rows, input_dim, output_dim) = (8, 512, 16);
