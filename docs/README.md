@@ -10,6 +10,7 @@ measurement on the Ryzen 7 9800X3D system.
 | [model.md](model.md) | TabICLv2 architecture and exact row-streaming boundary |
 | [architecture.md](architecture.md) | Engine components and request lifecycle |
 | [cli.md](cli.md) | Stable command and model-source conventions |
+| [python.md](python.md) | Python preprocessing package |
 | [static-context.md](static-context.md) | Training-time precomputation and invalidation |
 | [artifact-format.md](artifact-format.md) | Persistent model and context artifact design |
 | [precision.md](precision.md) | FP32, BF16, and INT8 numerical policy |
