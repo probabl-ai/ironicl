@@ -153,5 +153,9 @@ The Rust engine is a new implementation informed by the BSD-3-Clause TabICL
 project. Python preprocessing adapts the upstream algorithms; its source records
 provenance and distributions include the applicable license in `LICENSES/`.
 See [`docs/references.md`](docs/references.md) before copying or distributing
-upstream code or model artifacts. The project-wide license is still undecided;
-the third-party notice does not license the rest of Ironicl.
+upstream code or model artifacts.
+
+## License
+
+Ironicl is licensed under the [BSD 3-Clause License](LICENSE). The separate
+[TabICL notice](LICENSES/TabICL-BSD-3-Clause.txt) applies to adapted upstream code.
