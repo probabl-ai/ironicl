@@ -29,23 +29,22 @@ jobs:
           python -m pip install build
           # The default build creates the wheel from the sdist, not the checkout.
           python -m build
-      - name: Verify upstream notice in both distributions
+      - name: Verify project and upstream licenses in both distributions
         run: |
           python - <<'PY'
           from pathlib import Path
           import tarfile
           import zipfile
 
-          notice_path = "LICENSES/TabICL-BSD-3-Clause.txt"
-          notice = Path(notice_path).read_bytes()
           sdist, = Path("dist").glob("*.tar.gz")
           wheel, = Path("dist").glob("*.whl")
-          with tarfile.open(sdist) as archive:
-              member = f"{sdist.name.removesuffix('.tar.gz')}/{notice_path}"
-              assert archive.extractfile(member).read() == notice, "sdist notice differs"
-          with zipfile.ZipFile(wheel) as archive:
-              member, = [name for name in archive.namelist() if name.endswith(f"/licenses/{notice_path}")]
-              assert archive.read(member) == notice, "wheel notice differs"
+          with tarfile.open(sdist) as source, zipfile.ZipFile(wheel) as binary:
+              for license_path in ("LICENSE", "LICENSES/TabICL-BSD-3-Clause.txt"):
+                  license_text = Path(license_path).read_bytes()
+                  member = f"{sdist.name.removesuffix('.tar.gz')}/{license_path}"
+                  assert source.extractfile(member).read() == license_text, f"sdist {license_path} differs"
+                  member, = [name for name in binary.namelist() if name.endswith(f"/licenses/{license_path}")]
+                  assert binary.read(member) == license_text, f"wheel {license_path} differs"
           PY
       - name: Create isolated test environment
         run: |
