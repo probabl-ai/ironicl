@@ -74,6 +74,9 @@ official v2 checkpoints pass these gates with Candle 0.9.1.
 
 ## License
 
+Ironicl uses the [BSD 3-Clause License](../LICENSE), copyright 2026, Probabl.
+The project license does not replace upstream copyright or license notices.
+
 The local TabICL code uses the BSD 3-Clause License, with separate terms noted
 for its forecast-derived code. Ironicl does not need forecast code.
 
@@ -100,5 +103,6 @@ its upstream commit and dependency versions in
 `tests/fixtures/preprocessing.json`. It contains generated numeric data, not
 model weights or user data.
 
-Add a project license before public distribution. The upstream notice covers
-the adapted code, not the rest of Ironicl.
+Python source and wheel distributions include both the project license and the
+upstream notice. Dependencies and model checkpoints remain subject to their
+respective licenses.
