@@ -126,5 +126,5 @@ pass its own probability and label gates before it can be compared.
 On the Ryzen benchmark host, run all required CPU and CUDA FP32 points with:
 
 ```bash
-/path/to/ironicl-bench/src/Ironicl/tools/run_ryzen_tabicl_sklearn_cache_benchmarks.sh
+tools/run_ryzen_tabicl_sklearn_cache_benchmarks.sh "$BENCH_ROOT"
 ```

@@ -8,11 +8,8 @@
 - PyTorch: 2.13.0+cu130.
 - Ironicl: release build with `-C target-cpu=znver5`.
 
-The benchmark source and results are stored on the Ryzen host at:
-
-```text
-/path/to/ironicl-bench
-```
+The benchmark scripts in `tools/` take a benchmark root directory,
+`$BENCH_ROOT`, as their first argument. It holds sources, fixtures, and results.
 
 Each historical request uses official TabICL preprocessing before it is encoded
 as an `IRINPUT` bundle. Timed inference excludes preprocessing, model loading,

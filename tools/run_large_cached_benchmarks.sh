@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -u -o pipefail
 
-ROOT="${1:-/path/to/ironicl-bench}"
+ROOT="${1:?usage: $0 BENCH_ROOT}"
 PYTHON="$ROOT/.venv/bin/python"
 HARNESS="$ROOT/src/Ironicl/tools/benchmark_tabicl_sklearn_cache.py"
 RESULTS="$ROOT/results/tabicl-large-cache"

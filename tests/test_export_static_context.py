@@ -11,8 +11,6 @@ import numpy as np
 
 
 path = pathlib.Path(__file__).parents[1] / "tools" / "export_static_context.py"
-if not path.is_file():
-    path = pathlib.Path("/path/to/ironicl-bench/export_static_context.py")
 spec = importlib.util.spec_from_file_location("export_static_context", path)
 assert spec and spec.loader
 exporter = importlib.util.module_from_spec(spec)
