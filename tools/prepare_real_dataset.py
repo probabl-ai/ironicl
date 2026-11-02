@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Export official TabICL-preprocessed real data as an IRINPUT bundle."""
+"""Export Ironicl-preprocessed numeric data as an IRINPUT bundle.
+
+Install the local Python package first. No TabICL checkout or PyTorch is needed.
+"""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
-import os
 import struct
-import sys
 from pathlib import Path
 
 import numpy as np
-
 
 INPUT_MAGIC = b"IRINPUT\0"
 VERSION = 1
@@ -29,7 +29,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--metadata", type=Path)
-    parser.add_argument("--tabicl-root", type=Path, required=True)
     args = parser.parse_args()
     if args.train_rows < 2 or args.test_rows < 1 or args.estimators < 1:
         parser.error("row counts and estimator count must be positive")
@@ -107,11 +106,7 @@ def encode_bundle(x: np.ndarray, y: np.ndarray) -> bytes:
 
 def main() -> None:
     args = parse_args()
-    if os.environ.get("PYTHONHASHSEED") != "0":
-        raise SystemExit("set PYTHONHASHSEED=0 before running to preserve TabICL ensemble ordering")
-    sys.path.insert(0, str(args.tabicl_root.resolve()))
-    from sklearn.preprocessing import LabelEncoder
-    from tabicl._sklearn.preprocessing import EnsembleGenerator, TransformToNumerical
+    from ironicl.preprocessing import ClassifierPreprocessor
 
     x, labels, source = load_dataset(args.dataset)
     source_shape = [int(x.shape[0]), int(x.shape[1])]
@@ -120,28 +115,24 @@ def main() -> None:
     )
     x_train, x_test, selected_features = select_features(x_train, x_test, args.features)
 
-    label_encoder = LabelEncoder()
-    y_train = label_encoder.fit_transform(y_train_raw)
-    unknown_test = sorted(set(np.unique(y_test_raw)) - set(label_encoder.classes_))
-    if unknown_test:
-        raise ValueError(f"test split contains classes absent from training: {unknown_test}")
+    preprocessor = ClassifierPreprocessor(n_estimators=args.estimators, random_state=args.seed)
+    train_groups = preprocessor.fit_transform(x_train, y_train_raw)
+    test_groups = preprocessor.transform(x_test)
+    y_train = preprocessor.encode_labels(y_train_raw)
+    preprocessor.encode_labels(y_test_raw)  # Reject classes absent from training.
 
-    numerical = TransformToNumerical(verbose=False)
-    x_train_numeric = numerical.fit_transform(x_train)
-    x_test_numeric = numerical.transform(x_test)
-    generator = EnsembleGenerator(
-        classification=True,
-        n_estimators=args.estimators,
-        norm_methods=["none", "power"],
-        feat_shuffle_method="latin",
-        class_shuffle_method="shift",
-        outlier_threshold=4.0,
-        random_state=args.seed,
+    # IRINPUT still requires expanded [B,T,H] data. Keep that legacy allocation
+    # at the file-format boundary, not in the grouped Python preprocessing API.
+    transformed_x = np.empty(
+        (preprocessor.n_estimators_, len(x_train) + len(x_test), preprocessor.n_features_out_),
+        dtype=np.float32,
     )
-    generator.fit(x_train_numeric, y_train)
-    groups = generator.transform(x_test_numeric, mode="both")
-    transformed_x = np.concatenate([group[0] for group in groups.values()], axis=0).astype(np.float32)
-    transformed_y = np.concatenate([group[1] for group in groups.values()], axis=0).astype(np.float32)
+    transformed_y = np.empty((preprocessor.n_estimators_, len(y_train)), dtype=np.float32)
+    for ensemble, group in enumerate(preprocessor.ensemble_groups_):
+        features = preprocessor.feature_permutations_[ensemble]
+        transformed_x[ensemble, :len(x_train)] = train_groups[group][:, features]
+        transformed_x[ensemble, len(x_train):] = test_groups[group][:, features]
+        transformed_y[ensemble] = preprocessor.class_permutations_[ensemble][y_train]
     if not np.isfinite(transformed_x).all() or not np.isfinite(transformed_y).all():
         raise ValueError("preprocessed tensors contain non-finite values")
 
@@ -154,13 +145,13 @@ def main() -> None:
         "source": source,
         "source_shape": source_shape,
         "selected_source_features": selected_features,
-        "classes": [str(value) for value in label_encoder.classes_.tolist()],
+        "classes": [str(value) for value in preprocessor.classes_.tolist()],
         "seed": args.seed,
         "requested_estimators": args.estimators,
         "shape": [int(value) for value in transformed_x.shape],
         "training_rows": int(transformed_y.shape[1]),
         "test_rows": args.test_rows,
-        "normalization_methods": list(groups.keys()),
+        "normalization_methods": list(preprocessor.group_names_),
         "bundle_sha256": hashlib.sha256(encoded).hexdigest(),
     }
     metadata_path.parent.mkdir(parents=True, exist_ok=True)

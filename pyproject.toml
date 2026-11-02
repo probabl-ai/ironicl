@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ironicl"
+version = "0.1.0"
+description = "Python preprocessing for the Ironicl CPU inference engine"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2,<3",
+    "scikit-learn>=1.9,<1.10",
+    # PowerTransformer delegates fitting to SciPy. Older solvers drift from
+    # the pinned upstream FP32 oracle, so constrain this transitive dependency.
+    "scipy>=1.18,<1.19",
+]
+license-files = ["LICENSES/TabICL-BSD-3-Clause.txt"]
+
+[tool.setuptools.packages.find]
+where = ["python"]
