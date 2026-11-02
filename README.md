@@ -1,164 +1,103 @@
 # Ironicl
 
-Ironicl is an experimental, cache-aware CPU inference engine for TabICLv2. It
-targets AMD Zen 5 systems, starting with the Ryzen 7 9800X3D, while retaining a
-portable reference path that builds on Apple Silicon.
+[![Rust checks](https://github.com/probabl-ai/ironicl/actions/workflows/rust.yml/badge.svg)](https://github.com/probabl-ai/ironicl/actions/workflows/rust.yml)
+[![Python preprocessing](https://github.com/probabl-ai/ironicl/actions/workflows/python.yml/badge.svg)](https://github.com/probabl-ai/ironicl/actions/workflows/python.yml)
+[![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
 
-The project currently provides:
+Ironicl is a CPU inference engine for [TabICLv2](https://github.com/soda-inria/tabicl),
+written in Rust. It is built for a training table that does not change: Ironicl
+computes the training context once, stores it, and then answers new test rows
+against it.
 
-- exact TabICLv2 classifier and regressor parameter counts;
-- safe, pure-Rust inspection of PyTorch ZIP checkpoints;
-- full-KV and representation-cache memory planning;
-- runtime CPU capability reporting;
-- backend and precision-policy validation;
-- portable reference kernels and classifier execution from model artifacts;
-- exact FP32 full-K/V static-context export and cached query execution;
-- AVX-512 cached attention and dense-stage parallelism on the Ryzen target;
-- reference design documents for the engine and static-context artifacts.
+> [!WARNING]
+> Ironicl is experimental. Formats, commands, and APIs can change without notice.
+> The optimized path targets AMD Zen 5 (Ryzen 7 9800X3D). Other CPUs, including
+> Apple Silicon, use a slower portable path.
 
-It can write and verify portable Ironicl model artifacts. `run` accepts a
-validated binary classifier input bundle and prints classifier logits.
+## Status
 
-## Quick Start
+| Works now | Not yet |
+|---|---|
+| Safe checkpoint import in pure Rust (no pickle execution) | Python classifier API |
+| FP32 classifier inference on any CPU | Regression |
+| Static training context with AVX-512 kernels on Zen 5 | Categorical features and missing values |
+| Python preprocessing package | Published packages on crates.io or PyPI |
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, local checks, and
-CI coverage limits.
+## Quickstart
 
-```bash
-cargo test
-cargo run -- platform
-cargo run -- inspect --checkpoint model.ckpt
-cargo run -- plan --rows 50000 --features 100 --estimators 8 \
-  --weights bf16 --kv-dtype bf16 --cache kv --bandwidth-gbps 80
-```
+You need Rust (via [rustup](https://rustup.rs)) and Python 3.12 or newer.
 
-The planned model commands use the same explicit source convention:
+1. Build Ironicl:
 
-```bash
-ironicl inspect --checkpoint model.ckpt
-ironicl import --checkpoint model.ckpt --output model.ironicl
-ironicl run --checkpoint model.ckpt --input request.irinput
-ironicl run --model model.ironicl --input request.irinput
-ironicl run --model model.ironicl --context context.ironiclctx --input request.irquery
-ironicl benchmark --model model.ironicl --input request.irinput --warmup 2 --iterations 10
-```
+   ```bash
+   git clone https://github.com/probabl-ai/ironicl.git
+   cd ironicl
+   cargo build --release
+   ```
 
-Checkpoint and model inspection work now. `import` creates a verified portable
-model. `run --checkpoint` creates or reuses a content-addressed model cache,
-loads the bundle, and executes the portable FP32 classifier. `--no-cache` is
-not available for execution because it does not create an artifact.
+2. Download the released TabICLv2 classifier checkpoint (110 MB):
+
+   ```bash
+   curl -LO https://huggingface.co/jingang/TabICL/resolve/main/tabicl-classifier-v2-20260212.ckpt
+   ```
+
+3. Convert the checkpoint into an Ironicl model:
+
+   ```bash
+   ./target/release/ironicl import \
+     --checkpoint tabicl-classifier-v2-20260212.ckpt \
+     --output classifier.ironicl
+   ```
+
+4. Prepare a small request from the Covertype dataset:
+
+   ```bash
+   python3 -m venv .venv
+   .venv/bin/python -m pip install .
+   .venv/bin/python tools/prepare_real_dataset.py \
+     --dataset covertype --train-rows 1024 --test-rows 8 \
+     --output covertype.irinput
+   ```
+
+5. Run inference:
+
+   ```bash
+   ./target/release/ironicl run --model classifier.ironicl --input covertype.irinput
+   ```
+
+   Ironicl prints one row of class logits for each test row.
+
+See the [command-line reference](docs/cli.md) for `inspect`, `plan`, `platform`,
+and `benchmark`.
 
 ## Python Preprocessing
 
-The standalone preprocessing package requires Python 3.12+, NumPy, scikit-learn,
-and its SciPy dependency. It does not depend on TabICL or PyTorch:
-
-```bash
-python -m pip install .
-```
+The `ironicl` Python package reproduces TabICLv2 classifier preprocessing
+without PyTorch or TabICL:
 
 ```python
 from ironicl.preprocessing import ClassifierPreprocessor
 
 preprocessor = ClassifierPreprocessor(n_estimators=8, random_state=42)
 training_groups = preprocessor.fit_transform(X_train, y_train)
-training_labels = preprocessor.encode_labels(y_train)
 query_groups = preprocessor.transform(X_query)
 ```
 
-Each returned group is one contiguous FP32 matrix `[rows, filtered_features]`.
-`group_names_` records normalization order. `ensemble_groups_` maps ensemble
-members to those matrices; `feature_permutations_` and `class_permutations_`
-provide their feature and encoded-label mappings. The API does not expand
-features or labels per ensemble. `n_estimators_` records the actual ensemble
-count, which can be smaller than requested.
+It does not make predictions yet. See [Python preprocessing](docs/python.md) for
+supported inputs and version requirements.
 
-This initial implementation supports finite dense numeric inputs, 2–10 classes,
-and the default `none`/`power` transforms with Latin feature and cyclic class
-permutations. It removes constant features and rejects all-constant training
-data. Categorical inputs, missing values, and sparse matrices are not supported.
-Numeric DataFrames must have unique string column names in the same order at
-prediction time. Preprocessing is fitted on training data only, retains no
-training rows, and does not require `PYTHONHASHSEED` configuration. It preserves
-upstream's power-transform fallback, including its batch-wide clipping when a
-transform raises a domain error.
+## Documentation
 
-**This is a preprocessing-only Python package, not yet a Python classifier.**
-PyO3 bindings and Rust training-context construction remain to be implemented.
-`tools/prepare_real_dataset.py` now uses this package without `--tabicl-root`;
-it expands ensembles only when writing the existing IRINPUT file format.
-Other upstream oracle and context-export tools still require TabICL/PyTorch.
-The current pure-Python build backend will be replaced by maturin when the
-native extension is added.
-
-Run the Python checks after installation:
-
-```bash
-python -m unittest discover -s tests -p 'test_*.py' -v
-```
-
-The checked-in preprocessing oracle runs without upstream dependencies. The
-supported scikit-learn 1.9.x / SciPy 1.18.x combination preserves its power-fit
-behavior; older float32 solvers produce different results. NumPy 2.x is required.
-Run live comparisons separately, in an environment with both projects installed
-and an unmodified TabICL checkout at commit
-`bd030d47ff7d9f987f0f33431d743a3003bfe0d3`:
-
-```bash
-IRONICL_TABICL_SOURCE=/path/to/tabicl/src \
-  python -m unittest discover -s tests/parity -p 'test_*.py' -v
-```
-
-This dedicated suite compares independently fitted preprocessing chains, using
-synthetic inputs and bundled scikit-learn datasets. Missing prerequisites fail
-rather than skip. It tests preprocessing, not classifier predictions; see
-[`docs/validation.md`](docs/validation.md#python-preprocessing-parity) for setup,
-coverage, and numerical requirements.
-
-## Benchmarking
-
-Build the release binary and benchmark a resident imported model:
-
-```bash
-cargo run --release -- benchmark --model model.ironicl --input request.irinput
-```
-
-`benchmark` times only prediction calls after bundle and artifact loading and
-executor construction complete. It excludes preprocessing, checkpoint import,
-conversion, and load time from inference latency. See
-[`docs/benchmarking.md`](docs/benchmarking.md) for the output contract and
-[`docs/pytorch-cpu-comparison.md`](docs/pytorch-cpu-comparison.md) for the
-point-by-point comparison with official PyTorch CPU and the failed optimization
-record.
-
-On the M1 Max, `auto` selects the portable backend. On the target Arch Linux
-machine, it selects the Zen 5 backend only when all required AVX-512 features
-are detected for the chosen storage formats.
-
-## Design
-
-Start with [`docs/README.md`](docs/README.md). The key decisions are:
-
-- precompute all training-dependent state for a static training set;
-- persist model and context artifacts on NVMe;
-- load the current owned artifact into RAM before serving, with mmap as future
-  work;
-- process exact test queries against fixed training K/V;
-- evaluate BF16 cache storage with FP32 accumulation as the next
-  large-context path;
-- keep FP32 preprocessing, LayerNorm, QASSMax, RoPE, softmax, GELU, residuals,
-  decoder output, and ensemble reduction;
-- treat INT8 K/V as an accuracy experiment, not as the baseline.
-
-## Upstream
-
-The Rust engine is a new implementation informed by the BSD-3-Clause TabICL
-project. Python preprocessing adapts the upstream algorithms; its source records
-provenance and distributions include the applicable license in `LICENSES/`.
-See [`docs/references.md`](docs/references.md) before copying or distributing
-upstream code or model artifacts.
+- [Documentation index](docs/README.md): design, formats, and validation.
+- [Benchmarking](docs/benchmarking.md): how Ironicl measures latency.
+- [Contributing](CONTRIBUTING.md): development setup and checks.
 
 ## License
 
-Ironicl is licensed under the [BSD 3-Clause License](LICENSE). The separate
-[TabICL notice](LICENSES/TabICL-BSD-3-Clause.txt) applies to adapted upstream code.
+Ironicl is licensed under the [BSD 3-Clause License](LICENSE). The Python
+preprocessing adapts code from TabICL under its own
+[BSD 3-Clause notice](LICENSES/TabICL-BSD-3-Clause.txt). The TabICLv2
+checkpoints are published separately by their authors under BSD-3-Clause.
+
+If you use Ironicl, please cite the TabICL papers listed in
+[references](docs/references.md#papers).
