@@ -309,7 +309,8 @@ impl<'w, 'a> Builder<'w, 'a> {
     }
 
     /// One pre-norm transformer block: attention with a residual, then a GELU
-    /// feed-forward with a residual. `input` is `[lead, q_rows, dim]`.
+    /// feed-forward with a residual. `input` is `[lead, q_rows, dim]`. Returns
+    /// the output and the head-major keys and values it attended to.
     #[allow(clippy::too_many_arguments)]
     fn block(
         &self,
@@ -321,7 +322,7 @@ impl<'w, 'a> Builder<'w, 'a> {
         dim: usize,
         rope: Option<&Rope<'_>>,
         qass: Option<&Tensor>,
-    ) -> Result<Tensor> {
+    ) -> Result<(Tensor, Tensor, Tensor)> {
         let head_dim = dim / HEADS;
         let in_weight = self.weight(&format!("{attn}.in_proj_weight"))?;
         let in_bias = self.weight(&format!("{attn}.in_proj_bias"))?;
@@ -390,9 +391,86 @@ impl<'w, 'a> Builder<'w, 'a> {
             dim,
             2 * dim,
         )?);
-        Ok(self.add(
+        let output = self.add(
             &residual,
             &self.linear(&hidden, &format!("{prefix}.linear2"), 2 * dim, dim)?,
+        );
+        Ok((output, key, value))
+    }
+
+    /// The row stage for `[H, Q, 128]` column embeddings: the row transformer
+    /// over `[Q, 4 + H, 128]` sequences with the CLS tokens first, returning
+    /// `[1, Q, 512]` rows.
+    fn row_stage(&self, columns: &Tensor, features: usize) -> Result<Tensor> {
+        let streams = (features + RESERVED) as isize;
+        // Row stage, row-major: [Q, 4 + H, 128] with the CLS tokens first.
+        let columns = self.transpose(columns, 0, 1);
+        let zeros = self.multiply(&self.slice(&columns, 1, 0, 1), &self.scalar(0.0));
+        let cls = self.add(
+            &zeros,
+            &self.constant(
+                &self.weight("row_interactor.cls_tokens")?[..RESERVED * COLUMN_DIM],
+                &[RESERVED as isize, COLUMN_DIM as isize],
+            ),
+        );
+        let mut sequence = unsafe {
+            self.graph
+                .concatTensor_withTensor_dimension_name(&cls, &columns, 1, None)
+        };
+        let frequencies = self.weight("row_interactor.tf_row.rope.freqs")?;
+        let table = |rows: usize| {
+            let (mut cos, mut sin) = (
+                vec![0.0; rows * COLUMN_HEAD_DIM],
+                vec![0.0; rows * COLUMN_HEAD_DIM],
+            );
+            let half = COLUMN_HEAD_DIM / 2;
+            for row in 0..rows {
+                for (index, frequency) in frequencies[..half].iter().enumerate() {
+                    let (s, c) = (row as f32 * frequency).sin_cos();
+                    for offset in [index, index + half] {
+                        cos[row * COLUMN_HEAD_DIM + offset] = c;
+                        sin[row * COLUMN_HEAD_DIM + offset] = s;
+                    }
+                }
+            }
+            let dims = [rows as isize, COLUMN_HEAD_DIM as isize];
+            (self.constant(&cos, &dims), self.constant(&sin, &dims))
+        };
+        let (all, cls_rows) = (table(features + RESERVED), table(RESERVED));
+        for block in 0..2 {
+            let prefix = format!("row_interactor.tf_row.blocks.{block}");
+            (sequence, _, _) = self.block(
+                &sequence,
+                &Source::Tokens(&sequence),
+                &prefix,
+                &format!("{prefix}.attn"),
+                (-1, streams, streams),
+                COLUMN_DIM,
+                Some(&Rope {
+                    query: (&all.0, &all.1),
+                    key: (&all.0, &all.1),
+                }),
+                None,
+            )?;
+        }
+        // The last block updates only the CLS tokens.
+        let prefix = "row_interactor.tf_row.blocks.2";
+        let (cls_out, _, _) = self.block(
+            &self.slice(&sequence, 1, 0, RESERVED as isize),
+            &Source::Tokens(&sequence),
+            prefix,
+            &format!("{prefix}.attn"),
+            (-1, RESERVED as isize, streams),
+            COLUMN_DIM,
+            Some(&Rope {
+                query: (&cls_rows.0, &cls_rows.1),
+                key: (&all.0, &all.1),
+            }),
+            None,
+        )?;
+        Ok(self.reshape(
+            &self.layer_norm(&cls_out, "row_interactor.out_ln", COLUMN_DIM)?,
+            &[1, -1, ICL_DIM as isize],
         ))
     }
 }
@@ -427,7 +505,7 @@ impl IclGraph {
             let prefix = format!("icl_predictor.tf_icl.blocks.{block}");
             let (key, value) = (builder.placeholder(&kv_shape), builder.placeholder(&kv_shape));
             let base_scale = builder.placeholder(&[1, HEADS as isize, 1, ICL_HEAD_DIM as isize]);
-            hidden = builder.block(
+            (hidden, _, _) = builder.block(
                 &hidden,
                 &Source::Cached(&key, &value),
                 &prefix,
@@ -579,7 +657,7 @@ impl FrontGraph {
         column_values: &[&[f32]],
     ) -> Result<Self> {
         let builder = Builder::new(weights);
-        let (h, streams) = (features as isize, (features + RESERVED) as isize);
+        let h = features as isize;
         // Column stage, feature-major: [H, Q, 3] grouped inputs -> [H, Q, 128].
         let grouped = builder.placeholder(&[h, -1, 3]);
         let mut columns = builder.linear(&grouped, "col_embedder.in_linear", 3, COLUMN_DIM)?;
@@ -588,7 +666,7 @@ impl FrontGraph {
         for block in 0..COLUMN_BLOCKS {
             let prefix = format!("col_embedder.tf_col.blocks.{block}.multihead_attn2");
             let (key, value) = (builder.placeholder(&kv_shape), builder.placeholder(&kv_shape));
-            columns = builder.block(
+            (columns, _, _) = builder.block(
                 &columns,
                 &Source::Cached(&key, &value),
                 &prefix,
@@ -601,76 +679,7 @@ impl FrontGraph {
             keys.push(key);
             values.push(value);
         }
-        // Row stage, row-major: [Q, 4 + H, 128] with the CLS tokens first.
-        let columns = builder.transpose(&columns, 0, 1);
-        let zeros = builder.multiply(&builder.slice(&columns, 1, 0, 1), &builder.scalar(0.0));
-        let cls = builder.add(
-            &zeros,
-            &builder.constant(
-                &builder.weight("row_interactor.cls_tokens")?[..RESERVED * COLUMN_DIM],
-                &[RESERVED as isize, COLUMN_DIM as isize],
-            ),
-        );
-        let mut sequence = unsafe {
-            builder
-                .graph
-                .concatTensor_withTensor_dimension_name(&cls, &columns, 1, None)
-        };
-        let frequencies = builder.weight("row_interactor.tf_row.rope.freqs")?;
-        let table = |rows: usize| {
-            let (mut cos, mut sin) = (
-                vec![0.0; rows * COLUMN_HEAD_DIM],
-                vec![0.0; rows * COLUMN_HEAD_DIM],
-            );
-            let half = COLUMN_HEAD_DIM / 2;
-            for row in 0..rows {
-                for (index, frequency) in frequencies[..half].iter().enumerate() {
-                    let (s, c) = (row as f32 * frequency).sin_cos();
-                    for offset in [index, index + half] {
-                        cos[row * COLUMN_HEAD_DIM + offset] = c;
-                        sin[row * COLUMN_HEAD_DIM + offset] = s;
-                    }
-                }
-            }
-            let dims = [rows as isize, COLUMN_HEAD_DIM as isize];
-            (builder.constant(&cos, &dims), builder.constant(&sin, &dims))
-        };
-        let (all, cls_rows) = (table(features + RESERVED), table(RESERVED));
-        for block in 0..2 {
-            let prefix = format!("row_interactor.tf_row.blocks.{block}");
-            sequence = builder.block(
-                &sequence,
-                &Source::Tokens(&sequence),
-                &prefix,
-                &format!("{prefix}.attn"),
-                (-1, streams, streams),
-                COLUMN_DIM,
-                Some(&Rope {
-                    query: (&all.0, &all.1),
-                    key: (&all.0, &all.1),
-                }),
-                None,
-            )?;
-        }
-        // The last block updates only the CLS tokens.
-        let prefix = "row_interactor.tf_row.blocks.2";
-        let cls_out = builder.block(
-            &builder.slice(&sequence, 1, 0, RESERVED as isize),
-            &Source::Tokens(&sequence),
-            prefix,
-            &format!("{prefix}.attn"),
-            (-1, RESERVED as isize, streams),
-            COLUMN_DIM,
-            Some(&Rope {
-                query: (&cls_rows.0, &cls_rows.1),
-                key: (&all.0, &all.1),
-            }),
-            None,
-        )?;
-        let rows = builder.reshape(
-            &builder.layer_norm(&cls_out, "row_interactor.out_ln", COLUMN_DIM)?,
-            &[1, -1, ICL_DIM as isize],
-        );
+        let rows = builder.row_stage(&columns, features)?;
         // Each estimator's feature streams, skipping the unused reserved streams.
         let stream_elements = HEADS * INDUCING * COLUMN_HEAD_DIM;
         let split = |blocks: &[&[f32]]| -> Result<Vec<Vec<Buffer>>> {
@@ -720,3 +729,173 @@ impl FrontGraph {
         Ok(output)
     }
 }
+
+/// One estimator's static context built on the GPU: the training rows run
+/// through every stage once, and each column and ICL block's keys and values
+/// are captured. All shapes are fixed, so the graph is built per context.
+pub(crate) struct ContextGraph {
+    gpu: Gpu,
+    graph: Retained<MPSGraph>,
+    features: usize,
+    training_rows: usize,
+    grouped: Tensor,
+    column_labels: Tensor,
+    icl_labels: Tensor,
+    column: Vec<(Tensor, Tensor)>,
+    icl: Vec<(Tensor, Tensor)>,
+}
+
+/// Captured `(keys, values)` per block: column blocks `[H, 8, 128, 16]`, ICL
+/// blocks `[8, N, 64]`.
+pub(crate) type CapturedContext = (Vec<(Vec<f32>, Vec<f32>)>, Vec<(Vec<f32>, Vec<f32>)>);
+
+impl ContextGraph {
+    /// `column_base_scales` and `icl_base_scales` are the `QASSMax` base scales
+    /// for `training_rows` sources: 3 of `[8, 16]` and 12 of `[8, 64]`.
+    pub(crate) fn new(
+        gpu: &Gpu,
+        weights: &Weights<'_, '_>,
+        features: usize,
+        training_rows: usize,
+        column_base_scales: &[Vec<f32>],
+        icl_base_scales: &[Vec<f32>],
+    ) -> Result<Self> {
+        let builder = Builder::new(weights);
+        let (h, n) = (features as isize, training_rows as isize);
+        let grouped = builder.placeholder(&[h, n, 3]);
+        let column_labels = builder.placeholder(&[n, COLUMN_DIM as isize]);
+        let icl_labels = builder.placeholder(&[1, n, ICL_DIM as isize]);
+        let mut source = builder.add(
+            &builder.linear(&grouped, "col_embedder.in_linear", 3, COLUMN_DIM)?,
+            &column_labels,
+        );
+        let zeros = builder.multiply(&builder.slice(&source, 1, 0, 1), &builder.scalar(0.0));
+        let mut column = Vec::with_capacity(COLUMN_BLOCKS);
+        for (block, base_scale) in column_base_scales.iter().enumerate() {
+            // ISAB: the inducing points attend to the training rows, then the
+            // rows attend back; the second attention's keys and values are cached.
+            let prefix = format!("col_embedder.tf_col.blocks.{block}");
+            let inducing = builder.add(
+                &zeros,
+                &builder.constant(
+                    builder.weight(&format!("{prefix}.ind_vectors"))?,
+                    &[INDUCING as isize, COLUMN_DIM as isize],
+                ),
+            );
+            let base_scale = builder.constant(base_scale, &[1, HEADS as isize, 1, COLUMN_HEAD_DIM as isize]);
+            let first = format!("{prefix}.multihead_attn1");
+            let (hidden, _, _) = builder.block(
+                &inducing,
+                &Source::Tokens(&source),
+                &first,
+                &format!("{first}.attn"),
+                (h, INDUCING as isize, n),
+                COLUMN_DIM,
+                None,
+                Some(&base_scale),
+            )?;
+            let second = format!("{prefix}.multihead_attn2");
+            let (output, key, value) = builder.block(
+                &source,
+                &Source::Tokens(&hidden),
+                &second,
+                &format!("{second}.attn"),
+                (h, n, INDUCING as isize),
+                COLUMN_DIM,
+                None,
+                None,
+            )?;
+            source = output;
+            column.push((key, value));
+        }
+        let mut rows = builder.add(&builder.row_stage(&source, features)?, &icl_labels);
+        let mut icl = Vec::with_capacity(ICL_BLOCKS);
+        for (block, base_scale) in icl_base_scales.iter().enumerate() {
+            let prefix = format!("icl_predictor.tf_icl.blocks.{block}");
+            let base_scale = builder.constant(base_scale, &[1, HEADS as isize, 1, ICL_HEAD_DIM as isize]);
+            let (output, key, value) = builder.block(
+                &rows,
+                &Source::Tokens(&rows),
+                &prefix,
+                &format!("{prefix}.attn"),
+                (1, n, n),
+                ICL_DIM,
+                None,
+                Some(&base_scale),
+            )?;
+            rows = output;
+            icl.push((key, value));
+        }
+        Ok(Self {
+            gpu: gpu.clone(),
+            graph: builder.graph,
+            features,
+            training_rows,
+            grouped,
+            column_labels,
+            icl_labels,
+            column,
+            icl,
+        })
+    }
+
+    /// Build one estimator's context from `[H, N, 3]` grouped inputs and its
+    /// `[N, 128]` column and `[N, 512]` ICL label embeddings.
+    pub(crate) fn run(
+        &self,
+        grouped: &[f32],
+        column_labels: &[f32],
+        icl_labels: &[f32],
+    ) -> Result<CapturedContext> {
+        let (h, n) = (self.features as isize, self.training_rows as isize);
+        let inputs = [grouped, column_labels, icl_labels]
+            .iter()
+            .map(|values| self.gpu.buffer(values))
+            .collect::<Result<Vec<_>>>()?;
+        let column_shape = [h, HEADS as isize, INDUCING as isize, COLUMN_HEAD_DIM as isize];
+        let icl_shape = [1, HEADS as isize, n, ICL_HEAD_DIM as isize];
+        let column_elements = self.features * HEADS * INDUCING * COLUMN_HEAD_DIM;
+        let icl_elements = HEADS * self.training_rows * ICL_HEAD_DIM;
+        let column_buffers = (0..2 * COLUMN_BLOCKS)
+            .map(|_| self.gpu.empty(column_elements))
+            .collect::<Result<Vec<_>>>()?;
+        let icl_buffers = (0..2 * ICL_BLOCKS)
+            .map(|_| self.gpu.empty(icl_elements))
+            .collect::<Result<Vec<_>>>()?;
+        let mut outputs = Vec::with_capacity(2 * (COLUMN_BLOCKS + ICL_BLOCKS));
+        for (index, (key, value)) in self.column.iter().enumerate() {
+            outputs.push((key, &column_buffers[2 * index], &column_shape[..]));
+            outputs.push((value, &column_buffers[2 * index + 1], &column_shape[..]));
+        }
+        for (index, (key, value)) in self.icl.iter().enumerate() {
+            outputs.push((key, &icl_buffers[2 * index], &icl_shape[..]));
+            outputs.push((value, &icl_buffers[2 * index + 1], &icl_shape[..]));
+        }
+        self.gpu.run(
+            &self.graph,
+            &[
+                (&self.grouped, &inputs[0], &[h, n, 3]),
+                (&self.column_labels, &inputs[1], &[n, COLUMN_DIM as isize]),
+                (&self.icl_labels, &inputs[2], &[1, n, ICL_DIM as isize]),
+            ],
+            &outputs,
+        );
+        let read = |buffer: &Buffer, elements: usize| -> Vec<f32> {
+            // SAFETY: the run is complete and wrote `elements` floats.
+            unsafe { std::slice::from_raw_parts(buffer.contents().as_ptr().cast::<f32>(), elements) }.to_vec()
+        };
+        let pairs = |buffers: &[Buffer], elements: usize| {
+            buffers
+                .chunks_exact(2)
+                .map(|pair| (read(&pair[0], elements), read(&pair[1], elements)))
+                .collect()
+        };
+        Ok((
+            pairs(&column_buffers, column_elements),
+            pairs(&icl_buffers, icl_elements),
+        ))
+    }
+}
+
+// SAFETY: as for `IclGraph`; a `ContextGraph` is used by one thread at a time.
+unsafe impl Send for ContextGraph {}
