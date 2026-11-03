@@ -30,12 +30,15 @@ With the `metal` cargo feature on Apple Silicon, large query batches run every
 stage on the GPU with `MPSGraph`, one estimator at a time: a per-context front
 graph runs the column and row stages, and a per-model graph runs the twelve cached
 ICL blocks and the decoder, reading the front graph's rows from a shared buffer.
-The CPU only groups each feature with its neighbors, and keeps a request whose
-grouped inputs contain the all-missing marker. A context copies its FP32 keys and
-values into shared Metal buffers when it is built. The GPU path starts at 49,152
-query-times-training rows, the M1 Max crossover, and `IRONICL_NO_METAL=1` disables
-it. On macOS 27, `MPSGraph` prints "Failed to import MPS module" once per compiled
-shape; results are unaffected.
+Building a context with at least 222 training rows also runs on the GPU: a
+fixed-shape graph per context passes the training rows through every stage once
+and captures each column and ICL block's keys and values. The CPU only groups each
+feature with its neighbors and embeds labels, and keeps any request whose grouped
+inputs contain the all-missing marker. A context copies its FP32 keys and values
+into shared Metal buffers. The GPU paths start at 49,152 query-times-training (or
+training-squared) rows, the M1 Max crossover, and `IRONICL_NO_METAL=1` disables
+them. On macOS 27, `MPSGraph` prints "Failed to import MPS module" once per
+compiled shape; results are unaffected.
 
 Cached attention selects its backend once per executor. The AVX-512 path
 implements score tiles and softmax-weighted V tiles; portable execution retains

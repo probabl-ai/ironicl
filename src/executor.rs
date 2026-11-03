@@ -318,6 +318,10 @@ const GPU_MIN_SCORES: usize = 49_152;
 /// Attention keys and values in head-major `[heads, rows, head_dim]` order.
 type KeyValue = (Vec<f32>, Vec<f32>);
 
+/// One estimator's captured keys and values: per column block, every feature's
+/// in feature order; per ICL block, the training rows'.
+type EstimatorCaches = (Vec<KeyValue>, Vec<KeyValue>);
+
 /// One embedded column stream, with its keys and values when captured.
 type ColumnStream = (usize, Vec<f32>, Vec<KeyValue>);
 
@@ -399,6 +403,99 @@ impl ClassifierExecutor {
         }
     }
 
+    /// The GPU and its ICL graph, built on first use; `None` without a GPU or
+    /// with `IRONICL_NO_METAL` set.
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_graph(&self) -> Option<Arc<GpuGraph>> {
+        if std::env::var_os("IRONICL_NO_METAL").is_some() {
+            return None;
+        }
+        self.icl_graph
+            .get_or_init(|| {
+                let gpu = crate::metal::Gpu::new().ok().flatten()?;
+                let icl = crate::metal::IclGraph::new(&gpu, &|name| self.tensor(name)).ok()?;
+                Some(Arc::new(GpuGraph { gpu, icl }))
+            })
+            .clone()
+    }
+
+    /// Build each estimator's captured keys and values on the GPU. Returns
+    /// `None` without a GPU, below the size where it pays off, or when a
+    /// grouped triple is the all-missing marker that only the CPU path handles.
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    fn build_estimators_gpu(
+        &self,
+        (b, n, h): (usize, usize, usize),
+        x: &[f32],
+        y_train: &[f32],
+    ) -> Result<Option<Vec<EstimatorCaches>>> {
+        if n * n < GPU_MIN_SCORES {
+            return Ok(None);
+        }
+        let Some(graph) = self.gpu_graph() else {
+            return Ok(None);
+        };
+        let mut inputs = Vec::with_capacity(b);
+        for ensemble in 0..b {
+            let Some(grouped) = group_features(&x[ensemble * n * h..][..n * h], n, h) else {
+                return Ok(None);
+            };
+            let labels = label_indices(&y_train[ensemble * n..][..n])?;
+            let mut column_labels = vec![0.0; n * COLUMN_DIM];
+            one_hot_linear_f32(
+                &labels,
+                self.tensor("col_embedder.y_encoder.weight")?,
+                self.tensor("col_embedder.y_encoder.bias")?,
+                10,
+                COLUMN_DIM,
+                &mut column_labels,
+            )?;
+            let mut icl_labels = vec![0.0; n * ICL_DIM];
+            one_hot_linear_f32(
+                &labels,
+                self.tensor("icl_predictor.y_encoder.weight")?,
+                self.tensor("icl_predictor.y_encoder.bias")?,
+                10,
+                ICL_DIM,
+                &mut icl_labels,
+            )?;
+            inputs.push((grouped, column_labels, icl_labels));
+        }
+        let column_scales = (0..3)
+            .map(|block| {
+                qass_base_scale(
+                    self,
+                    &format!("col_embedder.tf_col.blocks.{block}.multihead_attn1.attn"),
+                    n,
+                    COLUMN_DIM,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let icl_scales = (0..12)
+            .map(|block| {
+                qass_base_scale(
+                    self,
+                    &format!("icl_predictor.tf_icl.blocks.{block}.attn"),
+                    n,
+                    ICL_DIM,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let context = crate::metal::ContextGraph::new(
+            &graph.gpu,
+            &|name| self.tensor(name),
+            h,
+            n,
+            &column_scales,
+            &icl_scales,
+        )?;
+        inputs
+            .iter()
+            .map(|(grouped, column_labels, icl_labels)| context.run(grouped, column_labels, icl_labels))
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
+    }
+
     /// Run the training rows once and keep their attention keys and values as
     /// an exact static context for query-only prediction.
     ///
@@ -453,27 +550,44 @@ impl ClassifierExecutor {
         // ponytail: one rayon task per estimator; peak memory grows with the
         // number of estimators built at once. Bound the concurrency if large
         // contexts run out of memory.
-        let estimators = (0..b)
-            .into_par_iter()
-            .map(|ensemble| {
-                let x = &x[ensemble * n * h..][..n * h];
-                let labels = &y_train[ensemble * n..][..n];
-                let (columns, feature_caches) = self.column_embeddings(x, labels, n, h, n, true)?;
-                let rows = self.row_embeddings(&columns, n, streams)?;
-                let mut caches = Vec::with_capacity(12);
-                self.icl_rows(rows, labels, n, n, Some(&mut caches))?;
-                Ok((feature_caches, caches))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        for (feature_caches, caches) in estimators {
-            for (block, (keys, values)) in column.iter_mut().enumerate() {
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        let estimators = self.build_estimators_gpu((b, n, h), x, y_train)?;
+        #[cfg(not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")))]
+        let estimators: Option<Vec<EstimatorCaches>> = None;
+        let estimators = match estimators {
+            Some(estimators) => estimators,
+            None => (0..b)
+                .into_par_iter()
+                .map(|ensemble| {
+                    let x = &x[ensemble * n * h..][..n * h];
+                    let labels = &y_train[ensemble * n..][..n];
+                    let (columns, feature_caches) = self.column_embeddings(x, labels, n, h, n, true)?;
+                    let rows = self.row_embeddings(&columns, n, streams)?;
+                    let mut caches = Vec::with_capacity(12);
+                    self.icl_rows(rows, labels, n, n, Some(&mut caches))?;
+                    // Per block, every feature's keys and values in feature order.
+                    let column = (0..3)
+                        .map(|block| {
+                            let keys = feature_caches
+                                .iter()
+                                .flat_map(|caches| caches[block].0.iter().copied());
+                            let values = feature_caches
+                                .iter()
+                                .flat_map(|caches| caches[block].1.iter().copied());
+                            (keys.collect(), values.collect())
+                        })
+                        .collect();
+                    Ok((column, caches))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        };
+        for (column_caches, caches) in estimators {
+            for ((keys, values), (key, value)) in column.iter_mut().zip(column_caches) {
                 // The cached path never reads the reserved CLS streams.
                 keys.resize(keys.len() + RESERVED * column_elements, 0.0);
                 values.resize(values.len() + RESERVED * column_elements, 0.0);
-                for caches in &feature_caches {
-                    keys.extend_from_slice(&caches[block].0);
-                    values.extend_from_slice(&caches[block].1);
-                }
+                keys.extend(key);
+                values.extend(value);
             }
             for ((key, value), (keys, values)) in caches.into_iter().zip(&mut icl) {
                 keys.extend(key);
@@ -1310,15 +1424,7 @@ impl StaticClassifierExecutor {
         }
         let model = &self.model;
         let weights = |name: &str| model.tensor(name);
-        let graph = model
-            .icl_graph
-            .get_or_init(|| {
-                let gpu = crate::metal::Gpu::new().ok().flatten()?;
-                let icl = crate::metal::IclGraph::new(&gpu, &weights).ok()?;
-                Some(Arc::new(GpuGraph { gpu, icl }))
-            })
-            .clone();
-        let Some(graph) = graph else {
+        let Some(graph) = model.gpu_graph() else {
             return Ok(self);
         };
         let tensors = |stage: &str, blocks: usize, kind: &str| -> Option<Vec<&[f32]>> {
@@ -1383,18 +1489,9 @@ impl StaticClassifierExecutor {
         let (q, h, classes) = (request.query_rows(), metadata.feature_count, metadata.class_count);
         let mut groups = Vec::with_capacity(metadata.ensemble_count);
         for ensemble in 0..metadata.ensemble_count {
-            let x = &request.x()[ensemble * q * h..][..q * h];
-            // [H, Q, 3]: each feature with the features 1, 2, and 4 places after it.
-            let mut grouped = vec![0.0; h * q * 3];
-            for (index, triple) in grouped.chunks_exact_mut(3).enumerate() {
-                let (feature, row) = (index / q, index % q);
-                for (part, offset) in [1_usize, 2, 4].iter().enumerate() {
-                    triple[part] = x[row * h + (feature + offset) % h];
-                }
-                if triple.iter().all(|value| *value == -100.0) {
-                    return Ok(false);
-                }
-            }
+            let Some(grouped) = group_features(&request.x()[ensemble * q * h..][..q * h], q, h) else {
+                return Ok(false);
+            };
             groups.push(grouped);
         }
         for (ensemble, (grouped, output)) in groups.iter().zip(values.chunks_mut(q * classes)).enumerate() {
@@ -3078,30 +3175,44 @@ impl StaticClassifierExecutor {
 
     #[allow(clippy::cast_precision_loss)]
     fn build_qass_base_scale(model: &ClassifierExecutor, prefix: &str, source: usize) -> Result<Vec<f32>> {
-        let name = |part: &str| format!("{prefix}.ssmax_layer.{part}");
-        let first_weight = model.tensor(&name("base_mlp.0.weight"))?;
-        let first_bias = model.tensor(&name("base_mlp.0.bias"))?;
-        let second_weight = model.tensor(&name("base_mlp.2.weight"))?;
-        let second_bias = model.tensor(&name("base_mlp.2.bias"))?;
-        let log_source = (source.max(1) as f32).ln();
-        let mut hidden = [0.0; 64];
-        for index in 0..64 {
-            let value = first_weight[index].mul_add(log_source, first_bias[index]);
-            hidden[index] = 0.5 * value * (1.0 + libm::erff(value / core::f32::consts::SQRT_2));
-        }
-        let mut scale = vec![0.0; HEADS * 64];
-        affine_f32(
-            &hidden,
-            1,
-            64,
-            second_weight,
-            Some(second_bias),
-            HEADS * 64,
-            &mut scale,
-        )?;
-        Ok(scale)
+        qass_base_scale(model, prefix, source, HEADS * 64)
     }
+}
 
+/// `QASSMax` base scales for `source` keys: `[heads * head_dim]`, the same for
+/// every query, so they are computed once per source length.
+#[allow(clippy::cast_precision_loss)] // ln(source) needs no more precision.
+fn qass_base_scale(
+    model: &ClassifierExecutor,
+    prefix: &str,
+    source: usize,
+    width: usize,
+) -> Result<Vec<f32>> {
+    let name = |part: &str| format!("{prefix}.ssmax_layer.{part}");
+    let first_weight = model.tensor(&name("base_mlp.0.weight"))?;
+    let first_bias = model.tensor(&name("base_mlp.0.bias"))?;
+    let second_weight = model.tensor(&name("base_mlp.2.weight"))?;
+    let second_bias = model.tensor(&name("base_mlp.2.bias"))?;
+    let log_source = (source.max(1) as f32).ln();
+    let mut hidden = [0.0; 64];
+    for index in 0..64 {
+        let value = first_weight[index].mul_add(log_source, first_bias[index]);
+        hidden[index] = 0.5 * value * (1.0 + libm::erff(value / core::f32::consts::SQRT_2));
+    }
+    let mut scale = vec![0.0; width];
+    affine_f32(
+        &hidden,
+        1,
+        64,
+        second_weight,
+        Some(second_bias),
+        width,
+        &mut scale,
+    )?;
+    Ok(scale)
+}
+
+impl StaticClassifierExecutor {
     #[allow(clippy::cast_precision_loss)]
     fn qass(
         &self,
@@ -3159,6 +3270,24 @@ impl StaticClassifierExecutor {
         }
         Ok(())
     }
+}
+
+/// Group each feature of `[rows, H]` inputs with the features 1, 2, and 4
+/// places after it, as `[H, rows, 3]`. Returns `None` when a triple is the
+/// all-missing marker, which only the CPU column stage handles.
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+fn group_features(x: &[f32], rows: usize, h: usize) -> Option<Vec<f32>> {
+    let mut grouped = vec![0.0; h * rows * 3];
+    for (index, triple) in grouped.chunks_exact_mut(3).enumerate() {
+        let (feature, row) = (index / rows, index % rows);
+        for (part, offset) in [1_usize, 2, 4].iter().enumerate() {
+            triple[part] = x[row * h + (feature + offset) % h];
+        }
+        if triple.iter().all(|value| *value == -100.0) {
+            return None;
+        }
+    }
+    Some(grouped)
 }
 
 fn aggregate_classifier_probabilities(
