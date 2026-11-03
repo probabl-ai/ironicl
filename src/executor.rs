@@ -279,9 +279,13 @@ pub struct ClassifierExecutor {
     icl_graph: Arc<OnceLock<Option<Arc<GpuGraph>>>>,
 }
 
-/// The Metal ICL graph, built on first use and shared by every context of a model.
+/// The GPU and the Metal ICL graph, built on first use and shared by every
+/// context of a model.
 #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-struct GpuGraph(crate::metal::IclGraph);
+struct GpuGraph {
+    gpu: crate::metal::Gpu,
+    icl: crate::metal::IclGraph,
+}
 
 #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
 impl std::fmt::Debug for GpuGraph {
@@ -295,6 +299,7 @@ impl std::fmt::Debug for GpuGraph {
 struct GpuContext {
     graph: Arc<GpuGraph>,
     context: crate::metal::IclContext,
+    front: crate::metal::FrontGraph,
 }
 
 #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
@@ -304,7 +309,7 @@ impl std::fmt::Debug for GpuContext {
     }
 }
 
-/// Smallest `query_rows * training_rows` that runs the ICL stage on the GPU.
+/// Smallest `query_rows * training_rows` that runs prediction on the GPU.
 /// On an M1 Max the GPU wins from about 64 query rows with 1,000 training rows
 /// and from 8 query rows with 7,071; below that the CPU is faster.
 #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
@@ -1304,35 +1309,56 @@ impl StaticClassifierExecutor {
             return Ok(self);
         }
         let model = &self.model;
+        let weights = |name: &str| model.tensor(name);
         let graph = model
             .icl_graph
             .get_or_init(|| {
-                crate::metal::IclGraph::new(|name| model.tensor(name))
-                    .ok()
-                    .flatten()
-                    .map(|graph| Arc::new(GpuGraph(graph)))
+                let gpu = crate::metal::Gpu::new().ok().flatten()?;
+                let icl = crate::metal::IclGraph::new(&gpu, &weights).ok()?;
+                Some(Arc::new(GpuGraph { gpu, icl }))
             })
             .clone();
         let Some(graph) = graph else {
             return Ok(self);
         };
-        let tensors = |kind: &str| -> Option<Vec<&[f32]>> {
-            (0..12)
-                .map(|block| self.context.tensor(&format!("icl.{block}.{kind}"))?.fp32_values())
+        let tensors = |stage: &str, blocks: usize, kind: &str| -> Option<Vec<&[f32]>> {
+            (0..blocks)
+                .map(|block| {
+                    self.context
+                        .tensor(&format!("{stage}.{block}.{kind}"))?
+                        .fp32_values()
+                })
                 .collect()
         };
-        let (Some(keys), Some(values)) = (tensors("key"), tensors("value")) else {
+        let (Some(keys), Some(values), Some(column_keys), Some(column_values)) = (
+            tensors("icl", 12, "key"),
+            tensors("icl", 12, "value"),
+            tensors("column", 3, "key"),
+            tensors("column", 3, "value"),
+        ) else {
             return Ok(self);
         };
         let metadata = self.context.metadata();
-        let context = graph.0.context(
+        let context = graph.icl.context(
             metadata.ensemble_count,
             metadata.training_rows,
             &keys,
             &values,
             &self.qass_base_scales,
         )?;
-        self.gpu = Some(Arc::new(GpuContext { graph, context }));
+        let front = crate::metal::FrontGraph::new(
+            &graph.gpu,
+            &weights,
+            metadata.ensemble_count,
+            metadata.feature_count,
+            &column_keys,
+            &column_values,
+        )?;
+        self.gpu = Some(Arc::new(GpuContext {
+            graph,
+            context,
+            front,
+        }));
         Ok(self)
     }
 
@@ -1342,32 +1368,43 @@ impl StaticClassifierExecutor {
         Ok(self)
     }
 
-    /// Run the column and row stages on the CPU, one estimator per worker, then
-    /// the ICL blocks and decoder on the GPU.
+    /// Run every stage on the GPU, one estimator at a time. The CPU only groups
+    /// each feature with its neighbors. Returns false, with nothing written,
+    /// when a grouped triple is the all-missing marker that only the CPU path
+    /// handles.
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
     fn predict_logits_gpu(
         &self,
         gpu: &GpuContext,
         request: ClassifierQueryRequest<'_>,
-        plan: ExecutionPlan,
         values: &mut [f32],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let metadata = self.context.metadata();
-        let q = request.query_rows();
-        let rows = self.affine_pool.install(|| {
-            (0..metadata.ensemble_count)
-                .into_par_iter()
-                .map(|ensemble| self.cached_frontend(request, ensemble, plan.inner_workers))
-                .collect::<Result<Vec<_>>>()
-        })?;
-        let classes = metadata.class_count;
-        for (ensemble, (rows, output)) in rows.iter().zip(values.chunks_mut(q * classes)).enumerate() {
-            let logits = gpu.graph.0.run(&gpu.context, ensemble, rows, q)?;
+        let (q, h, classes) = (request.query_rows(), metadata.feature_count, metadata.class_count);
+        let mut groups = Vec::with_capacity(metadata.ensemble_count);
+        for ensemble in 0..metadata.ensemble_count {
+            let x = &request.x()[ensemble * q * h..][..q * h];
+            // [H, Q, 3]: each feature with the features 1, 2, and 4 places after it.
+            let mut grouped = vec![0.0; h * q * 3];
+            for (index, triple) in grouped.chunks_exact_mut(3).enumerate() {
+                let (feature, row) = (index / q, index % q);
+                for (part, offset) in [1_usize, 2, 4].iter().enumerate() {
+                    triple[part] = x[row * h + (feature + offset) % h];
+                }
+                if triple.iter().all(|value| *value == -100.0) {
+                    return Ok(false);
+                }
+            }
+            groups.push(grouped);
+        }
+        for (ensemble, (grouped, output)) in groups.iter().zip(values.chunks_mut(q * classes)).enumerate() {
+            let rows = gpu.front.run(ensemble, grouped, q)?;
+            let logits = gpu.graph.icl.run(&gpu.context, ensemble, &rows, q)?;
             for (row, output) in output.chunks_exact_mut(classes).enumerate() {
                 output.copy_from_slice(&logits[row * 10..][..classes]);
             }
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Reset sparse-attention decisions collected by this executor.
@@ -1430,8 +1467,8 @@ impl StaticClassifierExecutor {
         #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
         if let Some(gpu) = &self.gpu
             && request.query_rows() * metadata.training_rows >= GPU_MIN_SCORES
+            && self.predict_logits_gpu(gpu, request, &mut values)?
         {
-            self.predict_logits_gpu(gpu, request, plan, &mut values)?;
             return Ok(ClassifierLogits {
                 shape: [
                     metadata.ensemble_count,
