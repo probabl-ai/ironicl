@@ -3158,6 +3158,9 @@ fn executor_threads() -> usize {
                 .filter(|threads| *threads > 0)
                 .unwrap_or(1);
         }
+        if let Some(cores) = performance_cores() {
+            return cores;
+        }
         let logical = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
         if cfg!(target_arch = "x86_64") {
             logical.div_ceil(2)
@@ -3165,6 +3168,44 @@ fn executor_threads() -> usize {
             logical
         }
     })
+}
+
+/// Performance-core count on macOS. Using only these cores keeps workers off
+/// the efficiency cores, and on an M1 Max (8 + 2 cores) it lets 8 estimators
+/// run in parallel instead of one at a time with each split 10 ways.
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)] // One libSystem call; std has no portable equivalent.
+fn performance_cores() -> Option<usize> {
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const std::ffi::c_char,
+            value: *mut std::ffi::c_void,
+            length: *mut usize,
+            new_value: *const std::ffi::c_void,
+            new_length: usize,
+        ) -> i32;
+    }
+    let mut cores = 0_i32;
+    let mut length = std::mem::size_of::<i32>();
+    // SAFETY: the name is NUL-terminated and `cores` holds `length` bytes.
+    let status = unsafe {
+        sysctlbyname(
+            c"hw.perflevel0.physicalcpu".as_ptr(),
+            (&raw mut cores).cast(),
+            &raw mut length,
+            std::ptr::null(),
+            0,
+        )
+    };
+    (status == 0 && length == std::mem::size_of::<i32>())
+        .then(|| usize::try_from(cores).ok())
+        .flatten()
+        .filter(|cores| *cores > 0)
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn performance_cores() -> Option<usize> {
+    None
 }
 
 fn cached_attention_key_tile_rows() -> usize {
