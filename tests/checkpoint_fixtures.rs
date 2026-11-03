@@ -8,9 +8,9 @@ use std::{
 };
 
 use ironicl::{
-    CheckpointCacheOptions, CheckpointProfile, ClassifierExecutor, ClassifierInputBundle, PreparedCheckpoint,
-    TaskKind, import_checkpoint, inspect_checkpoint, inspect_model_artifact, load_model_artifact,
-    prepare_checkpoint,
+    CheckpointCacheOptions, CheckpointProfile, ClassifierExecutor, ClassifierInputBundle,
+    ClassifierQueryRequest, PreparedCheckpoint, TaskKind, import_checkpoint, inspect_checkpoint,
+    inspect_model_artifact, load_model_artifact, prepare_checkpoint,
 };
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -194,6 +194,68 @@ fn matches_python_classifier_oracle_when_fixtures_are_available() {
         );
     }
     println!("Python oracle parity: max_abs={max_abs:.9e}, max_rel={max_rel:.9e}");
+}
+
+#[test]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::many_single_char_names
+)]
+fn built_context_matches_the_uncached_forward_pass() {
+    let Some(model_path) = fixture("tabicl-classifier-v2.ironicl") else {
+        return;
+    };
+    let executor =
+        ClassifierExecutor::new(load_model_artifact(&model_path).expect("load classifier artifact"));
+    let (b, n, q, h, classes) = (2, 40, 8, 5, 3_u64);
+    let mut state = 0x2545_f491_u32;
+    let mut x = vec![0.0_f32; b * (n + q) * h];
+    for value in &mut x {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        *value = (state >> 8) as f32 / (1 << 24) as f32 * 4.0 - 2.0;
+    }
+    // Each estimator shifts the classes, as TabICL's cyclic class shuffle does.
+    let shifts: Vec<Vec<u64>> = (0..b as u64)
+        .map(|e| (0..classes).map(|c| (c + e) % classes).collect())
+        .collect();
+    let y: Vec<f32> = (0..b)
+        .flat_map(|e| (0..n).map(move |row| (row as u64 % classes, e)))
+        .map(|(c, e)| shifts[e][c as usize] as f32)
+        .collect();
+    let rows = |start: usize, count: usize| -> Vec<f32> {
+        (0..b)
+            .flat_map(|e| x[(e * (n + q) + start) * h..][..count * h].to_vec())
+            .collect()
+    };
+
+    let bundle = ClassifierInputBundle::new(b, n + q, h, n, x.clone(), y.clone()).expect("valid bundle");
+    let expected = executor
+        .predict_logits(bundle.request())
+        .expect("uncached logits");
+    let context = executor
+        .build_context(
+            b,
+            n,
+            h,
+            &rows(0, n),
+            &y,
+            shifts.concat(),
+            (0..b).flat_map(|_| 0..h as u64).collect(),
+        )
+        .expect("build context");
+    let query = rows(n, q);
+    let actual = context
+        .predict_logits(ClassifierQueryRequest::new(b, q, h, &query).expect("valid query"))
+        .expect("cached logits");
+
+    assert_eq!(actual.shape(), expected.shape());
+    for (index, (actual, expected)) in actual.values().iter().zip(expected.values()).enumerate() {
+        assert!(
+            (actual - expected).abs() <= 1e-4,
+            "logit {index}: cached {actual}, uncached {expected}"
+        );
+    }
 }
 
 #[test]

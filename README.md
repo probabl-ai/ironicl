@@ -18,7 +18,7 @@ against it.
 
 | Works now | Not yet |
 |---|---|
-| Safe checkpoint import in pure Rust (no pickle execution) | Fast static context from Python |
+| Safe checkpoint import in pure Rust (no pickle execution) | Fast context building on non-Zen 5 CPUs |
 | FP32 classifier inference on any CPU | Regression |
 | Static training context with AVX-512 kernels on Zen 5 | Categorical features and missing values |
 | Python `TabICLClassifier`, a drop-in for TabICL's | Published packages on crates.io or PyPI |
@@ -82,8 +82,9 @@ clf = TabICLClassifier(n_estimators=8, random_state=42).fit(X_train, y_train)
 proba = clf.predict_proba(X_test)
 ```
 
-Building the package needs Rust. Prediction currently uses the slower uncached
-path. See [Python package](docs/python.md) for supported inputs.
+Building the package needs Rust. `fit` builds the training context in Rust,
+and `predict_proba` runs only the query rows against it. See
+[Python package](docs/python.md) for supported inputs.
 
 ## Documentation
 

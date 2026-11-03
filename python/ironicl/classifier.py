@@ -27,12 +27,6 @@ def _model(checkpoint: Path) -> Model:
     return Model(checkpoint)
 
 
-def _softmax(x: np.ndarray, temperature: float) -> np.ndarray:
-    x = x / np.float32(temperature)
-    e = np.exp(x - x.max(axis=-1, keepdims=True))
-    return e / e.sum(axis=-1, keepdims=True)
-
-
 class TabICLClassifier(ClassifierMixin, BaseEstimator):
     """TabICLv2 classifier with Ironicl's Rust inference engine.
 
@@ -92,7 +86,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         self.inference_config = inference_config
 
     def fit(self, X, y) -> TabICLClassifier:
-        """Fit preprocessing, load the model, and keep the training context."""
+        """Fit preprocessing and build the training context in Rust."""
         for name, supported in (
             ("feat_shuffle_method", ("latin",)),
             ("class_shuffle_method", ("shift",)),
@@ -113,11 +107,17 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
             norm_methods=(methods,) if isinstance(methods, str) else tuple(methods),
             outlier_threshold=self.outlier_threshold,
         )
-        self.train_groups_ = preprocessor.fit_transform(X, y)
-        self.y_train_ = preprocessor.encode_labels(y)
+        train_groups = preprocessor.fit_transform(X, y)
+        labels = preprocessor.encode_labels(y)
+        y_train = preprocessor.class_permutations_[:, labels].astype(np.float32)
         self.preprocessor_ = preprocessor
         self.checkpoint_path_ = self._checkpoint()
-        _model(self.checkpoint_path_)
+        self.context_ = _model(self.checkpoint_path_).fit_context(
+            self._ensemble_rows(train_groups),
+            y_train,
+            np.ascontiguousarray(preprocessor.class_permutations_, dtype=np.uint64),
+            np.ascontiguousarray(preprocessor.feature_permutations_, dtype=np.uint64),
+        )
         self.classes_ = preprocessor.classes_
         self.n_classes_ = len(self.classes_)
         self.n_features_in_ = preprocessor.n_features_in_
@@ -128,26 +128,18 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
     def predict_proba(self, X) -> np.ndarray:
         """Return class probabilities with shape ``(n_samples, n_classes)``."""
         check_is_fitted(self)
-        pre = self.preprocessor_
-        test_groups = pre.transform(X)
-        train_rows, test_rows = len(self.y_train_), len(test_groups[0])
-        x = np.empty((pre.n_estimators_, train_rows + test_rows, pre.n_features_out_), dtype=np.float32)
-        y = np.empty((pre.n_estimators_, train_rows), dtype=np.float32)
-        for estimator, group in enumerate(pre.ensemble_groups_):
-            features = pre.feature_permutations_[estimator]
-            x[estimator, :train_rows] = self.train_groups_[group][:, features]
-            x[estimator, train_rows:] = test_groups[group][:, features]
-            y[estimator] = pre.class_permutations_[estimator][self.y_train_]
+        values, shape = self.context_.predict_proba(
+            self._ensemble_rows(self.preprocessor_.transform(X)),
+            self.softmax_temperature,
+            self.average_logits,
+        )
+        return np.frombuffer(values, dtype=np.float32).reshape(shape).copy()  # Writable, like upstream.
 
-        values, shape = _model(self.checkpoint_path_).predict_logits(x, y)
-        logits = np.frombuffer(values, dtype=np.float32).reshape(shape)
-        # Undo each estimator's class shift: logits[e, :, c] belongs to class permutation[e][c].
-        logits = np.take_along_axis(logits, pre.class_permutations_[:, None, :].astype(np.intp), axis=2)
-        if self.average_logits:
-            proba = _softmax(logits.mean(axis=0), self.softmax_temperature)
-        else:
-            proba = _softmax(logits, self.softmax_temperature).mean(axis=0)
-        return proba / proba.sum(axis=1, keepdims=True)
+    def _ensemble_rows(self, groups: list[np.ndarray]) -> np.ndarray:
+        """Stack each estimator's feature-permuted group into ``[B, rows, H]``."""
+        pre = self.preprocessor_
+        rows = [groups[group][:, pre.feature_permutations_[e]] for e, group in enumerate(pre.ensemble_groups_)]
+        return np.stack(rows).astype(np.float32, copy=False)
 
     def predict(self, X) -> np.ndarray:
         """Return the most probable class label for each sample."""

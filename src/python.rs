@@ -1,7 +1,7 @@
 //! `ironicl._core`: the private Python extension module.
 //!
-//! Python owns validation, preprocessing, and aggregation. This module only
-//! loads the model and runs the forward pass.
+//! Python owns validation and preprocessing. This module loads the model,
+//! builds the training context, and predicts against it.
 
 #![allow(clippy::needless_pass_by_value)] // PyO3 and `map_err` pass arguments by value.
 
@@ -15,8 +15,8 @@ use pyo3::{
 };
 
 use crate::{
-    CheckpointCacheOptions, ClassifierExecutor, ClassifierInputBundle, Error, PreparedCheckpoint,
-    load_model_artifact, prepare_checkpoint,
+    CheckpointCacheOptions, ClassifierAggregation, ClassifierExecutor, ClassifierQueryRequest, Error,
+    PreparedCheckpoint, StaticClassifierExecutor, load_model_artifact, prepare_checkpoint,
 };
 
 fn py_error(error: Error) -> PyErr {
@@ -48,35 +48,70 @@ impl Model {
         .map_err(py_error)
     }
 
-    /// Run the uncached forward pass on FP32 `x[B, T, H]` and `y_train[B, N]`.
-    ///
-    /// Returns test-row logits as FP32 bytes and their `[B, T - N, C]` shape.
-    fn predict_logits<'py>(
+    /// Run FP32 training rows `x[B, N, H]` with labels `y_train[B, N]` once and
+    /// keep their attention keys and values. Permutations are `[B, C]` and `[B, H]`.
+    fn fit_context(
+        &self,
+        py: Python<'_>,
+        x: PyBuffer<f32>,
+        y_train: PyBuffer<f32>,
+        class_permutations: PyBuffer<u64>,
+        feature_permutations: PyBuffer<u64>,
+    ) -> PyResult<Context> {
+        let &[ensembles, rows, features] = x.shape() else {
+            return Err(PyValueError::new_err("x must have shape [B, N, H]"));
+        };
+        let (x, y_train) = (x.to_vec(py)?, y_train.to_vec(py)?);
+        let (class_permutations, feature_permutations) =
+            (class_permutations.to_vec(py)?, feature_permutations.to_vec(py)?);
+        py.detach(|| {
+            self.0.build_context(
+                ensembles,
+                rows,
+                features,
+                &x,
+                &y_train,
+                class_permutations,
+                feature_permutations,
+            )
+        })
+        .map(Context)
+        .map_err(py_error)
+    }
+}
+
+/// A fitted training context. Prediction runs only the query rows.
+#[pyclass(frozen)]
+struct Context(StaticClassifierExecutor);
+
+#[pymethods]
+impl Context {
+    /// Predict FP32 query rows `x[B, Q, H]`. Returns probabilities as FP32
+    /// bytes and their `[Q, C]` shape.
+    fn predict_proba<'py>(
         &self,
         py: Python<'py>,
         x: PyBuffer<f32>,
-        y_train: PyBuffer<f32>,
-    ) -> PyResult<(Bound<'py, PyBytes>, [usize; 3])> {
-        let (&[ensembles, rows, features], &[_, train_rows]) = (x.shape(), y_train.shape()) else {
-            return Err(PyValueError::new_err(
-                "x must have shape [B, T, H] and y_train [B, N]",
-            ));
+        softmax_temperature: f32,
+        average_logits: bool,
+    ) -> PyResult<(Bound<'py, PyBytes>, [usize; 2])> {
+        let &[ensembles, rows, features] = x.shape() else {
+            return Err(PyValueError::new_err("x must have shape [B, Q, H]"));
         };
-        let bundle = ClassifierInputBundle::new(
-            ensembles,
-            rows,
-            features,
-            train_rows,
-            x.to_vec(py)?,
-            y_train.to_vec(py)?,
-        )
-        .map_err(py_error)?;
-        let logits = py
-            .detach(|| self.0.predict_logits(bundle.request()))
+        let x = x.to_vec(py)?;
+        let aggregation = ClassifierAggregation {
+            softmax_temperature,
+            average_logits,
+        };
+        let probabilities = py
+            .detach(|| {
+                let request = ClassifierQueryRequest::new(ensembles, rows, features, &x)?;
+                self.0.predict_probabilities(request, aggregation)
+            })
             .map_err(py_error)?;
         Ok((
-            PyBytes::new(py, bytemuck::cast_slice(logits.values())),
-            logits.shape(),
+            PyBytes::new(py, bytemuck::cast_slice(probabilities.values())),
+            probabilities.shape(),
         ))
     }
 }
@@ -84,5 +119,6 @@ impl Model {
 #[pymodule]
 #[pyo3(name = "_core")]
 fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
-    module.add_class::<Model>()
+    module.add_class::<Model>()?;
+    module.add_class::<Context>()
 }

@@ -19,10 +19,11 @@ use std::{
 };
 
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
+use sha2::{Digest, Sha256};
 
 use crate::{
     ClassifierQueryRequest, ClassifierRequest, Error, ModelArtifact, Result, StaticContextArtifact,
-    StaticContextTensorData, StaticQueryBundle,
+    StaticContextMetadata, StaticContextTensor, StaticContextTensorData, StaticQueryBundle,
     execution_plan::ExecutionPlan,
     kernels::{
         native::{
@@ -273,8 +274,14 @@ impl ClassifierLogits {
 /// Immutable, uncached executor for a validated official classifier artifact.
 #[derive(Debug, Clone)]
 pub struct ClassifierExecutor {
-    model: ModelArtifact,
+    model: Arc<ModelArtifact>,
 }
+
+/// Attention keys and values in head-major `[heads, rows, head_dim]` order.
+type KeyValue = (Vec<f32>, Vec<f32>);
+
+/// One embedded column stream, with its keys and values when captured.
+type ColumnStream = (usize, Vec<f32>, Vec<KeyValue>);
 
 /// Immutable query-only executor backed by one exact full-K/V static context.
 ///
@@ -345,7 +352,143 @@ impl ClassifierExecutor {
     /// Take ownership of an exact-manifest validated classifier model.
     #[must_use]
     pub fn new(model: ModelArtifact) -> Self {
-        Self { model }
+        Self {
+            model: Arc::new(model),
+        }
+    }
+
+    /// Run the training rows once and keep their attention keys and values as
+    /// an exact static context for query-only prediction.
+    ///
+    /// `x` holds preprocessed FP32 `[B, N, H]` training rows and `y_train` the
+    /// `[B, N]` class-permuted labels. The permutations are stored as context
+    /// metadata; `class_permutations` is used to undo each estimator's class
+    /// order when probabilities are aggregated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for inconsistent dimensions or labels, invalid
+    /// permutations, or a training set beyond the uncached activation limit.
+    pub fn build_context(
+        &self,
+        ensembles: usize,
+        training_rows: usize,
+        features: usize,
+        x: &[f32],
+        y_train: &[f32],
+        class_permutations: Vec<u64>,
+        feature_permutations: Vec<u64>,
+    ) -> Result<StaticClassifierExecutor> {
+        let (b, n, h) = (ensembles, training_rows, features);
+        if b == 0
+            || n == 0
+            || h == 0
+            || x.len() != checked_product(&[b, n, h], "context features")?
+            || y_train.len() != checked_product(&[b, n], "context labels")?
+        {
+            return Err(Error::InvalidArgument(format!(
+                "context needs nonempty x[B, N, H] and y_train[B, N] for B={b}, N={n}, H={h}"
+            )));
+        }
+        admit_request(b, n, h, n)?;
+        let classes = validate_labels(y_train, b, n)?;
+        let streams = h + RESERVED;
+        let column_elements = HEADS * INDUCING * 16;
+        let mut column: Vec<KeyValue> = (0..3)
+            .map(|_| {
+                let capacity = b * streams * column_elements;
+                (Vec::with_capacity(capacity), Vec::with_capacity(capacity))
+            })
+            .collect();
+        let mut icl: Vec<KeyValue> = (0..12)
+            .map(|_| {
+                (
+                    Vec::with_capacity(b * n * ICL_DIM),
+                    Vec::with_capacity(b * n * ICL_DIM),
+                )
+            })
+            .collect();
+        // ponytail: one rayon task per estimator; peak memory grows with the
+        // number of estimators built at once. Bound the concurrency if large
+        // contexts run out of memory.
+        let estimators = (0..b)
+            .into_par_iter()
+            .map(|ensemble| {
+                let x = &x[ensemble * n * h..][..n * h];
+                let labels = &y_train[ensemble * n..][..n];
+                let (columns, feature_caches) = self.column_embeddings(x, labels, n, h, n, true)?;
+                let rows = self.row_embeddings(&columns, n, streams)?;
+                let mut caches = Vec::with_capacity(12);
+                self.icl_rows(rows, labels, n, n, Some(&mut caches))?;
+                Ok((feature_caches, caches))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (feature_caches, caches) in estimators {
+            for (block, (keys, values)) in column.iter_mut().enumerate() {
+                // The cached path never reads the reserved CLS streams.
+                keys.resize(keys.len() + RESERVED * column_elements, 0.0);
+                values.resize(values.len() + RESERVED * column_elements, 0.0);
+                for caches in &feature_caches {
+                    keys.extend_from_slice(&caches[block].0);
+                    values.extend_from_slice(&caches[block].1);
+                }
+            }
+            for ((key, value), (keys, values)) in caches.into_iter().zip(&mut icl) {
+                keys.extend(key);
+                values.extend(value);
+            }
+        }
+        let mut tensors = Vec::with_capacity(30);
+        let as_u64 = |values: &[usize]| values.iter().map(|&value| value as u64).collect::<Vec<_>>();
+        for (stage, caches, dimensions) in [
+            ("column", column, as_u64(&[b, streams, HEADS, INDUCING, 16])),
+            ("icl", icl, as_u64(&[b, HEADS, n, ICL_DIM / HEADS])),
+        ] {
+            for (layer, (keys, values)) in caches.into_iter().enumerate() {
+                for (kind, values) in [("key", keys), ("value", values)] {
+                    tensors.push(StaticContextTensor {
+                        name: format!("{stage}.{layer}.{kind}"),
+                        dimensions: dimensions.clone(),
+                        values,
+                    });
+                }
+            }
+        }
+        let mut model_sha256 = [0; 32];
+        let source = self.model.summary().source_sha256.as_bytes();
+        for (byte, pair) in model_sha256.iter_mut().zip(source.chunks_exact(2)) {
+            *byte = std::str::from_utf8(pair)
+                .ok()
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                .ok_or_else(|| Error::Artifact("model source SHA-256 is not hexadecimal".into()))?;
+        }
+        let context_sha256 = Sha256::new()
+            .chain_update(
+                as_u64(&[b, n, h])
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .chain_update(bytemuck::cast_slice::<f32, u8>(x))
+            .chain_update(bytemuck::cast_slice::<f32, u8>(y_train))
+            .chain_update(bytemuck::cast_slice::<u64, u8>(&class_permutations))
+            .chain_update(bytemuck::cast_slice::<u64, u8>(&feature_permutations))
+            .finalize()
+            .into();
+        let context = StaticContextArtifact::new(
+            StaticContextMetadata {
+                model_sha256,
+                context_sha256,
+                ensemble_count: b,
+                training_rows: n,
+                feature_count: h,
+                class_count: classes,
+                class_permutations,
+                feature_permutations,
+            },
+            tensors,
+        )?;
+        StaticClassifierExecutor::with_executor(self.clone(), context)
     }
 
     /// Execute the complete FP32 classifier forward graph without persistent caches.
@@ -401,7 +544,7 @@ impl ClassifierExecutor {
             let x = &request.x()[checked_product(&[ensemble, t, h], "feature offset")?..]
                 [..checked_product(&[t, h], "feature rows")?];
             let labels = &request.y_train()[ensemble * n..][..n];
-            let columns = self.column_embeddings(x, labels, t, h, n)?;
+            let (columns, _) = self.column_embeddings(x, labels, t, h, n, false)?;
             let rows = self.row_embeddings(&columns, t, h + RESERVED)?;
             if let Some(trace_values) = &mut column_values {
                 trace_values.extend_from_slice(&columns);
@@ -444,7 +587,17 @@ impl ClassifierExecutor {
         }
     }
 
-    fn column_embeddings(&self, x: &[f32], labels: &[f32], t: usize, h: usize, n: usize) -> Result<Vec<f32>> {
+    /// Embed every feature stream. With `capture`, also return each feature's
+    /// three `multihead_attn2` key/value pairs, in feature order.
+    fn column_embeddings(
+        &self,
+        x: &[f32],
+        labels: &[f32],
+        t: usize,
+        h: usize,
+        n: usize,
+        capture: bool,
+    ) -> Result<(Vec<f32>, Vec<Vec<KeyValue>>)> {
         let _profile = profile::scope(Category::Column);
         let streams = h
             .checked_add(RESERVED)
@@ -473,11 +626,12 @@ impl ClassifierExecutor {
             let mut handles = Vec::with_capacity(workers);
             for start in (0..h).step_by(chunk) {
                 let end = (start + chunk).min(h);
-                handles.push(scope.spawn(move || -> Result<Vec<(usize, Vec<f32>)>> {
+                handles.push(scope.spawn(move || -> Result<Vec<ColumnStream>> {
                     let mut results = Vec::with_capacity(end - start);
                     for feature in start..end {
-                        let embedded = self.column_stream(x, y, t, h, n, feature, in_weight, in_bias)?;
-                        results.push((feature + RESERVED, embedded));
+                        let (embedded, caches) =
+                            self.column_stream(x, y, t, h, n, feature, in_weight, in_bias, capture)?;
+                        results.push((feature + RESERVED, embedded, caches));
                     }
                     Ok(results)
                 }));
@@ -487,13 +641,17 @@ impl ClassifierExecutor {
                 .map(|handle| handle.join().expect("column worker must not panic"))
                 .collect::<Result<Vec<_>>>()
         })?;
-        for (stream, embedded) in results.into_iter().flatten() {
+        let mut feature_caches = Vec::with_capacity(if capture { h } else { 0 });
+        for (stream, embedded, caches) in results.into_iter().flatten() {
             for row in 0..t {
                 output[(row * streams + stream) * COLUMN_DIM..][..COLUMN_DIM]
                     .copy_from_slice(&embedded[row * COLUMN_DIM..][..COLUMN_DIM]);
             }
+            if capture {
+                feature_caches.push(caches);
+            }
         }
-        Ok(output)
+        Ok((output, feature_caches))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -507,7 +665,8 @@ impl ClassifierExecutor {
         feature: usize,
         in_weight: &[f32],
         in_bias: &[f32],
-    ) -> Result<Vec<f32>> {
+        capture: bool,
+    ) -> Result<(Vec<f32>, Vec<KeyValue>)> {
         let mut source = vec![0.0; checked_product(&[t, 3], "column grouped features")?];
         for row in 0..t {
             let target = &mut source[row * 3..][..3];
@@ -527,15 +686,31 @@ impl ClassifierExecutor {
                 embedded[row * COLUMN_DIM + dim] += y[row * COLUMN_DIM + dim];
             }
         }
+        let mut caches = Vec::with_capacity(if capture { 3 } else { 0 });
         for block in 0..3 {
-            embedded = self.isab(embedded, t, n, block)?;
+            let cache;
+            (embedded, cache) = self.isab(embedded, t, n, block)?;
+            if capture {
+                // The cached path has no equivalent of the all-missing shortcut.
+                caches.push(cache.ok_or_else(|| {
+                    Error::NotImplemented("a static context for an all-missing feature column".into())
+                })?);
+            }
         }
-        Ok(embedded)
+        Ok((embedded, caches))
     }
 
-    fn isab(&self, source: Vec<f32>, t: usize, n: usize, block: usize) -> Result<Vec<f32>> {
+    /// Return the block output and the `multihead_attn2` keys and values, or no
+    /// keys and values when the all-missing stream passes through unchanged.
+    fn isab(
+        &self,
+        source: Vec<f32>,
+        t: usize,
+        n: usize,
+        block: usize,
+    ) -> Result<(Vec<f32>, Option<KeyValue>)> {
         if source.iter().all(|value| *value == -100.0) {
-            return Ok(source);
+            return Ok((source, None));
         }
         let prefix = format!("col_embedder.tf_col.blocks.{block}");
         let inducing = self.tensor(&format!("{prefix}.ind_vectors"))?;
@@ -550,17 +725,10 @@ impl ClassifierExecutor {
             true,
             None,
         )?;
-        self.block(
-            &source,
-            &hidden,
-            &hidden,
-            t,
-            INDUCING,
-            COLUMN_DIM,
-            &format!("{prefix}.multihead_attn2"),
-            false,
-            None,
-        )
+        let attn2 = format!("{prefix}.multihead_attn2");
+        let cache = self.source_heads(&hidden, &hidden, INDUCING, COLUMN_DIM, &attn2, None)?;
+        let output = self.attend(&source, t, &cache, INDUCING, COLUMN_DIM, &attn2, false, None)?;
+        Ok((output, Some(cache)))
     }
 
     fn row_embeddings(&self, columns: &[f32], t: usize, streams: usize) -> Result<Vec<f32>> {
@@ -634,8 +802,16 @@ impl ClassifierExecutor {
         Ok(normalized)
     }
 
-    fn icl_logits(&self, mut rows: Vec<f32>, labels: &[f32], t: usize, n: usize) -> Result<Vec<f32>> {
-        let _profile = profile::scope(Category::Icl);
+    /// Add the training targets and run the twelve ICL blocks. With `capture`,
+    /// also collect each block's training-row keys and values.
+    fn icl_rows(
+        &self,
+        mut rows: Vec<f32>,
+        labels: &[f32],
+        t: usize,
+        n: usize,
+        mut capture: Option<&mut Vec<KeyValue>>,
+    ) -> Result<Vec<f32>> {
         let indices = label_indices(labels)?;
         let mut targets = vec![0.0; checked_product(&[n, ICL_DIM], "ICL target embeddings")?];
         one_hot_linear_f32(
@@ -653,18 +829,19 @@ impl ClassifierExecutor {
         }
         for block in 0..12 {
             let prefix = format!("icl_predictor.tf_icl.blocks.{block}");
-            rows = self.block(
-                &rows,
-                &rows[..n * ICL_DIM],
-                &rows[..n * ICL_DIM],
-                t,
-                n,
-                ICL_DIM,
-                &prefix,
-                true,
-                None,
-            )?;
+            let source = &rows[..n * ICL_DIM];
+            let cache = self.source_heads(source, source, n, ICL_DIM, &prefix, None)?;
+            rows = self.attend(&rows, t, &cache, n, ICL_DIM, &prefix, true, None)?;
+            if let Some(caches) = capture.as_deref_mut() {
+                caches.push(cache);
+            }
         }
+        Ok(rows)
+    }
+
+    fn icl_logits(&self, rows: Vec<f32>, labels: &[f32], t: usize, n: usize) -> Result<Vec<f32>> {
+        let _profile = profile::scope(Category::Icl);
+        let rows = self.icl_rows(rows, labels, t, n, None)?;
         let mut normalized = vec![0.0; checked_product(&[t, ICL_DIM], "ICL normalized rows")?];
         layer_norm_f32(
             &rows,
@@ -712,11 +889,23 @@ impl ClassifierExecutor {
         qass: bool,
         rope: Option<usize>,
     ) -> Result<Vec<f32>> {
+        let cache = self.source_heads(k, v, source_rows, dim, prefix, rope)?;
+        self.attend(q, q_rows, &cache, source_rows, dim, prefix, qass, rope)
+    }
+
+    /// Normalize and project the attention sources into head-major keys and values.
+    fn source_heads(
+        &self,
+        k: &[f32],
+        v: &[f32],
+        source_rows: usize,
+        dim: usize,
+        prefix: &str,
+        rope: Option<usize>,
+    ) -> Result<KeyValue> {
         let _profile = profile::scope(Category::Block);
         let norm_weight = self.tensor(&format!("{prefix}.norm1.weight"))?;
         let norm_bias = self.tensor(&format!("{prefix}.norm1.bias"))?;
-        let mut q_norm = vec![0.0; q.len()];
-        layer_norm_f32(q, q_rows, dim, norm_weight, Some(norm_bias), &mut q_norm)?;
         let mut k_norm = vec![0.0; k.len()];
         layer_norm_f32(k, source_rows, dim, norm_weight, Some(norm_bias), &mut k_norm)?;
         let v_norm = if std::ptr::eq(k.as_ptr(), v.as_ptr()) {
@@ -729,16 +918,6 @@ impl ClassifierExecutor {
         let attn_prefix = format!("{prefix}.attn");
         let weight = self.tensor(&format!("{attn_prefix}.in_proj_weight"))?;
         let bias = self.tensor(&format!("{attn_prefix}.in_proj_bias"))?;
-        let mut q_proj = vec![0.0; q.len()];
-        affine_f32(
-            &q_norm,
-            q_rows,
-            dim,
-            &weight[..dim * dim],
-            Some(&bias[..dim]),
-            dim,
-            &mut q_proj,
-        )?;
         let mut k_proj = vec![0.0; k.len()];
         affine_f32(
             &k_norm,
@@ -759,11 +938,62 @@ impl ClassifierExecutor {
             dim,
             &mut v_proj,
         )?;
+        let mut k_heads = tokens_to_heads(&k_proj, source_rows, dim, HEADS);
+        let v_heads = tokens_to_heads(&v_proj, source_rows, dim, HEADS);
+        if rope.is_some() {
+            let mut rotated = vec![0.0; k_heads.len()];
+            rope_non_interleaved_f32(
+                &k_heads,
+                HEADS,
+                source_rows,
+                dim / HEADS,
+                self.tensor("row_interactor.tf_row.rope.freqs")?,
+                0,
+                &mut rotated,
+            )?;
+            k_heads = rotated;
+        }
+        Ok((k_heads, v_heads))
+    }
+
+    /// Attend from `q` to projected sources, then apply the residual feed-forward block.
+    fn attend(
+        &self,
+        q: &[f32],
+        q_rows: usize,
+        (k_heads, v_heads): &KeyValue,
+        source_rows: usize,
+        dim: usize,
+        prefix: &str,
+        qass: bool,
+        rope: Option<usize>,
+    ) -> Result<Vec<f32>> {
+        let _profile = profile::scope(Category::Block);
+        let mut q_norm = vec![0.0; q.len()];
+        layer_norm_f32(
+            q,
+            q_rows,
+            dim,
+            self.tensor(&format!("{prefix}.norm1.weight"))?,
+            Some(self.tensor(&format!("{prefix}.norm1.bias"))?),
+            &mut q_norm,
+        )?;
+        let attn_prefix = format!("{prefix}.attn");
+        let weight = self.tensor(&format!("{attn_prefix}.in_proj_weight"))?;
+        let bias = self.tensor(&format!("{attn_prefix}.in_proj_bias"))?;
+        let mut q_proj = vec![0.0; q.len()];
+        affine_f32(
+            &q_norm,
+            q_rows,
+            dim,
+            &weight[..dim * dim],
+            Some(&bias[..dim]),
+            dim,
+            &mut q_proj,
+        )?;
         let heads = HEADS;
         let head_dim = dim / heads;
         let mut q_heads = tokens_to_heads(&q_proj, q_rows, dim, heads);
-        let mut k_heads = tokens_to_heads(&k_proj, source_rows, dim, heads);
-        let v_heads = tokens_to_heads(&v_proj, source_rows, dim, heads);
         if qass {
             let original = q_heads.clone();
             self.qass(
@@ -777,21 +1007,17 @@ impl ClassifierExecutor {
             )?;
         }
         if rope.is_some() {
-            let frequencies = self.tensor("row_interactor.tf_row.rope.freqs")?;
             let mut rotated = vec![0.0; q_heads.len()];
-            rope_non_interleaved_f32(&q_heads, heads, q_rows, head_dim, frequencies, 0, &mut rotated)?;
-            q_heads = rotated;
-            let mut rotated = vec![0.0; k_heads.len()];
             rope_non_interleaved_f32(
-                &k_heads,
+                &q_heads,
                 heads,
-                source_rows,
+                q_rows,
                 head_dim,
-                frequencies,
+                self.tensor("row_interactor.tf_row.rope.freqs")?,
                 0,
                 &mut rotated,
             )?;
-            k_heads = rotated;
+            q_heads = rotated;
         }
         let mut attended = vec![0.0; q_heads.len()];
         if rope.is_some() && row_source_major_attention_enabled() {
@@ -804,8 +1030,8 @@ impl ClassifierExecutor {
             source_major_online_attention_with_backend_f32(
                 &q_heads,
                 q_rows,
-                &k_heads,
-                &v_heads,
+                k_heads,
+                v_heads,
                 source_rows,
                 heads,
                 head_dim,
@@ -829,8 +1055,8 @@ impl ClassifierExecutor {
             tiled_online_scaled_dot_product_attention_f32(
                 &q_heads,
                 q_rows,
-                &k_heads,
-                &v_heads,
+                k_heads,
+                v_heads,
                 source_rows,
                 heads,
                 head_dim,
@@ -945,8 +1171,12 @@ impl StaticClassifierExecutor {
     /// Returns an artifact error if the model identity, architecture, or required
     /// cache tensor names and shapes do not match the serving contract.
     pub fn new(model: ModelArtifact, context: StaticContextArtifact) -> Result<Self> {
-        validate_static_context(&model, &context)?;
-        let model = ClassifierExecutor::new(model);
+        Self::with_executor(ClassifierExecutor::new(model), context)
+    }
+
+    /// Pair a context with an executor whose model weights it shares.
+    fn with_executor(model: ClassifierExecutor, context: StaticContextArtifact) -> Result<Self> {
+        validate_static_context(&model.model, &context)?;
         let input_weight = model.tensor("col_embedder.in_linear.weight")?;
         let mut column_input_weight = vec![0.0; input_weight.len()];
         for output in 0..COLUMN_DIM {

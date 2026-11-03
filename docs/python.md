@@ -31,8 +31,10 @@ parameter names and defaults. A live parity test checks this.
 - `batch_size`, `kv_cache`, `use_amp`, `use_fa3`, `offload_mode`,
   `disk_offload_dir`, `n_jobs`, and `verbose` control PyTorch execution and have
   no effect.
-- Prediction runs the uncached forward pass over training and test rows. It is
-  meant for small tables until Rust builds the static context.
+- `fit` runs the training rows through the model once and keeps their attention
+  keys and values in memory, like upstream's `kv_cache=True`. `predict_proba`
+  then runs only the query rows. The context takes about 49 KB per training row
+  and estimator. A fitted estimator cannot be pickled yet.
 
 ## Preprocessing
 
