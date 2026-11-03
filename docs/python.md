@@ -73,9 +73,10 @@ upstream oracle and context-export tools still require TabICL/PyTorch.
 
 ## Version Requirements
 
-The supported scikit-learn 1.9.x / SciPy 1.18.x combination preserves the
-upstream power-fit behavior; older float32 solvers produce different results.
-NumPy 2.x is required.
+The package requires NumPy 2.0+, scikit-learn 1.7+, and SciPy 1.17+. These are
+the oldest releases that pass the frozen upstream oracle. With SciPy 1.16 or
+older, the float32 power-transform fit gives different results. There are no
+upper bounds; the CI parity job installs the latest releases.
 
 ## Tests
 
