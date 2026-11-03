@@ -25,10 +25,13 @@ impl ExecutionPlan {
                 flat_pool_ensembles: true,
             };
         }
-        // ponytail: macOS only for now. Running fewer estimators than threads
+        // ponytail: Apple Silicon only for now. Running fewer estimators than threads
         // one at a time loses to running them all at once on an M1 Max; x86
         // keeps its measured plan until this is checked on Zen 5.
-        if !force_serial && cfg!(target_os = "macos") && (2..total_threads).contains(&ensembles) {
+        if !force_serial
+            && cfg!(all(target_os = "macos", target_arch = "aarch64"))
+            && (2..total_threads).contains(&ensembles)
+        {
             return Self {
                 ensemble_workers: ensembles,
                 inner_workers: total_threads / ensembles,

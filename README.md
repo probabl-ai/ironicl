@@ -11,8 +11,9 @@ training context once, stores it, and then answers new test rows against it.
 
 > [!WARNING]
 > Ironicl is experimental. Formats, commands, and APIs can change without notice.
-> The optimized path targets AMD Zen 5 (Ryzen 7 9800X3D). On macOS, dense layers
-> and attention use Apple Accelerate. Other CPUs use a slower portable path.
+> The optimized paths target AMD Zen 5 (Ryzen 7 9800X3D) and Apple Silicon, where
+> dense layers and attention use Apple Accelerate. Other CPUs, including Intel
+> Macs, use a slower portable path.
 
 ## Status
 
