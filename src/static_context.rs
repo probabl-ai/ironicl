@@ -284,7 +284,9 @@ impl StaticContextArtifact {
     }
 
     /// Validate tensors written into page-aligned memory and own them without
-    /// copying. The memory becomes read-only.
+    /// copying. The memory becomes read-only. With `values_checked`, the
+    /// writer has already proven every value finite, and only names and
+    /// shapes are checked here.
     ///
     /// # Errors
     ///
@@ -296,6 +298,7 @@ impl StaticContextArtifact {
     pub(crate) fn from_page_aligned(
         metadata: StaticContextMetadata,
         tensors: PageAlignedTensors,
+        values_checked: bool,
     ) -> Result<Self> {
         validate_metadata(&metadata)?;
         if tensors.layout.is_empty() || tensors.layout.len() > MAX_TENSOR_COUNT {
@@ -305,7 +308,11 @@ impl StaticContextArtifact {
         for (name, dimensions, byte_offset, byte_length) in tensors.layout {
             let values =
                 bytemuck::cast_slice::<u8, f32>(&tensors.mapping[byte_offset..byte_offset + byte_length]);
-            validate_tensor_parts(&name, &dimensions, values)?;
+            if values_checked {
+                validate_tensor_shape(&name, &dimensions, values.len())?;
+            } else {
+                validate_tensor_parts(&name, &dimensions, values)?;
+            }
             let values = StaticContextTensorValues::MappedFp32 {
                 byte_offset,
                 byte_length,
@@ -1070,6 +1077,16 @@ fn validate_tensor(tensor: &StaticContextTensor) -> Result<()> {
 }
 
 fn validate_tensor_parts(name: &str, dimensions: &[u64], values: &[f32]) -> Result<()> {
+    validate_tensor_shape(name, dimensions, values.len())?;
+    if values.iter().any(|value| !value.is_finite()) {
+        return Err(artifact_error(format!(
+            "static context tensor '{name}' has a non-finite value"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_tensor_shape(name: &str, dimensions: &[u64], length: usize) -> Result<()> {
     if name.is_empty()
         || name.len() > MAX_TENSOR_NAME_BYTES
         || dimensions.is_empty()
@@ -1077,14 +1094,12 @@ fn validate_tensor_parts(name: &str, dimensions: &[u64], values: &[f32]) -> Resu
     {
         return Err(artifact_error("static context tensor name or rank is invalid"));
     }
-    let elements = checked_elements(dimensions)?;
-    if values.len() != elements || values.iter().any(|value| !value.is_finite()) {
+    if length != checked_elements(dimensions)? {
         return Err(artifact_error(format!(
-            "static context tensor '{name}' has an invalid shape or non-finite value"
+            "static context tensor '{name}' has an invalid shape"
         )));
     }
-    if values
-        .len()
+    if length
         .checked_mul(4)
         .ok_or_else(|| artifact_error("tensor byte length overflows usize"))?
         > MAX_TENSOR_BYTES
