@@ -2370,7 +2370,80 @@ fn layer_norm_statistics_for_target(
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
+fn layer_norm_for_target(
+    input: &[f32],
+    rows: usize,
+    width: usize,
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    output: &mut [f32],
+) -> bool {
+    if !width.is_multiple_of(16) {
+        return false;
+    }
+    // Advanced SIMD is mandatory for AArch64.
+    unsafe { layer_norm_neon(input, rows, width, weight, bias, output) }
+    true
+}
+
+/// NEON `LayerNorm` with the same two-pass statistics as the AVX-512 kernel.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn layer_norm_neon(
+    input: &[f32],
+    rows: usize,
+    width: usize,
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    output: &mut [f32],
+) {
+    use core::arch::aarch64::{
+        float32x4_t, vaddq_f32, vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32, vmulq_f32, vst1q_f32,
+        vsubq_f32,
+    };
+    // Four accumulators break the add dependency chain; the caller checked width % 16 == 0.
+    unsafe fn reduce(accumulators: [float32x4_t; 4]) -> f32 {
+        unsafe {
+            vaddvq_f32(vaddq_f32(
+                vaddq_f32(accumulators[0], accumulators[1]),
+                vaddq_f32(accumulators[2], accumulators[3]),
+            ))
+        }
+    }
+    unsafe {
+        for row in 0..rows {
+            let input = input.as_ptr().add(row * width);
+            let output = output.as_mut_ptr().add(row * width);
+            let mut sums = [vdupq_n_f32(0.0); 4];
+            for column in (0..width).step_by(16) {
+                for (lane, sum) in sums.iter_mut().enumerate() {
+                    *sum = vaddq_f32(*sum, vld1q_f32(input.add(column + lane * 4)));
+                }
+            }
+            let mean = reduce(sums) / width as f32;
+            let mean_vector = vdupq_n_f32(mean);
+            let mut squares = [vdupq_n_f32(0.0); 4];
+            for column in (0..width).step_by(16) {
+                for (lane, square) in squares.iter_mut().enumerate() {
+                    let centered = vsubq_f32(vld1q_f32(input.add(column + lane * 4)), mean_vector);
+                    *square = vfmaq_f32(*square, centered, centered);
+                }
+            }
+            let scale = vdupq_n_f32((reduce(squares) / width as f32 + 1e-5_f32).sqrt().recip());
+            for column in (0..width).step_by(4) {
+                let normalized = vmulq_f32(vsubq_f32(vld1q_f32(input.add(column)), mean_vector), scale);
+                let mut result = vmulq_f32(normalized, vld1q_f32(weight.as_ptr().add(column)));
+                if let Some(bias) = bias {
+                    result = vaddq_f32(result, vld1q_f32(bias.as_ptr().add(column)));
+                }
+                vst1q_f32(output.add(column), result);
+            }
+        }
+    }
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn layer_norm_for_target(
     _input: &[f32],
     _rows: usize,
