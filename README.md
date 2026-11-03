@@ -11,8 +11,8 @@ against it.
 
 > [!WARNING]
 > Ironicl is experimental. Formats, commands, and APIs can change without notice.
-> The optimized path targets AMD Zen 5 (Ryzen 7 9800X3D). Other CPUs, including
-> Apple Silicon, use a slower portable path.
+> The optimized path targets AMD Zen 5 (Ryzen 7 9800X3D). On macOS, dense layers
+> and attention use Apple Accelerate. Other CPUs use a slower portable path.
 
 ## Status
 
