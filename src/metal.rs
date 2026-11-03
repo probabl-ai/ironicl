@@ -436,17 +436,17 @@ impl<'w, 'a> Builder<'w, 'a> {
     /// Non-interleaved `RoPE`: `x * cos + rotate_half(x) * sin`, with
     /// `rotate_half([left, right]) = [-right, left]`.
     fn rope(&self, input: &Tensor, (cos, sin): (&Tensor, &Tensor), head_dim: usize) -> Tensor {
-        let half = head_dim / 2;
-        let mut rotation = vec![0.0; head_dim * head_dim];
-        for index in 0..half {
-            rotation[(index + half) * head_dim + index] = -1.0;
-            rotation[index * head_dim + index + half] = 1.0;
-        }
-        let rotated = self.matmul(
-            input,
-            &self.constant(&rotation, &[head_dim as isize, head_dim as isize]),
-        );
-        self.add(&self.multiply(input, cos), &self.multiply(&rotated, sin))
+        // `sin` carries the sign: [-sin, sin], so rotate_half is a half swap.
+        let half = (head_dim / 2) as isize;
+        let swapped = unsafe {
+            self.graph.concatTensor_withTensor_dimension_name(
+                &self.slice(input, 3, half, half),
+                &self.slice(input, 3, 0, half),
+                3,
+                None,
+            )
+        };
+        self.add(&self.multiply(input, cos), &self.multiply(&swapped, sin))
     }
 
     /// One pre-norm transformer block: attention with a residual, then a GELU
@@ -586,8 +586,9 @@ impl<'w, 'a> Builder<'w, 'a> {
                     let (s, c) = (row as f32 * frequency).sin_cos();
                     for offset in [index, index + half] {
                         cos[row * COLUMN_HEAD_DIM + offset] = c;
-                        sin[row * COLUMN_HEAD_DIM + offset] = s;
                     }
+                    sin[row * COLUMN_HEAD_DIM + index] = -s;
+                    sin[row * COLUMN_HEAD_DIM + index + half] = s;
                 }
             }
             let dims = [rows as isize, COLUMN_HEAD_DIM as isize];
