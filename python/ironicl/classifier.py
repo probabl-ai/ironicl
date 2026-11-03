@@ -35,6 +35,19 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
     ``n_jobs``, and ``verbose`` control PyTorch execution and have no effect.
     ``support_many_classes`` has no effect because more than 10 classes are not
     supported yet.
+
+    ``optimize`` is Ironicl's own parameter, after TabICL's. It sets how far
+    Ironicl may trade exactness for speed on Apple Silicon GPUs:
+
+    - ``"safe"``: FP32 throughout; matches TabICL within 1e-4.
+    - ``"auto"``: context keys and values stored in FP16 and attention against
+      them computed in FP16; probabilities stay within about 1e-3 of ``"safe"``.
+    - ``"fast"``: everything ``"auto"`` does, and later further reduced
+      precision with probabilities within about 1e-2.
+
+    ``None`` (default) reads the ``IRONICL_OPTIMIZE`` environment variable and
+    falls back to ``"safe"``. Without a Metal GPU, every level behaves like
+    ``"safe"``.
     """
 
     def __init__(
@@ -61,6 +74,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         n_jobs: int | None = None,
         verbose: bool = False,
         inference_config: dict | None = None,
+        optimize: str | None = None,
     ):
         self.n_estimators = n_estimators
         self.norm_methods = norm_methods
@@ -84,6 +98,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         self.n_jobs = n_jobs
         self.verbose = verbose
         self.inference_config = inference_config
+        self.optimize = optimize
 
     def fit(self, X, y) -> TabICLClassifier:
         """Fit preprocessing and build the training context in Rust."""
@@ -117,6 +132,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
             preprocessor.class_permutations_[:, labels].astype(np.float32),
             np.ascontiguousarray(preprocessor.class_permutations_, dtype=np.uint64),
             np.ascontiguousarray(preprocessor.feature_permutations_, dtype=np.uint64),
+            self._optimize(),
         )
         self.preprocessor_ = preprocessor
         self.checkpoint_path_ = checkpoint
@@ -141,6 +157,12 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         """Return the most probable class label for each sample."""
         probabilities = self.predict_proba(X)  # Checks that the classifier is fitted.
         return self.preprocessor_.decode_labels(np.argmax(probabilities, axis=1))
+
+    def _optimize(self) -> str:
+        optimize = self.optimize if self.optimize is not None else os.environ.get("IRONICL_OPTIMIZE", "safe")
+        if optimize not in ("safe", "auto", "fast"):
+            raise ValueError(f"optimize must be 'safe', 'auto', or 'fast', not {optimize!r}")
+        return optimize
 
     def _checkpoint(self) -> Path:
         if self.model_path is not None and Path(self.model_path).exists():

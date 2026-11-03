@@ -24,7 +24,16 @@ use objc2_metal_performance_shaders_graph::{
     MPSGraphShapedType, MPSGraphTensor, MPSGraphTensorData,
 };
 
-use crate::{Error, Result};
+use crate::{Error, Result, static_context::TensorStorage};
+
+/// The `MPSGraph` element type for a stored tensor type.
+fn kind(storage: TensorStorage) -> MPSDataType {
+    match storage {
+        TensorStorage::Fp32 => FLOAT,
+        TensorStorage::F16 => MPSDataType::Float16,
+        TensorStorage::Bf16 => MPSDataType::BFloat16,
+    }
+}
 
 const ICL_DIM: usize = 512;
 const COLUMN_DIM: usize = 128;
@@ -42,7 +51,7 @@ type Tensor = Retained<MPSGraphTensor>;
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type Weights<'w, 'a> = dyn Fn(&str) -> Result<&'a [f32]> + 'w;
 /// A graph input or output: its tensor, buffer, and shape.
-type Binding = (Tensor, Buffer, Vec<isize>);
+type Binding = (Tensor, Buffer, Vec<isize>, MPSDataType);
 
 fn shape(dimensions: &[isize]) -> Retained<MPSShape> {
     let numbers = dimensions
@@ -99,13 +108,17 @@ impl Gpu {
     }
 
     fn buffer(&self, values: &[f32]) -> Result<Buffer> {
-        let pointer = std::ptr::NonNull::new(values.as_ptr().cast_mut().cast())
+        self.buffer_bytes(bytemuck::cast_slice(values))
+    }
+
+    fn buffer_bytes(&self, bytes: &[u8]) -> Result<Buffer> {
+        let pointer = std::ptr::NonNull::new(bytes.as_ptr().cast_mut().cast())
             .ok_or_else(|| metal_error("empty buffer"))?;
         // SAFETY: Metal copies the bytes of a live slice into a new shared buffer.
         unsafe {
             self.device.newBufferWithBytes_length_options(
                 pointer,
-                std::mem::size_of_val(values),
+                bytes.len(),
                 MTLResourceOptions::StorageModeShared,
             )
         }
@@ -128,16 +141,18 @@ impl Gpu {
         .ok_or_else(|| metal_error("cannot wrap page-aligned memory"))
     }
 
-    /// A buffer over `values`: wrapped in place when `page_aligned` (the slice
-    /// starts on a page inside page-padded memory), otherwise copied.
-    fn tensor_buffer(&self, values: &[f32], page_aligned: bool) -> Result<Buffer> {
+    /// A buffer over a tensor's `bytes`: wrapped in place when `page_aligned`
+    /// (the bytes start on a page inside page-padded memory), otherwise copied.
+    fn tensor_buffer(&self, bytes: &[u8], page_aligned: bool) -> Result<Buffer> {
         if !page_aligned {
-            return self.buffer(values);
+            return self.buffer_bytes(bytes);
         }
-        let pointer = std::ptr::NonNull::from(values).cast::<u8>();
+        let pointer = std::ptr::NonNull::from(bytes).cast::<u8>();
         self.wrap(
             pointer,
-            std::mem::size_of_val(values).next_multiple_of(crate::static_context::TENSOR_PAGE_BYTES),
+            bytes
+                .len()
+                .next_multiple_of(crate::static_context::TENSOR_PAGE_BYTES),
         )
     }
 
@@ -174,14 +189,14 @@ fn dictionary(items: &[&Binding]) -> Dictionary {
     let tensors: Vec<&MPSGraphTensor> = items.iter().map(|item| &*item.0).collect();
     let data: Vec<_> = items
         .iter()
-        .map(|(_, buffer, dimensions)| {
+        .map(|(_, buffer, dimensions, kind)| {
             // SAFETY: each buffer is live, shared, and at least as long as its shape.
             unsafe {
                 MPSGraphTensorData::initWithMTLBuffer_shape_dataType(
                     MPSGraphTensorData::alloc(),
                     buffer,
                     &shape(dimensions),
-                    FLOAT,
+                    *kind,
                 )
             }
         })
@@ -275,11 +290,27 @@ impl<'w, 'a> Builder<'w, 'a> {
 
     /// A placeholder bound to `buffer` for every run.
     fn bound(&self, buffer: Buffer, dimensions: &[isize]) -> Tensor {
-        let tensor = self.placeholder(dimensions);
+        self.bound_typed(buffer, dimensions, FLOAT)
+    }
+
+    /// A placeholder of element type `kind` bound to `buffer`, in that type.
+    fn bound_typed(&self, buffer: Buffer, dimensions: &[isize], kind: MPSDataType) -> Tensor {
+        let tensor = unsafe {
+            self.graph
+                .placeholderWithShape_dataType_name(Some(&shape(dimensions)), kind, None)
+        };
         self.bindings
             .borrow_mut()
-            .push((tensor.clone(), buffer, dimensions.to_vec()));
+            .push((tensor.clone(), buffer, dimensions.to_vec(), kind));
         tensor
+    }
+
+    /// `input` converted to element type `kind`; a no-op for the same type.
+    fn cast(&self, input: &Tensor, kind: MPSDataType) -> Tensor {
+        if unsafe { input.dataType() } == kind {
+            return input.clone();
+        }
+        unsafe { self.graph.castTensor_toType_name(input, kind, None) }
     }
 
     /// A model weight under `key`, converted by `values` on first use.
@@ -523,16 +554,20 @@ impl<'w, 'a> Builder<'w, 'a> {
             ),
             None => (query, key),
         };
+        // Reduced-precision caches: attention runs in their type, so the
+        // caches are read as stored instead of converted to an FP32 copy.
+        let cache_kind = unsafe { key.dataType() };
         let attended = unsafe {
             self.graph
                 .scaledDotProductAttentionWithQueryTensor_keyTensor_valueTensor_scale_name(
-                    &query,
+                    &self.cast(&query, cache_kind),
                     &key,
                     &value,
                     (head_dim as f32).sqrt().recip(),
                     None,
                 )
         };
+        let attended = self.cast(&attended, FLOAT);
         let merged = self.reshape(&self.transpose(&attended, 1, 2), &[lead, q_rows, dim as isize]);
         let residual = self.add(
             input,
@@ -696,8 +731,9 @@ unsafe impl Sync for PredictGraph {}
 impl PredictGraph {
     /// `column_keys` and `column_values` hold each column block's
     /// `[B, H + 4, 8, 128, 16]` cache, `icl_keys` and `icl_values` each ICL
-    /// block's `[B, 8, N, 64]`, and `base_scales` each ICL block's `[8, 64]`.
-    /// With `page_aligned`, the caches are wrapped in place instead of copied.
+    /// block's `[B, 8, N, 64]` in `icl`'s storage type, and `base_scales` each
+    /// ICL block's `[8, 64]`. With `page_aligned`, the caches are wrapped in
+    /// place instead of copied.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         model: &ModelWeights,
@@ -705,11 +741,11 @@ impl PredictGraph {
         shape: Shape,
         column_keys: &[&[f32]],
         column_values: &[&[f32]],
-        icl_keys: &[&[f32]],
-        icl_values: &[&[f32]],
+        icl: (&[&[u8]], &[&[u8]], TensorStorage),
         base_scales: &[Vec<f32>],
         page_aligned: bool,
     ) -> Result<Self> {
+        let (icl_keys, icl_values, icl_storage) = icl;
         let gpu = model.gpu();
         let builder = Builder::new(model, weights);
         let (b, h, n) = (
@@ -731,7 +767,10 @@ impl PredictGraph {
             let prefix = format!("col_embedder.tf_col.blocks.{block}.multihead_attn2");
             // The cached path never reads the reserved streams.
             let cache = |values: &[f32]| -> Result<Tensor> {
-                let full = builder.bound(gpu.tensor_buffer(values, page_aligned)?, &column_shape);
+                let full = builder.bound(
+                    gpu.tensor_buffer(bytemuck::cast_slice(values), page_aligned)?,
+                    &column_shape,
+                );
                 Ok(builder.reshape(
                     &builder.slice(&full, 1, RESERVED as isize, h),
                     &[b * h, HEADS as isize, INDUCING as isize, COLUMN_HEAD_DIM as isize],
@@ -753,8 +792,17 @@ impl PredictGraph {
         let icl_shape = [b, HEADS as isize, n, ICL_HEAD_DIM as isize];
         for block in 0..ICL_BLOCKS {
             let prefix = format!("icl_predictor.tf_icl.blocks.{block}");
-            let key = builder.bound(gpu.tensor_buffer(icl_keys[block], page_aligned)?, &icl_shape);
-            let value = builder.bound(gpu.tensor_buffer(icl_values[block], page_aligned)?, &icl_shape);
+            // 16-bit caches are converted to FP32 on load; the math stays FP32.
+            let key = builder.bound_typed(
+                gpu.tensor_buffer(icl_keys[block], page_aligned)?,
+                &icl_shape,
+                kind(icl_storage),
+            );
+            let value = builder.bound_typed(
+                gpu.tensor_buffer(icl_values[block], page_aligned)?,
+                &icl_shape,
+                kind(icl_storage),
+            );
             let base_scale = builder.constant(
                 &base_scales[block],
                 &[1, HEADS as isize, 1, ICL_HEAD_DIM as isize],
@@ -801,11 +849,13 @@ impl PredictGraph {
             self.grouped.clone(),
             input,
             vec![(b * h) as isize, rows as isize, 3],
+            FLOAT,
         );
         let output = (
             self.logits.clone(),
             output,
             vec![b as isize, rows as isize, DECODER_OUTPUTS as isize],
+            FLOAT,
         );
         let mut inputs = self.bindings.iter().collect::<Vec<_>>();
         inputs.push(&input);
@@ -821,7 +871,7 @@ impl PredictGraph {
                         MPSGraphShapedType::initWithShape_dataType(
                             MPSGraphShapedType::alloc(),
                             Some(&shape(&item.2)),
-                            FLOAT,
+                            item.3,
                         )
                     })
                     .collect();
@@ -936,8 +986,8 @@ impl PredictGraph {
 /// `icl_labels` `[B, N, 512]`. The keys and values are written in place into
 /// `outputs`, page-aligned regions in context order: each column block's key
 /// and value as `[B, H + 4, 8, 128, 16]` with zero reserved streams, then each
-/// ICL block's as `[B, 8, N, 64]`. Returns an error if any written value is
-/// not finite.
+/// ICL block's as `[B, 8, N, 64]` in `icl_storage`'s type. Returns an error
+/// if any written value is not finite, including FP16 overflow.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // One linear graph definition.
 pub(crate) fn build_context(
     model: &ModelWeights,
@@ -948,6 +998,7 @@ pub(crate) fn build_context(
     grouped: &[f32],
     column_labels: &[f32],
     icl_labels: &[f32],
+    icl_storage: TensorStorage,
     outputs: &[(std::ptr::NonNull<u8>, usize)],
 ) -> Result<()> {
     let gpu = model.gpu();
@@ -1064,29 +1115,31 @@ pub(crate) fn build_context(
     let mut targets = Vec::with_capacity(2 * (COLUMN_BLOCKS + ICL_BLOCKS));
     for (key, value) in &column {
         targets.extend([
-            (full_column(key), column_shape.clone()),
-            (full_column(value), column_shape.clone()),
+            (full_column(key), column_shape.clone(), FLOAT),
+            (full_column(value), column_shape.clone(), FLOAT),
         ]);
     }
+    let icl_kind = kind(icl_storage);
     for (key, value) in &icl {
         targets.extend([
-            (key.clone(), icl_shape.clone()),
-            (value.clone(), icl_shape.clone()),
+            (builder.cast(key, icl_kind), icl_shape.clone(), icl_kind),
+            (builder.cast(value, icl_kind), icl_shape.clone(), icl_kind),
         ]);
     }
     if targets.len() != outputs.len() {
         return Err(metal_error("context output regions do not match the graph"));
     }
-    // One NaN-propagating max |value| over every output, so the CPU checks a
-    // single float instead of scanning the whole context.
+    // One NaN-propagating max |value| over every output, as stored, so the
+    // CPU checks a single float instead of scanning the whole context.
     let largest = targets
         .iter()
-        .map(|(tensor, _)| unsafe {
-            builder.graph.reductionMaximumPropagateNaNWithTensor_axis_name(
+        .map(|(tensor, _, _)| unsafe {
+            let largest = builder.graph.reductionMaximumPropagateNaNWithTensor_axis_name(
                 &builder.reshape(&builder.graph.absoluteWithTensor_name(tensor, None), &[-1]),
                 0,
                 None,
-            )
+            );
+            builder.cast(&largest, FLOAT)
         })
         .reduce(|left, right| unsafe {
             builder
@@ -1097,9 +1150,11 @@ pub(crate) fn build_context(
     let mut outputs = targets
         .into_iter()
         .zip(outputs)
-        .map(|((tensor, dimensions), &(pointer, bytes))| Ok((tensor, gpu.wrap(pointer, bytes)?, dimensions)))
+        .map(|((tensor, dimensions, kind), &(pointer, bytes))| {
+            Ok((tensor, gpu.wrap(pointer, bytes)?, dimensions, kind))
+        })
         .collect::<Result<Vec<Binding>>>()?;
-    outputs.push((largest, gpu.empty(1)?, vec![1]));
+    outputs.push((largest, gpu.empty(1)?, vec![1], FLOAT));
     let bindings = builder.bindings.into_inner();
     gpu.run(
         &builder.graph,

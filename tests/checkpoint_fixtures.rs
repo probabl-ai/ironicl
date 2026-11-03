@@ -9,7 +9,7 @@ use std::{
 
 use ironicl::{
     CheckpointCacheOptions, CheckpointProfile, ClassifierExecutor, ClassifierInputBundle,
-    ClassifierQueryRequest, PreparedCheckpoint, TaskKind, import_checkpoint, inspect_checkpoint,
+    ClassifierQueryRequest, Optimize, PreparedCheckpoint, TaskKind, import_checkpoint, inspect_checkpoint,
     inspect_model_artifact, load_model_artifact, prepare_checkpoint,
 };
 use sha2::{Digest, Sha256};
@@ -235,28 +235,54 @@ fn built_context_matches_the_uncached_forward_pass() {
     let expected = executor
         .predict_logits(bundle.request())
         .expect("uncached logits");
-    let context = executor
-        .build_context(
-            b,
-            n,
-            h,
-            &rows(0, n),
-            &y,
-            shifts.concat(),
-            (0..b).flat_map(|_| 0..h as u64).collect(),
-        )
-        .expect("build context");
     let query = rows(n, q);
-    let actual = context
-        .predict_logits(ClassifierQueryRequest::new(b, q, h, &query).expect("valid query"))
-        .expect("cached logits");
-
-    assert_eq!(actual.shape(), expected.shape());
-    for (index, (actual, expected)) in actual.values().iter().zip(expected.values()).enumerate() {
-        assert!(
-            (actual - expected).abs() <= 1e-4,
-            "logit {index}: cached {actual}, uncached {expected}"
-        );
+    // Logit tolerances per level; reduced levels only differ from `Safe` on
+    // GPU-built contexts. Probability errors are several times smaller.
+    let mut safe = Vec::new();
+    for (optimize, tolerance) in [
+        (Optimize::Safe, 1e-4),
+        // Measured on an M1 Max with FP16 caches and attention: 4.6e-3.
+        (Optimize::Auto, 1e-2),
+        (Optimize::Fast, 5e-2),
+    ] {
+        let context = executor
+            .build_context(
+                b,
+                n,
+                h,
+                &rows(0, n),
+                &y,
+                shifts.concat(),
+                (0..b).flat_map(|_| 0..h as u64).collect(),
+                optimize,
+            )
+            .expect("build context");
+        let actual = context
+            .predict_logits(ClassifierQueryRequest::new(b, q, h, &query).expect("valid query"))
+            .expect("cached logits");
+        assert_eq!(actual.shape(), expected.shape());
+        for (index, (actual, expected)) in actual.values().iter().zip(expected.values()).enumerate() {
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "{optimize:?} logit {index}: cached {actual}, uncached {expected}"
+            );
+        }
+        if optimize == Optimize::Safe {
+            safe = actual.values().to_vec();
+        } else if cfg!(all(
+            feature = "metal",
+            target_os = "macos",
+            target_arch = "aarch64"
+        )) {
+            assert!(
+                actual
+                    .values()
+                    .iter()
+                    .zip(&safe)
+                    .any(|(left, right)| left.to_bits() != right.to_bits()),
+                "{optimize:?} must store reduced-precision keys and values"
+            );
+        }
     }
 }
 

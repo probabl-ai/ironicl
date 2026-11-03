@@ -16,7 +16,7 @@ use pyo3::{
 
 use crate::{
     CheckpointCacheOptions, ClassifierAggregation, ClassifierExecutor, ClassifierQueryRequest, Error,
-    PreparedCheckpoint, StaticClassifierExecutor, load_model_artifact, prepare_checkpoint,
+    Optimize, PreparedCheckpoint, StaticClassifierExecutor, load_model_artifact, prepare_checkpoint,
 };
 
 fn py_error(error: Error) -> PyErr {
@@ -49,7 +49,8 @@ impl Model {
     }
 
     /// Run FP32 training rows `x[B, N, H]` with labels `y_train[B, N]` once and
-    /// keep their attention keys and values. Permutations are `[B, C]` and `[B, H]`.
+    /// keep their attention keys and values. Permutations are `[B, C]` and
+    /// `[B, H]`; `optimize` is `"safe"`, `"auto"`, or `"fast"`.
     fn fit_context(
         &self,
         py: Python<'_>,
@@ -57,7 +58,9 @@ impl Model {
         y_train: PyBuffer<f32>,
         class_permutations: PyBuffer<u64>,
         feature_permutations: PyBuffer<u64>,
+        optimize: &str,
     ) -> PyResult<Context> {
+        let optimize = optimize.parse::<Optimize>().map_err(py_error)?;
         let &[ensembles, rows, features] = x.shape() else {
             return Err(PyValueError::new_err("x must have shape [B, N, H]"));
         };
@@ -73,6 +76,7 @@ impl Model {
                 &y_train,
                 class_permutations,
                 feature_permutations,
+                optimize,
             )
         })
         .map(Context)
