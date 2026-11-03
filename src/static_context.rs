@@ -7,7 +7,7 @@
 
 use std::{collections::BTreeMap, fs::File, path::Path, sync::Arc};
 
-use memmap2::{Mmap, MmapOptions};
+use memmap2::{Mmap, MmapMut, MmapOptions};
 use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
@@ -132,6 +132,80 @@ struct StaticContextTensorRecord {
 enum StaticContextStorage {
     Owned,
     Mapped(Arc<Mmap>),
+    /// Anonymous memory where every tensor starts on a page and is padded to a
+    /// page multiple, so a GPU can wrap each tensor without copying it.
+    #[cfg_attr(
+        not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )] // Metal only.
+    PageAligned(Arc<Mmap>),
+}
+
+/// Page size for page-aligned tensors: the 16 KiB Apple Silicon page, a
+/// multiple of 4 KiB pages elsewhere.
+#[cfg_attr(
+    not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)] // Metal only.
+pub(crate) const TENSOR_PAGE_BYTES: usize = 16 * 1024;
+
+/// FP32 tensors being written into page-aligned anonymous memory, for
+/// [`StaticContextArtifact::from_page_aligned`].
+#[cfg_attr(
+    not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)] // Metal only.
+pub(crate) struct PageAlignedTensors {
+    mapping: MmapMut,
+    /// Name, dimensions, byte offset, and byte length of each tensor.
+    layout: Vec<(String, Vec<u64>, usize, usize)>,
+}
+
+#[cfg_attr(
+    not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)] // Metal only.
+impl PageAlignedTensors {
+    /// Reserve zeroed, page-aligned space for each `(name, dimensions)`.
+    pub(crate) fn new(specs: Vec<(String, Vec<u64>)>) -> Result<Self> {
+        let mut layout = Vec::with_capacity(specs.len());
+        let mut offset = 0_usize;
+        for (name, dimensions) in specs {
+            let bytes = checked_elements(&dimensions)?
+                .checked_mul(4)
+                .ok_or_else(|| artifact_error("tensor byte length overflows usize"))?;
+            layout.push((name, dimensions, offset, bytes));
+            offset = offset
+                .checked_add(bytes.next_multiple_of(TENSOR_PAGE_BYTES))
+                .ok_or_else(|| artifact_error("total tensor byte length overflows usize"))?;
+        }
+        if offset > MAX_TOTAL_TENSOR_BYTES {
+            return Err(artifact_error(
+                "static context tensor payload exceeds the resource limit",
+            ));
+        }
+        let mapping = MmapOptions::new()
+            .len(offset.max(TENSOR_PAGE_BYTES))
+            .map_anon()
+            .map_err(artifact_error)?;
+        Ok(Self { mapping, layout })
+    }
+
+    /// Each tensor's page-aligned start and page-padded byte length, in the
+    /// order given to [`Self::new`]. The pointers stay valid while `self` and
+    /// the artifact made from it live.
+    pub(crate) fn regions(&mut self) -> Vec<(std::ptr::NonNull<u8>, usize)> {
+        let mapping = &mut self.mapping;
+        self.layout
+            .iter()
+            .map(|(_, _, offset, bytes)| {
+                (
+                    std::ptr::NonNull::from(&mut mapping[*offset]),
+                    bytes.next_multiple_of(TENSOR_PAGE_BYTES),
+                )
+            })
+            .collect()
+    }
 }
 
 /// A verified static context backed by owned or read-only mapped tensor storage.
@@ -207,6 +281,62 @@ impl StaticContextArtifact {
             tensors: named,
             storage: StaticContextStorage::Owned,
         })
+    }
+
+    /// Validate tensors written into page-aligned memory and own them without
+    /// copying. The memory becomes read-only.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Artifact`] when metadata, names, shapes, or values are invalid.
+    #[cfg_attr(
+        not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )] // Metal only.
+    pub(crate) fn from_page_aligned(
+        metadata: StaticContextMetadata,
+        tensors: PageAlignedTensors,
+    ) -> Result<Self> {
+        validate_metadata(&metadata)?;
+        if tensors.layout.is_empty() || tensors.layout.len() > MAX_TENSOR_COUNT {
+            return Err(artifact_error("static context tensor count is invalid"));
+        }
+        let mut named = BTreeMap::new();
+        for (name, dimensions, byte_offset, byte_length) in tensors.layout {
+            let values =
+                bytemuck::cast_slice::<u8, f32>(&tensors.mapping[byte_offset..byte_offset + byte_length]);
+            validate_tensor_parts(&name, &dimensions, values)?;
+            let values = StaticContextTensorValues::MappedFp32 {
+                byte_offset,
+                byte_length,
+            };
+            if named
+                .insert(name, StaticContextTensorRecord { dimensions, values })
+                .is_some()
+            {
+                return Err(artifact_error("static context tensor names must be unique"));
+            }
+        }
+        Ok(Self {
+            version: STATIC_CONTEXT_FP32_VERSION,
+            metadata,
+            tensors: named,
+            storage: StaticContextStorage::PageAligned(Arc::new(
+                tensors.mapping.make_read_only().map_err(artifact_error)?,
+            )),
+        })
+    }
+
+    /// The page-aligned memory holding every tensor, if the artifact has it.
+    #[cfg_attr(
+        not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
+        allow(dead_code)
+    )] // Metal only.
+    pub(crate) fn page_aligned_storage(&self) -> Option<&Arc<Mmap>> {
+        match &self.storage {
+            StaticContextStorage::PageAligned(mapping) => Some(mapping),
+            _ => None,
+        }
     }
 
     /// Decode, verify, and own a complete static-context artifact.
@@ -844,7 +974,7 @@ impl StaticContextArtifact {
                 StaticContextTensorData::Fp32(values)
             }
             (
-                StaticContextStorage::Mapped(mapping),
+                StaticContextStorage::Mapped(mapping) | StaticContextStorage::PageAligned(mapping),
                 StaticContextTensorValues::MappedFp32 {
                     byte_offset,
                     byte_length,
@@ -854,7 +984,7 @@ impl StaticContextArtifact {
                     .expect("mapped FP32 tensor alignment was validated"),
             ),
             (
-                StaticContextStorage::Mapped(mapping),
+                StaticContextStorage::Mapped(mapping) | StaticContextStorage::PageAligned(mapping),
                 StaticContextTensorValues::MappedBf16 {
                     byte_offset,
                     byte_length,
@@ -936,30 +1066,31 @@ fn validate_permutation(values: &[u64], expected_length: usize, name: &str) -> R
 }
 
 fn validate_tensor(tensor: &StaticContextTensor) -> Result<()> {
-    if tensor.name.is_empty()
-        || tensor.name.len() > MAX_TENSOR_NAME_BYTES
-        || tensor.dimensions.is_empty()
-        || tensor.dimensions.len() > MAX_TENSOR_RANK
+    validate_tensor_parts(&tensor.name, &tensor.dimensions, &tensor.values)
+}
+
+fn validate_tensor_parts(name: &str, dimensions: &[u64], values: &[f32]) -> Result<()> {
+    if name.is_empty()
+        || name.len() > MAX_TENSOR_NAME_BYTES
+        || dimensions.is_empty()
+        || dimensions.len() > MAX_TENSOR_RANK
     {
         return Err(artifact_error("static context tensor name or rank is invalid"));
     }
-    let elements = checked_elements(&tensor.dimensions)?;
-    if tensor.values.len() != elements || tensor.values.iter().any(|value| !value.is_finite()) {
+    let elements = checked_elements(dimensions)?;
+    if values.len() != elements || values.iter().any(|value| !value.is_finite()) {
         return Err(artifact_error(format!(
-            "static context tensor '{}' has an invalid shape or non-finite value",
-            tensor.name
+            "static context tensor '{name}' has an invalid shape or non-finite value"
         )));
     }
-    if tensor
-        .values
+    if values
         .len()
         .checked_mul(4)
         .ok_or_else(|| artifact_error("tensor byte length overflows usize"))?
         > MAX_TENSOR_BYTES
     {
         return Err(artifact_error(format!(
-            "static context tensor '{}' exceeds the resource limit",
-            tensor.name
+            "static context tensor '{name}' exceeds the resource limit"
         )));
     }
     Ok(())
