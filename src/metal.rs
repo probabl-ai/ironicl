@@ -19,8 +19,9 @@ use objc2_foundation::{NSArray, NSData, NSDictionary, NSNumber};
 use objc2_metal::{MTLBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLResourceOptions};
 use objc2_metal_performance_shaders::{MPSDataType, MPSShape};
 use objc2_metal_performance_shaders_graph::{
-    MPSGraph, MPSGraphCompilationDescriptor, MPSGraphExecutionDescriptor, MPSGraphOptimization,
-    MPSGraphTensor, MPSGraphTensorData,
+    MPSGraph, MPSGraphCompilationDescriptor, MPSGraphDevice, MPSGraphExecutable,
+    MPSGraphExecutableExecutionDescriptor, MPSGraphExecutionDescriptor, MPSGraphOptimization,
+    MPSGraphShapedType, MPSGraphTensor, MPSGraphTensorData,
 };
 
 use crate::{Error, Result};
@@ -60,7 +61,9 @@ fn metal_error(message: &str) -> Error {
 pub(crate) struct Gpu {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    compilation: Retained<MPSGraphCompilationDescriptor>,
     execution: Retained<MPSGraphExecutionDescriptor>,
+    executable_execution: Retained<MPSGraphExecutableExecutionDescriptor>,
 }
 
 impl Gpu {
@@ -76,18 +79,22 @@ impl Gpu {
         // M1 Max. Level 1's pass that places operations on the Neural Engine
         // or CPU printed "Failed to import MPS module" on every compile.
         // SAFETY: plain descriptor construction.
-        let execution = unsafe {
+        let (compilation, execution, executable_execution) = unsafe {
             let compilation = MPSGraphCompilationDescriptor::new();
             compilation.setOptimizationLevel(MPSGraphOptimization::Level0);
             let execution = MPSGraphExecutionDescriptor::new();
             execution.setWaitUntilCompleted(true);
             execution.setCompilationDescriptor(Some(&compilation));
-            execution
+            let executable_execution = MPSGraphExecutableExecutionDescriptor::new();
+            executable_execution.setWaitUntilCompleted(true);
+            (compilation, execution, executable_execution)
         };
         Ok(Some(Self {
             device,
             queue,
+            compilation,
             execution,
+            executable_execution,
         }))
     }
 
@@ -659,13 +666,24 @@ fn bucket(rows: usize) -> usize {
     rows.next_multiple_of(1 << shift)
 }
 
-/// One query bucket's input and output buffers and the dictionaries that
-/// feed them to the graph.
+/// One query bucket's input and output buffers and how to run the graph on
+/// them.
 struct Prepared {
     input: Buffer,
     output: Buffer,
-    feeds: Dictionary,
-    results: Dictionary,
+    run: PreparedRun,
+}
+
+enum PreparedRun {
+    /// A graph run that `MPSGraph` matches to a compiled executable per call.
+    Graph { feeds: Dictionary, results: Dictionary },
+    /// An executable compiled once, with its inputs in feed order. Skipping
+    /// the per-call lookup saved 0.5-1.4 ms per single-row predict.
+    Executable {
+        executable: Retained<MPSGraphExecutable>,
+        inputs: Retained<NSArray<MPSGraphTensorData>>,
+        results: Retained<NSArray<MPSGraphTensorData>>,
+    },
 }
 
 // SAFETY: the Objective-C objects are immutable after construction, and every
@@ -769,7 +787,9 @@ impl PredictGraph {
         })
     }
 
-    fn prepare(&self, rows: usize) -> Result<Prepared> {
+    /// Allocate a bucket's buffers. A `cached` bucket also compiles its
+    /// executable once; an uncached one would compile on every call.
+    fn prepare(&self, rows: usize, cached: bool) -> Result<Prepared> {
         let (b, h) = (self.shape.ensembles, self.shape.features);
         let input = self.gpu.empty(b * h * rows * 3)?;
         // Padding rows must be finite; they never mix with real rows.
@@ -788,11 +808,58 @@ impl PredictGraph {
         );
         let mut inputs = self.bindings.iter().collect::<Vec<_>>();
         inputs.push(&input);
+        let (feeds, results) = (dictionary(&inputs), dictionary(&[&output]));
+        let run = if cached {
+            // SAFETY: compiling the graph for these inputs' shapes; every feed
+            // tensor has a value in `feeds`.
+            unsafe {
+                let tensors: Vec<&MPSGraphTensor> = inputs.iter().map(|item| &*item.0).collect();
+                let types: Vec<_> = inputs
+                    .iter()
+                    .map(|item| {
+                        MPSGraphShapedType::initWithShape_dataType(
+                            MPSGraphShapedType::alloc(),
+                            Some(&shape(&item.2)),
+                            FLOAT,
+                        )
+                    })
+                    .collect();
+                let executable = self
+                    .graph
+                    .compileWithDevice_feeds_targetTensors_targetOperations_compilationDescriptor(
+                        Some(&MPSGraphDevice::deviceWithMTLDevice(&self.gpu.device)),
+                        &NSDictionary::from_retained_objects(&tensors, &types),
+                        &NSArray::from_slice(&[&*self.logits]),
+                        None,
+                        Some(&self.gpu.compilation),
+                    );
+                let order = executable
+                    .feedTensors()
+                    .ok_or_else(|| metal_error("compiled graph has no feeds"))?;
+                let inputs = order
+                    .iter()
+                    .map(|tensor| {
+                        feeds
+                            .objectForKey(&tensor)
+                            .ok_or_else(|| metal_error("compiled graph feed is unbound"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                let output = results
+                    .objectForKey(&self.logits)
+                    .ok_or_else(|| metal_error("graph output is unbound"))?;
+                PreparedRun::Executable {
+                    executable,
+                    inputs: NSArray::from_retained_slice(&inputs),
+                    results: NSArray::from_retained_slice(&[output]),
+                }
+            }
+        } else {
+            PreparedRun::Graph { feeds, results }
+        };
         Ok(Prepared {
-            feeds: dictionary(&inputs),
-            results: dictionary(&[&output]),
             input: input.1,
             output: output.1,
+            run,
         })
     }
 
@@ -813,10 +880,10 @@ impl PredictGraph {
         let prepared = if rows <= CACHED_BUCKET_ROWS {
             match cache.entry(rows) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(self.prepare(rows)?),
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(self.prepare(rows, true)?),
             }
         } else {
-            uncached = self.prepare(rows)?;
+            uncached = self.prepare(rows, false)?;
             &uncached
         };
         // SAFETY: the lock gives this call sole use of the buffer, which holds
@@ -827,8 +894,22 @@ impl PredictGraph {
         if !fill(input, rows) {
             return Ok(None);
         }
-        self.gpu
-            .run_prepared(&self.graph, &prepared.feeds, &prepared.results);
+        match &prepared.run {
+            PreparedRun::Graph { feeds, results } => self.gpu.run_prepared(&self.graph, feeds, results),
+            // SAFETY: synchronous run; the arrays keep their buffers alive.
+            PreparedRun::Executable {
+                executable,
+                inputs,
+                results,
+            } => unsafe {
+                executable.runWithMTLCommandQueue_inputsArray_resultsArray_executionDescriptor(
+                    &self.gpu.queue,
+                    inputs,
+                    Some(results),
+                    Some(&self.gpu.executable_execution),
+                );
+            },
+        }
         // SAFETY: the run is complete and wrote `[b, rows, 10]` floats.
         let output = unsafe {
             std::slice::from_raw_parts(

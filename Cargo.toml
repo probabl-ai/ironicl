@@ -70,6 +70,7 @@ objc2-metal-performance-shaders-graph = { version = "0.3.2", default-features = 
     "MPSGraphArithmeticOps",
     "MPSGraphCore",
     "MPSGraphDevice",
+    "MPSGraphExecutable",
     "MPSGraphMatrixMultiplicationOps",
     "MPSGraphMemoryOps",
     "MPSGraphNormalizationOps",
