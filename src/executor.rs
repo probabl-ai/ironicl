@@ -1499,14 +1499,18 @@ impl StaticClassifierExecutor {
     ) -> Result<bool> {
         let metadata = self.context.metadata();
         let (q, h, classes) = (request.query_rows(), metadata.feature_count, metadata.class_count);
-        let mut grouped = Vec::with_capacity(metadata.ensemble_count * h * q * 3);
-        for ensemble in 0..metadata.ensemble_count {
-            let Some(group) = group_features(&request.x()[ensemble * q * h..][..q * h], q, h) else {
-                return Ok(false);
-            };
-            grouped.extend(group);
-        }
-        let logits = gpu.predict.run(&grouped, q)?;
+        let x = request.x();
+        let Some(logits) = gpu.predict.run(q, |input, stride| {
+            input
+                .chunks_exact_mut(h * stride * 3)
+                .enumerate()
+                .all(|(ensemble, input)| {
+                    group_features_into(&x[ensemble * q * h..][..q * h], (q, h), stride, input)
+                })
+        })?
+        else {
+            return Ok(false);
+        };
         for (output, logits) in values.chunks_exact_mut(classes).zip(logits.chunks_exact(10)) {
             output.copy_from_slice(&logits[..classes]);
         }
@@ -3286,16 +3290,25 @@ impl StaticClassifierExecutor {
 #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
 fn group_features(x: &[f32], rows: usize, h: usize) -> Option<Vec<f32>> {
     let mut grouped = vec![0.0; h * rows * 3];
-    for (index, triple) in grouped.chunks_exact_mut(3).enumerate() {
-        let (feature, row) = (index / rows, index % rows);
-        for (part, offset) in [1_usize, 2, 4].iter().enumerate() {
-            triple[part] = x[row * h + (feature + offset) % h];
-        }
-        if triple.iter().all(|value| *value == -100.0) {
-            return None;
+    group_features_into(x, (rows, h), rows, &mut grouped).then_some(grouped)
+}
+
+/// [`group_features`] into `[H, stride, 3]` output, leaving rows past `rows`
+/// untouched. Returns false on the all-missing marker.
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+fn group_features_into(x: &[f32], (rows, h): (usize, usize), stride: usize, output: &mut [f32]) -> bool {
+    for feature in 0..h {
+        for row in 0..rows {
+            let triple = &mut output[(feature * stride + row) * 3..][..3];
+            for (part, offset) in [1_usize, 2, 4].iter().enumerate() {
+                triple[part] = x[row * h + (feature + offset) % h];
+            }
+            if triple.iter().all(|value| *value == -100.0) {
+                return false;
+            }
         }
     }
-    Some(grouped)
+    true
 }
 
 fn aggregate_classifier_probabilities(

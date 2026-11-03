@@ -122,7 +122,30 @@ impl Gpu {
 
     /// Run `graph` synchronously, feeding `inputs` and writing `outputs`.
     fn run(&self, graph: &MPSGraph, inputs: &[&Binding], outputs: &[&Binding]) {
-        let data = |(_, buffer, dimensions): &Binding| {
+        self.run_prepared(graph, &dictionary(inputs), &dictionary(outputs));
+    }
+
+    fn run_prepared(&self, graph: &MPSGraph, feeds: &Dictionary, results: &Dictionary) {
+        // SAFETY: synchronous run; the dictionaries keep their buffers alive.
+        unsafe {
+            graph.runWithMTLCommandQueue_feeds_targetOperations_resultsDictionary(
+                &self.queue,
+                feeds,
+                None,
+                results,
+            );
+        }
+    }
+}
+
+type Dictionary = Retained<NSDictionary<MPSGraphTensor, MPSGraphTensorData>>;
+
+/// Map each binding's tensor to its buffer viewed with the binding's shape.
+fn dictionary(items: &[&Binding]) -> Dictionary {
+    let tensors: Vec<&MPSGraphTensor> = items.iter().map(|item| &*item.0).collect();
+    let data: Vec<_> = items
+        .iter()
+        .map(|(_, buffer, dimensions)| {
             // SAFETY: each buffer is live, shared, and at least as long as its shape.
             unsafe {
                 MPSGraphTensorData::initWithMTLBuffer_shape_dataType(
@@ -132,22 +155,9 @@ impl Gpu {
                     FLOAT,
                 )
             }
-        };
-        let input_tensors: Vec<&MPSGraphTensor> = inputs.iter().map(|item| &*item.0).collect();
-        let output_tensors: Vec<&MPSGraphTensor> = outputs.iter().map(|item| &*item.0).collect();
-        let input_data: Vec<_> = inputs.iter().map(|item| data(item)).collect();
-        let output_data: Vec<_> = outputs.iter().map(|item| data(item)).collect();
-        let feeds = NSDictionary::from_retained_objects(&input_tensors, &input_data);
-        let results = NSDictionary::from_retained_objects(&output_tensors, &output_data); // SAFETY: synchronous run; the buffers outlive it.
-        unsafe {
-            graph.runWithMTLCommandQueue_feeds_targetOperations_resultsDictionary(
-                &self.queue,
-                &feeds,
-                None,
-                &results,
-            );
-        }
-    }
+        })
+        .collect();
+    NSDictionary::from_retained_objects(&tensors, &data)
 }
 
 /// A model's weights in shared GPU buffers, converted once and reused by every
@@ -610,11 +620,34 @@ pub(crate) struct PredictGraph {
     bindings: Vec<Binding>,
     grouped: Tensor,
     logits: Tensor,
-    lock: Mutex<()>,
+    /// Buffers and dictionaries per cached query bucket. The lock also
+    /// serializes graph runs.
+    prepared: Mutex<HashMap<usize, Prepared>>,
+}
+
+/// Query buckets up to this many rows keep their buffers between calls.
+const CACHED_BUCKET_ROWS: usize = 1024;
+
+/// Round a query count up to a bucket that keeps its top four significant
+/// bits, so the graph compiles for 8 shapes per doubling of the batch size and
+/// pads at most 12.5%. Power-of-two buckets padded up to 2x, which cost more
+/// than the compiles they saved on large batches.
+fn bucket(rows: usize) -> usize {
+    let shift = (usize::BITS - rows.leading_zeros()).saturating_sub(4);
+    rows.next_multiple_of(1 << shift)
+}
+
+/// One query bucket's input and output buffers and the dictionaries that
+/// feed them to the graph.
+struct Prepared {
+    input: Buffer,
+    output: Buffer,
+    feeds: Dictionary,
+    results: Dictionary,
 }
 
 // SAFETY: the Objective-C objects are immutable after construction, and every
-// graph run holds `lock`.
+// graph run holds the `prepared` lock.
 unsafe impl Send for PredictGraph {}
 // SAFETY: as above.
 unsafe impl Sync for PredictGraph {}
@@ -710,33 +743,84 @@ impl PredictGraph {
             bindings: builder.bindings.into_inner(),
             grouped,
             logits,
-            lock: Mutex::new(()),
+            prepared: Mutex::default(),
         })
     }
 
-    /// Predict from `[B * H, Q, 3]` grouped inputs. Returns `[B, Q, 10]` logits.
-    pub(crate) fn run(&self, grouped: &[f32], query_rows: usize) -> Result<Vec<f32>> {
-        let (b, h, q) = (self.shape.ensembles, self.shape.features, query_rows);
+    fn prepare(&self, rows: usize) -> Result<Prepared> {
+        let (b, h) = (self.shape.ensembles, self.shape.features);
+        let input = self.gpu.empty(b * h * rows * 3)?;
+        // Padding rows must be finite; they never mix with real rows.
+        // SAFETY: the new buffer holds `b * h * rows * 3` floats.
+        unsafe { std::ptr::write_bytes(input.contents().as_ptr().cast::<f32>(), 0, b * h * rows * 3) };
+        let output = self.gpu.empty(b * rows * DECODER_OUTPUTS)?;
         let input = (
             self.grouped.clone(),
-            self.gpu.buffer(grouped)?,
-            vec![(b * h) as isize, q as isize, 3],
+            input,
+            vec![(b * h) as isize, rows as isize, 3],
         );
-        let elements = b * q * DECODER_OUTPUTS;
         let output = (
             self.logits.clone(),
-            self.gpu.empty(elements)?,
-            vec![b as isize, q as isize, DECODER_OUTPUTS as isize],
+            output,
+            vec![b as isize, rows as isize, DECODER_OUTPUTS as isize],
         );
         let mut inputs = self.bindings.iter().collect::<Vec<_>>();
         inputs.push(&input);
-        let _guard = self.lock.lock().map_err(|_| metal_error("graph lock poisoned"))?;
-        self.gpu.run(&self.graph, &inputs, &[&output]);
-        // SAFETY: the run is complete and wrote `elements` floats.
-        Ok(
-            unsafe { std::slice::from_raw_parts(output.1.contents().as_ptr().cast::<f32>(), elements) }
-                .to_vec(),
-        )
+        Ok(Prepared {
+            feeds: dictionary(&inputs),
+            results: dictionary(&[&output]),
+            input: input.1,
+            output: output.1,
+        })
+    }
+
+    /// Predict `query_rows` rows. `fill` writes the `[B * H, rows, 3]` grouped
+    /// inputs, given the bucket's row count as the stride, and returns false
+    /// to cancel. Returns `[B, query_rows, 10]` logits.
+    pub(crate) fn run(
+        &self,
+        query_rows: usize,
+        fill: impl FnOnce(&mut [f32], usize) -> bool,
+    ) -> Result<Option<Vec<f32>>> {
+        let (b, h, rows) = (self.shape.ensembles, self.shape.features, bucket(query_rows));
+        let mut cache = self
+            .prepared
+            .lock()
+            .map_err(|_| metal_error("graph lock poisoned"))?;
+        let uncached;
+        let prepared = if rows <= CACHED_BUCKET_ROWS {
+            match cache.entry(rows) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(self.prepare(rows)?),
+            }
+        } else {
+            uncached = self.prepare(rows)?;
+            &uncached
+        };
+        // SAFETY: the lock gives this call sole use of the buffer, which holds
+        // `b * h * rows * 3` floats.
+        let input = unsafe {
+            std::slice::from_raw_parts_mut(prepared.input.contents().as_ptr().cast::<f32>(), b * h * rows * 3)
+        };
+        if !fill(input, rows) {
+            return Ok(None);
+        }
+        self.gpu
+            .run_prepared(&self.graph, &prepared.feeds, &prepared.results);
+        // SAFETY: the run is complete and wrote `[b, rows, 10]` floats.
+        let output = unsafe {
+            std::slice::from_raw_parts(
+                prepared.output.contents().as_ptr().cast::<f32>(),
+                b * rows * DECODER_OUTPUTS,
+            )
+        };
+        Ok(Some(
+            output
+                .chunks_exact(rows * DECODER_OUTPUTS)
+                .flat_map(|estimator| &estimator[..query_rows * DECODER_OUTPUTS])
+                .copied()
+                .collect(),
+        ))
     }
 }
 

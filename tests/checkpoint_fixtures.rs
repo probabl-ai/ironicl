@@ -208,9 +208,9 @@ fn built_context_matches_the_uncached_forward_pass() {
     };
     let executor =
         ClassifierExecutor::new(load_model_artifact(&model_path).expect("load classifier artifact"));
-    // With the `metal` feature, 240 x 240 training and 240 x 256 query scores
-    // reach the GPU for both context building and prediction.
-    let (b, n, q, h, classes) = (2, 240, 256, 5, 3_u64);
+    // With the `metal` feature, 240 training rows build on the GPU, and 250
+    // query rows are padded to the GPU's 256-row bucket.
+    let (b, n, q, h, classes) = (2, 240, 250, 5, 3_u64);
     let mut state = 0x2545_f491_u32;
     let mut x = vec![0.0_f32; b * (n + q) * h];
     for value in &mut x {
