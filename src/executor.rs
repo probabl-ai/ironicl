@@ -48,7 +48,6 @@ const INDUCING: usize = 128;
 const RESERVED: usize = 4;
 const ATTENTION_QUERY_BLOCK_ROWS: usize = 16;
 const ATTENTION_KEY_TILE_ROWS: usize = 128;
-const CLASSIFIER_SOFTMAX_TEMPERATURE: f32 = 0.9;
 const MAX_ACTIVATION_BYTES: usize = 1536 * 1024 * 1024;
 const MAX_ACTIVATION_ELEMENTS: usize = MAX_ACTIVATION_BYTES / std::mem::size_of::<f32>();
 const SPARSE_INDEX_TENSORS: [&str; 4] = [
@@ -157,6 +156,24 @@ impl Bf16DensePolicy {
 pub struct ClassifierLogits {
     shape: [usize; 3],
     values: Vec<f32>,
+}
+
+/// How ensemble logits become class probabilities, matching `TabICLClassifier`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ClassifierAggregation {
+    /// Divides logits before softmax. Must be positive and finite.
+    pub softmax_temperature: f32,
+    /// Average logits before softmax when true; otherwise average probabilities.
+    pub average_logits: bool,
+}
+
+impl Default for ClassifierAggregation {
+    fn default() -> Self {
+        Self {
+            softmax_temperature: 0.9,
+            average_logits: true,
+        }
+    }
 }
 
 /// Aggregated classifier probabilities in row-major `[test_rows, C]` order.
@@ -1202,21 +1219,20 @@ impl StaticClassifierExecutor {
         )
     }
 
-    /// Execute cached inference and apply official class correction, logit
-    /// averaging, and temperature-scaled softmax.
+    /// Execute cached inference, undo class permutations, and aggregate the
+    /// ensemble with temperature-scaled softmax.
     ///
     /// # Errors
     ///
-    /// Returns the same errors as [`Self::predict_logits`].
+    /// Returns the same errors as [`Self::predict_logits`], and an error for an
+    /// invalid softmax temperature.
     pub fn predict_probabilities(
         &self,
         request: ClassifierQueryRequest<'_>,
+        aggregation: ClassifierAggregation,
     ) -> Result<ClassifierProbabilities> {
         let logits = self.predict_logits(request)?;
-        Ok(aggregate_classifier_probabilities(
-            &logits,
-            &self.context.metadata().class_permutations,
-        ))
+        aggregate_classifier_probabilities(&logits, &self.context.metadata().class_permutations, aggregation)
     }
 
     /// Execute independent prepared-query requests as one cache-sharing microbatch.
@@ -1231,6 +1247,7 @@ impl StaticClassifierExecutor {
     pub fn predict_probabilities_batch(
         &self,
         requests: &[ClassifierQueryRequest<'_>],
+        aggregation: ClassifierAggregation,
     ) -> Result<Vec<ClassifierProbabilities>> {
         if requests.is_empty() {
             return Err(Error::InvalidArgument(
@@ -1246,7 +1263,7 @@ impl StaticClassifierExecutor {
             metadata.feature_count,
             &packed,
         )?;
-        let probabilities = self.predict_probabilities(packed_request)?;
+        let probabilities = self.predict_probabilities(packed_request, aggregation)?;
         let mut offset = 0_usize;
         requests
             .iter()
@@ -1288,7 +1305,11 @@ impl StaticClassifierExecutor {
     ///
     /// Returns an error when the query references another model or static
     /// context, or when normal query execution fails.
-    pub fn predict_bundle_probabilities(&self, query: &StaticQueryBundle) -> Result<ClassifierProbabilities> {
+    pub fn predict_bundle_probabilities(
+        &self,
+        query: &StaticQueryBundle,
+        aggregation: ClassifierAggregation,
+    ) -> Result<ClassifierProbabilities> {
         if query.model_sha256() != &self.context.metadata().model_sha256
             || query.context_sha256() != &self.context.metadata().context_sha256
         {
@@ -1296,7 +1317,7 @@ impl StaticClassifierExecutor {
                 "query bundle model or context identity does not match the static context".into(),
             ));
         }
-        self.predict_probabilities(query.request()?)
+        self.predict_probabilities(query.request()?, aggregation)
     }
 
     fn cached_column_embeddings(
@@ -2748,38 +2769,61 @@ impl StaticClassifierExecutor {
 fn aggregate_classifier_probabilities(
     logits: &ClassifierLogits,
     class_permutations: &[u64],
-) -> ClassifierProbabilities {
+    aggregation: ClassifierAggregation,
+) -> Result<ClassifierProbabilities> {
+    let temperature = aggregation.softmax_temperature;
+    if !temperature.is_finite() || temperature <= 0.0 {
+        return Err(Error::InvalidArgument(
+            "softmax temperature must be positive and finite".into(),
+        ));
+    }
     let [ensembles, rows, classes] = logits.shape;
     let mut values = vec![0.0_f32; rows * classes];
+    let mut member = vec![0.0_f32; classes];
     let ensemble_scale =
         1.0 / f32::from(u16::try_from(ensembles).expect("validated ensemble count fits u16"));
     for ensemble in 0..ensembles {
         for row in 0..rows {
-            for class in 0..classes {
+            for (class, value) in member.iter_mut().enumerate() {
                 let shuffled_class = class_permutations[ensemble * classes + class] as usize;
-                values[row * classes + class] +=
-                    logits.values[(ensemble * rows + row) * classes + shuffled_class] * ensemble_scale;
+                *value = logits.values[(ensemble * rows + row) * classes + shuffled_class];
+            }
+            if !aggregation.average_logits {
+                softmax(&mut member, temperature);
+            }
+            for (total, value) in values[row * classes..][..classes].iter_mut().zip(&member) {
+                *total += value * ensemble_scale;
             }
         }
     }
     for row in values.chunks_exact_mut(classes) {
-        let maximum = row
-            .iter()
-            .copied()
-            .map(|value| value / CLASSIFIER_SOFTMAX_TEMPERATURE)
-            .fold(f32::NEG_INFINITY, f32::max);
-        let mut denominator = 0.0_f32;
-        for value in &mut *row {
-            *value = (*value / CLASSIFIER_SOFTMAX_TEMPERATURE - maximum).exp();
-            denominator += *value;
+        if aggregation.average_logits {
+            softmax(row, temperature);
         }
+        // Upstream renormalizes after either averaging mode.
+        let sum = row.iter().sum::<f32>();
         for value in row {
-            *value /= denominator;
+            *value /= sum;
         }
     }
-    ClassifierProbabilities {
+    Ok(ClassifierProbabilities {
         shape: [rows, classes],
         values,
+    })
+}
+
+fn softmax(values: &mut [f32], temperature: f32) {
+    let maximum = values
+        .iter()
+        .map(|value| value / temperature)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut denominator = 0.0_f32;
+    for value in &mut *values {
+        *value = (*value / temperature - maximum).exp();
+        denominator += *value;
+    }
+    for value in values {
+        *value /= denominator;
     }
 }
 
@@ -3745,7 +3789,7 @@ fn heads_to_tokens_into(input: &[f32], rows: usize, dim: usize, heads: usize, ou
 #[cfg(test)]
 mod tests {
     use super::{
-        CLASSIFIER_SOFTMAX_TEMPERATURE, ClassifierLogits, admit_request, admit_static_request,
+        ClassifierAggregation, ClassifierLogits, admit_request, admit_static_request,
         aggregate_classifier_probabilities, attention_scratch_scores, attention_scratch_state,
         model_hash_matches, pack_query_microbatch, parallel_cached_attention_f32_key_bf16_value,
         tokens_to_heads, validate_labels, validate_static_cache_contract,
@@ -3959,24 +4003,57 @@ mod tests {
     }
 
     #[test]
-    fn probabilities_reverse_class_permutations_before_averaging_logits() {
-        let probabilities = aggregate_classifier_probabilities(
-            &ClassifierLogits {
-                shape: [2, 1, 3],
-                values: vec![1.0, 2.0, 3.0, 4.0, 8.0, 6.0],
-            },
-            &[2, 0, 1, 1, 2, 0],
-        );
-        assert_eq!(probabilities.shape(), [1, 3]);
-        let expected_logits = [5.5_f32, 3.5, 3.0];
-        let maximum = expected_logits[0] / CLASSIFIER_SOFTMAX_TEMPERATURE;
-        let denominator = expected_logits
-            .iter()
-            .map(|value| (*value / CLASSIFIER_SOFTMAX_TEMPERATURE - maximum).exp())
-            .sum::<f32>();
-        for (actual, expected) in probabilities.values().iter().zip(expected_logits) {
-            let expected = (expected / CLASSIFIER_SOFTMAX_TEMPERATURE - maximum).exp() / denominator;
-            assert!((actual - expected).abs() < 1e-7, "{actual} != {expected}");
+    fn probabilities_reverse_class_permutations_and_follow_aggregation_options() {
+        let logits = ClassifierLogits {
+            shape: [2, 1, 3],
+            values: vec![1.0, 2.0, 3.0, 4.0, 8.0, 6.0],
+        };
+        let permutations = [2, 0, 1, 1, 2, 0];
+        // After undoing the permutations, the members' logits are these rows.
+        let members = [[3.0_f32, 1.0, 2.0], [8.0, 6.0, 4.0]];
+        let reference = |values: &[f32], temperature: f32| -> Vec<f32> {
+            let exp = values
+                .iter()
+                .map(|value| (value / temperature).exp())
+                .collect::<Vec<_>>();
+            let sum = exp.iter().sum::<f32>();
+            exp.iter().map(|value| value / sum).collect()
+        };
+        for (temperature, average_logits) in [(0.9, true), (0.5, true), (0.9, false), (2.0, false)] {
+            let aggregation = ClassifierAggregation {
+                softmax_temperature: temperature,
+                average_logits,
+            };
+            let expected = if average_logits {
+                let mean = [0, 1, 2].map(|class| f32::midpoint(members[0][class], members[1][class]));
+                reference(&mean, temperature)
+            } else {
+                let (first, second) = (
+                    reference(&members[0], temperature),
+                    reference(&members[1], temperature),
+                );
+                first
+                    .iter()
+                    .zip(&second)
+                    .map(|(a, b)| f32::midpoint(*a, *b))
+                    .collect()
+            };
+            let probabilities = aggregate_classifier_probabilities(&logits, &permutations, aggregation)
+                .expect("valid aggregation");
+            assert_eq!(probabilities.shape(), [1, 3]);
+            for (actual, expected) in probabilities.values().iter().zip(expected) {
+                assert!(
+                    (actual - expected).abs() < 1e-6,
+                    "{aggregation:?}: {actual} != {expected}"
+                );
+            }
+        }
+        for temperature in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let aggregation = ClassifierAggregation {
+                softmax_temperature: temperature,
+                average_logits: true,
+            };
+            assert!(aggregate_classifier_probabilities(&logits, &permutations, aggregation).is_err());
         }
     }
 

@@ -1,9 +1,9 @@
 use std::{env, process, time::Instant};
 
 use ironicl::{
-    BenchmarkArgs, BenchmarkStats, ClassifierExecutor, ClassifierInputBundle, Command, CpuCapabilities,
-    HelpTopic, ImportArgs, InspectArgs, ModelSource, PlanArgs, RunArgs, StaticClassifierExecutor,
-    StaticContextArtifact, StaticQueryBundle,
+    BenchmarkArgs, BenchmarkStats, ClassifierAggregation, ClassifierExecutor, ClassifierInputBundle, Command,
+    CpuCapabilities, HelpTopic, ImportArgs, InspectArgs, ModelSource, PlanArgs, RunArgs,
+    StaticClassifierExecutor, StaticContextArtifact, StaticQueryBundle,
     cache::ByteSize,
     error::{Error, Result},
     estimate_memory, parse_cli, resolve_backend,
@@ -206,7 +206,9 @@ fn run_model(args: RunArgs) -> Result<()> {
         let context = StaticContextArtifact::read(&context_path)?;
         let executor = StaticClassifierExecutor::new(model, context)?;
         if args.probabilities {
-            print_probabilities(&executor.predict_bundle_probabilities(&query)?);
+            print_probabilities(
+                &executor.predict_bundle_probabilities(&query, ClassifierAggregation::default())?,
+            );
         } else {
             print_logits(&executor.predict_bundle(&query)?);
         }
@@ -360,7 +362,10 @@ fn benchmark_prediction(
         return Ok(BenchmarkPrediction::Probabilities(
             static_executor
                 .expect("cached executor")
-                .predict_bundle_probabilities(query.expect("cached query"))?,
+                .predict_bundle_probabilities(
+                    query.expect("cached query"),
+                    ClassifierAggregation::default(),
+                )?,
         ));
     }
     let logits = if let (Some(executor), Some(input)) = (executor, input) {

@@ -37,8 +37,8 @@ pub use cli::{
 pub use config::{CacheMode, ExecutionConfig, StorageDType, TabIclV2Model, TaskKind, Workload};
 pub use error::{Error, Result};
 pub use executor::{
-    ClassifierExecutor, ClassifierLogits, ClassifierLogitsTrace, ClassifierProbabilities,
-    ClassifierTraceStage, SparseAttentionStatistics, StaticClassifierExecutor,
+    ClassifierAggregation, ClassifierExecutor, ClassifierLogits, ClassifierLogitsTrace,
+    ClassifierProbabilities, ClassifierTraceStage, SparseAttentionStatistics, StaticClassifierExecutor,
 };
 pub use input_bundle::{
     CLASSIFIER_INPUT_BUNDLE_KIND, CLASSIFIER_INPUT_BUNDLE_MAGIC, CLASSIFIER_INPUT_BUNDLE_VERSION,

@@ -12,7 +12,10 @@ use std::{
     path::PathBuf,
 };
 
-use crate::{ClassifierQueryRequest, StaticClassifierExecutor, StaticContextArtifact, load_model_artifact};
+use crate::{
+    ClassifierAggregation, ClassifierQueryRequest, StaticClassifierExecutor, StaticContextArtifact,
+    load_model_artifact,
+};
 
 const SUCCESS: c_int = 0;
 const INVALID_ARGUMENT: c_int = 1;
@@ -129,7 +132,7 @@ pub unsafe extern "C" fn ironicl_static_executor_predict_probabilities(
             .map_err(|error| (INVALID_ARGUMENT, error.to_string()))?;
         let executor = unsafe { &(*handle).executor };
         let probabilities = executor
-            .predict_probabilities(request)
+            .predict_probabilities(request, ClassifierAggregation::default())
             .map_err(|error| (EXECUTION_ERROR, error.to_string()))?;
         if output_length != probabilities.values().len() {
             return Err((
@@ -208,7 +211,7 @@ pub unsafe extern "C" fn ironicl_static_executor_predict_probabilities_batch(
             .map_err(|error| (INVALID_ARGUMENT, error.to_string()))?;
         let executor = unsafe { &(*handle).executor };
         let probabilities = executor
-            .predict_probabilities_batch(&requests)
+            .predict_probabilities_batch(&requests, ClassifierAggregation::default())
             .map_err(|error| (EXECUTION_ERROR, error.to_string()))?;
         let expected_length = request_count
             .checked_mul(query_rows)
