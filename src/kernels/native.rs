@@ -29,6 +29,141 @@ pub(crate) const fn affine_uses_sgemm(rows: usize) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64")) && rows >= SGEMM_MIN_ROWS
 }
 
+/// Longest source that `small_attention` handles; one query row's scores live on the stack.
+const SMALL_ATTENTION_MAX_SOURCES: usize = 128;
+
+/// Exact head-major attention for short sources, such as the row stage's
+/// 26-token sequences. It avoids the tiled kernel's per-pair calls. Returns
+/// false when the shape or target is not supported.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn small_attention(
+    query: &[f32],
+    query_rows: usize,
+    key: &[f32],
+    value: &[f32],
+    source_rows: usize,
+    heads: usize,
+    head_dim: usize,
+    output: &mut [f32],
+) -> bool {
+    if source_rows == 0 || source_rows > SMALL_ATTENTION_MAX_SOURCES || !head_dim.is_multiple_of(4) {
+        return false;
+    }
+    small_attention_for_target(
+        query,
+        query_rows,
+        key,
+        value,
+        source_rows,
+        heads,
+        head_dim,
+        output,
+    )
+}
+
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+fn small_attention_for_target(
+    query: &[f32],
+    query_rows: usize,
+    key: &[f32],
+    value: &[f32],
+    source_rows: usize,
+    heads: usize,
+    head_dim: usize,
+    output: &mut [f32],
+) -> bool {
+    assert!(query.len() >= heads * query_rows * head_dim && output.len() >= heads * query_rows * head_dim);
+    assert!(key.len() >= heads * source_rows * head_dim && value.len() >= heads * source_rows * head_dim);
+    // Advanced SIMD is mandatory for AArch64; the assertions bound every access.
+    unsafe {
+        small_attention_neon(
+            query,
+            query_rows,
+            key,
+            value,
+            source_rows,
+            heads,
+            head_dim,
+            output,
+        );
+    }
+    true
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+#[allow(clippy::too_many_arguments)]
+fn small_attention_for_target(
+    _query: &[f32],
+    _query_rows: usize,
+    _key: &[f32],
+    _value: &[f32],
+    _source_rows: usize,
+    _heads: usize,
+    _head_dim: usize,
+    _output: &mut [f32],
+) -> bool {
+    false
+}
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn small_attention_neon(
+    query: &[f32],
+    query_rows: usize,
+    key: &[f32],
+    value: &[f32],
+    source_rows: usize,
+    heads: usize,
+    head_dim: usize,
+    output: &mut [f32],
+) {
+    use core::arch::aarch64::{vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32, vst1q_f32};
+    let scale = (head_dim as f32).sqrt().recip();
+    let mut scores = [0.0_f32; SMALL_ATTENTION_MAX_SOURCES];
+    unsafe {
+        for head in 0..heads {
+            let key = key.as_ptr().add(head * source_rows * head_dim);
+            let value = value.as_ptr().add(head * source_rows * head_dim);
+            for row in 0..query_rows {
+                let offset = (head * query_rows + row) * head_dim;
+                let query = query.as_ptr().add(offset);
+                let output = output.as_mut_ptr().add(offset);
+                let mut maximum = f32::NEG_INFINITY;
+                for (source, score) in scores[..source_rows].iter_mut().enumerate() {
+                    let key = key.add(source * head_dim);
+                    let mut dot = vdupq_n_f32(0.0);
+                    for column in (0..head_dim).step_by(4) {
+                        dot = vfmaq_f32(dot, vld1q_f32(query.add(column)), vld1q_f32(key.add(column)));
+                    }
+                    *score = vaddvq_f32(dot) * scale;
+                    maximum = maximum.max(*score);
+                }
+                let mut sum = 0.0_f32;
+                for score in &mut scores[..source_rows] {
+                    *score = (*score - maximum).exp();
+                    sum += *score;
+                }
+                for column in (0..head_dim).step_by(4) {
+                    vst1q_f32(output.add(column), vdupq_n_f32(0.0));
+                }
+                for (source, score) in scores[..source_rows].iter().enumerate() {
+                    let weight = vdupq_n_f32(score / sum);
+                    let value = value.add(source * head_dim);
+                    for column in (0..head_dim).step_by(4) {
+                        let target = output.add(column);
+                        vst1q_f32(
+                            target,
+                            vfmaq_f32(vld1q_f32(target), weight, vld1q_f32(value.add(column))),
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Smallest `query_rows * source_rows` per head that goes to Accelerate on Apple Silicon.
 const SGEMM_MIN_ATTENTION_SCORES: usize = 4096;
 
@@ -4312,58 +4447,22 @@ mod tests {
         }
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    #[test]
-    fn accelerate_matches_naive_affine_and_attention() {
-        let values = |count: usize, seed: f32| {
-            (0..count)
-                .map(|i| ((i as f32 + seed) * 0.37).sin())
-                .collect::<Vec<_>>()
-        };
-        let (rows, input_dim, output_dim) = (33, 20, 7);
-        let (input, weight, bias) = (
-            values(rows * input_dim, 1.0),
-            values(output_dim * input_dim, 2.0),
-            values(output_dim, 3.0),
-        );
-        let mut actual = vec![0.0; rows * output_dim];
-        assert!(super::accelerate::affine(
-            &input,
-            rows,
-            input_dim,
-            &weight,
-            Some(&bias),
-            output_dim,
-            &mut actual
-        ));
-        for row in 0..rows {
-            for out in 0..output_dim {
-                let expected = bias[out]
-                    + (0..input_dim)
-                        .map(|i| input[row * input_dim + i] * weight[out * input_dim + i])
-                        .sum::<f32>();
-                assert!((actual[row * output_dim + out] - expected).abs() < 1e-4);
-            }
-        }
+    fn sine_values(count: usize, seed: f32) -> Vec<f32> {
+        (0..count).map(|i| ((i as f32 + seed) * 0.37).sin()).collect()
+    }
 
-        // More query rows than one 256-row tile, two heads.
-        let (heads, q_rows, source_rows, head_dim) = (2, 300, 9, 4);
-        let query = values(heads * q_rows * head_dim, 4.0);
-        let (key, value) = (
-            values(heads * source_rows * head_dim, 5.0),
-            values(heads * source_rows * head_dim, 6.0),
-        );
+    /// Run `kernel` on `[heads, rows, head_dim]` inputs and compare it with a
+    /// plain softmax attention loop.
+    #[allow(dead_code)] // Unused on targets without a fast attention kernel.
+    fn assert_attention_matches_naive(
+        (heads, q_rows, source_rows, head_dim): (usize, usize, usize, usize),
+        kernel: impl Fn(&[f32], &[f32], &[f32], &mut [f32]) -> bool,
+    ) {
+        let query = sine_values(heads * q_rows * head_dim, 4.0);
+        let key = sine_values(heads * source_rows * head_dim, 5.0);
+        let value = sine_values(heads * source_rows * head_dim, 6.0);
         let mut actual = vec![0.0; query.len()];
-        assert!(super::accelerate::attention(
-            &query,
-            q_rows,
-            &key,
-            &value,
-            source_rows,
-            heads,
-            head_dim,
-            &mut actual
-        ));
+        assert!(kernel(&query, &key, &value, &mut actual));
         let scale = (head_dim as f32).sqrt().recip();
         for head in 0..heads {
             for row in 0..q_rows {
@@ -4389,5 +4488,57 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn small_attention_matches_naive() {
+        // The row stage's shape, and the longest supported source.
+        for (q_rows, source_rows) in [(26, 26), (4, 26), (3, 128)] {
+            let shape = (8, q_rows, source_rows, 16);
+            assert_attention_matches_naive(shape, |query, key, value, output| {
+                super::small_attention(query, q_rows, key, value, source_rows, 8, 16, output)
+            });
+        }
+        assert!(!super::small_attention(&[], 1, &[], &[], 129, 1, 16, &mut []));
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn accelerate_matches_naive_affine_and_attention() {
+        let (rows, input_dim, output_dim) = (33, 20, 7);
+        let (input, weight, bias) = (
+            sine_values(rows * input_dim, 1.0),
+            sine_values(output_dim * input_dim, 2.0),
+            sine_values(output_dim, 3.0),
+        );
+        let mut actual = vec![0.0; rows * output_dim];
+        assert!(super::accelerate::affine(
+            &input,
+            rows,
+            input_dim,
+            &weight,
+            Some(&bias),
+            output_dim,
+            &mut actual
+        ));
+        for row in 0..rows {
+            for out in 0..output_dim {
+                let expected = bias[out]
+                    + (0..input_dim)
+                        .map(|i| input[row * input_dim + i] * weight[out * input_dim + i])
+                        .sum::<f32>();
+                assert!((actual[row * output_dim + out] - expected).abs() < 1e-4);
+            }
+        }
+
+        // More query rows than one 256-row tile, two heads.
+        let (heads, q_rows, source_rows, head_dim) = (2, 300, 9, 4);
+        assert_attention_matches_naive(
+            (heads, q_rows, source_rows, head_dim),
+            |query, key, value, output| {
+                super::accelerate::attention(query, q_rows, key, value, source_rows, heads, head_dim, output)
+            },
+        );
     }
 }
