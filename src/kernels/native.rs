@@ -100,9 +100,21 @@ mod accelerate {
     #[link(name = "Accelerate", kind = "framework")]
     unsafe extern "C" {
         fn vvexpf(output: *mut f32, input: *const f32, count: *const i32);
+        fn vDSP_maxv(input: *const f32, stride: isize, output: *mut f32, count: usize);
+        fn vDSP_vsadd(
+            input: *const f32,
+            stride: isize,
+            scalar: *const f32,
+            output: *mut f32,
+            output_stride: isize,
+            count: usize,
+        );
+        fn vDSP_sve(input: *const f32, stride: isize, output: *mut f32, count: usize);
     }
 
     /// Query rows per score tile, which bounds scratch to `ATTENTION_TILE * source_rows`.
+    /// Tiles from 16 to 1024 rows measured slower on an M1 Max: smaller tiles
+    /// lose `sgemm` efficiency faster than they gain cache locality.
     const ATTENTION_TILE: usize = 256;
 
     /// Head-major attention: `softmax(q k^T / sqrt(d)) v` for each head, with
@@ -129,14 +141,16 @@ mod accelerate {
         assert!(query.len() >= heads * q_rows * head_dim && output.len() >= heads * q_rows * head_dim);
         assert!(key.len() >= heads * source_rows * head_dim && value.len() >= heads * source_rows * head_dim);
         let scale = (head_dim as f32).sqrt().recip();
-        let mut scores = vec![0.0_f32; q_rows.min(ATTENTION_TILE) * source_rows];
+        let tile_rows = ATTENTION_TILE;
+        let mut scores = vec![0.0_f32; q_rows.min(tile_rows) * source_rows];
+        let mut sums = vec![0.0_f32; q_rows.min(tile_rows)];
         for head in 0..heads {
             let query = &query[head * q_rows * head_dim..];
             let key = &key[head * source_rows * head_dim..];
             let value = &value[head * source_rows * head_dim..];
             let output = &mut output[head * q_rows * head_dim..];
-            for start in (0..q_rows).step_by(ATTENTION_TILE) {
-                let rows = (q_rows - start).min(ATTENTION_TILE);
+            for start in (0..q_rows).step_by(tile_rows) {
+                let rows = (q_rows - start).min(tile_rows);
                 let scores = &mut scores[..rows * source_rows];
                 let tile = i32::try_from(rows).expect("tile rows fit i32");
                 // SAFETY: the assertions above keep every BLAS access inside the slices.
@@ -158,17 +172,19 @@ mod accelerate {
                         source,
                     );
                 }
-                for row in scores.chunks_exact_mut(source_rows) {
-                    let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                    for score in row.iter_mut() {
-                        *score -= maximum;
-                    }
+                // Unnormalized softmax; the output rows are divided by the sums below,
+                // which touches `head_dim` values per row instead of `source_rows`.
+                for (row, sum) in scores.chunks_exact_mut(source_rows).zip(&mut sums) {
                     let row_ptr = row.as_mut_ptr();
-                    // SAFETY: `row` holds exactly `source` values; vvexpf works in place.
-                    unsafe { vvexpf(row_ptr, row_ptr, &raw const source) };
-                    let scale = row.iter().sum::<f32>().recip();
-                    for score in row.iter_mut() {
-                        *score *= scale;
+                    let mut negated_maximum = 0.0_f32;
+                    // SAFETY: `row` holds exactly `source_rows` values; these vDSP and
+                    // vForce calls read and write only that range, in place.
+                    unsafe {
+                        vDSP_maxv(row_ptr, 1, &raw mut negated_maximum, source_rows);
+                        negated_maximum = -negated_maximum;
+                        vDSP_vsadd(row_ptr, 1, &raw const negated_maximum, row_ptr, 1, source_rows);
+                        vvexpf(row_ptr, row_ptr, &raw const source);
+                        vDSP_sve(row_ptr, 1, sum, source_rows);
                     }
                 }
                 // SAFETY: as above.
@@ -189,6 +205,13 @@ mod accelerate {
                         output[start * head_dim..].as_mut_ptr(),
                         dim,
                     );
+                }
+                let output = &mut output[start * head_dim..][..rows * head_dim];
+                for (row, sum) in output.chunks_exact_mut(head_dim).zip(&sums) {
+                    let scale = sum.recip();
+                    for value in row {
+                        *value *= scale;
+                    }
                 }
             }
         }
