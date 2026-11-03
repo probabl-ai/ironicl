@@ -21,4 +21,4 @@ license-files = ["LICENSE", "LICENSES/TabICL-BSD-3-Clause.txt"]
 [tool.maturin]
 python-source = "python"
 module-name = "ironicl._core"
-features = ["python"]
+features = ["python", "metal"]

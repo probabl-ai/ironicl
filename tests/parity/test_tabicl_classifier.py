@@ -39,15 +39,17 @@ class TabICLClassifierParityTest(unittest.TestCase):
 
     def test_predictions_match(self):
         cases = [
-            (load_iris, {}),
-            (load_wine, {"n_estimators": 3, "average_logits": False, "softmax_temperature": 0.5}),
-            (load_breast_cancer, {"norm_methods": "power", "random_state": 7}),
+            (load_iris, 96, 32, {}),
+            (load_wine, 96, 32, {"n_estimators": 3, "average_logits": False, "softmax_temperature": 0.5}),
+            (load_breast_cancer, 96, 32, {"norm_methods": "power", "random_state": 7}),
+            # Large enough for Ironicl's Metal ICL path on Apple Silicon.
+            (load_breast_cancer, 400, 169, {}),
         ]
-        for load, params in cases:
-            with self.subTest(dataset=load.__name__, **params):
+        for load, train_size, test_size, params in cases:
+            with self.subTest(dataset=load.__name__, train_size=train_size, **params):
                 x, y = load(return_X_y=True)
                 x_train, x_test, y_train, _ = train_test_split(
-                    x, y, train_size=96, test_size=32, random_state=0, stratify=y
+                    x, y, train_size=train_size, test_size=test_size, random_state=0, stratify=y
                 )
                 ours = TabICLClassifier(model_path=self.checkpoint, **params).fit(x_train, y_train)
                 theirs = self.upstream(model_path=self.checkpoint, device="cpu", **params)

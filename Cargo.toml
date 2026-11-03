@@ -18,6 +18,13 @@ path = "src/main.rs"
 [features]
 default = ["checkpoint"]
 checkpoint = ["dep:candle-core", "dep:zip"]
+metal = [
+    "dep:objc2",
+    "dep:objc2-foundation",
+    "dep:objc2-metal",
+    "dep:objc2-metal-performance-shaders",
+    "dep:objc2-metal-performance-shaders-graph",
+]
 profile = []
 python = ["checkpoint", "dep:pyo3"]
 
@@ -31,6 +38,45 @@ pyo3 = { version = "0.30.1", features = ["abi3-py312"], optional = true }
 rayon = "1.12.0"
 sha2 = "0.11.1"
 zip = { version = "9.3.0", default-features = false, optional = true }
+
+# The Metal backend: Apple Silicon only, behind the `metal` feature.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+objc2 = { version = "0.6.5", optional = true }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSData",
+    "NSDictionary",
+    "NSValue",
+], optional = true }
+objc2-metal = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "MTLAllocation",
+    "MTLBuffer",
+    "MTLCommandQueue",
+    "MTLDevice",
+    "MTLResource",
+], optional = true }
+objc2-metal-performance-shaders = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "MPSCoreTypes",
+], optional = true }
+objc2-metal-performance-shaders-graph = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "objc2-metal-performance-shaders",
+    "MPSGraph",
+    "MPSGraphActivationOps",
+    "MPSGraphArithmeticOps",
+    "MPSGraphCore",
+    "MPSGraphDevice",
+    "MPSGraphMatrixMultiplicationOps",
+    "MPSGraphMemoryOps",
+    "MPSGraphNormalizationOps",
+    "MPSGraphOperation",
+    "MPSGraphTensor",
+    "MPSGraphTensorData",
+    "MPSGraphTensorShapeOps",
+], optional = true }
 
 [dev-dependencies]
 tempfile = "3.27.0"

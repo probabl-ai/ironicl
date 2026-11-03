@@ -19,9 +19,10 @@ training context once, stores it, and then answers new test rows against it.
 
 | Works now | Not yet |
 |---|---|
-| Safe checkpoint import in pure Rust (no pickle execution) | Fast context building on non-Zen 5 CPUs |
+| Safe checkpoint import in pure Rust (no pickle execution) | Context building on the GPU |
 | FP32 classifier inference on any CPU | Regression |
 | Static training context with AVX-512 kernels on Zen 5 | Categorical features and missing values |
+| Accelerate kernels and a Metal ICL stage on Apple Silicon | Column and row stages on the GPU |
 | Python `TabICLClassifier`, a drop-in for TabICL's | Published packages on crates.io or PyPI |
 
 ## Quickstart
