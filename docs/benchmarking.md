@@ -19,6 +19,9 @@ IRONICL_THREADS=8 cargo run --release --no-default-features -- benchmark \
   --warmup 5 --iterations 50
 ```
 
+Without `IRONICL_THREADS`, the executor uses half the logical CPUs on x86-64,
+the performance-core count on macOS, and all logical CPUs elsewhere.
+
 Add `--probabilities` to cached mode to time class-permutation correction,
 estimator averaging, and final probability production. Set
 `IRONICL_SERIAL_ENSEMBLES=1` only for a control run that disables automatic

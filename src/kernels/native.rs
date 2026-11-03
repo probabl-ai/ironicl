@@ -58,7 +58,16 @@ pub(crate) fn attention_sgemm(
             output,
         );
     }
-    let _ = (query, query_rows, key, value, source_rows, heads, head_dim, output);
+    let _ = (
+        query,
+        query_rows,
+        key,
+        value,
+        source_rows,
+        heads,
+        head_dim,
+        output,
+    );
     false
 }
 
