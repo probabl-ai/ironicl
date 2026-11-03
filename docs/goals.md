@@ -2,9 +2,19 @@
 
 ## Goal
 
-Build a CPU inference engine for released TabICLv2 checkpoints that minimizes
+Build an inference engine for released TabICLv2 checkpoints that minimizes
 latency and maximizes throughput when the training table is static and test rows
-arrive repeatedly.
+arrive repeatedly. It runs on the compute built into the host, with no PyTorch:
+
+- CPU vector units on every host;
+- on Apple Silicon, also the matrix coprocessor (through Accelerate) and the
+  integrated GPU (through Metal). These share the CPU's memory, so a training
+  context needs no copy to reach them;
+- on Apple Silicon, the Neural Engine (through Core ML) as an opt-in experiment.
+  It computes in FP16, so it needs its own accuracy gate, like the BF16 variants:
+  full label agreement and a bounded probability error, not the FP32 `1e-4`
+  tolerance. FP16 overflows above 65504, which BF16 does not, so the gate must
+  cover attention scores and activations.
 
 The first optimized target is:
 
@@ -16,8 +26,9 @@ The first optimized target is:
 - a fixed feature schema and training context;
 - one-row latency and 8-16-row microbatch throughput.
 
-The project must continue to build and run correctness tests on macOS and Apple
-M1 Max through portable Rust code.
+The second target is Apple Silicon (M1 Max and later), using all of its
+built-in compute units. The project must also build and run correctness tests
+on other hosts through portable Rust code.
 
 ## Required Outcomes
 
@@ -33,7 +44,7 @@ M1 Max through portable Rust code.
 ## Initial Non-Goals
 
 - Pretraining or fine-tuning TabICLv2.
-- CUDA, ROCm, Metal, or NPU execution.
+- Discrete-GPU runtimes such as CUDA and ROCm.
 - More than 10 classifier classes in the cached path.
 - Exact online insertion or deletion of training rows.
 - Bitwise parity across PyTorch, operating systems, or CPU architectures.

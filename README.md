@@ -4,10 +4,10 @@
 [![Python preprocessing](https://github.com/probabl-ai/ironicl/actions/workflows/python.yml/badge.svg)](https://github.com/probabl-ai/ironicl/actions/workflows/python.yml)
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
 
-Ironicl is a CPU inference engine for [TabICLv2](https://github.com/soda-inria/tabicl),
-written in Rust. It is built for a training table that does not change: Ironicl
-computes the training context once, stores it, and then answers new test rows
-against it.
+Ironicl is an inference engine for [TabICLv2](https://github.com/soda-inria/tabicl),
+written in Rust. It runs without PyTorch on the compute built into the host. It
+is built for a training table that does not change: Ironicl computes the
+training context once, stores it, and then answers new test rows against it.
 
 > [!WARNING]
 > Ironicl is experimental. Formats, commands, and APIs can change without notice.
