@@ -18,10 +18,10 @@ against it.
 
 | Works now | Not yet |
 |---|---|
-| Safe checkpoint import in pure Rust (no pickle execution) | Python classifier API |
+| Safe checkpoint import in pure Rust (no pickle execution) | Fast static context from Python |
 | FP32 classifier inference on any CPU | Regression |
 | Static training context with AVX-512 kernels on Zen 5 | Categorical features and missing values |
-| Python preprocessing package | Published packages on crates.io or PyPI |
+| Python `TabICLClassifier`, a drop-in for TabICL's | Published packages on crates.io or PyPI |
 
 ## Quickstart
 
@@ -70,21 +70,20 @@ You need Rust (via [rustup](https://rustup.rs)) and Python 3.12 or newer.
 See the [command-line reference](docs/cli.md) for `inspect`, `plan`, `platform`,
 and `benchmark`.
 
-## Python Preprocessing
+## Python Package
 
-The `ironicl` Python package reproduces TabICLv2 classifier preprocessing
-without PyTorch or TabICL:
+The `ironicl` Python package replaces TabICL's classifier without PyTorch.
+Change only the import:
 
 ```python
-from ironicl.preprocessing import ClassifierPreprocessor
+from ironicl import TabICLClassifier  # was: from tabicl import TabICLClassifier
 
-preprocessor = ClassifierPreprocessor(n_estimators=8, random_state=42)
-training_groups = preprocessor.fit_transform(X_train, y_train)
-query_groups = preprocessor.transform(X_query)
+clf = TabICLClassifier(n_estimators=8, random_state=42).fit(X_train, y_train)
+proba = clf.predict_proba(X_test)
 ```
 
-It does not make predictions yet. See [Python preprocessing](docs/python.md) for
-supported inputs and version requirements.
+Building the package needs Rust. Prediction currently uses the slower uncached
+path. See [Python package](docs/python.md) for supported inputs.
 
 ## Documentation
 

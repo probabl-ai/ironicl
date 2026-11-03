@@ -10,6 +10,7 @@ lint-rust:
 	cargo fmt --all -- --check
 	cargo clippy --locked --all-targets -- -D warnings
 	cargo clippy --locked --all-targets --no-default-features -- -D warnings
+	cargo clippy --locked --all-targets --features python -- -D warnings
 
 test-python:
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py' -v

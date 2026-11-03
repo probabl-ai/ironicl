@@ -18,6 +18,8 @@ pub mod kernels;
 pub mod model_artifact;
 pub mod platform;
 pub mod profile;
+#[cfg(feature = "python")]
+mod python;
 pub mod query_bundle;
 pub mod static_context;
 

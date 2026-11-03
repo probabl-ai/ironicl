@@ -94,12 +94,12 @@ The Python targets use `python3` from `PATH`. Override the interpreter when need
 make test-python PYTHON=/path/to/venv/bin/python
 ```
 
-The Python targets do not install dependencies. None of the targets downloads model
-checkpoints. Rust checks may download the pinned toolchain and Cargo dependencies
+The Python targets do not install dependencies. Only `make test-parity` downloads
+the released classifier checkpoint. Rust checks may download the pinned toolchain and Cargo dependencies
 on first use. To fix Rust formatting, run `cargo fmt --all`; `make lint-rust` only
 checks it.
 
-### Live preprocessing parity
+### Live TabICL parity
 
 Follow [the parity setup instructions](docs/validation.md#python-preprocessing-parity)
 to install the Ironicl wheel and pinned TabICL checkout in a separate environment.

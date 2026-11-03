@@ -1,11 +1,11 @@
 [build-system]
-requires = ["setuptools>=77"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
 
 [project]
 name = "ironicl"
 version = "0.1.0"
-description = "Python preprocessing for the Ironicl CPU inference engine"
+description = "TabICLv2 classifier inference on CPU, without PyTorch"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -18,5 +18,7 @@ dependencies = [
 license = "BSD-3-Clause"
 license-files = ["LICENSE", "LICENSES/TabICL-BSD-3-Clause.txt"]
 
-[tool.setuptools.packages.find]
-where = ["python"]
+[tool.maturin]
+python-source = "python"
+module-name = "ironicl._core"
+features = ["python"]
