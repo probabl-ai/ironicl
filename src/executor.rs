@@ -580,7 +580,8 @@ impl ClassifierExecutor {
         };
         #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
         if let Some(tensors) = self.build_tensors_gpu((b, n, h), x, y_train)? {
-            let context = StaticContextArtifact::from_page_aligned(metadata, tensors)?;
+            // The build graph checked every value on the GPU.
+            let context = StaticContextArtifact::from_page_aligned(metadata, tensors, true)?;
             return StaticClassifierExecutor::with_executor(self.clone(), context);
         }
         let streams = h + RESERVED;

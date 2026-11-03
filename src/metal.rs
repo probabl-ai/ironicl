@@ -832,7 +832,8 @@ impl PredictGraph {
 /// `icl_labels` `[B, N, 512]`. The keys and values are written in place into
 /// `outputs`, page-aligned regions in context order: each column block's key
 /// and value as `[B, H + 4, 8, 128, 16]` with zero reserved streams, then each
-/// ICL block's as `[B, 8, N, 64]`.
+/// ICL block's as `[B, 8, N, 64]`. Returns an error if any written value is
+/// not finite.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // One linear graph definition.
 pub(crate) fn build_context(
     model: &ModelWeights,
@@ -972,16 +973,39 @@ pub(crate) fn build_context(
     if targets.len() != outputs.len() {
         return Err(metal_error("context output regions do not match the graph"));
     }
-    let outputs = targets
+    // One NaN-propagating max |value| over every output, so the CPU checks a
+    // single float instead of scanning the whole context.
+    let largest = targets
+        .iter()
+        .map(|(tensor, _)| unsafe {
+            builder.graph.reductionMaximumPropagateNaNWithTensor_axis_name(
+                &builder.reshape(&builder.graph.absoluteWithTensor_name(tensor, None), &[-1]),
+                0,
+                None,
+            )
+        })
+        .reduce(|left, right| unsafe {
+            builder
+                .graph
+                .maximumWithNaNPropagationWithPrimaryTensor_secondaryTensor_name(&left, &right, None)
+        })
+        .ok_or_else(|| metal_error("context has no outputs"))?;
+    let mut outputs = targets
         .into_iter()
         .zip(outputs)
         .map(|((tensor, dimensions), &(pointer, bytes))| Ok((tensor, gpu.wrap(pointer, bytes)?, dimensions)))
         .collect::<Result<Vec<Binding>>>()?;
+    outputs.push((largest, gpu.empty(1)?, vec![1]));
     let bindings = builder.bindings.into_inner();
     gpu.run(
         &builder.graph,
         &bindings.iter().collect::<Vec<_>>(),
         &outputs.iter().collect::<Vec<_>>(),
     );
+    // SAFETY: the run is complete and wrote one float.
+    let largest = unsafe { *outputs[outputs.len() - 1].1.contents().as_ptr().cast::<f32>() };
+    if !largest.is_finite() {
+        return Err(metal_error("the built context contains a non-finite value"));
+    }
     Ok(())
 }
