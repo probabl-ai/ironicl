@@ -20,7 +20,10 @@ The initial scalar `dot_f32` and `softmax_f32` functions are contracts, not
 performance implementations.
 
 The current affine kernel dispatches to custom NEON on AArch64 and AVX-512F on
-supported x86-64 hosts, with scalar fallback. Cached attention selects its
+supported x86-64 hosts, with scalar fallback. On macOS, affine layers with at
+least 16 rows and attention with at least 4096 scores per head call Accelerate's
+`cblas_sgemm` instead; Accelerate runs them on the matrix coprocessor. Batching
+the row stage across rows measured slower on an M1 Max, so it stays per row. Cached attention selects its
 backend once per executor. The AVX-512 path implements score tiles and
 softmax-weighted V tiles; portable execution retains the FP32 reference path.
 

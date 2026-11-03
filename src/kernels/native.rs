@@ -18,6 +18,224 @@ const BF16_AFFINE_OUTPUT_BLOCK: usize = 16;
 const BF16_AFFINE_MAX_ROWS: usize = 8;
 const MAX_PACKED_ATTENTION_QUERY_ROWS: usize = 16;
 const SQRT_2: f32 = core::f32::consts::SQRT_2;
+/// Smallest affine row count that goes to Accelerate on macOS. Thresholds
+/// from 4 to 64 rows and 1024 to 16384 scores measured the same on an M1 Max.
+const SGEMM_MIN_ROWS: usize = 16;
+
+/// Whether an affine layer with `rows` input rows runs as one Accelerate
+/// `sgemm`. Callers then skip their own row splitting: Accelerate uses the
+/// matrix coprocessor, which all cores in a cluster share.
+pub(crate) const fn affine_uses_sgemm(rows: usize) -> bool {
+    cfg!(target_os = "macos") && rows >= SGEMM_MIN_ROWS
+}
+
+/// Smallest `query_rows * source_rows` per head that goes to Accelerate on macOS.
+const SGEMM_MIN_ATTENTION_SCORES: usize = 4096;
+
+/// Run head-major attention through Accelerate on macOS when it is large
+/// enough. Returns false when the caller must use its own kernel.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attention_sgemm(
+    query: &[f32],
+    query_rows: usize,
+    key: &[f32],
+    value: &[f32],
+    source_rows: usize,
+    heads: usize,
+    head_dim: usize,
+    output: &mut [f32],
+) -> bool {
+    #[cfg(target_os = "macos")]
+    if query_rows * source_rows >= SGEMM_MIN_ATTENTION_SCORES {
+        return accelerate::attention(
+            query,
+            query_rows,
+            key,
+            value,
+            source_rows,
+            heads,
+            head_dim,
+            output,
+        );
+    }
+    let _ = (query, query_rows, key, value, source_rows, heads, head_dim, output);
+    false
+}
+
+#[cfg(target_os = "macos")]
+mod accelerate {
+    const ROW_MAJOR: i32 = 101;
+    const NO_TRANS: i32 = 111;
+    const TRANS: i32 = 112;
+
+    #[link(name = "Accelerate", kind = "framework")]
+    unsafe extern "C" {
+        fn cblas_sgemm(
+            order: i32,
+            trans_a: i32,
+            trans_b: i32,
+            m: i32,
+            n: i32,
+            k: i32,
+            alpha: f32,
+            a: *const f32,
+            lda: i32,
+            b: *const f32,
+            ldb: i32,
+            beta: f32,
+            c: *mut f32,
+            ldc: i32,
+        );
+    }
+
+    #[link(name = "Accelerate", kind = "framework")]
+    unsafe extern "C" {
+        fn vvexpf(output: *mut f32, input: *const f32, count: *const i32);
+    }
+
+    /// Query rows per score tile, which bounds scratch to `ATTENTION_TILE * source_rows`.
+    const ATTENTION_TILE: usize = 256;
+
+    /// Head-major attention: `softmax(q k^T / sqrt(d)) v` for each head, with
+    /// `query` and `output` `[heads, q_rows, d]` and `key`, `value` `[heads, source_rows, d]`.
+    /// Returns false when a dimension does not fit the BLAS integer type.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn attention(
+        query: &[f32],
+        q_rows: usize,
+        key: &[f32],
+        value: &[f32],
+        source_rows: usize,
+        heads: usize,
+        head_dim: usize,
+        output: &mut [f32],
+    ) -> bool {
+        let (Ok(source), Ok(dim), Ok(_)) = (
+            i32::try_from(source_rows),
+            i32::try_from(head_dim),
+            i32::try_from(q_rows.min(ATTENTION_TILE) * source_rows),
+        ) else {
+            return false;
+        };
+        assert!(query.len() >= heads * q_rows * head_dim && output.len() >= heads * q_rows * head_dim);
+        assert!(key.len() >= heads * source_rows * head_dim && value.len() >= heads * source_rows * head_dim);
+        let scale = (head_dim as f32).sqrt().recip();
+        let mut scores = vec![0.0_f32; q_rows.min(ATTENTION_TILE) * source_rows];
+        for head in 0..heads {
+            let query = &query[head * q_rows * head_dim..];
+            let key = &key[head * source_rows * head_dim..];
+            let value = &value[head * source_rows * head_dim..];
+            let output = &mut output[head * q_rows * head_dim..];
+            for start in (0..q_rows).step_by(ATTENTION_TILE) {
+                let rows = (q_rows - start).min(ATTENTION_TILE);
+                let scores = &mut scores[..rows * source_rows];
+                let tile = i32::try_from(rows).expect("tile rows fit i32");
+                // SAFETY: the assertions above keep every BLAS access inside the slices.
+                unsafe {
+                    cblas_sgemm(
+                        ROW_MAJOR,
+                        NO_TRANS,
+                        TRANS,
+                        tile,
+                        source,
+                        dim,
+                        scale,
+                        query[start * head_dim..].as_ptr(),
+                        dim,
+                        key.as_ptr(),
+                        dim,
+                        0.0,
+                        scores.as_mut_ptr(),
+                        source,
+                    );
+                }
+                for row in scores.chunks_exact_mut(source_rows) {
+                    let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    for score in row.iter_mut() {
+                        *score -= maximum;
+                    }
+                    let row_ptr = row.as_mut_ptr();
+                    // SAFETY: `row` holds exactly `source` values; vvexpf works in place.
+                    unsafe { vvexpf(row_ptr, row_ptr, &raw const source) };
+                    let scale = row.iter().sum::<f32>().recip();
+                    for score in row.iter_mut() {
+                        *score *= scale;
+                    }
+                }
+                // SAFETY: as above.
+                unsafe {
+                    cblas_sgemm(
+                        ROW_MAJOR,
+                        NO_TRANS,
+                        NO_TRANS,
+                        tile,
+                        dim,
+                        source,
+                        1.0,
+                        scores.as_ptr(),
+                        source,
+                        value.as_ptr(),
+                        dim,
+                        0.0,
+                        output[start * head_dim..].as_mut_ptr(),
+                        dim,
+                    );
+                }
+            }
+        }
+        true
+    }
+
+    /// `output[rows, out] = input[rows, in] * weight[out, in]^T + bias`.
+    /// Returns false when a dimension does not fit the BLAS integer type.
+    pub(super) fn affine(
+        input: &[f32],
+        rows: usize,
+        input_dim: usize,
+        weight: &[f32],
+        bias: Option<&[f32]>,
+        output_dim: usize,
+        output: &mut [f32],
+    ) -> bool {
+        let (Ok(m), Ok(n), Ok(k)) = (
+            i32::try_from(rows),
+            i32::try_from(output_dim),
+            i32::try_from(input_dim),
+        ) else {
+            return false;
+        };
+        assert!(input.len() >= rows * input_dim && weight.len() >= output_dim * input_dim);
+        assert!(output.len() >= rows * output_dim);
+        match bias {
+            Some(bias) => {
+                for row in output[..rows * output_dim].chunks_exact_mut(output_dim) {
+                    row.copy_from_slice(&bias[..output_dim]);
+                }
+            }
+            None => output[..rows * output_dim].fill(0.0),
+        }
+        // SAFETY: the assertions above keep every BLAS access inside the slices.
+        unsafe {
+            cblas_sgemm(
+                ROW_MAJOR,
+                NO_TRANS,
+                TRANS,
+                m,
+                n,
+                k,
+                1.0,
+                input.as_ptr(),
+                k,
+                weight.as_ptr(),
+                k,
+                1.0,
+                output.as_mut_ptr(),
+                n,
+            );
+        }
+        true
+    }
+}
 
 /// FP32 affine weights packed as `[output_block, input, output_lane]`.
 #[derive(Debug, Clone, PartialEq)]
@@ -2509,6 +2727,11 @@ fn affine_for_target(
     output_dim: usize,
     output: &mut [f32],
 ) -> bool {
+    #[cfg(target_os = "macos")]
+    if affine_uses_sgemm(rows) && accelerate::affine(input, rows, input_dim, weight, bias, output_dim, output)
+    {
+        return true;
+    }
     // Advanced SIMD is mandatory for AArch64, including Apple Silicon.
     unsafe {
         affine_neon(input, rows, input_dim, weight, bias, output_dim, output);
@@ -3981,6 +4204,85 @@ mod tests {
         for (actual, expected) in actual.iter().zip(expected) {
             let tolerance = 1e-5 + 1e-5 * expected.abs();
             assert!((actual - expected).abs() <= tolerance);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn accelerate_matches_naive_affine_and_attention() {
+        let values = |count: usize, seed: f32| {
+            (0..count)
+                .map(|i| ((i as f32 + seed) * 0.37).sin())
+                .collect::<Vec<_>>()
+        };
+        let (rows, input_dim, output_dim) = (33, 20, 7);
+        let (input, weight, bias) = (
+            values(rows * input_dim, 1.0),
+            values(output_dim * input_dim, 2.0),
+            values(output_dim, 3.0),
+        );
+        let mut actual = vec![0.0; rows * output_dim];
+        assert!(super::accelerate::affine(
+            &input,
+            rows,
+            input_dim,
+            &weight,
+            Some(&bias),
+            output_dim,
+            &mut actual
+        ));
+        for row in 0..rows {
+            for out in 0..output_dim {
+                let expected = bias[out]
+                    + (0..input_dim)
+                        .map(|i| input[row * input_dim + i] * weight[out * input_dim + i])
+                        .sum::<f32>();
+                assert!((actual[row * output_dim + out] - expected).abs() < 1e-4);
+            }
+        }
+
+        // More query rows than one 256-row tile, two heads.
+        let (heads, q_rows, source_rows, head_dim) = (2, 300, 9, 4);
+        let query = values(heads * q_rows * head_dim, 4.0);
+        let (key, value) = (
+            values(heads * source_rows * head_dim, 5.0),
+            values(heads * source_rows * head_dim, 6.0),
+        );
+        let mut actual = vec![0.0; query.len()];
+        assert!(super::accelerate::attention(
+            &query,
+            q_rows,
+            &key,
+            &value,
+            source_rows,
+            heads,
+            head_dim,
+            &mut actual
+        ));
+        let scale = (head_dim as f32).sqrt().recip();
+        for head in 0..heads {
+            for row in 0..q_rows {
+                let q = &query[(head * q_rows + row) * head_dim..][..head_dim];
+                let scores = (0..source_rows)
+                    .map(|source| {
+                        let k = &key[(head * source_rows + source) * head_dim..][..head_dim];
+                        q.iter().zip(k).map(|(a, b)| a * b).sum::<f32>() * scale
+                    })
+                    .collect::<Vec<_>>();
+                let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let weights = scores
+                    .iter()
+                    .map(|score| (score - maximum).exp())
+                    .collect::<Vec<_>>();
+                let total = weights.iter().sum::<f32>();
+                for dim in 0..head_dim {
+                    let expected = (0..source_rows)
+                        .map(|source| weights[source] * value[(head * source_rows + source) * head_dim + dim])
+                        .sum::<f32>()
+                        / total;
+                    assert!((actual[(head * q_rows + row) * head_dim + dim] - expected).abs() < 1e-5);
+                }
+            }
         }
     }
 }
