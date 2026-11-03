@@ -26,13 +26,16 @@ Accelerate's `cblas_sgemm` instead; Accelerate runs them on the matrix
 coprocessor. Batching the row stage across rows measured slower on an M1 Max, so
 it stays per row.
 
-With the `metal` cargo feature on Apple Silicon, large query batches run the
-twelve cached ICL blocks and the decoder on the GPU as one `MPSGraph`, once per
-estimator; the CPU still runs the column and row stages. A context copies its
-FP32 ICL keys and values into shared Metal buffers when it is built. The GPU
-path starts at 49,152 query-times-training rows, the M1 Max crossover, and
-`IRONICL_NO_METAL=1` disables it. On macOS 27, `MPSGraph` prints "Failed to
-import MPS module" once per compiled shape; results are unaffected.
+With the `metal` cargo feature on Apple Silicon, large query batches run every
+stage on the GPU with `MPSGraph`, one estimator at a time: a per-context front
+graph runs the column and row stages, and a per-model graph runs the twelve cached
+ICL blocks and the decoder, reading the front graph's rows from a shared buffer.
+The CPU only groups each feature with its neighbors, and keeps a request whose
+grouped inputs contain the all-missing marker. A context copies its FP32 keys and
+values into shared Metal buffers when it is built. The GPU path starts at 49,152
+query-times-training rows, the M1 Max crossover, and `IRONICL_NO_METAL=1` disables
+it. On macOS 27, `MPSGraph` prints "Failed to import MPS module" once per compiled
+shape; results are unaffected.
 
 Cached attention selects its backend once per executor. The AVX-512 path
 implements score tiles and softmax-weighted V tiles; portable execution retains
