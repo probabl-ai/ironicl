@@ -26,19 +26,20 @@ Accelerate's `cblas_sgemm` instead; Accelerate runs them on the matrix
 coprocessor. Batching the row stage across rows measured slower on an M1 Max, so
 it stays per row.
 
-With the `metal` cargo feature on Apple Silicon, large query batches run every
-stage on the GPU with `MPSGraph`, one estimator at a time: a per-context front
-graph runs the column and row stages, and a per-model graph runs the twelve cached
-ICL blocks and the decoder, reading the front graph's rows from a shared buffer.
-Building a context with at least 222 training rows also runs on the GPU: a
-fixed-shape graph per context passes the training rows through every stage once
-and captures each column and ICL block's keys and values. The CPU only groups each
-feature with its neighbors and embeds labels, and keeps any request whose grouped
-inputs contain the all-missing marker. A context copies its FP32 keys and values
-into shared Metal buffers. The GPU paths start at 49,152 query-times-training (or
-training-squared) rows, the M1 Max crossover, and `IRONICL_NO_METAL=1` disables
-them. On macOS 27, `MPSGraph` prints "Failed to import MPS module" once per
-compiled shape; results are unaffected.
+With the `metal` cargo feature on Apple Silicon, each context gets two `MPSGraph`
+graphs with its ensemble, feature, and training-row counts fixed. The predict
+graph runs the column, row, and ICL stages and the decoder for every estimator in
+one run, with only the query count unknown; one batched run beat the CPU on an M1
+Max from a single query row, so prediction always uses it. The build graph runs
+the training rows through every stage once and captures each column and ICL
+block's keys and values; its graph setup costs about 250 ms, so contexts with
+fewer than 160 training rows build on the CPU. Model weights live once per model
+in shared GPU buffers and are fed to the graphs as placeholders. The CPU only
+groups each feature with its neighbors and embeds labels, and keeps any request
+whose grouped inputs contain the all-missing marker. A context copies its FP32
+keys and values into shared Metal buffers. `IRONICL_NO_METAL=1` disables the GPU.
+On macOS 27, `MPSGraph` prints "Failed to import MPS module" once per compiled
+shape; results are unaffected.
 
 Cached attention selects its backend once per executor. The AVX-512 path
 implements score tiles and softmax-weighted V tiles; portable execution retains
