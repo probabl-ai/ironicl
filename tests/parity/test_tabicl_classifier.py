@@ -30,11 +30,15 @@ class TabICLClassifierParityTest(unittest.TestCase):
         cls.checkpoint = hub.hf_hub_download("jingang/TabICL", CHECKPOINT)
 
     def test_public_signatures_match(self):
+        # TabICL's parameters in order, then Ironicl's own trailing keywords.
+        extras = {"__init__": [("optimize", None)]}
         for name in ("__init__", "fit", "predict_proba", "predict"):
             ours = inspect.signature(getattr(TabICLClassifier, name)).parameters.values()
             theirs = inspect.signature(getattr(self.upstream, name)).parameters.values()
             self.assertEqual(
-                [(p.name, p.default) for p in ours], [(p.name, p.default) for p in theirs], name
+                [(p.name, p.default) for p in ours],
+                [(p.name, p.default) for p in theirs] + extras.get(name, []),
+                name,
             )
 
     def test_predictions_match(self):
@@ -66,6 +70,34 @@ class TabICLClassifierParityTest(unittest.TestCase):
             clf.fit([[0.0], [1.0]], [0, 1])
         with self.assertRaises(NotFittedError):
             clf.predict([[0.0]])
+
+
+    def test_optimize_levels_stay_within_their_bounds(self):
+        # Reduced levels against "safe" (M1 Max measurements on 12 datasets:
+        # max 4.9e-4, mean 2.3e-5). Labels may differ only on near-ties. Without
+        # a Metal GPU every level is "safe" and the bounds hold trivially.
+        bounds = {"auto": (1e-3, 1e-4), "fast": (1e-2, 1e-3)}
+        x, y = load_breast_cancer(return_X_y=True)
+        x_train, x_test, y_train, _ = train_test_split(
+            x, y, train_size=400, test_size=169, random_state=0, stratify=y
+        )
+        safe = TabICLClassifier(model_path=self.checkpoint, optimize="safe").fit(x_train, y_train)
+        expected = safe.predict_proba(x_test)
+        for optimize, (max_error, mean_error) in bounds.items():
+            with self.subTest(optimize=optimize):
+                clf = TabICLClassifier(model_path=self.checkpoint, optimize=optimize)
+                actual = clf.fit(x_train, y_train).predict_proba(x_test)
+                error = np.abs(actual - expected)
+                self.assertLessEqual(error.max(), max_error)
+                self.assertLessEqual(error.mean(), mean_error)
+                top = np.sort(expected, axis=1)
+                near_tie = top[:, -1] - top[:, -2] < 2 * max_error
+                flipped = actual.argmax(1) != expected.argmax(1)
+                self.assertFalse((flipped & ~near_tie).any())
+
+    def test_optimize_rejects_unknown_levels(self):
+        with self.assertRaisesRegex(ValueError, "optimize"):
+            TabICLClassifier(model_path=self.checkpoint, optimize="turbo").fit([[0.0], [1.0]], [0, 1])
 
 
 if __name__ == "__main__":

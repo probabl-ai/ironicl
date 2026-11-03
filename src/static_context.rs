@@ -72,6 +72,8 @@ pub struct StaticContextTensor {
 pub enum StaticContextTensorData<'a> {
     Fp32(&'a [f32]),
     Bf16(&'a [u16]),
+    /// IEEE half precision, written by GPU-built contexts under `optimize="auto"`.
+    F16(&'a [u16]),
 }
 
 impl StaticContextTensorData<'_> {
@@ -79,7 +81,7 @@ impl StaticContextTensorData<'_> {
     pub const fn len(self) -> usize {
         match self {
             Self::Fp32(values) => values.len(),
-            Self::Bf16(values) => values.len(),
+            Self::Bf16(values) | Self::F16(values) => values.len(),
         }
     }
 
@@ -93,6 +95,7 @@ impl StaticContextTensorData<'_> {
         match self {
             Self::Fp32(values) => Self::Fp32(&values[start..][..length]),
             Self::Bf16(values) => Self::Bf16(&values[start..][..length]),
+            Self::F16(values) => Self::F16(&values[start..][..length]),
         }
     }
 }
@@ -110,7 +113,7 @@ impl<'a> StaticContextTensorRef<'a> {
     pub const fn fp32_values(self) -> Option<&'a [f32]> {
         match self.data {
             StaticContextTensorData::Fp32(values) => Some(values),
-            StaticContextTensorData::Bf16(_) => None,
+            StaticContextTensorData::Bf16(_) | StaticContextTensorData::F16(_) => None,
         }
     }
 }
@@ -120,6 +123,7 @@ enum StaticContextTensorValues {
     Owned(Vec<f32>),
     MappedFp32 { byte_offset: usize, byte_length: usize },
     MappedBf16 { byte_offset: usize, byte_length: usize },
+    MappedF16 { byte_offset: usize, byte_length: usize },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -157,8 +161,33 @@ pub(crate) const TENSOR_PAGE_BYTES: usize = 16 * 1024;
 )] // Metal only.
 pub(crate) struct PageAlignedTensors {
     mapping: MmapMut,
-    /// Name, dimensions, byte offset, and byte length of each tensor.
-    layout: Vec<(String, Vec<u64>, usize, usize)>,
+    /// Name, dimensions, element type, byte offset, and byte length of each tensor.
+    layout: Vec<(String, Vec<u64>, TensorStorage, usize, usize)>,
+}
+
+/// The element type of a page-aligned tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)] // Metal only.
+pub(crate) enum TensorStorage {
+    Fp32,
+    F16,
+    Bf16,
+}
+
+#[cfg_attr(
+    not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
+    allow(dead_code)
+)] // Metal only.
+impl TensorStorage {
+    pub(crate) const fn bytes(self) -> usize {
+        match self {
+            Self::Fp32 => 4,
+            Self::F16 | Self::Bf16 => 2,
+        }
+    }
 }
 
 #[cfg_attr(
@@ -166,15 +195,15 @@ pub(crate) struct PageAlignedTensors {
     allow(dead_code)
 )] // Metal only.
 impl PageAlignedTensors {
-    /// Reserve zeroed, page-aligned space for each `(name, dimensions)`.
-    pub(crate) fn new(specs: Vec<(String, Vec<u64>)>) -> Result<Self> {
+    /// Reserve zeroed, page-aligned space for each `(name, dimensions, storage)`.
+    pub(crate) fn new(specs: Vec<(String, Vec<u64>, TensorStorage)>) -> Result<Self> {
         let mut layout = Vec::with_capacity(specs.len());
         let mut offset = 0_usize;
-        for (name, dimensions) in specs {
+        for (name, dimensions, storage) in specs {
             let bytes = checked_elements(&dimensions)?
-                .checked_mul(4)
+                .checked_mul(storage.bytes())
                 .ok_or_else(|| artifact_error("tensor byte length overflows usize"))?;
-            layout.push((name, dimensions, offset, bytes));
+            layout.push((name, dimensions, storage, offset, bytes));
             offset = offset
                 .checked_add(bytes.next_multiple_of(TENSOR_PAGE_BYTES))
                 .ok_or_else(|| artifact_error("total tensor byte length overflows usize"))?;
@@ -198,7 +227,7 @@ impl PageAlignedTensors {
         let mapping = &mut self.mapping;
         self.layout
             .iter()
-            .map(|(_, _, offset, bytes)| {
+            .map(|(_, _, _, offset, bytes)| {
                 (
                     std::ptr::NonNull::from(&mut mapping[*offset]),
                     bytes.next_multiple_of(TENSOR_PAGE_BYTES),
@@ -286,7 +315,7 @@ impl StaticContextArtifact {
     /// Validate tensors written into page-aligned memory and own them without
     /// copying. The memory becomes read-only. With `values_checked`, the
     /// writer has already proven every value finite, and only names and
-    /// shapes are checked here.
+    /// shapes are checked here. Tensors may be FP32, FP16, or BF16.
     ///
     /// # Errors
     ///
@@ -305,17 +334,42 @@ impl StaticContextArtifact {
             return Err(artifact_error("static context tensor count is invalid"));
         }
         let mut named = BTreeMap::new();
-        for (name, dimensions, byte_offset, byte_length) in tensors.layout {
-            let values =
-                bytemuck::cast_slice::<u8, f32>(&tensors.mapping[byte_offset..byte_offset + byte_length]);
-            if values_checked {
-                validate_tensor_shape(&name, &dimensions, values.len())?;
-            } else {
-                validate_tensor_parts(&name, &dimensions, values)?;
+        for (name, dimensions, storage, byte_offset, byte_length) in tensors.layout {
+            let bytes = &tensors.mapping[byte_offset..byte_offset + byte_length];
+            let elements = byte_length / storage.bytes();
+            validate_tensor_shape(&name, &dimensions, elements)?;
+            if !values_checked {
+                let finite = match storage {
+                    TensorStorage::Fp32 => bytemuck::cast_slice::<u8, f32>(bytes)
+                        .iter()
+                        .all(|value| value.is_finite()),
+                    // A value is not finite when its exponent bits are all ones.
+                    TensorStorage::F16 => bytemuck::cast_slice::<u8, u16>(bytes)
+                        .iter()
+                        .all(|value| value & 0x7C00 != 0x7C00),
+                    TensorStorage::Bf16 => bytemuck::cast_slice::<u8, u16>(bytes)
+                        .iter()
+                        .all(|value| value & 0x7F80 != 0x7F80),
+                };
+                if !finite {
+                    return Err(artifact_error(format!(
+                        "static context tensor '{name}' has a non-finite value"
+                    )));
+                }
             }
-            let values = StaticContextTensorValues::MappedFp32 {
-                byte_offset,
-                byte_length,
+            let values = match storage {
+                TensorStorage::Fp32 => StaticContextTensorValues::MappedFp32 {
+                    byte_offset,
+                    byte_length,
+                },
+                TensorStorage::F16 => StaticContextTensorValues::MappedF16 {
+                    byte_offset,
+                    byte_length,
+                },
+                TensorStorage::Bf16 => StaticContextTensorValues::MappedBf16 {
+                    byte_offset,
+                    byte_length,
+                },
             };
             if named
                 .insert(name, StaticContextTensorRecord { dimensions, values })
@@ -999,6 +1053,16 @@ impl StaticContextArtifact {
             ) => StaticContextTensorData::Bf16(
                 bytemuck::try_cast_slice(&mapping[*byte_offset..*byte_offset + *byte_length])
                     .expect("mapped BF16 tensor alignment was validated"),
+            ),
+            (
+                StaticContextStorage::PageAligned(mapping),
+                StaticContextTensorValues::MappedF16 {
+                    byte_offset,
+                    byte_length,
+                },
+            ) => StaticContextTensorData::F16(
+                bytemuck::try_cast_slice(&mapping[*byte_offset..*byte_offset + *byte_length])
+                    .expect("page-aligned FP16 tensors are 2-byte aligned"),
             ),
             _ => unreachable!("static context tensor storage must match artifact storage"),
         }

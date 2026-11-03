@@ -159,6 +159,39 @@ pub struct ClassifierLogits {
     values: Vec<f32>,
 }
 
+/// How far Ironicl may trade exactness for speed.
+///
+/// Reduced-precision levels apply to contexts built on the GPU (the `metal`
+/// feature on Apple Silicon); elsewhere every level behaves like `Safe`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Optimize {
+    /// FP32 throughout; matches `TabICL` within `1e-4`.
+    #[default]
+    Safe,
+    /// ICL keys and values stored in FP16, and ICL attention computed in
+    /// FP16; everything else FP32. Measured probability errors stayed below
+    /// 5e-4 with unchanged labels.
+    Auto,
+    /// Everything `Auto` does; further reduced-precision work will be
+    /// allowed here first.
+    Fast,
+}
+
+impl std::str::FromStr for Optimize {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "safe" => Ok(Self::Safe),
+            "auto" => Ok(Self::Auto),
+            "fast" => Ok(Self::Fast),
+            _ => Err(Error::InvalidArgument(format!(
+                "optimize must be \"safe\", \"auto\", or \"fast\", not {value:?}"
+            ))),
+        }
+    }
+}
+
 /// How ensemble logits become class probabilities, matching `TabICLClassifier`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ClassifierAggregation {
@@ -428,7 +461,15 @@ impl ClassifierExecutor {
         (b, n, h): (usize, usize, usize),
         x: &[f32],
         y_train: &[f32],
+        optimize: Optimize,
     ) -> Result<Option<crate::static_context::PageAlignedTensors>> {
+        use crate::static_context::TensorStorage;
+        let icl_storage = match optimize {
+            Optimize::Safe => TensorStorage::Fp32,
+            // BF16 had no native GPU arithmetic on an M1 Max: slower and less
+            // accurate than FP16, so `Fast` uses FP16 until it gets more.
+            Optimize::Auto | Optimize::Fast => TensorStorage::F16,
+        };
         if n < GPU_MIN_BUILD_ROWS {
             return Ok(None);
         }
@@ -480,13 +521,19 @@ impl ClassifierExecutor {
             .collect::<Result<Vec<_>>>()?;
         let as_u64 = |values: &[usize]| values.iter().map(|&value| value as u64).collect::<Vec<_>>();
         let mut specs = Vec::with_capacity(30);
-        for (stage, blocks, dimensions) in [
-            ("column", 3, as_u64(&[b, h + RESERVED, HEADS, INDUCING, 16])),
-            ("icl", 12, as_u64(&[b, HEADS, n, ICL_DIM / HEADS])),
+        // Only the ICL caches, almost all of a context, take the reduced type.
+        for (stage, blocks, dimensions, storage) in [
+            (
+                "column",
+                3,
+                as_u64(&[b, h + RESERVED, HEADS, INDUCING, 16]),
+                TensorStorage::Fp32,
+            ),
+            ("icl", 12, as_u64(&[b, HEADS, n, ICL_DIM / HEADS]), icl_storage),
         ] {
             for block in 0..blocks {
                 for kind in ["key", "value"] {
-                    specs.push((format!("{stage}.{block}.{kind}"), dimensions.clone()));
+                    specs.push((format!("{stage}.{block}.{kind}"), dimensions.clone(), storage));
                 }
             }
         }
@@ -504,6 +551,7 @@ impl ClassifierExecutor {
             &grouped,
             &column_labels,
             &icl_labels,
+            icl_storage,
             &tensors.regions(),
         )?;
         Ok(Some(tensors))
@@ -515,7 +563,8 @@ impl ClassifierExecutor {
     /// `x` holds preprocessed FP32 `[B, N, H]` training rows and `y_train` the
     /// `[B, N]` class-permuted labels. The permutations are stored as context
     /// metadata; `class_permutations` is used to undo each estimator's class
-    /// order when probabilities are aggregated.
+    /// order when probabilities are aggregated. `optimize` selects the ICL
+    /// key and value storage of GPU-built contexts.
     ///
     /// # Errors
     ///
@@ -530,7 +579,11 @@ impl ClassifierExecutor {
         y_train: &[f32],
         class_permutations: Vec<u64>,
         feature_permutations: Vec<u64>,
+        optimize: Optimize,
     ) -> Result<StaticClassifierExecutor> {
+        // Reduced precision needs a GPU-built context; elsewhere every level is `Safe`.
+        #[cfg(not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")))]
+        let _ = optimize;
         let (b, n, h) = (ensembles, training_rows, features);
         if b == 0
             || n == 0
@@ -579,7 +632,7 @@ impl ClassifierExecutor {
             feature_permutations,
         };
         #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-        if let Some(tensors) = self.build_tensors_gpu((b, n, h), x, y_train)? {
+        if let Some(tensors) = self.build_tensors_gpu((b, n, h), x, y_train, optimize)? {
             // The build graph checked every value on the GPU.
             let context = StaticContextArtifact::from_page_aligned(metadata, tensors, true)?;
             return StaticClassifierExecutor::with_executor(self.clone(), context);
@@ -1440,23 +1493,50 @@ impl StaticClassifierExecutor {
         let Some(graph) = model.gpu_graph() else {
             return Ok(self);
         };
-        let tensors = |stage: &str, blocks: usize, kind: &str| -> Option<Vec<&[f32]>> {
-            (0..blocks)
+        let column = |kind: &str| -> Option<Vec<&[f32]>> {
+            (0..3)
                 .map(|block| {
                     self.context
-                        .tensor(&format!("{stage}.{block}.{kind}"))?
+                        .tensor(&format!("column.{block}.{kind}"))?
                         .fp32_values()
                 })
                 .collect()
         };
-        let (Some(keys), Some(values), Some(column_keys), Some(column_values)) = (
-            tensors("icl", 12, "key"),
-            tensors("icl", 12, "value"),
-            tensors("column", 3, "key"),
-            tensors("column", 3, "value"),
-        ) else {
+        // ICL caches in whatever type the context stores, as raw bytes.
+        let icl = |kind: &str| -> Option<(Vec<&[u8]>, crate::static_context::TensorStorage)> {
+            use crate::static_context::TensorStorage;
+            let mut storage = None;
+            let blocks = (0..12)
+                .map(|block| {
+                    let (bytes, block_storage) =
+                        match self.context.tensor(&format!("icl.{block}.{kind}"))?.data {
+                            StaticContextTensorData::Fp32(values) => {
+                                (bytemuck::cast_slice(values), TensorStorage::Fp32)
+                            }
+                            StaticContextTensorData::F16(values) => {
+                                (bytemuck::cast_slice(values), TensorStorage::F16)
+                            }
+                            StaticContextTensorData::Bf16(values) => {
+                                (bytemuck::cast_slice(values), TensorStorage::Bf16)
+                            }
+                        };
+                    (*storage.get_or_insert(block_storage) == block_storage).then_some(bytes)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some((blocks, storage?))
+        };
+        let (
+            Some((keys, icl_storage)),
+            Some((values, value_storage)),
+            Some(column_keys),
+            Some(column_values),
+        ) = (icl("key"), icl("value"), column("key"), column("value"))
+        else {
             return Ok(self);
         };
+        if icl_storage != value_storage {
+            return Ok(self);
+        }
         let metadata = self.context.metadata();
         let predict = crate::metal::PredictGraph::new(
             &graph.0,
@@ -1468,8 +1548,7 @@ impl StaticClassifierExecutor {
             },
             &column_keys,
             &column_values,
-            &keys,
-            &values,
+            (&keys, &values, icl_storage),
             &self.qass_base_scales,
             self.context.page_aligned_storage().is_some(),
         )?;
