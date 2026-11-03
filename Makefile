@@ -1,6 +1,6 @@
 PYTHON ?= python3
 
-.PHONY: test-rust lint-rust test-python test-parity
+.PHONY: test-rust lint-rust audit test-python test-parity
 
 test-rust:
 	cargo test --locked
@@ -11,6 +11,10 @@ lint-rust:
 	cargo clippy --locked --all-targets -- -D warnings
 	cargo clippy --locked --all-targets --no-default-features -- -D warnings
 	cargo clippy --locked --all-targets --features python -- -D warnings
+
+# RUSTSEC-2024-0436: paste is unmaintained; it comes through candle-core.
+audit:
+	cargo audit --deny warnings --ignore RUSTSEC-2024-0436
 
 test-python:
 	$(PYTHON) -m unittest discover -s tests -p 'test_*.py' -v
