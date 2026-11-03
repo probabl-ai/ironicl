@@ -42,8 +42,9 @@ neighbors and embeds labels, and keeps any request whose grouped inputs contain
 the all-missing marker. A GPU-built context writes its keys and values once into
 page-aligned memory that the CPU reads as tensors and the GPU wraps without
 copying; a CPU-built context is copied to the GPU once. `IRONICL_NO_METAL=1`
-disables the GPU. On macOS 27, `MPSGraph` prints "Failed to import MPS module"
-once per compiled shape; results are unaffected.
+disables the GPU. Graphs compile at `MPSGraph` optimization level 0: level 1 was
+no faster, and its pass that places operations on the Neural Engine or CPU printed
+"Failed to import MPS module" on every compile.
 
 Cached attention selects its backend once per executor. The AVX-512 path
 implements score tiles and softmax-weighted V tiles; portable execution retains

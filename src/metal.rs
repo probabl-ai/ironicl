@@ -18,7 +18,10 @@ use objc2::{AllocAnyThread, rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSArray, NSData, NSDictionary, NSNumber};
 use objc2_metal::{MTLBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLResourceOptions};
 use objc2_metal_performance_shaders::{MPSDataType, MPSShape};
-use objc2_metal_performance_shaders_graph::{MPSGraph, MPSGraphTensor, MPSGraphTensorData};
+use objc2_metal_performance_shaders_graph::{
+    MPSGraph, MPSGraphCompilationDescriptor, MPSGraphExecutionDescriptor, MPSGraphOptimization,
+    MPSGraphTensor, MPSGraphTensorData,
+};
 
 use crate::{Error, Result};
 
@@ -52,11 +55,12 @@ fn metal_error(message: &str) -> Error {
     Error::InvalidArgument(format!("Metal backend: {message}"))
 }
 
-/// The shared device and command queue.
+/// The shared device and command queue, and how graphs run on them.
 #[derive(Clone)]
 pub(crate) struct Gpu {
     device: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    execution: Retained<MPSGraphExecutionDescriptor>,
 }
 
 impl Gpu {
@@ -68,7 +72,23 @@ impl Gpu {
         let queue = device
             .newCommandQueue()
             .ok_or_else(|| metal_error("cannot create a command queue"))?;
-        Ok(Some(Self { device, queue }))
+        // Optimization level 0 measured as fast as the default level 1 on an
+        // M1 Max. Level 1's pass that places operations on the Neural Engine
+        // or CPU printed "Failed to import MPS module" on every compile.
+        // SAFETY: plain descriptor construction.
+        let execution = unsafe {
+            let compilation = MPSGraphCompilationDescriptor::new();
+            compilation.setOptimizationLevel(MPSGraphOptimization::Level0);
+            let execution = MPSGraphExecutionDescriptor::new();
+            execution.setWaitUntilCompleted(true);
+            execution.setCompilationDescriptor(Some(&compilation));
+            execution
+        };
+        Ok(Some(Self {
+            device,
+            queue,
+            execution,
+        }))
     }
 
     fn buffer(&self, values: &[f32]) -> Result<Buffer> {
@@ -126,13 +146,15 @@ impl Gpu {
     }
 
     fn run_prepared(&self, graph: &MPSGraph, feeds: &Dictionary, results: &Dictionary) {
-        // SAFETY: synchronous run; the dictionaries keep their buffers alive.
+        // SAFETY: the descriptor waits until the run completes, and the
+        // dictionaries keep their buffers alive.
         unsafe {
-            graph.runWithMTLCommandQueue_feeds_targetOperations_resultsDictionary(
+            graph.runAsyncWithMTLCommandQueue_feeds_targetOperations_resultsDictionary_executionDescriptor(
                 &self.queue,
                 feeds,
                 None,
                 results,
+                Some(&self.execution),
             );
         }
     }
