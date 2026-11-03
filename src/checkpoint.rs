@@ -266,7 +266,7 @@ fn read_pickle_root(bytes: Vec<u8>) -> Result<(Object, String, CheckpointArchive
     let mut pickle_names = Vec::new();
     for index in 0..archive.len() {
         let entry = archive.by_index(index).map_err(checkpoint_error)?;
-        let name = entry.name().to_owned();
+        let name = entry.name().map_err(checkpoint_error)?.into_owned();
         if entry.enclosed_name().is_none() {
             return Err(Error::Checkpoint(format!(
                 "archive entry '{name}' has an unsafe path"
@@ -591,7 +591,7 @@ fn model_dtype(dtype: DType) -> ModelTensorDType {
         DType::F16 => ModelTensorDType::F16,
         DType::F32 => ModelTensorDType::F32,
         DType::F64 => ModelTensorDType::F64,
-        DType::U32 => unreachable!("checkpoint parser does not accept U32 storage"),
+        _ => unreachable!("storage_dtype accepts only the dtypes above"),
     }
 }
 
