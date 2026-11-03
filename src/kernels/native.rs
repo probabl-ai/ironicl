@@ -18,7 +18,7 @@ const BF16_AFFINE_OUTPUT_BLOCK: usize = 16;
 const BF16_AFFINE_MAX_ROWS: usize = 8;
 const MAX_PACKED_ATTENTION_QUERY_ROWS: usize = 16;
 const SQRT_2: f32 = core::f32::consts::SQRT_2;
-/// Smallest affine row count that goes to Accelerate on macOS. Thresholds
+/// Smallest affine row count that goes to Accelerate on Apple Silicon. Thresholds
 /// from 4 to 64 rows and 1024 to 16384 scores measured the same on an M1 Max.
 const SGEMM_MIN_ROWS: usize = 16;
 
@@ -26,13 +26,13 @@ const SGEMM_MIN_ROWS: usize = 16;
 /// `sgemm`. Callers then skip their own row splitting: Accelerate uses the
 /// matrix coprocessor, which all cores in a cluster share.
 pub(crate) const fn affine_uses_sgemm(rows: usize) -> bool {
-    cfg!(target_os = "macos") && rows >= SGEMM_MIN_ROWS
+    cfg!(all(target_os = "macos", target_arch = "aarch64")) && rows >= SGEMM_MIN_ROWS
 }
 
-/// Smallest `query_rows * source_rows` per head that goes to Accelerate on macOS.
+/// Smallest `query_rows * source_rows` per head that goes to Accelerate on Apple Silicon.
 const SGEMM_MIN_ATTENTION_SCORES: usize = 4096;
 
-/// Run head-major attention through Accelerate on macOS when it is large
+/// Run head-major attention through Accelerate on Apple Silicon when it is large
 /// enough. Returns false when the caller must use its own kernel.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn attention_sgemm(
@@ -45,7 +45,7 @@ pub(crate) fn attention_sgemm(
     head_dim: usize,
     output: &mut [f32],
 ) -> bool {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if query_rows * source_rows >= SGEMM_MIN_ATTENTION_SCORES {
         return accelerate::attention(
             query,
@@ -71,7 +71,7 @@ pub(crate) fn attention_sgemm(
     false
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod accelerate {
     const ROW_MAJOR: i32 = 101;
     const NO_TRANS: i32 = 111;
@@ -2832,7 +2832,7 @@ fn affine_for_target(
     output_dim: usize,
     output: &mut [f32],
 ) -> bool {
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if affine_uses_sgemm(rows) && accelerate::affine(input, rows, input_dim, weight, bias, output_dim, output)
     {
         return true;
@@ -4312,7 +4312,7 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     #[test]
     fn accelerate_matches_naive_affine_and_attention() {
         let values = |count: usize, seed: f32| {

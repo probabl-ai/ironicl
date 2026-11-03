@@ -27,7 +27,7 @@ The first optimized target is:
 - one-row latency and 8-16-row microbatch throughput.
 
 The second target is Apple Silicon (M1 Max and later), using all of its
-built-in compute units. The project must also build and run correctness tests
+built-in compute units. Intel Macs are not a target and use the portable path. The project must also build and run correctness tests
 on other hosts through portable Rust code.
 
 ## Required Outcomes

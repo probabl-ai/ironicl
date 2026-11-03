@@ -3170,10 +3170,10 @@ fn executor_threads() -> usize {
     })
 }
 
-/// Performance-core count on macOS. Using only these cores keeps workers off
+/// Performance-core count on Apple Silicon. Using only these cores keeps workers off
 /// the efficiency cores, and on an M1 Max (8 + 2 cores) it lets 8 estimators
 /// run in parallel instead of one at a time with each split 10 ways.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #[allow(unsafe_code)] // One libSystem call; std has no portable equivalent.
 fn performance_cores() -> Option<usize> {
     unsafe extern "C" {
@@ -3203,7 +3203,7 @@ fn performance_cores() -> Option<usize> {
         .filter(|cores| *cores > 0)
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 const fn performance_cores() -> Option<usize> {
     None
 }
