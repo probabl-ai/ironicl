@@ -85,6 +85,35 @@ impl Gpu {
         .ok_or_else(|| metal_error("cannot allocate a buffer"))
     }
 
+    /// Wrap `bytes` of existing page-aligned memory without copying it. The
+    /// memory must outlive the buffer.
+    fn wrap(&self, pointer: std::ptr::NonNull<u8>, bytes: usize) -> Result<Buffer> {
+        // SAFETY: callers pass a page-aligned, page-padded region that outlives
+        // the buffer; no deallocator, because the region's owner frees it.
+        unsafe {
+            self.device.newBufferWithBytesNoCopy_length_options_deallocator(
+                pointer.cast(),
+                bytes,
+                MTLResourceOptions::StorageModeShared,
+                None,
+            )
+        }
+        .ok_or_else(|| metal_error("cannot wrap page-aligned memory"))
+    }
+
+    /// A buffer over `values`: wrapped in place when `page_aligned` (the slice
+    /// starts on a page inside page-padded memory), otherwise copied.
+    fn tensor_buffer(&self, values: &[f32], page_aligned: bool) -> Result<Buffer> {
+        if !page_aligned {
+            return self.buffer(values);
+        }
+        let pointer = std::ptr::NonNull::from(values).cast::<u8>();
+        self.wrap(
+            pointer,
+            std::mem::size_of_val(values).next_multiple_of(crate::static_context::TENSOR_PAGE_BYTES),
+        )
+    }
+
     fn empty(&self, elements: usize) -> Result<Buffer> {
         self.device
             .newBufferWithLength_options(elements * 4, MTLResourceOptions::StorageModeShared)
@@ -594,6 +623,7 @@ impl PredictGraph {
     /// `column_keys` and `column_values` hold each column block's
     /// `[B, H + 4, 8, 128, 16]` cache, `icl_keys` and `icl_values` each ICL
     /// block's `[B, 8, N, 64]`, and `base_scales` each ICL block's `[8, 64]`.
+    /// With `page_aligned`, the caches are wrapped in place instead of copied.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         model: &ModelWeights,
@@ -604,6 +634,7 @@ impl PredictGraph {
         icl_keys: &[&[f32]],
         icl_values: &[&[f32]],
         base_scales: &[Vec<f32>],
+        page_aligned: bool,
     ) -> Result<Self> {
         let gpu = model.gpu();
         let builder = Builder::new(model, weights);
@@ -626,7 +657,7 @@ impl PredictGraph {
             let prefix = format!("col_embedder.tf_col.blocks.{block}.multihead_attn2");
             // The cached path never reads the reserved streams.
             let cache = |values: &[f32]| -> Result<Tensor> {
-                let full = builder.bound(gpu.buffer(values)?, &column_shape);
+                let full = builder.bound(gpu.tensor_buffer(values, page_aligned)?, &column_shape);
                 Ok(builder.reshape(
                     &builder.slice(&full, 1, RESERVED as isize, h),
                     &[b * h, HEADS as isize, INDUCING as isize, COLUMN_HEAD_DIM as isize],
@@ -648,8 +679,8 @@ impl PredictGraph {
         let icl_shape = [b, HEADS as isize, n, ICL_HEAD_DIM as isize];
         for block in 0..ICL_BLOCKS {
             let prefix = format!("icl_predictor.tf_icl.blocks.{block}");
-            let key = builder.bound(gpu.buffer(icl_keys[block])?, &icl_shape);
-            let value = builder.bound(gpu.buffer(icl_values[block])?, &icl_shape);
+            let key = builder.bound(gpu.tensor_buffer(icl_keys[block], page_aligned)?, &icl_shape);
+            let value = builder.bound(gpu.tensor_buffer(icl_values[block], page_aligned)?, &icl_shape);
             let base_scale = builder.constant(
                 &base_scales[block],
                 &[1, HEADS as isize, 1, ICL_HEAD_DIM as isize],
@@ -709,33 +740,33 @@ impl PredictGraph {
     }
 }
 
-/// Captured `(keys, values)` per block: column blocks `[B, H, 8, 128, 16]`,
-/// ICL blocks `[B, 8, N, 64]`.
-pub(crate) type CapturedContext = (Vec<(Vec<f32>, Vec<f32>)>, Vec<(Vec<f32>, Vec<f32>)>);
-
 /// Build a context on the GPU: the training rows of every estimator run
 /// through every stage once, and each column and ICL block's keys and values
 /// are captured. `column_base_scales` and `icl_base_scales` are the `QASSMax`
 /// base scales for `N` sources: 3 of `[8, 16]` and 12 of `[8, 64]`.
 /// `grouped` is `[B * H, N, 3]`, `column_labels` `[B, N, 128]`, and
-/// `icl_labels` `[B, N, 512]`.
+/// `icl_labels` `[B, N, 512]`. The keys and values are written in place into
+/// `outputs`, page-aligned regions in context order: each column block's key
+/// and value as `[B, H + 4, 8, 128, 16]` with zero reserved streams, then each
+/// ICL block's as `[B, 8, N, 64]`.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // One linear graph definition.
 pub(crate) fn build_context(
     model: &ModelWeights,
     weights: &Weights<'_, '_>,
-    shape: Shape,
+    size: Shape,
     column_base_scales: &[Vec<f32>],
     icl_base_scales: &[Vec<f32>],
     grouped: &[f32],
     column_labels: &[f32],
     icl_labels: &[f32],
-) -> Result<CapturedContext> {
+    outputs: &[(std::ptr::NonNull<u8>, usize)],
+) -> Result<()> {
     let gpu = model.gpu();
     let builder = Builder::new(model, weights);
     let (b, h, n) = (
-        shape.ensembles as isize,
-        shape.features as isize,
-        shape.training_rows as isize,
+        size.ensembles as isize,
+        size.features as isize,
+        size.training_rows as isize,
     );
     let grouped_input = builder.bound(gpu.buffer(grouped)?, &[b * h, n, 3]);
     let column_labels = builder.bound(gpu.buffer(column_labels)?, &[b, 1, n, COLUMN_DIM as isize]);
@@ -789,7 +820,7 @@ pub(crate) fn build_context(
         column.push((key, value));
     }
     let mut rows = builder.add(
-        &builder.row_stage(&source, (shape.ensembles, shape.features))?,
+        &builder.row_stage(&source, (size.ensembles, size.features))?,
         &icl_labels,
     );
     let mut icl = Vec::with_capacity(ICL_BLOCKS);
@@ -810,34 +841,63 @@ pub(crate) fn build_context(
         icl.push((key, value));
     }
 
-    let column_shape = vec![b * h, HEADS as isize, INDUCING as isize, COLUMN_HEAD_DIM as isize];
+    // Column caches in context layout: zero reserved streams, then the features.
+    let feature_shape = [b, h, HEADS as isize, INDUCING as isize, COLUMN_HEAD_DIM as isize];
+    let reserved = unsafe {
+        builder.graph.constantWithScalar_shape_dataType(
+            0.0,
+            &shape(&[
+                b,
+                RESERVED as isize,
+                HEADS as isize,
+                INDUCING as isize,
+                COLUMN_HEAD_DIM as isize,
+            ]),
+            FLOAT,
+        )
+    };
+    let full_column = |tensor: &Tensor| unsafe {
+        builder.graph.concatTensor_withTensor_dimension_name(
+            &reserved,
+            &builder.reshape(tensor, &feature_shape),
+            1,
+            None,
+        )
+    };
+    let column_shape = vec![
+        b,
+        h + RESERVED as isize,
+        HEADS as isize,
+        INDUCING as isize,
+        COLUMN_HEAD_DIM as isize,
+    ];
     let icl_shape = vec![b, HEADS as isize, n, ICL_HEAD_DIM as isize];
-    let column_elements = shape.ensembles * shape.features * HEADS * INDUCING * COLUMN_HEAD_DIM;
-    let icl_elements = shape.ensembles * HEADS * shape.training_rows * ICL_HEAD_DIM;
-    let mut outputs = Vec::with_capacity(2 * (COLUMN_BLOCKS + ICL_BLOCKS));
-    for (caches, dimensions, elements) in [
-        (&column, &column_shape, column_elements),
-        (&icl, &icl_shape, icl_elements),
-    ] {
-        for (key, value) in caches {
-            outputs.push((key.clone(), gpu.empty(elements)?, dimensions.clone()));
-            outputs.push((value.clone(), gpu.empty(elements)?, dimensions.clone()));
-        }
+    let mut targets = Vec::with_capacity(2 * (COLUMN_BLOCKS + ICL_BLOCKS));
+    for (key, value) in &column {
+        targets.extend([
+            (full_column(key), column_shape.clone()),
+            (full_column(value), column_shape.clone()),
+        ]);
     }
+    for (key, value) in &icl {
+        targets.extend([
+            (key.clone(), icl_shape.clone()),
+            (value.clone(), icl_shape.clone()),
+        ]);
+    }
+    if targets.len() != outputs.len() {
+        return Err(metal_error("context output regions do not match the graph"));
+    }
+    let outputs = targets
+        .into_iter()
+        .zip(outputs)
+        .map(|((tensor, dimensions), &(pointer, bytes))| Ok((tensor, gpu.wrap(pointer, bytes)?, dimensions)))
+        .collect::<Result<Vec<Binding>>>()?;
     let bindings = builder.bindings.into_inner();
     gpu.run(
         &builder.graph,
         &bindings.iter().collect::<Vec<_>>(),
         &outputs.iter().collect::<Vec<_>>(),
     );
-    let read = |(_, buffer, dimensions): &Binding| -> Vec<f32> {
-        let elements = dimensions.iter().product::<isize>().unsigned_abs();
-        // SAFETY: the run is complete and wrote `elements` floats.
-        unsafe { std::slice::from_raw_parts(buffer.contents().as_ptr().cast::<f32>(), elements) }.to_vec()
-    };
-    let mut pairs = outputs
-        .chunks_exact(2)
-        .map(|pair| (read(&pair[0]), read(&pair[1])));
-    let column = pairs.by_ref().take(COLUMN_BLOCKS).collect();
-    Ok((column, pairs.collect()))
+    Ok(())
 }

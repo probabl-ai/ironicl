@@ -297,6 +297,8 @@ struct GpuContext {
     predict: crate::metal::PredictGraph,
     /// Keeps the model's weight buffers alive with the graph that reads them.
     _model: Arc<GpuGraph>,
+    /// Keeps page-aligned context memory alive while GPU buffers wrap it.
+    _storage: Option<Arc<memmap2::Mmap>>,
 }
 
 #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
@@ -416,16 +418,17 @@ impl ClassifierExecutor {
             .clone()
     }
 
-    /// Build each estimator's captured keys and values on the GPU. Returns
-    /// `None` without a GPU, below `GPU_MIN_BUILD_ROWS`, or when a
-    /// grouped triple is the all-missing marker that only the CPU path handles.
+    /// Build every estimator's keys and values on the GPU, straight into
+    /// page-aligned context tensors. Returns `None` without a GPU, below
+    /// `GPU_MIN_BUILD_ROWS`, or when a grouped triple is the all-missing marker
+    /// that only the CPU path handles.
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-    fn build_estimators_gpu(
+    fn build_tensors_gpu(
         &self,
         (b, n, h): (usize, usize, usize),
         x: &[f32],
         y_train: &[f32],
-    ) -> Result<Option<Vec<EstimatorCaches>>> {
+    ) -> Result<Option<crate::static_context::PageAlignedTensors>> {
         if n < GPU_MIN_BUILD_ROWS {
             return Ok(None);
         }
@@ -475,7 +478,20 @@ impl ClassifierExecutor {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let (column, icl) = crate::metal::build_context(
+        let as_u64 = |values: &[usize]| values.iter().map(|&value| value as u64).collect::<Vec<_>>();
+        let mut specs = Vec::with_capacity(30);
+        for (stage, blocks, dimensions) in [
+            ("column", 3, as_u64(&[b, h + RESERVED, HEADS, INDUCING, 16])),
+            ("icl", 12, as_u64(&[b, HEADS, n, ICL_DIM / HEADS])),
+        ] {
+            for block in 0..blocks {
+                for kind in ["key", "value"] {
+                    specs.push((format!("{stage}.{block}.{kind}"), dimensions.clone()));
+                }
+            }
+        }
+        let mut tensors = crate::static_context::PageAlignedTensors::new(specs)?;
+        crate::metal::build_context(
             &graph.0,
             &|name| self.tensor(name),
             crate::metal::Shape {
@@ -488,30 +504,9 @@ impl ClassifierExecutor {
             &grouped,
             &column_labels,
             &icl_labels,
+            &tensors.regions(),
         )?;
-        // Split the batched captures into the per-estimator layout.
-        let (column_elements, icl_elements) = (h * HEADS * INDUCING * 16, n * ICL_DIM);
-        let slice = |pairs: &[KeyValue], elements: usize, ensemble: usize| -> Vec<KeyValue> {
-            pairs
-                .iter()
-                .map(|(key, value)| {
-                    (
-                        key[ensemble * elements..][..elements].to_vec(),
-                        value[ensemble * elements..][..elements].to_vec(),
-                    )
-                })
-                .collect()
-        };
-        Ok(Some(
-            (0..b)
-                .map(|ensemble| {
-                    (
-                        slice(&column, column_elements, ensemble),
-                        slice(&icl, icl_elements, ensemble),
-                    )
-                })
-                .collect(),
-        ))
+        Ok(Some(tensors))
     }
 
     /// Run the training rows once and keep their attention keys and values as
@@ -549,6 +544,45 @@ impl ClassifierExecutor {
         }
         admit_request(b, n, h, n)?;
         let classes = validate_labels(y_train, b, n)?;
+        let mut model_sha256 = [0; 32];
+        let source = self.model.summary().source_sha256.as_bytes();
+        for (byte, pair) in model_sha256.iter_mut().zip(source.chunks_exact(2)) {
+            *byte = std::str::from_utf8(pair)
+                .ok()
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+                .ok_or_else(|| Error::Artifact("model source SHA-256 is not hexadecimal".into()))?;
+        }
+        let context_sha256 = Sha256::new()
+            .chain_update(
+                [b, n, h]
+                    .iter()
+                    .map(|&value| value as u64)
+                    .collect::<Vec<_>>()
+                    .iter()
+                    .flat_map(|value| value.to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+            .chain_update(bytemuck::cast_slice::<f32, u8>(x))
+            .chain_update(bytemuck::cast_slice::<f32, u8>(y_train))
+            .chain_update(bytemuck::cast_slice::<u64, u8>(&class_permutations))
+            .chain_update(bytemuck::cast_slice::<u64, u8>(&feature_permutations))
+            .finalize()
+            .into();
+        let metadata = StaticContextMetadata {
+            model_sha256,
+            context_sha256,
+            ensemble_count: b,
+            training_rows: n,
+            feature_count: h,
+            class_count: classes,
+            class_permutations,
+            feature_permutations,
+        };
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        if let Some(tensors) = self.build_tensors_gpu((b, n, h), x, y_train)? {
+            let context = StaticContextArtifact::from_page_aligned(metadata, tensors)?;
+            return StaticClassifierExecutor::with_executor(self.clone(), context);
+        }
         let streams = h + RESERVED;
         let column_elements = HEADS * INDUCING * 16;
         let mut column: Vec<KeyValue> = (0..3)
@@ -568,37 +602,30 @@ impl ClassifierExecutor {
         // ponytail: one rayon task per estimator; peak memory grows with the
         // number of estimators built at once. Bound the concurrency if large
         // contexts run out of memory.
-        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-        let estimators = self.build_estimators_gpu((b, n, h), x, y_train)?;
-        #[cfg(not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")))]
-        let estimators: Option<Vec<EstimatorCaches>> = None;
-        let estimators = match estimators {
-            Some(estimators) => estimators,
-            None => (0..b)
-                .into_par_iter()
-                .map(|ensemble| {
-                    let x = &x[ensemble * n * h..][..n * h];
-                    let labels = &y_train[ensemble * n..][..n];
-                    let (columns, feature_caches) = self.column_embeddings(x, labels, n, h, n, true)?;
-                    let rows = self.row_embeddings(&columns, n, streams)?;
-                    let mut caches = Vec::with_capacity(12);
-                    self.icl_rows(rows, labels, n, n, Some(&mut caches))?;
-                    // Per block, every feature's keys and values in feature order.
-                    let column = (0..3)
-                        .map(|block| {
-                            let keys = feature_caches
-                                .iter()
-                                .flat_map(|caches| caches[block].0.iter().copied());
-                            let values = feature_caches
-                                .iter()
-                                .flat_map(|caches| caches[block].1.iter().copied());
-                            (keys.collect(), values.collect())
-                        })
-                        .collect();
-                    Ok((column, caches))
-                })
-                .collect::<Result<Vec<_>>>()?,
-        };
+        let estimators: Vec<EstimatorCaches> = (0..b)
+            .into_par_iter()
+            .map(|ensemble| {
+                let x = &x[ensemble * n * h..][..n * h];
+                let labels = &y_train[ensemble * n..][..n];
+                let (columns, feature_caches) = self.column_embeddings(x, labels, n, h, n, true)?;
+                let rows = self.row_embeddings(&columns, n, streams)?;
+                let mut caches = Vec::with_capacity(12);
+                self.icl_rows(rows, labels, n, n, Some(&mut caches))?;
+                // Per block, every feature's keys and values in feature order.
+                let column = (0..3)
+                    .map(|block| {
+                        let keys = feature_caches
+                            .iter()
+                            .flat_map(|caches| caches[block].0.iter().copied());
+                        let values = feature_caches
+                            .iter()
+                            .flat_map(|caches| caches[block].1.iter().copied());
+                        (keys.collect(), values.collect())
+                    })
+                    .collect();
+                Ok((column, caches))
+            })
+            .collect::<Result<Vec<_>>>()?;
         for (column_caches, caches) in estimators {
             for ((keys, values), (key, value)) in column.iter_mut().zip(column_caches) {
                 // The cached path never reads the reserved CLS streams.
@@ -628,40 +655,7 @@ impl ClassifierExecutor {
                 }
             }
         }
-        let mut model_sha256 = [0; 32];
-        let source = self.model.summary().source_sha256.as_bytes();
-        for (byte, pair) in model_sha256.iter_mut().zip(source.chunks_exact(2)) {
-            *byte = std::str::from_utf8(pair)
-                .ok()
-                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
-                .ok_or_else(|| Error::Artifact("model source SHA-256 is not hexadecimal".into()))?;
-        }
-        let context_sha256 = Sha256::new()
-            .chain_update(
-                as_u64(&[b, n, h])
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<_>>(),
-            )
-            .chain_update(bytemuck::cast_slice::<f32, u8>(x))
-            .chain_update(bytemuck::cast_slice::<f32, u8>(y_train))
-            .chain_update(bytemuck::cast_slice::<u64, u8>(&class_permutations))
-            .chain_update(bytemuck::cast_slice::<u64, u8>(&feature_permutations))
-            .finalize()
-            .into();
-        let context = StaticContextArtifact::new(
-            StaticContextMetadata {
-                model_sha256,
-                context_sha256,
-                ensemble_count: b,
-                training_rows: n,
-                feature_count: h,
-                class_count: classes,
-                class_permutations,
-                feature_permutations,
-            },
-            tensors,
-        )?;
+        let context = StaticContextArtifact::new(metadata, tensors)?;
         StaticClassifierExecutor::with_executor(self.clone(), context)
     }
 
@@ -1476,10 +1470,12 @@ impl StaticClassifierExecutor {
             &keys,
             &values,
             &self.qass_base_scales,
+            self.context.page_aligned_storage().is_some(),
         )?;
         self.gpu = Some(Arc::new(GpuContext {
             predict,
             _model: graph,
+            _storage: self.context.page_aligned_storage().cloned(),
         }));
         Ok(self)
     }

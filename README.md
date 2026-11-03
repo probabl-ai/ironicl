@@ -22,7 +22,7 @@ training context once, stores it, and then answers new test rows against it.
 | Safe checkpoint import in pure Rust (no pickle execution) | Overlapping CPU and GPU work |
 | FP32 classifier inference on any CPU | Regression |
 | Static training context with AVX-512 kernels on Zen 5 | Categorical features and missing values |
-| Accelerate kernels and Metal batch prediction on Apple Silicon | Zero-copy GPU contexts |
+| Accelerate kernels and Metal prediction and context building on Apple Silicon | Pickling a fitted estimator |
 | Python `TabICLClassifier`, a drop-in for TabICL's | Published packages on crates.io or PyPI |
 
 ## Quickstart

@@ -36,10 +36,11 @@ block's keys and values; its graph setup costs about 250 ms, so contexts with
 fewer than 160 training rows build on the CPU. Model weights live once per model
 in shared GPU buffers and are fed to the graphs as placeholders. The CPU only
 groups each feature with its neighbors and embeds labels, and keeps any request
-whose grouped inputs contain the all-missing marker. A context copies its FP32
-keys and values into shared Metal buffers. `IRONICL_NO_METAL=1` disables the GPU.
-On macOS 27, `MPSGraph` prints "Failed to import MPS module" once per compiled
-shape; results are unaffected.
+whose grouped inputs contain the all-missing marker. A GPU-built context writes
+its keys and values once into page-aligned memory that the CPU reads as tensors
+and the GPU wraps without copying; a CPU-built context is copied to the GPU once.
+`IRONICL_NO_METAL=1` disables the GPU. On macOS 27, `MPSGraph` prints "Failed to
+import MPS module" once per compiled shape; results are unaffected.
 
 Cached attention selects its backend once per executor. The AVX-512 path
 implements score tiles and softmax-weighted V tiles; portable execution retains
