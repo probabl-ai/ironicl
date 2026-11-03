@@ -275,7 +275,40 @@ impl ClassifierLogits {
 #[derive(Debug, Clone)]
 pub struct ClassifierExecutor {
     model: Arc<ModelArtifact>,
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    icl_graph: Arc<OnceLock<Option<Arc<GpuGraph>>>>,
 }
+
+/// The Metal ICL graph, built on first use and shared by every context of a model.
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+struct GpuGraph(crate::metal::IclGraph);
+
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+impl std::fmt::Debug for GpuGraph {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GpuGraph")
+    }
+}
+
+/// One context's Metal buffers and the graph that reads them.
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+struct GpuContext {
+    graph: Arc<GpuGraph>,
+    context: crate::metal::IclContext,
+}
+
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+impl std::fmt::Debug for GpuContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GpuContext")
+    }
+}
+
+/// Smallest `query_rows * training_rows` that runs the ICL stage on the GPU.
+/// On an M1 Max the GPU wins from about 64 query rows with 1,000 training rows
+/// and from 8 query rows with 7,071; below that the CPU is faster.
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+const GPU_MIN_SCORES: usize = 49_152;
 
 /// Attention keys and values in head-major `[heads, rows, head_dim]` order.
 type KeyValue = (Vec<f32>, Vec<f32>);
@@ -300,6 +333,8 @@ pub struct StaticClassifierExecutor {
     bf16_dense_compensation: Bf16AffineCompensation,
     attention_backend: crate::kernels::native::AttentionBackend,
     sparse_attention_stats: Arc<SparseAttentionStats>,
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    gpu: Option<Arc<GpuContext>>,
 }
 
 /// Sparse ICL attention decisions since the last reset.
@@ -354,6 +389,8 @@ impl ClassifierExecutor {
     pub fn new(model: ModelArtifact) -> Self {
         Self {
             model: Arc::new(model),
+            #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+            icl_graph: Arc::default(),
         }
     }
 
@@ -1241,7 +1278,7 @@ impl StaticClassifierExecutor {
             .thread_name(|index| format!("ironicl-affine-{index}"))
             .build()
             .map_err(|error| Error::InvalidArgument(format!("cannot create affine worker pool: {error}")))?;
-        Ok(Self {
+        Self {
             model,
             context,
             affine_pool: Arc::new(affine_pool),
@@ -1253,7 +1290,84 @@ impl StaticClassifierExecutor {
             bf16_dense_compensation,
             attention_backend: crate::kernels::native::attention_backend(),
             sparse_attention_stats: Arc::new(SparseAttentionStats::default()),
-        })
+            #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+            gpu: None,
+        }
+        .with_gpu()
+    }
+
+    /// Copy the ICL keys and values to the GPU when Metal is available. FP32
+    /// unpacked contexts only; `IRONICL_NO_METAL` keeps everything on the CPU.
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    fn with_gpu(mut self) -> Result<Self> {
+        if std::env::var_os("IRONICL_NO_METAL").is_some() || self.context.has_packed_icl_keys() {
+            return Ok(self);
+        }
+        let model = &self.model;
+        let graph = model
+            .icl_graph
+            .get_or_init(|| {
+                crate::metal::IclGraph::new(|name| model.tensor(name))
+                    .ok()
+                    .flatten()
+                    .map(|graph| Arc::new(GpuGraph(graph)))
+            })
+            .clone();
+        let Some(graph) = graph else {
+            return Ok(self);
+        };
+        let tensors = |kind: &str| -> Option<Vec<&[f32]>> {
+            (0..12)
+                .map(|block| self.context.tensor(&format!("icl.{block}.{kind}"))?.fp32_values())
+                .collect()
+        };
+        let (Some(keys), Some(values)) = (tensors("key"), tensors("value")) else {
+            return Ok(self);
+        };
+        let metadata = self.context.metadata();
+        let context = graph.0.context(
+            metadata.ensemble_count,
+            metadata.training_rows,
+            &keys,
+            &values,
+            &self.qass_base_scales,
+        )?;
+        self.gpu = Some(Arc::new(GpuContext { graph, context }));
+        Ok(self)
+    }
+
+    #[cfg(not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")))]
+    #[allow(clippy::unnecessary_wraps)]
+    fn with_gpu(self) -> Result<Self> {
+        Ok(self)
+    }
+
+    /// Run the column and row stages on the CPU, one estimator per worker, then
+    /// the ICL blocks and decoder on the GPU.
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    fn predict_logits_gpu(
+        &self,
+        gpu: &GpuContext,
+        request: ClassifierQueryRequest<'_>,
+        plan: ExecutionPlan,
+        values: &mut [f32],
+    ) -> Result<()> {
+        let metadata = self.context.metadata();
+        let q = request.query_rows();
+        let rows = self.affine_pool.install(|| {
+            (0..metadata.ensemble_count)
+                .into_par_iter()
+                .map(|ensemble| self.cached_frontend(request, ensemble, plan.inner_workers))
+                .collect::<Result<Vec<_>>>()
+        })?;
+        let classes = metadata.class_count;
+        for (ensemble, (rows, output)) in rows.iter().zip(values.chunks_mut(q * classes)).enumerate() {
+            let logits = gpu.graph.0.run(&gpu.context, ensemble, rows, q)?;
+            for (row, output) in output.chunks_exact_mut(classes).enumerate() {
+                output.copy_from_slice(&logits[row * 10..][..classes]);
+            }
+        }
+        Ok(())
     }
 
     /// Reset sparse-attention decisions collected by this executor.
@@ -1313,6 +1427,20 @@ impl StaticClassifierExecutor {
             &[request.query_rows(), metadata.class_count],
             "static ensemble output",
         )?;
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        if let Some(gpu) = &self.gpu
+            && request.query_rows() * metadata.training_rows >= GPU_MIN_SCORES
+        {
+            self.predict_logits_gpu(gpu, request, plan, &mut values)?;
+            return Ok(ClassifierLogits {
+                shape: [
+                    metadata.ensemble_count,
+                    request.query_rows(),
+                    metadata.class_count,
+                ],
+                values,
+            });
+        }
         if layer_major {
             self.predict_layer_major(request, plan.inner_workers, &mut values)?;
         } else if plan.ensemble_workers == 1 {

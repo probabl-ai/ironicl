@@ -208,7 +208,8 @@ fn built_context_matches_the_uncached_forward_pass() {
     };
     let executor =
         ClassifierExecutor::new(load_model_artifact(&model_path).expect("load classifier artifact"));
-    let (b, n, q, h, classes) = (2, 40, 8, 5, 3_u64);
+    // 200 x 256 query scores reach the GPU path when the `metal` feature is on.
+    let (b, n, q, h, classes) = (2, 200, 256, 5, 3_u64);
     let mut state = 0x2545_f491_u32;
     let mut x = vec![0.0_f32; b * (n + q) * h];
     for value in &mut x {

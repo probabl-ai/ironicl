@@ -20,12 +20,23 @@ The initial scalar `dot_f32` and `softmax_f32` functions are contracts, not
 performance implementations.
 
 The current affine kernel dispatches to custom NEON on AArch64 and AVX-512F on
-supported x86-64 hosts, with scalar fallback. On Apple Silicon, affine layers with at
-least 16 rows and attention with at least 4096 scores per head call Accelerate's
-`cblas_sgemm` instead; Accelerate runs them on the matrix coprocessor. Batching
-the row stage across rows measured slower on an M1 Max, so it stays per row. Cached attention selects its
-backend once per executor. The AVX-512 path implements score tiles and
-softmax-weighted V tiles; portable execution retains the FP32 reference path.
+supported x86-64 hosts, with scalar fallback. On Apple Silicon, affine layers with
+at least 16 rows and attention with at least 4096 scores per head call
+Accelerate's `cblas_sgemm` instead; Accelerate runs them on the matrix
+coprocessor. Batching the row stage across rows measured slower on an M1 Max, so
+it stays per row.
+
+With the `metal` cargo feature on Apple Silicon, large query batches run the
+twelve cached ICL blocks and the decoder on the GPU as one `MPSGraph`, once per
+estimator; the CPU still runs the column and row stages. A context copies its
+FP32 ICL keys and values into shared Metal buffers when it is built. The GPU
+path starts at 49,152 query-times-training rows, the M1 Max crossover, and
+`IRONICL_NO_METAL=1` disables it. On macOS 27, `MPSGraph` prints "Failed to
+import MPS module" once per compiled shape; results are unaffected.
+
+Cached attention selects its backend once per executor. The AVX-512 path
+implements score tiles and softmax-weighted V tiles; portable execution retains
+the FP32 reference path.
 
 ### Current Native FP32 Kernels
 
