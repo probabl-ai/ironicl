@@ -430,7 +430,7 @@ Build on the Ryzen host:
 ```bash
 RUSTFLAGS="-C target-cpu=znver5" cargo build \
   --manifest-path $BENCH_ROOT/src/Ironicl/Cargo.toml \
-  --release --no-default-features
+  --release
 ```
 
 Run the exact target:

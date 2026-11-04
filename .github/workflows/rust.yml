@@ -34,7 +34,7 @@ jobs:
       - name: Explain validation scope
         run: |
           echo '## Rust validation scope' >> "$GITHUB_STEP_SUMMARY"
-          echo 'This job runs formatting, Clippy, and tests with and without default features.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'This job runs formatting, Clippy, and tests, including the python and metal feature set.' >> "$GITHUB_STEP_SUMMARY"
           echo 'Model and oracle fixtures are not provisioned; fixture-backed tests return early when files are absent.' >> "$GITHUB_STEP_SUMMARY"
           echo 'Hardware-gated kernels may also be skipped. This is not upstream model parity or Zen 5 validation.' >> "$GITHUB_STEP_SUMMARY"
       - name: Check formatting and Clippy

@@ -4,7 +4,6 @@ pub mod artifact;
 pub mod backend;
 pub mod benchmark;
 pub mod cache;
-#[cfg(feature = "checkpoint")]
 pub mod checkpoint;
 pub mod checkpoint_cache;
 pub mod cli;
@@ -28,7 +27,6 @@ pub mod static_context;
 pub use backend::{BackendKind, BackendPreference, resolve_backend};
 pub use benchmark::BenchmarkStats;
 pub use cache::{CacheEstimate, MemoryPlan, estimate_memory};
-#[cfg(feature = "checkpoint")]
 pub use checkpoint::{CheckpointProfile, CheckpointSummary, import_checkpoint, inspect_checkpoint};
 pub use checkpoint_cache::{PreparedCheckpoint, prepare_checkpoint};
 pub use cli::{

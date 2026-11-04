@@ -7,7 +7,7 @@
 Reads the trusted released checkpoint, validates tensor names and shapes, and
 converts tensors into an internal layer-major format. Serving must not depend on
 Python or PyTorch. The pure-Rust checkpoint front end uses Candle's pinned
-PyTorch pickle reader and is compiled through the `checkpoint` feature.
+PyTorch pickle reader.
 
 ### Preprocessing Bridge
 

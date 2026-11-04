@@ -12,7 +12,7 @@ cargo run --release -- benchmark --model model.ironicl --input request.irinput \
 For cached query-only inference:
 
 ```bash
-IRONICL_THREADS=8 cargo run --release --no-default-features -- benchmark \
+IRONICL_THREADS=8 cargo run --release -- benchmark \
   --model model.ironicl \
   --context context.ironiclctx \
   --input request.irquery \

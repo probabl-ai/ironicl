@@ -83,7 +83,7 @@ live upstream comparisons.
 
 | Command | Scope |
 |---|---|
-| `make test-rust` | Rust tests with default features and with `--no-default-features`, using `Cargo.lock`. |
+| `make test-rust` | Rust tests with default features, using `Cargo.lock`. |
 | `make lint-rust` | Formatting and Clippy for all feature configurations; warnings are errors. |
 | `make audit` | `Cargo.lock` against the RustSec advisory database; needs `cargo install cargo-audit`. |
 | `make lint-python` | Ruff pyflakes (`F`) checks for `python/ironicl` and `tools`; needs `pip install ruff` (or `uvx ruff`). |

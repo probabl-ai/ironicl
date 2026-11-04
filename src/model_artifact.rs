@@ -1,21 +1,17 @@
-use std::{collections::BTreeMap, fmt, fs::File, io::Read, path::Path};
-
-#[cfg(feature = "checkpoint")]
 use std::{
-    collections::BTreeSet,
-    fs::{self, OpenOptions},
-    io::Write,
-    path::PathBuf,
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+    fs::{self, File, OpenOptions},
+    io::{Read, Write},
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(feature = "checkpoint")]
-use crate::artifact::{pad_to_alignment, usize_to_u32, write_u16, write_u32, write_u64};
 use crate::{
     TaskKind,
     artifact::{
         ByteReader, CHECKSUM_BYTES, TENSOR_ALIGNMENT, align_up, artifact_error, encode_sha256,
-        sha256, u64_to_usize, usize_to_u64,
+        pad_to_alignment, sha256, u64_to_usize, usize_to_u32, usize_to_u64, write_u16, write_u32, write_u64,
     },
     error::{Error, Result},
 };
@@ -117,7 +113,6 @@ pub(crate) enum ModelTensorDType {
 }
 
 impl ModelTensorDType {
-    #[cfg(feature = "checkpoint")]
     fn id(self) -> u8 {
         match self {
             Self::U8 => 1,
@@ -163,7 +158,6 @@ impl ModelTensorDType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(feature = "checkpoint")]
 pub(crate) struct ModelTensor {
     pub name: String,
     pub dtype: ModelTensorDType,
@@ -172,7 +166,6 @@ pub(crate) struct ModelTensor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(feature = "checkpoint")]
 pub(crate) struct ModelArtifactData {
     pub source_sha256: [u8; 32],
     pub config: ModelConfig,
@@ -344,7 +337,6 @@ pub fn inspect_model_artifact(path: &Path) -> Result<ModelArtifactSummary> {
     Ok(parse_model_artifact_bytes(&bytes)?.summary)
 }
 
-#[cfg(feature = "checkpoint")]
 pub(crate) fn write_model_artifact(path: &Path, model: &ModelArtifactData) -> Result<ModelArtifactSummary> {
     let bytes = encode_model_artifact(model)?;
     let expected = parse_model_artifact_bytes(&bytes)?.summary;
@@ -380,7 +372,6 @@ pub(crate) fn write_model_artifact(path: &Path, model: &ModelArtifactData) -> Re
     write_result
 }
 
-#[cfg(feature = "checkpoint")]
 fn encode_model_artifact(model: &ModelArtifactData) -> Result<Vec<u8>> {
     model.config.validate()?;
     if model.source_sha256 == [0; 32] {
@@ -690,7 +681,6 @@ fn parse_model_artifact_bytes(bytes: &[u8]) -> Result<ParsedModelArtifact> {
     })
 }
 
-#[cfg(feature = "checkpoint")]
 fn validate_tensor(tensor: &ModelTensor) -> Result<()> {
     if tensor.name.is_empty() || tensor.name.len() > MAX_TENSOR_NAME_BYTES {
         return Err(Error::Artifact(format!("invalid tensor name '{}'", tensor.name)));
@@ -888,7 +878,6 @@ fn read_artifact_bytes(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-#[cfg(feature = "checkpoint")]
 fn create_temporary_path(path: &Path) -> Result<PathBuf> {
     let parent = usable_parent(path);
     let filename = path
@@ -913,7 +902,6 @@ fn create_temporary_path(path: &Path) -> Result<PathBuf> {
     ))
 }
 
-#[cfg(feature = "checkpoint")]
 fn usable_parent(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -924,7 +912,7 @@ fn required_config(value: Option<u64>, name: &str) -> Result<u64> {
     value.ok_or_else(|| Error::Artifact(format!("model configuration '{name}' is missing")))
 }
 
-#[cfg(all(test, feature = "checkpoint"))]
+#[cfg(test)]
 mod tests {
     use tempfile::tempdir;
 
