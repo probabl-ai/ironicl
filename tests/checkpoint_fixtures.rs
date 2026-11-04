@@ -287,6 +287,57 @@ fn built_context_matches_the_uncached_forward_pass() {
 }
 
 #[test]
+#[allow(clippy::cast_precision_loss, clippy::many_single_char_names)]
+fn large_cached_query_runs_in_chunks() {
+    let Some(model_path) = fixture("tabicl-classifier-v2.ironicl") else {
+        return;
+    };
+    let executor =
+        ClassifierExecutor::new(load_model_artifact(&model_path).expect("load classifier artifact"));
+    // 3000 query rows exceed the chunk size; each estimator's rows must land
+    // in place when the chunks are joined.
+    let (b, n, q, h) = (2, 240, 3000, 5);
+    let value = |index: usize| ((index * 7919) % 1000) as f32 / 250.0 - 2.0;
+    let train: Vec<f32> = (0..b * n * h).map(value).collect();
+    let query: Vec<f32> = (0..b * q * h).map(|index| value(index + 17)).collect();
+    let y: Vec<f32> = (0..b * n).map(|row| (row % 3) as f32).collect();
+    let context = executor
+        .build_context(
+            b,
+            n,
+            h,
+            &train,
+            &y,
+            (0..b).flat_map(|_| 0..3).collect(),
+            (0..b).flat_map(|_| 0..h as u64).collect(),
+            Optimize::Safe,
+        )
+        .expect("build context");
+    let all = context
+        .predict_logits(ClassifierQueryRequest::new(b, q, h, &query).expect("valid query"))
+        .expect("chunked logits");
+    let part = q / 3;
+    for start in (0..q).step_by(part) {
+        let rows: Vec<f32> = (0..b)
+            .flat_map(|e| query[(e * q + start) * h..][..part * h].to_vec())
+            .collect();
+        let expected = context
+            .predict_logits(ClassifierQueryRequest::new(b, part, h, &rows).expect("valid query"))
+            .expect("part logits");
+        for e in 0..b {
+            let actual = &all.values()[(e * q + start) * 3..][..part * 3];
+            let expected = &expected.values()[e * part * 3..][..part * 3];
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert!(
+                    (actual - expected).abs() <= 1e-4,
+                    "chunked {actual}, alone {expected}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn no_cache_validates_without_writing() {
     let Some(checkpoint) = fixture("tabicl-classifier-v2-20260212.ckpt") else {
         return;
