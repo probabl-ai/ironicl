@@ -30,9 +30,11 @@ The first optimized target is:
 - a fixed feature schema and training context;
 - one-row latency and 8-16-row microbatch throughput.
 
-The second target is Apple Silicon (M1 Max and later), using all of its
-built-in compute units. Intel Macs are not a target and use the portable path. The project must also build and run correctness tests
-on other hosts through portable Rust code.
+Apple Silicon (M1 Max and later) is the second target and is implemented: it uses
+the matrix coprocessor through Accelerate, the integrated GPU through Metal, and
+NEON CPU kernels, with FP16 under the `optimize` levels. Intel Macs are not a
+target and use the portable path. The project must also build and run correctness
+tests on other hosts through portable Rust code.
 
 ## Required Outcomes
 
@@ -40,7 +42,9 @@ on other hosts through portable Rust code.
 2. Build a deterministic static-context artifact from fitted preprocessing,
    training features, training targets, and ensemble configuration.
 3. Produce predictions that pass the validation policy in `validation.md`.
-4. Dispatch optimized kernels only after runtime CPU capability checks.
+4. Dispatch optimized kernels only after runtime CPU capability checks, and the
+   Metal GPU path only when the `metal` feature is built and `IRONICL_NO_METAL`
+   is unset.
 5. Fall back to a portable FP32 implementation on unsupported hosts.
 6. Report memory, bandwidth, and precision choices before allocating a context.
 7. Avoid hidden allocations in the steady-state request path.

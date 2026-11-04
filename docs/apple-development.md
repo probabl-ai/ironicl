@@ -3,7 +3,8 @@
 ## Purpose
 
 The M1 Max is the primary development machine. It validates architecture,
-artifact parsing, portable kernels, tests, CLI behavior, and PyTorch parity. It
+artifact parsing, portable kernels, tests, CLI behavior, and PyTorch parity, and
+it runs its own performance backend (Accelerate, NEON, and the Metal GPU). It
 cannot validate the AMD performance backend.
 
 ## Work Supported on macOS
@@ -17,6 +18,26 @@ cannot validate the AMD performance backend.
 - Property tests for layout transforms and online softmax.
 - Fuzzing of artifact metadata and bounds checks.
 - Small functional benchmarks that detect gross regressions.
+
+## Apple Silicon Performance Backend
+
+macOS is a performance target, not only a development host. On Apple Silicon:
+
+- the affine kernel dispatches to NEON; affine layers with at least 16 rows and
+  attention with at least 4096 scores per head call Accelerate's `cblas_sgemm`
+  on the matrix coprocessor. NEON also provides LayerNorm and short-source
+  attention, and softmax is vectorized with vDSP;
+- the `metal` cargo feature enables a Metal GPU path that builds static contexts
+  and runs the predict graph. `IRONICL_NO_METAL=1` disables it; contexts with
+  fewer than 160 training rows build on the CPU because the build graph's setup
+  costs about 250 ms; `IRONICL_GPU_BUILD_BUDGET` sets the per-group working-set
+  budget in bytes (default: Metal's recommended working set, at most about
+  2.2 GB per estimator). Query counts pad to buckets that keep their top four
+  significant bits.
+
+The full experiment record and gates are in
+[experiments.md](experiments.md#apple-silicon-experiments). The GPU latencies
+there are manual measurements; no tracked harness exercises the Metal path yet.
 
 ## Work Deferred to the Arch Linux Host
 
@@ -33,7 +54,8 @@ cannot validate the AMD performance backend.
 ## Portability Contract
 
 - `cargo test` and `cargo clippy` must pass on `aarch64-apple-darwin`.
-- x86 intrinsics must remain behind target and runtime gates.
+- architecture-specific intrinsics (x86 AVX-512 and AArch64 NEON) must remain
+  behind target and runtime gates.
 - Artifacts use explicit byte order and layout metadata.
 - Do not serialize `usize`, native enums, or native Rust structs.
 - Golden fixtures must be small enough to keep in the repository or generated

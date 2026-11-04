@@ -57,13 +57,13 @@ Completed:
 - Python full-KV context builder and preprocessed query exporter;
 - full-KV artifact reader/writer and whole-file checksum;
 - one-row and microbatch cached inference;
-- online stable attention.
+- online stable attention;
+- mmap-backed static-context loading.
 
 Remaining:
 
 - fixed native preprocessing schema and implementation;
 - representation-cache execution;
-- mmap-backed loading;
 - no steady-state allocations.
 
 Exit gate: cached parity and restart-safe artifacts.
@@ -82,7 +82,28 @@ for `B=1,N=1024,Q=64,H=54`, with `3.05e-5` maximum absolute logit error.
 
 Exit gate: optimized FP32 is faster than portable FP32 without accuracy change.
 
+## Phase 4b: Apple Silicon Backend
+
+Status: shipped. Apple Silicon has its own performance backend, not just the
+portable correctness path.
+
+- Accelerate `cblas_sgemm` for dense layers and attention on the matrix
+  coprocessor, with NEON LayerNorm and short-source attention kernels;
+- a Metal GPU path (behind the `metal` feature) that builds static contexts and
+  runs the full predict graph per estimator in one run, with query bucketing,
+  large-query chunking, and memory-bounded estimator grouping;
+- the `optimize=safe|auto|fast` levels, with FP16 ICL caches and FP16 attention
+  under `auto` and `fast` behind the FP16 accuracy gate;
+- performance-core executor threads and parallel estimators on macOS.
+
+Exit gate: GPU and reduced-precision paths match the portable FP32 output within
+their gates. See [experiments.md](experiments.md#apple-silicon-experiments).
+
 ## Phase 5: BF16 Storage
+
+Status: partially shipped. The default context stores BF16 ICL values with
+FP32 accumulation, and the executor has packed BF16 affine and dense paths; the
+full accuracy suite, artifact variants, and migration policy remain.
 
 - BF16 weight conversion and packed kernels;
 - BF16 column and ICL cache storage;
@@ -106,6 +127,7 @@ Exit gate: no default change without dataset-level accuracy approval.
 
 - 999-quantile decoder and postprocessing;
 - regressor parity and accuracy suite;
-- Python API bridge if required;
+- Python API bridge: delivered as the sklearn-compatible `TabICLClassifier`
+  (`python/ironicl/classifier.py`) over the PyO3 bindings;
 - reproducible release artifacts;
 - deployment and operations documentation.

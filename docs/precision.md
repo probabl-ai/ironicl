@@ -41,7 +41,10 @@ model name.
 - ensemble reduction.
 
 This mixed policy is a requirement until validation proves a narrower FP32
-boundary is safe.
+boundary is safe. It describes the `safe` level and the x86 path. On Apple
+Silicon under `optimize=auto` or `fast`, ICL attention (Q-by-K scores, stable
+softmax, and probability-by-V accumulation) runs in FP16 on the GPU, under the
+FP16 gate below.
 
 ## FP32 Variant
 
@@ -109,8 +112,20 @@ Required experiment order:
 No INT8 cache policy becomes a default without end-to-end benchmark accuracy
 results across classification and regression datasets.
 
-## FP16
+## FP16 and the optimize levels
 
-FP16 is not a target storage policy. BF16 offers more exponent range and matches
-the intended Zen 5 dot-product path. FP16 can be revisited only if measured
-hardware and accuracy results justify another artifact variant.
+On the x86 Zen 5 path FP16 is not used: BF16 offers more exponent range and
+matches the intended dot-product path.
+
+On Apple Silicon, FP16 is a shipped GPU storage policy, selected by the
+`optimize` level:
+
+- `safe` keeps FP32 arithmetic and the FP32/BF16 storage above;
+- `auto` and `fast` store the ICL keys and values in FP16 and run ICL attention
+  in FP16 on the Metal GPU, converting only the queries.
+
+The level is set through the Python API or the `IRONICL_OPTIMIZE` environment
+variable. FP16 overflows above 65504, so the reduced-precision levels carry their
+own accuracy gate against the `safe` output, not the FP32 `1e-4` tolerance. The
+gate and its measurements are in
+[experiments.md](experiments.md#fp16-gate-for-the-optimize-levels).
