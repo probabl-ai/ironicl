@@ -273,7 +273,8 @@ fn built_context_matches_the_uncached_forward_pass() {
             feature = "metal",
             target_os = "macos",
             target_arch = "aarch64"
-        )) {
+        )) && std::env::var_os("IRONICL_NO_METAL").is_none()
+        {
             assert!(
                 actual
                     .values()
