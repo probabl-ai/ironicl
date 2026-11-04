@@ -6,11 +6,9 @@
 
 use std::{fs::File, io::Read, path::Path};
 
-use sha2::{Digest, Sha256};
-
 use crate::{
+    artifact::{ByteReader, CHECKSUM_BYTES, encode_sha256, sha256, write_u32, write_u64},
     error::{Error, Result},
-    model_artifact::encode_sha256,
 };
 
 /// Magic bytes at the start of a classifier input bundle.
@@ -21,7 +19,6 @@ pub const CLASSIFIER_INPUT_BUNDLE_VERSION: u32 = 1;
 pub const CLASSIFIER_INPUT_BUNDLE_KIND: u32 = 1;
 
 const HEADER_BYTES: usize = 80;
-const CHECKSUM_BYTES: usize = 32;
 const MAX_BUNDLE_BYTES: usize = 512 * 1024 * 1024;
 const MAX_ENSEMBLE_COUNT: usize = 4096;
 const MAX_TOTAL_ROWS: usize = 1_000_000;
@@ -433,57 +430,11 @@ fn decode_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
-fn sha256(bytes: &[u8]) -> [u8; 32] {
-    Sha256::digest(bytes).into()
-}
-fn write_u32(bytes: &mut Vec<u8>, value: u32) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-fn write_u64(bytes: &mut Vec<u8>, value: u64) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
 fn to_usize(value: u64, name: &str) -> Result<usize> {
     usize::try_from(value).map_err(|_| input_error(format!("{name} exceeds usize")))
 }
 fn input_error(message: impl std::fmt::Display) -> Error {
     Error::InputBundle(message.to_string())
-}
-
-struct ByteReader<'a> {
-    bytes: &'a [u8],
-    position: usize,
-}
-
-impl<'a> ByteReader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, position: 0 }
-    }
-    fn is_empty(&self) -> bool {
-        self.position == self.bytes.len()
-    }
-    fn read_u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(self.read_array()?))
-    }
-    fn read_u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.read_array()?))
-    }
-    fn read_array<const N: usize>(&mut self) -> Result<[u8; N]> {
-        self.read_bytes(N)?
-            .try_into()
-            .map_err(|_| input_error("bundle field has an invalid length"))
-    }
-    fn read_bytes(&mut self, length: usize) -> Result<&'a [u8]> {
-        let end = self
-            .position
-            .checked_add(length)
-            .ok_or_else(|| input_error("bundle offset overflows usize"))?;
-        let bytes = self
-            .bytes
-            .get(self.position..end)
-            .ok_or_else(|| input_error("bundle is truncated"))?;
-        self.position = end;
-        Ok(bytes)
-    }
 }
 
 #[cfg(test)]

@@ -3442,7 +3442,7 @@ fn validate_static_context(model: &ModelArtifact, context: &StaticContextArtifac
 }
 
 fn model_hash_matches(model_hash: &[u8], context_hash: &[u8; 32]) -> bool {
-    model_hash == crate::model_artifact::encode_sha256(context_hash).as_bytes()
+    model_hash == crate::artifact::encode_sha256(context_hash).as_bytes()
 }
 
 /// A context's cache tensors in order: each column block's key and value as

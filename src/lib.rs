@@ -25,7 +25,6 @@ mod python;
 pub mod query_bundle;
 pub mod static_context;
 
-pub use artifact::{ARTIFACT_FORMAT_VERSION, ARTIFACT_MAGIC, ArtifactDescriptor};
 pub use backend::{BackendKind, BackendPreference, resolve_backend};
 pub use benchmark::BenchmarkStats;
 pub use cache::{CacheEstimate, MemoryPlan, estimate_memory};
