@@ -2309,6 +2309,24 @@ impl StaticClassifierExecutor {
                         )?;
                     }
                 }
+                // Only queries the GPU hands back reach this: widen the
+                // block's FP16 caches and run the FP32 kernel.
+                (StaticContextTensorData::F16(key), StaticContextTensorData::F16(value)) => {
+                    let widen =
+                        |values: &[u16]| values.iter().map(|&bits| f16_to_f32(bits)).collect::<Vec<_>>();
+                    parallel_cached_attention(
+                        self.attention_backend,
+                        &q_heads,
+                        q_rows,
+                        &widen(key),
+                        &widen(value),
+                        source_rows,
+                        head_dim,
+                        self.context.has_packed_icl_keys(),
+                        &mut attended,
+                        workers,
+                    )?;
+                }
                 _ => {
                     return Err(Error::Artifact(
                         "static context attention K/V dtypes do not match".into(),
@@ -3486,6 +3504,19 @@ fn group_features_into(x: &[f32], (rows, h): (usize, usize), stride: usize, outp
         }
     }
     true
+}
+
+/// IEEE half-precision bits as `f32`, exactly. `f16` is not stable Rust yet.
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
+    let exponent = (bits >> 10) & 0x1f;
+    let mantissa = f32::from(bits & 0x3ff);
+    sign * match exponent {
+        0 => mantissa * (-24.0_f32).exp2(),
+        31 if mantissa == 0.0 => f32::INFINITY,
+        31 => f32::NAN,
+        _ => (1.0 + mantissa / 1024.0) * (f32::from(exponent) - 15.0).exp2(),
+    }
 }
 
 fn aggregate_classifier_probabilities(
@@ -4839,5 +4870,25 @@ mod tests {
     fn admission_rejects_huge_dimensions_without_input_allocation() {
         assert!(admit_request(1, 1_000_000, 1, 1).is_err());
         assert!(admit_request(1, usize::MAX, usize::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn widens_half_precision_exactly() {
+        for (bits, expected) in [
+            (0x3c00, 1.0),
+            (0xc000, -2.0),
+            (0x3555, 0.333_251_95),
+            (0x7bff, 65504.0),
+            (0x0001, 5.960_464_5e-8),
+            (0x0000, 0.0),
+            (0x7c00, f32::INFINITY),
+        ] {
+            assert_eq!(
+                super::f16_to_f32(bits).to_bits(),
+                f32::to_bits(expected),
+                "{bits:#06x}"
+            );
+        }
+        assert!(super::f16_to_f32(0x7e00).is_nan());
     }
 }
