@@ -114,6 +114,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
             raise NotImplementedError("random_state=None is not supported")
         if y is None:
             raise ValueError("This classifier requires y to be passed, but the target y is None.")
+        optimize = self._optimize()
 
         methods = self.norm_methods or ["none", "power"]
         preprocessor = ClassifierPreprocessor(
@@ -132,7 +133,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
             preprocessor.class_permutations_[:, labels].astype(np.float32),
             np.ascontiguousarray(preprocessor.class_permutations_, dtype=np.uint64),
             np.ascontiguousarray(preprocessor.feature_permutations_, dtype=np.uint64),
-            self._optimize(),
+            optimize,
         )
         self.preprocessor_ = preprocessor
         self.checkpoint_path_ = checkpoint
@@ -151,7 +152,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
             self.softmax_temperature,
             self.average_logits,
         )
-        return np.frombuffer(values, dtype=np.float32).reshape(shape).copy()  # Writable, like upstream.
+        return np.frombuffer(values, dtype=np.float32).reshape(shape).copy()  # Writable, like TabICL.
 
     def predict(self, X) -> np.ndarray:
         """Return the most probable class label for each sample."""

@@ -96,8 +96,11 @@ class TabICLClassifierParityTest(unittest.TestCase):
                 self.assertFalse((flipped & ~near_tie).any())
 
     def test_optimize_rejects_unknown_levels(self):
+        clf = TabICLClassifier(model_path=self.checkpoint, optimize="turbo")
         with self.assertRaisesRegex(ValueError, "optimize"):
-            TabICLClassifier(model_path=self.checkpoint, optimize="turbo").fit([[0.0], [1.0]], [0, 1])
+            clf.fit([[0.0], [1.0]], [0, 1])
+        with self.assertRaises(NotFittedError):  # A failed fit must not look fitted.
+            clf.predict([[0.0]])
 
 
 if __name__ == "__main__":
