@@ -337,6 +337,51 @@ fn large_cached_query_runs_in_chunks() {
     }
 }
 
+/// A query row whose grouped features are all the missing marker runs on the
+/// CPU, which must read the FP16 caches of an `Auto` context.
+#[test]
+#[allow(clippy::cast_precision_loss, clippy::many_single_char_names)]
+fn reduced_precision_context_predicts_all_missing_rows() {
+    let Some(model_path) = fixture("tabicl-classifier-v2.ironicl") else {
+        return;
+    };
+    let executor =
+        ClassifierExecutor::new(load_model_artifact(&model_path).expect("load classifier artifact"));
+    let (b, n, q, h) = (2, 240, 4, 5);
+    let value = |index: usize| ((index * 7919) % 1000) as f32 / 250.0 - 2.0;
+    let train: Vec<f32> = (0..b * n * h).map(value).collect();
+    let mut query: Vec<f32> = (0..b * q * h).map(|index| value(index + 17)).collect();
+    for e in 0..b {
+        query[e * q * h..][..h].fill(-100.0);
+    }
+    let y: Vec<f32> = (0..b * n).map(|row| (row % 3) as f32).collect();
+    let logits = |optimize| {
+        executor
+            .build_context(
+                b,
+                n,
+                h,
+                &train,
+                &y,
+                (0..b).flat_map(|_| 0..3).collect(),
+                (0..b).flat_map(|_| 0..h as u64).collect(),
+                optimize,
+            )
+            .expect("build context")
+            .predict_logits(ClassifierQueryRequest::new(b, q, h, &query).expect("valid query"))
+            .expect("logits")
+            .values()
+            .to_vec()
+    };
+    let safe = logits(Optimize::Safe);
+    for (index, (auto, safe)) in logits(Optimize::Auto).iter().zip(&safe).enumerate() {
+        assert!(
+            (auto - safe).abs() <= 1e-2,
+            "logit {index}: auto {auto}, safe {safe}"
+        );
+    }
+}
+
 #[test]
 fn no_cache_validates_without_writing() {
     let Some(checkpoint) = fixture("tabicl-classifier-v2-20260212.ckpt") else {
