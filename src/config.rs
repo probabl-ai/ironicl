@@ -46,10 +46,16 @@ impl FromStr for TaskKind {
 }
 
 /// Storage formats. Arithmetic policy is separate and remains FP32 by default.
+///
+/// This is the one storage-dtype vocabulary shared by the config surface and the
+/// on-disk artifact directories. Model *import* dtypes are a separate concern
+/// (`model_artifact::ModelTensorDType`), since a checkpoint weight may be
+/// `i64`/`f64`/`u8` that a cache never stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageDType {
     Fp32,
     Bf16,
+    F16,
     Int8,
 }
 
@@ -58,8 +64,39 @@ impl StorageDType {
     pub const fn bytes_per_element(self) -> u64 {
         match self {
             Self::Fp32 => 4,
-            Self::Bf16 => 2,
+            Self::Bf16 | Self::F16 => 2,
             Self::Int8 => 1,
+        }
+    }
+
+    /// Stable on-disk tag for an artifact tensor-directory entry. The numbers are
+    /// a wire format shared by every artifact that stores these dtypes.
+    ///
+    /// Reserved but unimplemented: tag `5` = `int4`. It is sub-byte, so it does
+    /// not fit `bytes_per_element` and needs a packing convention decided before
+    /// it becomes a variant.
+    #[must_use]
+    pub(crate) const fn on_disk_tag(self) -> u16 {
+        match self {
+            Self::Fp32 => 1,
+            Self::Bf16 => 2,
+            Self::F16 => 3,
+            Self::Int8 => 4,
+        }
+    }
+
+    /// Parse an on-disk tag written by [`Self::on_disk_tag`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Artifact`] for an unknown or reserved tag.
+    pub(crate) fn from_disk_tag(tag: u16) -> Result<Self> {
+        match tag {
+            1 => Ok(Self::Fp32),
+            2 => Ok(Self::Bf16),
+            3 => Ok(Self::F16),
+            4 => Ok(Self::Int8),
+            _ => Err(Error::Artifact(format!("unsupported tensor dtype tag {tag}"))),
         }
     }
 }
@@ -69,6 +106,7 @@ impl fmt::Display for StorageDType {
         match self {
             Self::Fp32 => f.write_str("fp32"),
             Self::Bf16 => f.write_str("bf16"),
+            Self::F16 => f.write_str("f16"),
             Self::Int8 => f.write_str("int8"),
         }
     }
@@ -81,9 +119,10 @@ impl FromStr for StorageDType {
         match value {
             "fp32" | "f32" => Ok(Self::Fp32),
             "bf16" => Ok(Self::Bf16),
+            "f16" | "fp16" => Ok(Self::F16),
             "int8" | "i8" => Ok(Self::Int8),
             _ => Err(Error::InvalidArgument(format!(
-                "unknown storage dtype '{value}'; expected fp32, bf16, or int8"
+                "unknown storage dtype '{value}'; expected fp32, bf16, f16, or int8"
             ))),
         }
     }
