@@ -109,15 +109,17 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         )
         train_groups = preprocessor.fit_transform(X, y)
         labels = preprocessor.encode_labels(y)
-        y_train = preprocessor.class_permutations_[:, labels].astype(np.float32)
-        self.preprocessor_ = preprocessor
-        self.checkpoint_path_ = self._checkpoint()
-        self.context_ = _model(self.checkpoint_path_).fit_context(
-            self._ensemble_rows(train_groups),
-            y_train,
+        checkpoint = self._checkpoint()
+        # Fitted attributes are set only once the context exists, so a failed
+        # fit never looks fitted.
+        self.context_ = _model(checkpoint).fit_context(
+            _ensemble_rows(preprocessor, train_groups),
+            preprocessor.class_permutations_[:, labels].astype(np.float32),
             np.ascontiguousarray(preprocessor.class_permutations_, dtype=np.uint64),
             np.ascontiguousarray(preprocessor.feature_permutations_, dtype=np.uint64),
         )
+        self.preprocessor_ = preprocessor
+        self.checkpoint_path_ = checkpoint
         self.classes_ = preprocessor.classes_
         self.n_classes_ = len(self.classes_)
         self.n_features_in_ = preprocessor.n_features_in_
@@ -129,21 +131,16 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         """Return class probabilities with shape ``(n_samples, n_classes)``."""
         check_is_fitted(self)
         values, shape = self.context_.predict_proba(
-            self._ensemble_rows(self.preprocessor_.transform(X)),
+            _ensemble_rows(self.preprocessor_, self.preprocessor_.transform(X)),
             self.softmax_temperature,
             self.average_logits,
         )
         return np.frombuffer(values, dtype=np.float32).reshape(shape).copy()  # Writable, like upstream.
 
-    def _ensemble_rows(self, groups: list[np.ndarray]) -> np.ndarray:
-        """Stack each estimator's feature-permuted group into ``[B, rows, H]``."""
-        pre = self.preprocessor_
-        rows = [groups[group][:, pre.feature_permutations_[e]] for e, group in enumerate(pre.ensemble_groups_)]
-        return np.stack(rows).astype(np.float32, copy=False)
-
     def predict(self, X) -> np.ndarray:
         """Return the most probable class label for each sample."""
-        return self.preprocessor_.decode_labels(np.argmax(self.predict_proba(X), axis=1))
+        probabilities = self.predict_proba(X)  # Checks that the classifier is fitted.
+        return self.preprocessor_.decode_labels(np.argmax(probabilities, axis=1))
 
     def _checkpoint(self) -> Path:
         if self.model_path is not None and Path(self.model_path).exists():
@@ -163,3 +160,12 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         urllib.request.urlretrieve(CHECKPOINT_URL.format(self.checkpoint_version), partial)
         partial.replace(path)
         return path
+
+
+def _ensemble_rows(preprocessor: ClassifierPreprocessor, groups: list[np.ndarray]) -> np.ndarray:
+    """Stack each estimator's feature-permuted group into ``[B, rows, H]``."""
+    rows = [
+        groups[group][:, preprocessor.feature_permutations_[e]]
+        for e, group in enumerate(preprocessor.ensemble_groups_)
+    ]
+    return np.stack(rows).astype(np.float32, copy=False)

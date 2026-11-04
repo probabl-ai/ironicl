@@ -12,6 +12,7 @@ import unittest
 
 import numpy as np
 from sklearn.datasets import load_breast_cancer, load_iris, load_wine
+from sklearn.exceptions import NotFittedError
 from sklearn.model_selection import train_test_split
 from test_tabicl_preprocessing import load_upstream
 
@@ -56,6 +57,13 @@ class TabICLClassifierParityTest(unittest.TestCase):
                 )
                 np.testing.assert_array_equal(ours.predict(x_test), theirs.predict(x_test))
                 np.testing.assert_array_equal(ours.classes_, theirs.classes_)
+
+    def test_failed_fit_is_not_fitted(self):
+        clf = TabICLClassifier(model_path="/nonexistent/model.ckpt", allow_auto_download=False)
+        with self.assertRaises(FileNotFoundError):
+            clf.fit([[0.0], [1.0]], [0, 1])
+        with self.assertRaises(NotFittedError):
+            clf.predict([[0.0]])
 
 
 if __name__ == "__main__":
