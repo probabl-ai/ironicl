@@ -42,18 +42,19 @@ use crate::{
     profile::{self, Category},
 };
 
-const COLUMN_DIM: usize = 128;
-const ICL_DIM: usize = 512;
-const HEADS: usize = 8;
-const INDUCING: usize = 128;
-const RESERVED: usize = 4;
+pub(crate) const COLUMN_DIM: usize = 128;
+pub(crate) const ICL_DIM: usize = 512;
+pub(crate) const HEADS: usize = 8;
+pub(crate) const INDUCING: usize = 128;
+/// CLS streams ahead of the features in the row stage.
+pub(crate) const RESERVED: usize = 4;
 const ATTENTION_QUERY_BLOCK_ROWS: usize = 16;
 const ATTENTION_KEY_TILE_ROWS: usize = 128;
 const MAX_ACTIVATION_BYTES: usize = 1536 * 1024 * 1024;
 const MAX_ACTIVATION_ELEMENTS: usize = MAX_ACTIVATION_BYTES / std::mem::size_of::<f32>();
-/// Cached prediction splits larger queries. The GPU keeps the compiled graph
-/// of every query bucket up to this size.
-const QUERY_CHUNK_ROWS: usize = 1024;
+/// Cached prediction splits larger queries. The GPU keeps the buffers and
+/// compiled graph of every query bucket up to this size.
+pub(crate) const QUERY_CHUNK_ROWS: usize = 1024;
 const SPARSE_INDEX_TENSORS: [&str; 4] = [
     "icl.index.centroids",
     "icl.index.radii",
@@ -313,27 +314,13 @@ impl ClassifierLogits {
 pub struct ClassifierExecutor {
     model: Arc<ModelArtifact>,
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-    icl_graph: Arc<OnceLock<Option<Arc<GpuGraph>>>>,
-}
-
-/// The GPU and the model's weights in shared GPU buffers, created on first use
-/// and shared by every context of a model.
-#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-struct GpuGraph(crate::metal::ModelWeights);
-
-#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-impl std::fmt::Debug for GpuGraph {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("GpuGraph")
-    }
+    gpu_weights: Arc<OnceLock<Option<Arc<crate::metal::ModelWeights>>>>,
 }
 
 /// One context's Metal buffers and the graph that reads them.
 #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
 struct GpuContext {
     predict: crate::metal::PredictGraph,
-    /// Keeps the model's weight buffers alive with the graph that reads them.
-    _model: Arc<GpuGraph>,
     /// Keeps page-aligned context memory alive while GPU buffers wrap it.
     _storage: Option<Arc<memmap2::Mmap>>,
 }
@@ -343,21 +330,6 @@ impl std::fmt::Debug for GpuContext {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("GpuContext")
     }
-}
-
-/// Smallest training set that builds its context on the GPU. Building costs
-/// about 250 ms of graph setup on an M1 Max, so the CPU is faster below about
-/// 150 rows. Prediction always uses the GPU when the context is there: one
-/// batched run beat the CPU from a single query row.
-#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-const GPU_MIN_BUILD_ROWS: usize = 160;
-
-/// An upper bound on one estimator's share of the GPU build's peak memory.
-/// Measured on an M1 Max: the peak grows linearly in N, with no N x N term,
-/// by about 1.7 GB per estimator at 8192 x 54; this estimates 2.2 GB.
-#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-fn gpu_build_estimator_bytes(n: usize, h: usize) -> usize {
-    n.saturating_mul((h + RESERVED) * COLUMN_DIM * 4 * 8 + ICL_DIM * 4 * 16)
 }
 
 /// Attention keys and values in head-major `[heads, rows, head_dim]` order.
@@ -444,28 +416,29 @@ impl ClassifierExecutor {
         Self {
             model: Arc::new(model),
             #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-            icl_graph: Arc::default(),
+            gpu_weights: Arc::default(),
         }
     }
 
-    /// The GPU and its ICL graph, built on first use; `None` without a GPU or
+    /// The GPU and the model's weights in shared GPU buffers, created on first
+    /// use and shared by every context of the model. `None` without a GPU or
     /// with `IRONICL_NO_METAL` set.
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-    fn gpu_graph(&self) -> Option<Arc<GpuGraph>> {
+    fn gpu_weights(&self) -> Option<Arc<crate::metal::ModelWeights>> {
         if std::env::var_os("IRONICL_NO_METAL").is_some() {
             return None;
         }
-        self.icl_graph
+        self.gpu_weights
             .get_or_init(|| {
                 let gpu = crate::metal::Gpu::new().ok().flatten()?;
-                Some(Arc::new(GpuGraph(crate::metal::ModelWeights::new(gpu))))
+                Some(Arc::new(crate::metal::ModelWeights::new(gpu)))
             })
             .clone()
     }
 
     /// Build every estimator's keys and values on the GPU, straight into
     /// page-aligned context tensors. Returns `None` without a GPU, below
-    /// `GPU_MIN_BUILD_ROWS`, when a grouped triple is the all-missing marker
+    /// `metal::GPU_MIN_BUILD_ROWS`, when a grouped triple is the all-missing marker
     /// that only the CPU path handles, or when one estimator exceeds the
     /// build's memory budget.
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
@@ -483,17 +456,17 @@ impl ClassifierExecutor {
             // accurate than FP16, so `Fast` uses FP16 until it gets more.
             Optimize::Auto | Optimize::Fast => TensorStorage::F16,
         };
-        if n < GPU_MIN_BUILD_ROWS {
+        if n < crate::metal::GPU_MIN_BUILD_ROWS {
             return Ok(None);
         }
-        let Some(graph) = self.gpu_graph() else {
+        let Some(gpu_weights) = self.gpu_weights() else {
             return Ok(None);
         };
         let mut grouped = Vec::with_capacity(b * h * n * 3);
         let mut column_labels = vec![0.0; b * n * COLUMN_DIM];
         let mut icl_labels = vec![0.0; b * n * ICL_DIM];
         for ensemble in 0..b {
-            let Some(group) = group_features(&x[ensemble * n * h..][..n * h], n, h) else {
+            let Some(group) = crate::metal::group_features(&x[ensemble * n * h..][..n * h], n, h) else {
                 return Ok(None);
             };
             grouped.extend(group);
@@ -566,8 +539,8 @@ impl ClassifierExecutor {
         let budget = std::env::var("IRONICL_GPU_BUILD_BUDGET")
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or_else(|| graph.0.gpu().working_set_bytes());
-        let estimator_bytes = gpu_build_estimator_bytes(n, h);
+            .unwrap_or_else(|| gpu_weights.gpu().working_set_bytes());
+        let estimator_bytes = crate::metal::gpu_build_estimator_bytes(n, h);
         let Some(group) = (1..=b)
             .rev()
             .find(|&group| b % group == 0 && group * estimator_bytes <= budget)
@@ -579,7 +552,7 @@ impl ClassifierExecutor {
         for start in (0..b).step_by(group) {
             let output = scratch.as_mut().unwrap_or(&mut tensors);
             crate::metal::build_context(
-                &graph.0,
+                &gpu_weights,
                 &|name| self.tensor(name),
                 crate::metal::Shape {
                     ensembles: group,
@@ -1538,12 +1511,12 @@ impl StaticClassifierExecutor {
     /// contexts and contexts with mixed ICL storage stay on the CPU.
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
     fn with_gpu(mut self) -> Result<Self> {
-        if std::env::var_os("IRONICL_NO_METAL").is_some() || self.context.has_packed_icl_keys() {
+        if self.context.has_packed_icl_keys() {
             return Ok(self);
         }
         let model = &self.model;
         let weights = |name: &str| model.tensor(name);
-        let Some(graph) = model.gpu_graph() else {
+        let Some(gpu_weights) = model.gpu_weights() else {
             return Ok(self);
         };
         let column = |kind: &str| -> Option<Vec<&[f32]>> {
@@ -1592,7 +1565,7 @@ impl StaticClassifierExecutor {
         }
         let metadata = self.context.metadata();
         let predict = crate::metal::PredictGraph::new(
-            &graph.0,
+            &gpu_weights,
             &weights,
             crate::metal::Shape {
                 ensembles: metadata.ensemble_count,
@@ -1607,7 +1580,6 @@ impl StaticClassifierExecutor {
         )?;
         self.gpu = Some(Arc::new(GpuContext {
             predict,
-            _model: graph,
             _storage: self.context.page_aligned_storage().cloned(),
         }));
         Ok(self)
@@ -1638,7 +1610,7 @@ impl StaticClassifierExecutor {
                 .chunks_exact_mut(h * stride * 3)
                 .enumerate()
                 .all(|(ensemble, input)| {
-                    group_features_into(&x[ensemble * q * h..][..q * h], (q, h), stride, input)
+                    crate::metal::group_features_into(&x[ensemble * q * h..][..q * h], (q, h), stride, input)
                 })
         })?
         else {
@@ -3477,33 +3449,6 @@ impl StaticClassifierExecutor {
         }
         Ok(())
     }
-}
-
-/// Group each feature of `[rows, H]` inputs with the features 1, 2, and 4
-/// places after it, as `[H, rows, 3]`. Returns `None` when a triple is the
-/// all-missing marker, which only the CPU column stage handles.
-#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-fn group_features(x: &[f32], rows: usize, h: usize) -> Option<Vec<f32>> {
-    let mut grouped = vec![0.0; h * rows * 3];
-    group_features_into(x, (rows, h), rows, &mut grouped).then_some(grouped)
-}
-
-/// [`group_features`] into `[H, stride, 3]` output, leaving rows past `rows`
-/// untouched. Returns false on the all-missing marker.
-#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-fn group_features_into(x: &[f32], (rows, h): (usize, usize), stride: usize, output: &mut [f32]) -> bool {
-    for feature in 0..h {
-        for row in 0..rows {
-            let triple = &mut output[(feature * stride + row) * 3..][..3];
-            for (part, offset) in [1_usize, 2, 4].iter().enumerate() {
-                triple[part] = x[row * h + (feature + offset) % h];
-            }
-            if triple.iter().all(|value| *value == -100.0) {
-                return false;
-            }
-        }
-    }
-    true
 }
 
 /// IEEE half-precision bits as `f32`, exactly. `f16` is not stable Rust yet.
