@@ -29,14 +29,66 @@ pub(crate) const fn affine_uses_sgemm(rows: usize) -> bool {
     cfg!(all(target_os = "macos", target_arch = "aarch64")) && rows >= SGEMM_MIN_ROWS
 }
 
+/// Run head-major FP32 attention natively unless `backend` is `Portable`:
+/// through Accelerate when it is large enough, else with the short-source
+/// NEON kernel. Returns false when the caller must use its own kernel.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
+pub(crate) fn attention_f32(
+    backend: AttentionBackend,
+    query: &[f32],
+    query_rows: usize,
+    key: &[f32],
+    value: &[f32],
+    source_rows: usize,
+    heads: usize,
+    head_dim: usize,
+    output: &mut [f32],
+) -> bool {
+    if backend == AttentionBackend::Portable {
+        return false;
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if query_rows * source_rows >= SGEMM_MIN_ATTENTION_SCORES
+        && accelerate::attention(
+            query,
+            query_rows,
+            key,
+            value,
+            source_rows,
+            heads,
+            head_dim,
+            output,
+        )
+    {
+        return true;
+    }
+    #[cfg(target_arch = "aarch64")]
+    if small_attention(
+        query,
+        query_rows,
+        key,
+        value,
+        source_rows,
+        heads,
+        head_dim,
+        output,
+    ) {
+        return true;
+    }
+    false
+}
+
 /// Longest source that `small_attention` handles; one query row's scores live on the stack.
+#[cfg(target_arch = "aarch64")]
 const SMALL_ATTENTION_MAX_SOURCES: usize = 128;
 
 /// Exact head-major attention for short sources, such as the row stage's
 /// 26-token sequences. It avoids the tiled kernel's per-pair calls. Returns
-/// false when the shape or target is not supported.
+/// false when the shape is not supported.
+#[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn small_attention(
+fn small_attention(
     query: &[f32],
     query_rows: usize,
     key: &[f32],
@@ -49,33 +101,11 @@ pub(crate) fn small_attention(
     if source_rows == 0 || source_rows > SMALL_ATTENTION_MAX_SOURCES || !head_dim.is_multiple_of(4) {
         return false;
     }
-    small_attention_for_target(
-        query,
-        query_rows,
-        key,
-        value,
-        source_rows,
-        heads,
-        head_dim,
-        output,
-    )
-}
-
-#[cfg(target_arch = "aarch64")]
-#[allow(clippy::too_many_arguments)]
-fn small_attention_for_target(
-    query: &[f32],
-    query_rows: usize,
-    key: &[f32],
-    value: &[f32],
-    source_rows: usize,
-    heads: usize,
-    head_dim: usize,
-    output: &mut [f32],
-) -> bool {
     assert!(query.len() >= heads * query_rows * head_dim && output.len() >= heads * query_rows * head_dim);
     assert!(key.len() >= heads * source_rows * head_dim && value.len() >= heads * source_rows * head_dim);
-    // Advanced SIMD is mandatory for AArch64; the assertions bound every access.
+    // SAFETY: NEON is mandatory on AArch64. The assertions bound every slice
+    // access, `source_rows <= SMALL_ATTENTION_MAX_SOURCES` bounds the stack
+    // score array, and `head_dim % 4 == 0` matches the 4-lane loads.
     unsafe {
         small_attention_neon(
             query,
@@ -89,21 +119,6 @@ fn small_attention_for_target(
         );
     }
     true
-}
-
-#[cfg(not(target_arch = "aarch64"))]
-#[allow(clippy::too_many_arguments)]
-fn small_attention_for_target(
-    _query: &[f32],
-    _query_rows: usize,
-    _key: &[f32],
-    _value: &[f32],
-    _source_rows: usize,
-    _heads: usize,
-    _head_dim: usize,
-    _output: &mut [f32],
-) -> bool {
-    false
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -165,46 +180,8 @@ unsafe fn small_attention_neon(
 }
 
 /// Smallest `query_rows * source_rows` per head that goes to Accelerate on Apple Silicon.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const SGEMM_MIN_ATTENTION_SCORES: usize = 4096;
-
-/// Run head-major attention through Accelerate on Apple Silicon when it is large
-/// enough. Returns false when the caller must use its own kernel.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn attention_sgemm(
-    query: &[f32],
-    query_rows: usize,
-    key: &[f32],
-    value: &[f32],
-    source_rows: usize,
-    heads: usize,
-    head_dim: usize,
-    output: &mut [f32],
-) -> bool {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if query_rows * source_rows >= SGEMM_MIN_ATTENTION_SCORES {
-        return accelerate::attention(
-            query,
-            query_rows,
-            key,
-            value,
-            source_rows,
-            heads,
-            head_dim,
-            output,
-        );
-    }
-    let _ = (
-        query,
-        query_rows,
-        key,
-        value,
-        source_rows,
-        heads,
-        head_dim,
-        output,
-    );
-    false
-}
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod accelerate {
@@ -4501,6 +4478,19 @@ mod tests {
             });
         }
         assert!(!super::small_attention(&[], 1, &[], &[], 129, 1, 16, &mut []));
+        // A portable request never takes a native kernel.
+        let (query, mut output) = (vec![0.5; 16], vec![0.0; 16]);
+        assert!(!super::attention_f32(
+            super::AttentionBackend::Portable,
+            &query,
+            1,
+            &query,
+            &query,
+            1,
+            1,
+            16,
+            &mut output
+        ));
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
