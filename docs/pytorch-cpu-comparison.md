@@ -249,5 +249,5 @@ The current evidence supports these narrow conclusions:
 - Official classifier: `../tabicl/src/tabicl/_sklearn/classifier.py`
 - Official preprocessing: `../tabicl/src/tabicl/_sklearn/preprocessing.py`
 - Official attention: `../tabicl/src/tabicl/_model/attention.py`
-- Full experiment log: [`cached-fp32-optimization.md`](cached-fp32-optimization.md)
+- Full experiment log: [`experiments.md`](experiments.md)
 - Benchmark tables: [`real-dataset-benchmarks.md`](real-dataset-benchmarks.md)

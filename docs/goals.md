@@ -10,11 +10,15 @@ arrive repeatedly. It runs on the compute built into the host, with no PyTorch:
 - on Apple Silicon, also the matrix coprocessor (through Accelerate) and the
   integrated GPU (through Metal). These share the CPU's memory, so a training
   context needs no copy to reach them;
-- on Apple Silicon, the Neural Engine (through Core ML) as an opt-in experiment.
-  It computes in FP16, so it needs its own accuracy gate, like the BF16 variants:
-  full label agreement and a bounded probability error, not the FP32 `1e-4`
-  tolerance. FP16 overflows above 65504, which BF16 does not, so the gate must
-  cover attention scores and activations.
+- on Apple Silicon, the integrated GPU also runs reduced-precision FP16 under the
+  `optimize=auto` and `fast` levels. FP16 computes with its own accuracy gate, not
+  the FP32 `1e-4` tolerance: full label agreement and a bounded probability error.
+  FP16 overflows above 65504, which BF16 does not, so the gate covers attention
+  scores and activations. The gate and its measurements are in
+  [experiments.md](experiments.md#fp16-gate-for-the-optimize-levels).
+
+The Neural Engine (through Core ML) remains an opt-in experiment and is not yet
+implemented; it would share the FP16 accuracy gate above.
 
 The first optimized target is:
 

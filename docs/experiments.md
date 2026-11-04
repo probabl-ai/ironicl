@@ -1,12 +1,28 @@
-# Cached CPU Optimization Record
+# Experiments and Tests Log
+
+This is the authoritative record of what Ironicl tried, what it kept, and what
+it rejected, together with the tests and gates that verify each retained claim.
+It covers two backends: the Ryzen 7 9800X3D CPU path and the Apple Silicon
+(Accelerate, NEON, Metal GPU) path. For the project's goals and non-goals, see
+[goals.md](goals.md); this log records evidence, not scope.
+
+Companion documents: [pytorch-cpu-comparison.md](pytorch-cpu-comparison.md) is
+the cross-engine CPU comparison, and [real-dataset-benchmarks.md](real-dataset-benchmarks.md)
+holds the raw scaling measurements this log cites. Do not restate their numbers
+here; link to them.
 
 ## Scope
 
-This document records the accepted query-only full-K/V path for the Ryzen 7
-9800X3D. It separates retained changes from experiments that failed the latency
-or accuracy gates.
+The CPU sections below record the accepted query-only full-K/V path for the
+Ryzen 7 9800X3D. They separate retained changes from experiments that failed the
+latency or accuracy gates. The [Apple Silicon experiments](#apple-silicon-experiments)
+section records the Accelerate, NEON, and Metal GPU work and its own rejected
+experiments. [Acceptance gates](#acceptance-gates) lists every retention and
+accuracy gate, including the FP16 gate for the `optimize` levels, and
+[Claim to check](#claim-to-check) maps each retained claim to the test or
+benchmark that backs it.
 
-The current reference workload is:
+The current CPU reference workload is:
 
 ```text
 B=8, N=4096, Q=128 or 500, H=53, C=7
@@ -289,6 +305,81 @@ median. Top-16384 mass ranged from 16.4% to 100%, with an 89.2% median. A fixed
 small top-K policy is therefore not safe. Some heads are close to uniform and
 need a dense fallback or a different approximation.
 
+## Apple Silicon experiments
+
+These cover M1 Max and later. The CPU path adds Accelerate and NEON kernels; the
+GPU path runs the model with Metal. All share unified memory, so a context needs
+no copy to reach the coprocessor or GPU. The GPU path is behind the `metal` cargo
+feature and is disabled by `IRONICL_NO_METAL=1`.
+
+### Accelerate and NEON kernels (retained)
+
+- The affine kernel dispatches to custom NEON on AArch64. Affine layers with at
+  least 16 rows and attention with at least 4096 scores per head call Accelerate's
+  `cblas_sgemm` instead, which runs on the matrix coprocessor.
+- NEON LayerNorm, NEON attention for short sources, and a vDSP-vectorized softmax.
+- macOS schedules all estimators in parallel when threads outnumber them, and
+  prefers performance cores for executor threads.
+
+Rejected: batching the row stage across rows measured slower on an M1 Max, so it
+stays per row.
+
+### Metal GPU build and predict graphs (retained)
+
+Each context gets two `MPSGraph` graphs with its ensemble, feature, and
+training-row counts fixed.
+
+- The predict graph runs the column, row, and ICL stages and the decoder for
+  every estimator in one run, with only the query count unknown. One batched run
+  beat the CPU on an M1 Max from a single query row, so prediction always uses it.
+- The build graph runs the training rows through every stage once and captures
+  each column and ICL block's keys and values. Its setup costs about 250 ms, so
+  contexts with fewer than 160 training rows build on the CPU.
+- The build graph runs as many estimators at once as fit Metal's recommended
+  working set, at most 2.2 GB per estimator at 8192 x 54, in equal groups.
+  `IRONICL_GPU_BUILD_BUDGET` sets the budget in bytes instead; a single estimator
+  that exceeds the budget builds on the CPU.
+- Model weights live once per model in shared GPU buffers and are fed as graph
+  placeholders. A GPU-built context writes its keys and values once into
+  page-aligned memory that the CPU reads as tensors and the GPU wraps without
+  copying; a CPU-built context is copied to the GPU once.
+- Graphs compile at `MPSGraph` optimization level 0.
+
+### optimize levels and FP16 caches (retained)
+
+`optimize=safe|auto|fast` (or `IRONICL_OPTIMIZE`) selects the precision ladder.
+Under `auto` or `fast`, the build graph stores the ICL keys and values in FP16,
+and both graphs run ICL attention in FP16, converting only the queries. The CPU
+fallback reads the same FP16 caches (a query row whose grouped features are all
+the missing marker runs on the CPU). The accuracy gate is in
+[Acceptance gates](#acceptance-gates); measured on an M1 Max across 12 datasets,
+`auto` stayed within `4.9e-4` max and `2.3e-5` mean probability error of `safe`.
+
+### Query bucketing and chunking (retained)
+
+- Query counts are padded to a bucket that keeps their top four significant bits,
+  at most 12.5% padding, so new batch sizes rarely trigger a 150-400 ms graph
+  compile. Buckets up to 1024 rows keep their buffers between calls.
+- Large cached queries are split into chunks; each estimator's rows land in place
+  when the chunks are joined.
+
+### Metal rejected experiments
+
+| Experiment | Observed result | Decision |
+|---|---|---|
+| `MPSGraph` optimization level 1 | No faster; its pass that places operations on the Neural Engine or CPU printed "Failed to import MPS module" on every compile | Rejected; stay at level 0 |
+| Convert stored FP16 caches to FP32 inside the graph | Wrote a full FP32 copy on every run and was slower | Rejected |
+| BF16 ICL keys and values on the GPU | Slower and less accurate than FP16 on an M1 Max | Rejected; FP16 is the reduced-precision choice |
+| FP16 column and row attention | Added error without saving time | Rejected; FP16 limited to ICL attention |
+| Neural Engine (Core ML) placement | The only path to it was the level-1 NE placement pass, which failed to import | Not implemented; a Core ML lane remains a goals.md experiment, not shipped code |
+
+These Metal results come from manual M1 Max measurements in code comments and
+`kernels.md`; no tracked benchmark harness exercises the Metal path the way the
+`tools/` scripts exercise the Ryzen path. The Rust tests gate Metal *correctness*
+(`tests/gpu_build_groups.rs`, `tests/checkpoint_fixtures.rs`) but emit no latency
+numbers. Treat the Metal latencies above as indicative, not a contract. Closing
+this gap is open work.
+
 ## Acceptance Gates
 
 Retain an optimization only when all conditions hold:
@@ -307,6 +398,25 @@ Retain an optimization only when all conditions hold:
 
 Evaluate closely coupled score and value specializations as one attention
 microkernel change.
+
+### FP16 gate for the optimize levels
+
+The Apple Silicon `optimize` levels store reduced-precision caches, so they have
+their own accuracy gate against the `safe` (FP32) output, not the `1e-4` PyTorch
+tolerance. A reduced-precision level is retained only when, measured against the
+`safe` result on the same context:
+
+- `auto` stays within `1e-2` maximum absolute logit error (`1e-3` maximum
+  probability error) and `fast` within `5e-2`;
+- labels flip only on near-ties;
+- the GPU rejects any non-finite or overflowing value (FP16 saturates above
+  65504, which the gate must cover for attention scores and activations).
+
+These bounds are enforced in `tests/checkpoint_fixtures.rs`
+(`built_context_matches_the_uncached_forward_pass`) and
+`tests/parity/test_tabicl_classifier.py`
+(`test_optimize_levels_stay_within_their_bounds`), and the probability-error
+budget is checked in `python/ironicl/classifier.py`.
 
 Run latency comparisons sequentially on an otherwise idle host. Do not run
 thread-count variants in parallel.
@@ -348,6 +458,25 @@ python tools/compare_cached_logits.py \
   --context covertype-h54-n4096-b8-packed-bf16v.ironiclctx \
   --atol 1e-3
 ```
+
+## Claim to check
+
+Each retained claim maps to a test or benchmark that would fail if it broke. The
+fixture-gated Rust tests run with `cargo test -- --ignored` once
+`IRONICL_CHECKPOINT_FIXTURES` and `IRONICL_ORACLE_FIXTURES` point at the official
+checkpoints (see [validation.md](validation.md)); the parity tests need the
+separate upstream environment.
+
+| Claim | Backing check |
+|---|---|
+| Cached FP32 logits match the PyTorch oracle within `1e-4` | `checkpoint_fixtures.rs::matches_python_classifier_oracle_when_fixtures_are_available`; oracle built by `tools/export_tabicl_oracle.py` |
+| `optimize=auto`/`fast` FP16 stays within its gate, labels flip only on near-ties | `checkpoint_fixtures.rs::built_context_matches_the_uncached_forward_pass`; `test_tabicl_classifier.py::test_optimize_levels_stay_within_their_bounds` |
+| Grouped/budgeted GPU build matches a single-graph build | `gpu_build_groups.rs::grouped_gpu_build_matches_one_graph_run` (sets `IRONICL_GPU_BUILD_BUDGET`) |
+| Large cached queries chunk to identical logits | `checkpoint_fixtures.rs::large_cached_query_runs_in_chunks` |
+| All-missing query rows fall back to CPU and still read the FP16 `auto` caches | `checkpoint_fixtures.rs::reduced_precision_context_predicts_all_missing_rows` |
+| Public `predict_proba` matches upstream TabICL within `atol=1e-4`, identical labels | `test_tabicl_classifier.py::test_predictions_match` (live parity CI job) |
+| Preprocessing matches upstream (frozen oracle and live) | `tests/test_preprocessing.py` (15 tests) and `tests/parity/test_tabicl_preprocessing.py` (11 tests) |
+| Accepted fast lane serves Covertype at the recorded rate and error | `tools/benchmark_cached_end_to_end.py` + `tools/compare_cached_end_to_end.py`; see [Benchmark commands](#benchmark-commands) |
 
 ## Next Work
 
