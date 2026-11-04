@@ -92,66 +92,21 @@ struct SparseIndex<'a> {
 }
 
 impl Bf16DensePolicy {
-    fn from_environment(name: &'static str) -> Result<Option<Self>> {
-        let Some(value) = std::env::var_os(name) else {
-            return Ok(None);
-        };
-        let value = value
-            .into_string()
-            .map_err(|_| Error::InvalidArgument(format!("{name} must be valid UTF-8")))?;
-        if value.is_empty() || matches!(value.as_str(), "1" | "all") {
-            return Ok(Some(Self {
-                column_q: true,
-                column_out: true,
-                column_ffn1: true,
-                column_ffn2: true,
-                icl_q: true,
-                icl_out: true,
-                icl_ffn1: true,
-                icl_ffn2: true,
-                qass: true,
-                decoder: true,
-            }));
+    /// Every dense stage in BF16. The `bf16-dense` feature enables this whole
+    /// policy; finer selection was a runtime-only tuning knob that is gone.
+    const fn full() -> Self {
+        Self {
+            column_q: true,
+            column_out: true,
+            column_ffn1: true,
+            column_ffn2: true,
+            icl_q: true,
+            icl_out: true,
+            icl_ffn1: true,
+            icl_ffn2: true,
+            qass: true,
+            decoder: true,
         }
-
-        let mut policy = Self::default();
-        for part in value.split(',') {
-            match part {
-                "column" => {
-                    policy.column_q = true;
-                    policy.column_out = true;
-                    policy.column_ffn1 = true;
-                    policy.column_ffn2 = true;
-                }
-                "column-q" => policy.column_q = true,
-                "column-out" => policy.column_out = true,
-                "column-ffn1" => policy.column_ffn1 = true,
-                "column-ffn2" => policy.column_ffn2 = true,
-                "icl" => {
-                    policy.icl_q = true;
-                    policy.icl_out = true;
-                    policy.icl_ffn1 = true;
-                    policy.icl_ffn2 = true;
-                    policy.qass = true;
-                }
-                "icl-q" => policy.icl_q = true,
-                "icl-out" => policy.icl_out = true,
-                "icl-ffn" => {
-                    policy.icl_ffn1 = true;
-                    policy.icl_ffn2 = true;
-                }
-                "icl-ffn1" => policy.icl_ffn1 = true,
-                "icl-ffn2" => policy.icl_ffn2 = true,
-                "qass" => policy.qass = true,
-                "decoder" => policy.decoder = true,
-                _ => {
-                    return Err(Error::InvalidArgument(format!(
-                        "unknown {name} stage '{part}'; expected all, column[-q|-out|-ffn1|-ffn2], icl[-q|-out|-ffn|-ffn1|-ffn2], qass, or decoder"
-                    )));
-                }
-            }
-        }
-        Ok(Some(policy))
     }
 }
 
@@ -1457,9 +1412,11 @@ impl StaticClassifierExecutor {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let packed_f32_row =
-            std::env::var_os("IRONICL_PACKED_F32_ROW").is_some() && packed_f32_affine_supported();
-        let packed_f32_policy = Bf16DensePolicy::from_environment("IRONICL_PACKED_F32_DENSE")?;
+        // The BF16/packed dense experiment is off unless built with the
+        // `bf16-dense` feature; it is never activated by a runtime flag.
+        let bf16_dense = cfg!(feature = "bf16-dense");
+        let packed_f32_row = bf16_dense && packed_f32_affine_supported();
+        let packed_f32_policy = bf16_dense.then(Bf16DensePolicy::full);
         let packed_f32_affines = if packed_f32_affine_supported() {
             let mut packed = BTreeMap::new();
             if let Some(policy) = packed_f32_policy {
@@ -1472,22 +1429,10 @@ impl StaticClassifierExecutor {
         } else {
             None
         };
-        let bf16_dense_policy = Bf16DensePolicy::from_environment("IRONICL_BF16_DENSE")?;
-        let bf16_dense_compensation = if bf16_dense_policy.is_some() {
-            Self::bf16_dense_compensation_from_environment()?
-        } else {
-            Bf16AffineCompensation::None
-        };
-        let column_bf16_blocks = if bf16_dense_policy.is_some() {
-            Self::bf16_dense_blocks::<3>("IRONICL_BF16_DENSE_COLUMN_BLOCKS")?
-        } else {
-            [false; 3]
-        };
-        let icl_bf16_blocks = if bf16_dense_policy.is_some() {
-            Self::bf16_dense_blocks::<12>("IRONICL_BF16_DENSE_ICL_BLOCKS")?
-        } else {
-            [false; 12]
-        };
+        let bf16_dense_policy = bf16_dense.then(Bf16DensePolicy::full);
+        let bf16_dense_compensation = Bf16AffineCompensation::None;
+        let column_bf16_blocks = [bf16_dense; 3];
+        let icl_bf16_blocks = [bf16_dense; 12];
         let packed_bf16_affines = if let Some(policy) = bf16_dense_policy
             && packed_bf16_affine_supported()
         {
@@ -3201,50 +3146,6 @@ impl StaticClassifierExecutor {
         Ok(packed)
     }
 
-    fn bf16_dense_blocks<const N: usize>(name: &'static str) -> Result<[bool; N]> {
-        let Some(value) = std::env::var_os(name) else {
-            return Ok([true; N]);
-        };
-        let value = value
-            .into_string()
-            .map_err(|_| Error::InvalidArgument(format!("{name} must be valid UTF-8")))?;
-        if value.is_empty() || value == "all" {
-            return Ok([true; N]);
-        }
-        let mut selected = [false; N];
-        for part in value.split(',') {
-            let block = part.parse::<usize>().map_err(|_| {
-                Error::InvalidArgument(format!("{name} block '{part}' is not an unsigned integer"))
-            })?;
-            if block >= N {
-                return Err(Error::InvalidArgument(format!(
-                    "{name} block {block} is outside 0..{}",
-                    N - 1
-                )));
-            }
-            selected[block] = true;
-        }
-        Ok(selected)
-    }
-
-    fn bf16_dense_compensation_from_environment() -> Result<Bf16AffineCompensation> {
-        let Some(value) = std::env::var_os("IRONICL_BF16_DENSE_COMPENSATION") else {
-            return Ok(Bf16AffineCompensation::None);
-        };
-        let value = value.into_string().map_err(|_| {
-            Error::InvalidArgument("IRONICL_BF16_DENSE_COMPENSATION must be valid UTF-8".into())
-        })?;
-        match value.as_str() {
-            "" | "none" => Ok(Bf16AffineCompensation::None),
-            "input" => Ok(Bf16AffineCompensation::Input),
-            "weight" => Ok(Bf16AffineCompensation::Weight),
-            "first-order" | "both" => Ok(Bf16AffineCompensation::FirstOrder),
-            _ => Err(Error::InvalidArgument(format!(
-                "unknown IRONICL_BF16_DENSE_COMPENSATION '{value}'; expected none, input, weight, or first-order"
-            ))),
-        }
-    }
-
     #[allow(clippy::fn_params_excessive_bools)]
     fn pack_cached_block_affines(
         packed: &mut BTreeMap<String, PackedBf16Affine>,
@@ -3648,9 +3549,8 @@ fn row_source_major_attention_enabled() -> bool {
     crate::kernels::native::attention_backend() == crate::kernels::native::AttentionBackend::Avx512
 }
 
-fn sparse_attention_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| matches!(std::env::var("IRONICL_SPARSE_ATTENTION").as_deref(), Ok("1")))
+const fn sparse_attention_enabled() -> bool {
+    cfg!(feature = "sparse-attention")
 }
 
 fn static_execution_plan(ensembles: usize, total_threads: usize) -> ExecutionPlan {
@@ -3780,15 +3680,10 @@ fn sparse_cached_attention_f32_key_bf16_value(
     Ok(true)
 }
 
-fn sparse_max_omitted_mass() -> f32 {
-    static MAXIMUM: OnceLock<f32> = OnceLock::new();
-    *MAXIMUM.get_or_init(|| {
-        std::env::var("IRONICL_SPARSE_MAX_OMITTED_MASS")
-            .ok()
-            .and_then(|value| value.parse::<f32>().ok())
-            .filter(|value| value.is_finite() && *value > 0.0 && *value <= 1.0)
-            .unwrap_or(1e-5)
-    })
+const fn sparse_max_omitted_mass() -> f32 {
+    // The sparse-attention experiment's omitted-mass certificate (see
+    // docs/experiments.md). Tune by editing this constant and rebuilding.
+    1e-5
 }
 
 fn parallel_cached_attention(

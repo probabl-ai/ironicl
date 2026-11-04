@@ -133,8 +133,8 @@ version-3 header: `icl.index.centroids`, `icl.index.radii`,
 head-major. The index is all-or-nothing: a context with no index uses dense
 attention, while a malformed or incomplete index is rejected. Candidate
 retrieval must retain a dense fallback and cannot change the query bundle.
-Set `IRONICL_SPARSE_ATTENTION=1` to enable candidate retrieval for an indexed
-context. The first implementation selects candidates only when its omitted-mass
+Build with the `sparse-attention` cargo feature to enable candidate retrieval
+for an indexed context. The first implementation selects candidates only when its omitted-mass
 certificate is at most `1e-5`; otherwise it uses the dense kernel.
 
 A future combined artifact can organize complete K/V sections so one sequential
