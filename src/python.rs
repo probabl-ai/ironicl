@@ -51,7 +51,7 @@ impl Model {
     /// Run FP32 training rows `x[B, N, H]` with labels `y_train[B, N]` once and
     /// keep their attention keys and values. Permutations are `[B, C]` and
     /// `[B, H]`; `optimize` is `"safe"`, `"auto"`, or `"fast"`.
-    fn fit_context(
+    fn build_context(
         &self,
         py: Python<'_>,
         x: PyBuffer<f32>,

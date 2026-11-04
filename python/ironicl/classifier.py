@@ -128,7 +128,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         checkpoint = self._checkpoint()
         # Fitted attributes are set only once the context exists, so a failed
         # fit never looks fitted.
-        self.context_ = _model(checkpoint).fit_context(
+        self.context_ = _model(checkpoint).build_context(
             _ensemble_rows(preprocessor, train_groups),
             preprocessor.class_permutations_[:, labels].astype(np.float32),
             np.ascontiguousarray(preprocessor.class_permutations_, dtype=np.uint64),
@@ -166,15 +166,13 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         return optimize
 
     def _checkpoint(self) -> Path:
-        if self.model_path is not None and Path(self.model_path).exists():
-            return Path(self.model_path)
         if self.model_path is not None:
             path = Path(self.model_path)
         else:
             cache_root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
             path = cache_root / "ironicl" / "checkpoints" / self.checkpoint_version
-            if path.exists():
-                return path
+        if path.exists():
+            return path
         if not self.allow_auto_download:
             raise FileNotFoundError(f"Checkpoint {path} not found and allow_auto_download=False")
         # The Rust importer verifies the checkpoint's SHA-256 before use.
