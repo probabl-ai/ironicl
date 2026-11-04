@@ -22,3 +22,9 @@ license-files = ["LICENSE", "LICENSES/TabICL-BSD-3-Clause.txt"]
 python-source = "python"
 module-name = "ironicl._core"
 features = ["python", "metal"]
+
+[tool.ruff.lint]
+# Pyflakes only: catch real errors (unused imports, undefined names, bad
+# f-strings) without imposing a formatting or import-order policy on existing
+# code. Widen the rule set deliberately, not by default.
+select = ["F"]
