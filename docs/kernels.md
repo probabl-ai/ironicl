@@ -45,11 +45,11 @@ copying; a CPU-built context is copied to the GPU once. `IRONICL_NO_METAL=1`
 disables the GPU. Graphs compile at `MPSGraph` optimization level 0: level 1 was
 no faster, and its pass that places operations on the Neural Engine or CPU printed
 "Failed to import MPS module" on every compile. Under `optimize="auto"` or
-`"fast"`, the build graph stores the ICL keys and values in FP16 and the predict
-graph runs ICL attention in FP16, converting only the queries. Converting the
-stored FP16 caches to FP32 inside the graph instead wrote a full FP32 copy on
-every run and was slower. BF16 measured slower and less accurate than FP16 on an
-M1 Max.
+`"fast"`, the build graph stores the ICL keys and values in FP16, and both graphs
+run ICL attention in FP16, converting only the queries. Converting the stored FP16
+caches to FP32 inside the graph instead wrote a full FP32 copy on every run and
+was slower. BF16 measured slower and less accurate than FP16 on an M1 Max, and
+FP16 column and row attention added error without saving time.
 
 Cached attention selects its backend once per executor. The AVX-512 path
 implements score tiles and softmax-weighted V tiles; portable execution retains

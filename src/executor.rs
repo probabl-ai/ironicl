@@ -169,7 +169,8 @@ pub enum Optimize {
     #[default]
     Safe,
     /// ICL keys and values stored in FP16, and ICL attention computed in
-    /// FP16; everything else FP32. Measured probability errors stayed below
+    /// FP16 when building the context and when predicting; everything else
+    /// FP32. Measured probability errors stayed below
     /// 5e-4 with unchanged labels.
     Auto,
     /// Everything `Auto` does; further reduced-precision work will be
