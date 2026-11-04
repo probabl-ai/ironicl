@@ -24,7 +24,11 @@ use objc2_metal_performance_shaders_graph::{
     MPSGraphShapedType, MPSGraphTensor, MPSGraphTensorData,
 };
 
-use crate::{Error, Result, static_context::TensorStorage};
+use crate::{
+    Error, Result,
+    executor::{COLUMN_DIM, HEADS, ICL_DIM, INDUCING, QUERY_CHUNK_ROWS, RESERVED},
+    static_context::TensorStorage,
+};
 
 /// The `MPSGraph` element type for a stored tensor type.
 fn kind(storage: TensorStorage) -> MPSDataType {
@@ -35,13 +39,8 @@ fn kind(storage: TensorStorage) -> MPSDataType {
     }
 }
 
-const ICL_DIM: usize = 512;
-const COLUMN_DIM: usize = 128;
-const HEADS: usize = 8;
 const ICL_HEAD_DIM: usize = ICL_DIM / HEADS;
 const COLUMN_HEAD_DIM: usize = COLUMN_DIM / HEADS;
-const INDUCING: usize = 128;
-const RESERVED: usize = 4;
 const ICL_BLOCKS: usize = 12;
 const COLUMN_BLOCKS: usize = 3;
 const DECODER_OUTPUTS: usize = 10;
@@ -63,6 +62,66 @@ fn shape(dimensions: &[isize]) -> Retained<MPSShape> {
 
 fn metal_error(message: &str) -> Error {
     Error::InvalidArgument(format!("Metal backend: {message}"))
+}
+
+/// A column block's cached keys or values: `[B, streams, 8, 128, 16]`.
+fn column_cache_shape(ensembles: isize, streams: isize) -> [isize; 5] {
+    [
+        ensembles,
+        streams,
+        HEADS as isize,
+        INDUCING as isize,
+        COLUMN_HEAD_DIM as isize,
+    ]
+}
+
+/// An ICL block's cached keys or values: `[B, 8, N, 64]`.
+fn icl_cache_shape(ensembles: isize, training_rows: isize) -> [isize; 4] {
+    [ensembles, HEADS as isize, training_rows, ICL_HEAD_DIM as isize]
+}
+
+/// Smallest training set that builds its context on the GPU. Building costs
+/// about 250 ms of graph setup on an M1 Max, so the CPU is faster below about
+/// 150 rows. Prediction always uses the GPU when the context is there: one
+/// batched run beat the CPU from a single query row.
+pub(crate) const GPU_MIN_BUILD_ROWS: usize = 160;
+
+/// An upper bound on one estimator's share of the GPU build's peak memory.
+/// Measured on an M1 Max: the peak grows linearly in N, with no N x N term,
+/// by about 1.7 GB per estimator at 8192 x 54; this estimates 2.2 GB.
+pub(crate) fn gpu_build_estimator_bytes(n: usize, h: usize) -> usize {
+    n.saturating_mul((h + RESERVED) * COLUMN_DIM * 4 * 8 + ICL_DIM * 4 * 16)
+}
+
+/// Group each feature of `[rows, H]` inputs with the features 1, 2, and 4
+/// places after it, as `[H, rows, 3]`. Returns `None` when a triple is the
+/// all-missing marker, which only the CPU column stage handles.
+pub(crate) fn group_features(x: &[f32], rows: usize, h: usize) -> Option<Vec<f32>> {
+    let mut grouped = vec![0.0; h * rows * 3];
+    group_features_into(x, (rows, h), rows, &mut grouped).then_some(grouped)
+}
+
+/// [`group_features`] into `[H, stride, 3]` output, leaving rows past `rows`
+/// untouched. Returns false on the all-missing marker.
+#[allow(clippy::float_cmp)] // The marker is an exact sentinel value.
+pub(crate) fn group_features_into(
+    x: &[f32],
+    (rows, h): (usize, usize),
+    stride: usize,
+    output: &mut [f32],
+) -> bool {
+    for feature in 0..h {
+        for row in 0..rows {
+            let triple = &mut output[(feature * stride + row) * 3..][..3];
+            for (part, offset) in [1_usize, 2, 4].iter().enumerate() {
+                triple[part] = x[row * h + (feature + offset) % h];
+            }
+            if triple.iter().all(|value| *value == -100.0) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 /// The shared device and command queue, and how graphs run on them.
@@ -216,6 +275,12 @@ pub(crate) struct ModelWeights {
     buffers: Mutex<HashMap<String, Buffer>>,
 }
 
+impl std::fmt::Debug for ModelWeights {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ModelWeights")
+    }
+}
+
 // SAFETY: buffers are written once when created and only read after; the map
 // is behind a mutex.
 unsafe impl Send for ModelWeights {}
@@ -352,6 +417,26 @@ impl<'w, 'a> Builder<'w, 'a> {
         unsafe { self.graph.constantWithScalar_dataType(value, FLOAT) }
     }
 
+    fn zeros(&self, dimensions: &[isize]) -> Tensor {
+        unsafe {
+            self.graph
+                .constantWithScalar_shape_dataType(0.0, &shape(dimensions), FLOAT)
+        }
+    }
+
+    /// A `QASSMax` base scale, `[heads, head_dim]` values, shaped to scale
+    /// `[lead, heads, rows, head_dim]` queries.
+    fn base_scale(&self, values: &[f32], head_dim: usize) -> Tensor {
+        self.constant(values, &[1, HEADS as isize, 1, head_dim as isize])
+    }
+
+    fn concat(&self, left: &Tensor, right: &Tensor, dimension: isize) -> Tensor {
+        unsafe {
+            self.graph
+                .concatTensor_withTensor_dimension_name(left, right, dimension, None)
+        }
+    }
+
     fn add(&self, left: &Tensor, right: &Tensor) -> Tensor {
         unsafe {
             self.graph
@@ -394,22 +479,18 @@ impl<'w, 'a> Builder<'w, 'a> {
         }
     }
 
-    /// `input @ weight^T + bias` for a `[outputs, inputs]` weight stored under
-    /// `key`, or for block `part` of a weight that stacks several of them.
+    /// `input @ weight^T + bias` for a `[outputs, inputs]` weight and its bias,
+    /// or for block `part` of a weight and bias that stack several of them.
     fn affine(
         &self,
         input: &Tensor,
-        key: &str,
+        (weight_name, bias_name): (&str, &str),
         part: usize,
         (inputs, outputs): (usize, usize),
     ) -> Result<Tensor> {
-        let (weight, bias) = (
-            self.weight(&format!("{key}.weight"))?,
-            self.weight(&format!("{key}.bias"))?,
-        );
-        let weight = &weight[part * inputs * outputs..][..inputs * outputs];
+        let weight = &self.weight(weight_name)?[part * inputs * outputs..][..inputs * outputs];
         let transposed = self.model_weight(
-            &format!("{key}.weight[{part}]^T"),
+            &format!("{weight_name}[{part}]^T"),
             || {
                 let mut transposed = vec![0.0; inputs * outputs];
                 for out in 0..outputs {
@@ -421,9 +502,9 @@ impl<'w, 'a> Builder<'w, 'a> {
             },
             &[inputs as isize, outputs as isize],
         )?;
-        let bias = &bias[part * outputs..][..outputs];
+        let bias = &self.weight(bias_name)?[part * outputs..][..outputs];
         let bias = self.model_weight(
-            &format!("{key}.bias[{part}]"),
+            &format!("{bias_name}[{part}]"),
             || bias.to_vec(),
             &[outputs as isize],
         )?;
@@ -431,7 +512,12 @@ impl<'w, 'a> Builder<'w, 'a> {
     }
 
     fn linear(&self, input: &Tensor, prefix: &str, inputs: usize, outputs: usize) -> Result<Tensor> {
-        self.affine(input, prefix, 0, (inputs, outputs))
+        self.affine(
+            input,
+            (&format!("{prefix}.weight"), &format!("{prefix}.bias")),
+            0,
+            (inputs, outputs),
+        )
     }
 
     /// Exact GELU: `0.5 * x * (1 + erf(x / sqrt(2)))`.
@@ -481,14 +567,11 @@ impl<'w, 'a> Builder<'w, 'a> {
     fn rope(&self, input: &Tensor, (cos, sin): (&Tensor, &Tensor), head_dim: usize) -> Tensor {
         // `sin` carries the sign: [-sin, sin], so rotate_half is a half swap.
         let half = (head_dim / 2) as isize;
-        let swapped = unsafe {
-            self.graph.concatTensor_withTensor_dimension_name(
-                &self.slice(input, 3, half, half),
-                &self.slice(input, 3, 0, half),
-                3,
-                None,
-            )
-        };
+        let swapped = self.concat(
+            &self.slice(input, 3, half, half),
+            &self.slice(input, 3, 0, half),
+            3,
+        );
         self.add(&self.multiply(input, cos), &self.multiply(&swapped, sin))
     }
 
@@ -501,7 +584,6 @@ impl<'w, 'a> Builder<'w, 'a> {
         input: &Tensor,
         source: &Source<'_>,
         prefix: &str,
-        attn: &str,
         (lead, q_rows, source_rows): (isize, isize, isize),
         dim: usize,
         rope: Option<&Rope<'_>>,
@@ -509,34 +591,11 @@ impl<'w, 'a> Builder<'w, 'a> {
     ) -> Result<(Tensor, Tensor, Tensor)> {
         let head_dim = dim / HEADS;
         let norm = format!("{prefix}.norm1");
-        let in_proj = format!("{attn}.in_proj");
-        let in_proj_key = |part: usize, x: &Tensor| -> Result<Tensor> {
-            // The fused projection is stored as `{attn}.in_proj_weight/_bias`.
-            let weight = self.weight(&format!("{attn}.in_proj_weight"))?;
-            let bias = self.weight(&format!("{attn}.in_proj_bias"))?;
-            let rows = &weight[part * dim * dim..][..dim * dim];
-            let transposed = self.model_weight(
-                &format!("{in_proj}[{part}]^T"),
-                || {
-                    let mut transposed = vec![0.0; dim * dim];
-                    for out in 0..dim {
-                        for index in 0..dim {
-                            transposed[index * dim + out] = rows[out * dim + index];
-                        }
-                    }
-                    transposed
-                },
-                &[dim as isize, dim as isize],
-            )?;
-            let bias = &bias[part * dim..][..dim];
-            let bias = self.model_weight(
-                &format!("{in_proj}[{part}].bias"),
-                || bias.to_vec(),
-                &[dim as isize],
-            )?;
-            Ok(self.add(&self.matmul(x, &transposed), &bias))
-        };
-        let query = in_proj_key(0, &self.layer_norm(input, &norm, dim)?)?;
+        let attn = format!("{prefix}.attn");
+        // The query, key, and value projections are parts 0, 1, and 2 of one fused weight.
+        let in_proj = (format!("{attn}.in_proj_weight"), format!("{attn}.in_proj_bias"));
+        let project = |part: usize, x: &Tensor| self.affine(x, (&in_proj.0, &in_proj.1), part, (dim, dim));
+        let query = project(0, &self.layer_norm(input, &norm, dim)?)?;
         let mut query = self.split_heads(&query, lead, q_rows, head_dim);
         if let Some(base_scale) = qass {
             // QASSMax: q * base_scale * (1 + tanh(mlp(q))), the MLP shared across heads.
@@ -554,8 +613,8 @@ impl<'w, 'a> Builder<'w, 'a> {
             Source::Tokens(tokens) => {
                 let normalized = self.layer_norm(tokens, &norm, dim)?;
                 (
-                    self.split_heads(&in_proj_key(1, &normalized)?, lead, source_rows, head_dim),
-                    self.split_heads(&in_proj_key(2, &normalized)?, lead, source_rows, head_dim),
+                    self.split_heads(&project(1, &normalized)?, lead, source_rows, head_dim),
+                    self.split_heads(&project(2, &normalized)?, lead, source_rows, head_dim),
                 )
             }
         };
@@ -623,10 +682,7 @@ impl<'w, 'a> Builder<'w, 'a> {
                 &[RESERVED as isize, COLUMN_DIM as isize],
             )?,
         );
-        let mut sequence = unsafe {
-            self.graph
-                .concatTensor_withTensor_dimension_name(&cls, &columns, 1, None)
-        };
+        let mut sequence = self.concat(&cls, &columns, 1);
         let frequencies = self.weight("row_interactor.tf_row.rope.freqs")?;
         let table = |rows: usize| {
             let (mut cos, mut sin) = (
@@ -654,7 +710,6 @@ impl<'w, 'a> Builder<'w, 'a> {
                 &sequence,
                 &Source::Tokens(&sequence),
                 &prefix,
-                &format!("{prefix}.attn"),
                 (-1, streams, streams),
                 COLUMN_DIM,
                 Some(&Rope {
@@ -670,7 +725,6 @@ impl<'w, 'a> Builder<'w, 'a> {
             &self.slice(&sequence, 1, 0, RESERVED as isize),
             &Source::Tokens(&sequence),
             prefix,
-            &format!("{prefix}.attn"),
             (-1, RESERVED as isize, streams),
             COLUMN_DIM,
             Some(&Rope {
@@ -707,9 +761,6 @@ pub(crate) struct PredictGraph {
     /// serializes graph runs.
     prepared: Mutex<HashMap<usize, Prepared>>,
 }
-
-/// Query buckets up to this many rows keep their buffers between calls.
-const CACHED_BUCKET_ROWS: usize = 1024;
 
 /// Round a query count up to a bucket that keeps its top four significant
 /// bits, so the graph compiles for 8 shapes per doubling of the batch size and
@@ -774,13 +825,7 @@ impl PredictGraph {
         // Column stage, feature-major: [B * H, Q, 3] grouped inputs -> [B * H, Q, 128].
         let grouped = builder.placeholder(&[b * h, -1, 3]);
         let mut columns = builder.linear(&grouped, "col_embedder.in_linear", 3, COLUMN_DIM)?;
-        let column_shape = [
-            b,
-            h + RESERVED as isize,
-            HEADS as isize,
-            INDUCING as isize,
-            COLUMN_HEAD_DIM as isize,
-        ];
+        let column_shape = column_cache_shape(b, h + RESERVED as isize);
         for block in 0..COLUMN_BLOCKS {
             let prefix = format!("col_embedder.tf_col.blocks.{block}.multihead_attn2");
             // The cached path never reads the reserved streams.
@@ -799,7 +844,6 @@ impl PredictGraph {
                 &columns,
                 &Source::Cached(&key, &value),
                 &prefix,
-                &format!("{prefix}.attn"),
                 (b * h, -1, INDUCING as isize),
                 COLUMN_DIM,
                 None,
@@ -807,7 +851,7 @@ impl PredictGraph {
             )?;
         }
         let mut hidden = builder.row_stage(&columns, (shape.ensembles, shape.features))?;
-        let icl_shape = [b, HEADS as isize, n, ICL_HEAD_DIM as isize];
+        let icl_shape = icl_cache_shape(b, n);
         for block in 0..ICL_BLOCKS {
             let prefix = format!("icl_predictor.tf_icl.blocks.{block}");
             // Attention runs in the caches' stored type.
@@ -821,15 +865,11 @@ impl PredictGraph {
                 &icl_shape,
                 kind(icl_storage),
             );
-            let base_scale = builder.constant(
-                &base_scales[block],
-                &[1, HEADS as isize, 1, ICL_HEAD_DIM as isize],
-            );
+            let base_scale = builder.base_scale(&base_scales[block], ICL_HEAD_DIM);
             (hidden, _, _) = builder.block(
                 &hidden,
                 &Source::Cached(&key, &value),
                 &prefix,
-                &format!("{prefix}.attn"),
                 (b, -1, n),
                 ICL_DIM,
                 None,
@@ -946,7 +986,7 @@ impl PredictGraph {
             .lock()
             .map_err(|_| metal_error("graph lock poisoned"))?;
         let uncached;
-        let prepared = if rows <= CACHED_BUCKET_ROWS {
+        let prepared = if rows <= QUERY_CHUNK_ROWS {
             match cache.entry(rows) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => entry.insert(self.prepare(rows, true)?),
@@ -1010,7 +1050,7 @@ impl PredictGraph {
 pub(crate) fn build_context(
     model: &ModelWeights,
     weights: &Weights<'_, '_>,
-    size: Shape,
+    shape: Shape,
     column_base_scales: &[Vec<f32>],
     icl_base_scales: &[Vec<f32>],
     grouped: &[f32],
@@ -1022,9 +1062,9 @@ pub(crate) fn build_context(
     let gpu = model.gpu();
     let builder = Builder::new(model, weights);
     let (b, h, n) = (
-        size.ensembles as isize,
-        size.features as isize,
-        size.training_rows as isize,
+        shape.ensembles as isize,
+        shape.features as isize,
+        shape.training_rows as isize,
     );
     let grouped_input = builder.bound(gpu.buffer(grouped)?, &[b * h, n, 3]);
     let column_labels = builder.bound(gpu.buffer(column_labels)?, &[b, 1, n, COLUMN_DIM as isize]);
@@ -1051,13 +1091,12 @@ pub(crate) fn build_context(
                 &[INDUCING as isize, COLUMN_DIM as isize],
             )?,
         );
-        let base_scale = builder.constant(base_scale, &[1, HEADS as isize, 1, COLUMN_HEAD_DIM as isize]);
+        let base_scale = builder.base_scale(base_scale, COLUMN_HEAD_DIM);
         let first = format!("{prefix}.multihead_attn1");
         let (hidden, _, _) = builder.block(
             &inducing,
             &Source::Tokens(&source),
             &first,
-            &format!("{first}.attn"),
             (b * h, INDUCING as isize, n),
             COLUMN_DIM,
             None,
@@ -1068,7 +1107,6 @@ pub(crate) fn build_context(
             &source,
             &Source::Tokens(&hidden),
             &second,
-            &format!("{second}.attn"),
             (b * h, n, INDUCING as isize),
             COLUMN_DIM,
             None,
@@ -1077,8 +1115,8 @@ pub(crate) fn build_context(
         source = output;
         column.push((key, value));
     }
-    let mut rows = builder.add(
-        &builder.row_stage(&source, (size.ensembles, size.features))?,
+    let mut hidden = builder.add(
+        &builder.row_stage(&source, (shape.ensembles, shape.features))?,
         &icl_labels,
     );
     // FP16 caches also run the N x N ICL self-attention in FP16. Doing the same
@@ -1087,52 +1125,26 @@ pub(crate) fn build_context(
     let mut icl = Vec::with_capacity(ICL_BLOCKS);
     for (block, base_scale) in icl_base_scales.iter().enumerate() {
         let prefix = format!("icl_predictor.tf_icl.blocks.{block}");
-        let base_scale = builder.constant(base_scale, &[1, HEADS as isize, 1, ICL_HEAD_DIM as isize]);
+        let base_scale = builder.base_scale(base_scale, ICL_HEAD_DIM);
         let (output, key, value) = builder.block(
-            &rows,
-            &Source::Tokens(&rows),
+            &hidden,
+            &Source::Tokens(&hidden),
             &prefix,
-            &format!("{prefix}.attn"),
             (b, n, n),
             ICL_DIM,
             None,
             Some(&base_scale),
         )?;
-        rows = output;
+        hidden = output;
         icl.push((key, value));
     }
 
     // Column caches in context layout: zero reserved streams, then the features.
-    let feature_shape = [b, h, HEADS as isize, INDUCING as isize, COLUMN_HEAD_DIM as isize];
-    let reserved = unsafe {
-        builder.graph.constantWithScalar_shape_dataType(
-            0.0,
-            &shape(&[
-                b,
-                RESERVED as isize,
-                HEADS as isize,
-                INDUCING as isize,
-                COLUMN_HEAD_DIM as isize,
-            ]),
-            FLOAT,
-        )
-    };
-    let full_column = |tensor: &Tensor| unsafe {
-        builder.graph.concatTensor_withTensor_dimension_name(
-            &reserved,
-            &builder.reshape(tensor, &feature_shape),
-            1,
-            None,
-        )
-    };
-    let column_shape = vec![
-        b,
-        h + RESERVED as isize,
-        HEADS as isize,
-        INDUCING as isize,
-        COLUMN_HEAD_DIM as isize,
-    ];
-    let icl_shape = vec![b, HEADS as isize, n, ICL_HEAD_DIM as isize];
+    let reserved = builder.zeros(&column_cache_shape(b, RESERVED as isize));
+    let full_column =
+        |tensor: &Tensor| builder.concat(&reserved, &builder.reshape(tensor, &column_cache_shape(b, h)), 1);
+    let column_shape = column_cache_shape(b, h + RESERVED as isize).to_vec();
+    let icl_shape = icl_cache_shape(b, n).to_vec();
     let mut targets = Vec::with_capacity(2 * (COLUMN_BLOCKS + ICL_BLOCKS));
     for (key, value) in &column {
         targets.extend([
@@ -1152,6 +1164,7 @@ pub(crate) fn build_context(
     }
     // One NaN-propagating max |value| over every output, as stored, so the
     // CPU checks a single float instead of scanning the whole context.
+    // SAFETY (both closures): plain `MPSGraph` construction, as in `Builder`.
     let largest = targets
         .iter()
         .map(|(tensor, _, _)| unsafe {
