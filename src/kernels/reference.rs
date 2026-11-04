@@ -231,7 +231,8 @@ pub fn layer_norm_f32(
         require_length(bias, width, "layer norm bias")?;
     }
     require_length(output, elements, "layer norm output")?;
-    if !exact_layer_norm_enabled() && super::native::layer_norm_f32(input, rows, width, weight, bias, output)
+    if !cfg!(feature = "exact-math")
+        && super::native::layer_norm_f32(input, rows, width, weight, bias, output)
     {
         return Ok(());
     }
@@ -247,27 +248,18 @@ pub fn layer_norm_f32(
     Ok(())
 }
 
-fn exact_layer_norm_enabled() -> bool {
-    static EXACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EXACT.get_or_init(|| std::env::var_os("IRONICL_EXACT_LAYER_NORM").is_some())
-}
-
-/// Apply GELU, using a bounded native approximation unless exact mode is requested.
+/// Apply GELU, using a bounded native approximation unless the `exact-math`
+/// feature forces the scalar reference path.
 pub fn gelu_f32(input: &[f32], output: &mut [f32]) -> Result<()> {
     let _profile = profile::scope(Category::Gelu);
     require_length(output, input.len(), "GELU output")?;
-    if !exact_gelu_enabled() && super::native::gelu_f32(input, output) {
+    if !cfg!(feature = "exact-math") && super::native::gelu_f32(input, output) {
         return Ok(());
     }
     for (input, output) in input.iter().zip(output) {
         *output = gelu(*input);
     }
     Ok(())
-}
-
-fn exact_gelu_enabled() -> bool {
-    static EXACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EXACT.get_or_init(|| std::env::var_os("IRONICL_EXACT_GELU").is_some())
 }
 
 /// Add equally sized FP32 tensors into a caller-owned output buffer.

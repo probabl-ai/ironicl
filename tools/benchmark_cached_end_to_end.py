@@ -85,7 +85,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=50)
-    parser.add_argument("--fast-ironicl", action="store_true", help="Allow native approximate GELU and softmax.")
+    parser.add_argument(
+        "--fast-ironicl",
+        action="store_true",
+        help="Label the run as native approximate math (library built without --features exact-math).",
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--probabilities-output", type=Path, required=True)
     args = parser.parse_args()
@@ -263,9 +267,9 @@ def main() -> None:
         raise SystemExit("PYTHONHASHSEED=0 is required for deterministic TabICL ensemble ordering")
     if args.engine == "ironicl":
         os.environ["IRONICL_THREADS"] = str(args.threads)
-        if not args.fast_ironicl:
-            os.environ["IRONICL_EXACT_GELU"] = "1"
-            os.environ["IRONICL_EXACT_SOFTMAX"] = "1"
+        # Exact-control math (scalar GELU/softmax/LayerNorm) is a build-time
+        # choice: build the Ironicl library with `--features exact-math`. Pass
+        # --fast-ironicl to label a run built without that feature.
     if args.device == "cuda":
         os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
     import sys

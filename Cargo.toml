@@ -25,6 +25,9 @@ metal = [
     "dep:objc2-metal-performance-shaders",
     "dep:objc2-metal-performance-shaders-graph",
 ]
+# Force the scalar reference GELU, softmax, and LayerNorm instead of the bounded
+# native approximations, for exact PyTorch parity debugging and control runs.
+exact-math = []
 profile = []
 python = ["checkpoint", "dep:pyo3"]
 

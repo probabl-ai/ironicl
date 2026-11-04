@@ -978,8 +978,7 @@ pub(crate) fn softmax_exp_sum_f32(
     scores: &mut [f32],
     maximum: f32,
 ) -> Option<f32> {
-    static EXACT_SOFTMAX: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *EXACT_SOFTMAX.get_or_init(|| std::env::var_os("IRONICL_EXACT_SOFTMAX").is_some()) {
+    if cfg!(feature = "exact-math") {
         return None;
     }
     softmax_exp_sum_for_target(backend, scores, maximum)
