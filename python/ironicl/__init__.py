@@ -1,5 +1,5 @@
-"""Ironicl's Python support package.
+"""TabICLv2 inference on CPU, without PyTorch."""
 
-The current Python API provides preprocessing only. Native fitting and
-prediction bindings are not implemented yet.
-"""
+from ironicl.classifier import TabICLClassifier
+
+__all__ = ["TabICLClassifier"]

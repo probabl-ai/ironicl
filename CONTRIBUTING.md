@@ -84,7 +84,8 @@ live upstream comparisons.
 | Command | Scope |
 |---|---|
 | `make test-rust` | Rust tests with default features and with `--no-default-features`, using `Cargo.lock`. |
-| `make lint-rust` | Formatting and Clippy for both feature configurations; warnings are errors. |
+| `make lint-rust` | Formatting and Clippy for all feature configurations; warnings are errors. |
+| `make audit` | `Cargo.lock` against the RustSec advisory database; needs `cargo install cargo-audit`. |
 | `make test-python` | Standalone preprocessing and exporter tests, including the frozen upstream oracle. |
 | `make test-parity` | Direct comparisons with the pinned TabICL checkout; requires a separate environment. |
 
@@ -94,12 +95,12 @@ The Python targets use `python3` from `PATH`. Override the interpreter when need
 make test-python PYTHON=/path/to/venv/bin/python
 ```
 
-The Python targets do not install dependencies. None of the targets downloads model
-checkpoints. Rust checks may download the pinned toolchain and Cargo dependencies
+The Python targets do not install dependencies. Only `make test-parity` downloads
+the released classifier checkpoint. Rust checks may download the pinned toolchain and Cargo dependencies
 on first use. To fix Rust formatting, run `cargo fmt --all`; `make lint-rust` only
 checks it.
 
-### Live preprocessing parity
+### Live TabICL parity
 
 Follow [the parity setup instructions](docs/validation.md#python-preprocessing-parity)
 to install the Ironicl wheel and pinned TabICL checkout in a separate environment.
@@ -117,9 +118,10 @@ outputs or classifier predictions.
 ## CI coverage and limits
 
 The Rust workflow runs `make lint-rust` and `make test-rust` on Linux x86-64 and
-Apple Silicon. The Python workflow tests an installed wheel built from the source
-distribution, rather than the editable checkout used for local development. It
-runs standalone and live parity tests in separate Linux/Python 3.12 environments.
+Apple Silicon, and `make audit` once on Linux. The Python workflow tests an
+installed wheel built from the source distribution, rather than the editable
+checkout used for local development. It runs standalone and live parity tests in
+separate Linux/Python 3.12 environments.
 
 Rust CI does not provision official model or oracle fixtures. Tests in
 `tests/checkpoint_fixtures.rs` return early when those files are absent, even though

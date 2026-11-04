@@ -47,7 +47,7 @@ behavioral authority when they differ.
 The offline pure-Rust checkpoint path uses Candle's PyTorch pickle reader:
 
 - <https://github.com/huggingface/candle>
-- `candle-core` version `0.9.1`;
+- `candle-core` version `0.11.1`;
 - MIT or Apache-2.0 license;
 - CPU-only default feature set.
 
@@ -56,7 +56,7 @@ code. Ironicl applies a bounded opcode preflight, reads the primitive `config`
 mapping from that tree, and decodes tensor metadata with checked patterns. It
 treats released-checkpoint tensor counts, element counts, payload bytes, model
 configuration, and independent hashes as mandatory compatibility gates. Both
-official v2 checkpoints pass these gates with Candle 0.9.1.
+official v2 checkpoints pass these gates with Candle 0.11.1.
 
 ## Papers
 

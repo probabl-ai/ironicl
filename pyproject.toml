@@ -1,22 +1,24 @@
 [build-system]
-requires = ["setuptools>=77"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
 
 [project]
 name = "ironicl"
 version = "0.1.0"
-description = "Python preprocessing for the Ironicl CPU inference engine"
+description = "TabICLv2 classifier inference on CPU, without PyTorch"
 readme = "README.md"
 requires-python = ">=3.12"
+# Floors are the oldest releases that pass the frozen upstream oracle.
 dependencies = [
-    "numpy>=2,<3",
-    "scikit-learn>=1.9,<1.10",
-    # PowerTransformer delegates fitting to SciPy. Older solvers drift from
-    # the pinned upstream FP32 oracle, so constrain this transitive dependency.
-    "scipy>=1.18,<1.19",
+    "numpy>=2",
+    "scikit-learn>=1.7",
+    # PowerTransformer fits with SciPy, and older solvers drift from the oracle.
+    "scipy>=1.17",
 ]
 license = "BSD-3-Clause"
 license-files = ["LICENSE", "LICENSES/TabICL-BSD-3-Clause.txt"]
 
-[tool.setuptools.packages.find]
-where = ["python"]
+[tool.maturin]
+python-source = "python"
+module-name = "ironicl._core"
+features = ["python"]

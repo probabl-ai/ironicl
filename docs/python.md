@@ -1,17 +1,45 @@
-# Python Preprocessing
+# Python Package
 
-The `ironicl` Python package reproduces TabICLv2 classifier preprocessing. It
-requires Python 3.12+, NumPy, scikit-learn, and its SciPy dependency. It does
-not depend on TabICL or PyTorch.
+The `ironicl` Python package replaces TabICL's `TabICLClassifier`. It requires
+Python 3.12+, NumPy, scikit-learn, and SciPy. It does not depend on TabICL or
+PyTorch. Building it from source requires Rust, because maturin compiles the
+private `ironicl._core` extension module.
 
 ```bash
 python -m pip install .
 ```
 
-**This is a preprocessing-only Python package, not yet a Python classifier.**
-PyO3 bindings and Rust training-context construction remain to be implemented.
+## Classifier
 
-## Usage
+```python
+from ironicl import TabICLClassifier
+
+clf = TabICLClassifier(n_estimators=8, random_state=42).fit(X_train, y_train)
+proba = clf.predict_proba(X_test)
+labels = clf.predict(X_test)
+```
+
+The constructor, `fit`, `predict_proba`, and `predict` have TabICL 2.1.1's
+parameter names and defaults. A live parity test checks this.
+
+- Without `model_path`, `fit` downloads the released checkpoint from Hugging Face
+  to `$XDG_CACHE_HOME/ironicl/checkpoints` (default `~/.cache`). The Rust
+  importer verifies its SHA-256 and caches the converted model.
+- These values raise `NotImplementedError`: a `feat_shuffle_method` other than
+  `latin`, a `class_shuffle_method` other than `shift`, a `device` other than
+  `cpu`, any `inference_config`, and `random_state=None`.
+- `batch_size`, `kv_cache`, `use_amp`, `use_fa3`, `offload_mode`,
+  `disk_offload_dir`, `n_jobs`, and `verbose` control PyTorch execution and have
+  no effect.
+- `fit` runs the training rows through the model once and keeps their attention
+  keys and values in memory, like upstream's `kv_cache=True`. `predict_proba`
+  then runs only the query rows. The context takes about 49 KB per training row
+  and estimator. A fitted estimator cannot be pickled yet.
+
+## Preprocessing
+
+`ironicl.preprocessing.ClassifierPreprocessor` exposes the preprocessing step
+on its own:
 
 ```python
 from ironicl.preprocessing import ClassifierPreprocessor
@@ -43,15 +71,14 @@ transform raises a domain error.
 
 `tools/prepare_real_dataset.py` uses this package without `--tabicl-root`; it
 expands ensembles only when writing the existing IRINPUT file format. Other
-upstream oracle and context-export tools still require TabICL/PyTorch. The
-current pure-Python build backend will be replaced by maturin when the native
-extension is added.
+upstream oracle and context-export tools still require TabICL/PyTorch.
 
 ## Version Requirements
 
-The supported scikit-learn 1.9.x / SciPy 1.18.x combination preserves the
-upstream power-fit behavior; older float32 solvers produce different results.
-NumPy 2.x is required.
+The package requires NumPy 2.0+, scikit-learn 1.7+, and SciPy 1.17+. These are
+the oldest releases that pass the frozen upstream oracle. With SciPy 1.16 or
+older, the float32 power-transform fit gives different results. There are no
+upper bounds; the CI parity job installs the latest releases.
 
 ## Tests
 
@@ -71,7 +98,8 @@ IRONICL_TABICL_SOURCE=/path/to/tabicl/src \
 ```
 
 This dedicated suite compares independently fitted preprocessing chains, using
-synthetic inputs and bundled scikit-learn datasets. Missing prerequisites fail
-rather than skip. It tests preprocessing, not classifier predictions; see
+synthetic inputs and bundled scikit-learn datasets. It also compares
+`TabICLClassifier` signatures and `predict_proba` within `1e-4`, and downloads the
+released checkpoint for that. Missing prerequisites fail rather than skip. See
 [validation](validation.md#python-preprocessing-parity) for setup, coverage, and
 numerical requirements.
