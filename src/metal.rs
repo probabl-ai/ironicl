@@ -262,6 +262,8 @@ struct Builder<'w, 'a> {
     weights: &'w Weights<'w, 'a>,
     model: &'w ModelWeights,
     bindings: std::cell::RefCell<Vec<Binding>>,
+    /// The element type attention runs in when its keys and values are FP32.
+    attention: std::cell::Cell<MPSDataType>,
 }
 
 // SAFETY (all methods): plain `MPSGraph` construction. Shapes come from fixed
@@ -274,7 +276,12 @@ impl<'w, 'a> Builder<'w, 'a> {
             weights,
             model,
             bindings: std::cell::RefCell::default(),
+            attention: std::cell::Cell::new(FLOAT),
         }
+    }
+
+    fn set_attention(&self, kind: MPSDataType) {
+        self.attention.set(kind);
     }
 
     fn weight(&self, name: &str) -> Result<&'a [f32]> {
@@ -556,13 +563,19 @@ impl<'w, 'a> Builder<'w, 'a> {
         };
         // Reduced-precision caches: attention runs in their type, so the
         // caches are read as stored instead of converted to an FP32 copy.
-        let cache_kind = unsafe { key.dataType() };
+        // Stored 16-bit caches set the attention type; otherwise `self.attention` does.
+        let stored = unsafe { key.dataType() };
+        let kind = if stored == FLOAT {
+            self.attention.get()
+        } else {
+            stored
+        };
         let attended = unsafe {
             self.graph
                 .scaledDotProductAttentionWithQueryTensor_keyTensor_valueTensor_scale_name(
-                    &self.cast(&query, cache_kind),
-                    &key,
-                    &value,
+                    &self.cast(&query, kind),
+                    &self.cast(&key, kind),
+                    &self.cast(&value, kind),
                     (head_dim as f32).sqrt().recip(),
                     None,
                 )
@@ -1063,6 +1076,9 @@ pub(crate) fn build_context(
         &builder.row_stage(&source, (size.ensembles, size.features))?,
         &icl_labels,
     );
+    // FP16 caches also run the N x N ICL self-attention in FP16. Doing the same
+    // for the column and row attention added error without saving time.
+    builder.set_attention(kind(icl_storage));
     let mut icl = Vec::with_capacity(ICL_BLOCKS);
     for (block, base_scale) in icl_base_scales.iter().enumerate() {
         let prefix = format!("icl_predictor.tf_icl.blocks.{block}");

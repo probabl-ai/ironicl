@@ -45,14 +45,15 @@ Apple Silicon GPUs:
 | `optimize` | Precision | Accuracy against `"safe"` |
 |---|---|---|
 | `"safe"` | FP32 throughout | matches TabICL within `1e-4` |
-| `"auto"` | context keys and values stored in FP16; attention against them in FP16 | max probability error below `1e-3`, labels unchanged except near-ties |
+| `"auto"` | context keys and values stored in FP16; ICL attention in FP16 when building and when predicting | max probability error below `1e-3`, labels unchanged except near-ties |
 | `"fast"` | currently the same as `"auto"`; further reduced precision lands here first | probabilities within about `1e-2` |
 
 `None`, the default, reads the `IRONICL_OPTIMIZE` environment variable and
 falls back to `"safe"`. An explicit argument wins over the variable. Without a
 Metal GPU, every level behaves like `"safe"`. On an M1 Max, `"auto"` made
-7071x22 batch prediction 14% faster and single-row prediction 25% faster, with
-a maximum probability error of `4.9e-4` across 12 datasets.
+7071x22 fitting 16% faster, batch prediction 14% faster, and single-row
+prediction 25% faster, with a maximum probability error of `4.9e-4` across 12
+datasets.
 
 ## Preprocessing
 
