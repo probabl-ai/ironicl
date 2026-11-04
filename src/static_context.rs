@@ -322,14 +322,14 @@ impl StaticContextArtifact {
         })
     }
 
-    /// Validate tensors written into page-aligned memory and own them without
-    /// copying. The memory becomes read-only. With `values_checked`, the
-    /// writer has already proven every value finite, and only names and
-    /// shapes are checked here. Tensors may be FP32, FP16, or BF16.
+    /// Own tensors written into page-aligned memory without copying; the
+    /// memory becomes read-only. Only names and shapes are checked here: the
+    /// writer must already have proven every value finite. Tensors may be
+    /// FP32, FP16, or BF16.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Artifact`] when metadata, names, shapes, or values are invalid.
+    /// Returns [`Error::Artifact`] when metadata, names, or shapes are invalid.
     #[cfg_attr(
         not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
         allow(dead_code)
@@ -337,7 +337,6 @@ impl StaticContextArtifact {
     pub(crate) fn from_page_aligned(
         metadata: StaticContextMetadata,
         tensors: PageAlignedTensors,
-        values_checked: bool,
     ) -> Result<Self> {
         validate_metadata(&metadata)?;
         if tensors.layout.is_empty() || tensors.layout.len() > MAX_TENSOR_COUNT {
@@ -345,28 +344,8 @@ impl StaticContextArtifact {
         }
         let mut named = BTreeMap::new();
         for (name, dimensions, storage, byte_offset, byte_length) in tensors.layout {
-            let bytes = &tensors.mapping[byte_offset..byte_offset + byte_length];
             let elements = byte_length / storage.bytes();
             validate_tensor_shape(&name, &dimensions, elements)?;
-            if !values_checked {
-                let finite = match storage {
-                    TensorStorage::Fp32 => bytemuck::cast_slice::<u8, f32>(bytes)
-                        .iter()
-                        .all(|value| value.is_finite()),
-                    // A value is not finite when its exponent bits are all ones.
-                    TensorStorage::F16 => bytemuck::cast_slice::<u8, u16>(bytes)
-                        .iter()
-                        .all(|value| value & 0x7C00 != 0x7C00),
-                    TensorStorage::Bf16 => bytemuck::cast_slice::<u8, u16>(bytes)
-                        .iter()
-                        .all(|value| value & 0x7F80 != 0x7F80),
-                };
-                if !finite {
-                    return Err(artifact_error(format!(
-                        "static context tensor '{name}' has a non-finite value"
-                    )));
-                }
-            }
             let values = match storage {
                 TensorStorage::Fp32 => StaticContextTensorValues::MappedFp32 {
                     byte_offset,
@@ -1147,12 +1126,9 @@ fn validate_permutation(values: &[u64], expected_length: usize, name: &str) -> R
 }
 
 fn validate_tensor(tensor: &StaticContextTensor) -> Result<()> {
-    validate_tensor_parts(&tensor.name, &tensor.dimensions, &tensor.values)
-}
-
-fn validate_tensor_parts(name: &str, dimensions: &[u64], values: &[f32]) -> Result<()> {
-    validate_tensor_shape(name, dimensions, values.len())?;
-    if values.iter().any(|value| !value.is_finite()) {
+    let name = &tensor.name;
+    validate_tensor_shape(name, &tensor.dimensions, tensor.values.len())?;
+    if tensor.values.iter().any(|value| !value.is_finite()) {
         return Err(artifact_error(format!(
             "static context tensor '{name}' has a non-finite value"
         )));

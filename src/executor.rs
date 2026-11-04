@@ -438,8 +438,8 @@ impl ClassifierExecutor {
 
     /// Build every estimator's keys and values on the GPU, straight into
     /// page-aligned context tensors. Returns `None` without a GPU, below
-    /// `metal::GPU_MIN_BUILD_ROWS`, when a grouped triple is the all-missing marker
-    /// that only the CPU path handles, or when one estimator exceeds the
+    /// `metal::GPU_MIN_BUILD_ROWS`, when a grouped triple is the all-missing
+    /// marker that only the CPU path handles, or when one estimator exceeds the
     /// build's memory budget.
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
     fn build_tensors_gpu(
@@ -449,7 +449,7 @@ impl ClassifierExecutor {
         y_train: &[f32],
         optimize: Optimize,
     ) -> Result<Option<crate::static_context::PageAlignedTensors>> {
-        use crate::static_context::TensorStorage;
+        use crate::static_context::{PageAlignedTensors, TensorStorage};
         let icl_storage = match optimize {
             Optimize::Safe => TensorStorage::Fp32,
             // BF16 had no native GPU arithmetic on an M1 Max: slower and less
@@ -462,6 +462,100 @@ impl ClassifierExecutor {
         let Some(gpu_weights) = self.gpu_weights() else {
             return Ok(None);
         };
+        let Some((grouped, column_labels, icl_labels)) = self.gpu_build_inputs((b, n, h), x, y_train)? else {
+            return Ok(None);
+        };
+        // Run as many estimators per graph as fit Metal's working set, or
+        // IRONICL_GPU_BUILD_BUDGET bytes, in equal groups so every run has the
+        // same shape. When one estimator does not fit, the CPU builds the
+        // context.
+        let budget = std::env::var("IRONICL_GPU_BUILD_BUDGET")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| gpu_weights.gpu().working_set_bytes());
+        let estimator_bytes = crate::metal::gpu_build_estimator_bytes(n, h);
+        let Some(group) = (1..=b)
+            .rev()
+            .find(|&group| b % group == 0 && group * estimator_bytes <= budget)
+        else {
+            return Ok(None);
+        };
+        let column_scales = (0..3)
+            .map(|block| {
+                qass_base_scale(
+                    self,
+                    &format!("col_embedder.tf_col.blocks.{block}.multihead_attn1.attn"),
+                    n,
+                    COLUMN_DIM,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let icl_scales = (0..12)
+            .map(|block| {
+                qass_base_scale(
+                    self,
+                    &format!("icl_predictor.tf_icl.blocks.{block}.attn"),
+                    n,
+                    ICL_DIM,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Only the ICL caches, almost all of a context, take the reduced type.
+        let tensors = |ensembles: usize| {
+            PageAlignedTensors::new(
+                context_tensors(ensembles, n, h)
+                    .into_iter()
+                    .map(|(name, dimensions)| {
+                        let storage = if name.starts_with("icl.") {
+                            icl_storage
+                        } else {
+                            TensorStorage::Fp32
+                        };
+                        (name, dimensions, storage)
+                    })
+                    .collect(),
+            )
+        };
+        let mut context = tensors(b)?;
+        let mut scratch = if group == b { None } else { Some(tensors(group)?) };
+        for start in (0..b).step_by(group) {
+            let output = scratch.as_mut().unwrap_or(&mut context);
+            crate::metal::build_context(
+                &gpu_weights,
+                &|name| self.tensor(name),
+                crate::metal::Shape {
+                    ensembles: group,
+                    features: h,
+                    training_rows: n,
+                },
+                &column_scales,
+                &icl_scales,
+                &grouped[start * h * n * 3..][..group * h * n * 3],
+                &column_labels[start * n * COLUMN_DIM..][..group * n * COLUMN_DIM],
+                &icl_labels[start * n * ICL_DIM..][..group * n * ICL_DIM],
+                icl_storage,
+                &output.regions(),
+            )?;
+            // Estimators are the outermost dimension, so a group's slice of
+            // each tensor is contiguous.
+            if let Some(scratch) = &scratch {
+                context.copy_group(scratch, start / group);
+            }
+        }
+        Ok(Some(context))
+    }
+
+    /// The GPU build's inputs: each feature grouped with its neighbors as
+    /// `[B * H, N, 3]`, and the column and ICL label embeddings as
+    /// `[B, N, 128]` and `[B, N, 512]`. `None` on the all-missing marker.
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    #[allow(clippy::type_complexity)]
+    fn gpu_build_inputs(
+        &self,
+        (b, n, h): (usize, usize, usize),
+        x: &[f32],
+        y_train: &[f32],
+    ) -> Result<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>> {
         let mut grouped = Vec::with_capacity(b * h * n * 3);
         let mut column_labels = vec![0.0; b * n * COLUMN_DIM];
         let mut icl_labels = vec![0.0; b * n * ICL_DIM];
@@ -485,95 +579,7 @@ impl ClassifierExecutor {
                 )?;
             }
         }
-        let column_scales = (0..3)
-            .map(|block| {
-                qass_base_scale(
-                    self,
-                    &format!("col_embedder.tf_col.blocks.{block}.multihead_attn1.attn"),
-                    n,
-                    COLUMN_DIM,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let icl_scales = (0..12)
-            .map(|block| {
-                qass_base_scale(
-                    self,
-                    &format!("icl_predictor.tf_icl.blocks.{block}.attn"),
-                    n,
-                    ICL_DIM,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let as_u64 = |values: &[usize]| values.iter().map(|&value| value as u64).collect::<Vec<_>>();
-        // Each context tensor for `ensembles` estimators. Only the ICL
-        // caches, almost all of a context, take the reduced type.
-        let specs = |ensembles: usize| {
-            let mut specs = Vec::with_capacity(30);
-            for (stage, blocks, dimensions, storage) in [
-                (
-                    "column",
-                    3,
-                    as_u64(&[ensembles, h + RESERVED, HEADS, INDUCING, 16]),
-                    TensorStorage::Fp32,
-                ),
-                (
-                    "icl",
-                    12,
-                    as_u64(&[ensembles, HEADS, n, ICL_DIM / HEADS]),
-                    icl_storage,
-                ),
-            ] {
-                for block in 0..blocks {
-                    for kind in ["key", "value"] {
-                        specs.push((format!("{stage}.{block}.{kind}"), dimensions.clone(), storage));
-                    }
-                }
-            }
-            crate::static_context::PageAlignedTensors::new(specs)
-        };
-        // Run as many estimators per graph as fit Metal's working set, or
-        // IRONICL_GPU_BUILD_BUDGET bytes, in equal groups so every run has the
-        // same shape. When one estimator does not fit, the CPU builds the
-        // context.
-        let budget = std::env::var("IRONICL_GPU_BUILD_BUDGET")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or_else(|| gpu_weights.gpu().working_set_bytes());
-        let estimator_bytes = crate::metal::gpu_build_estimator_bytes(n, h);
-        let Some(group) = (1..=b)
-            .rev()
-            .find(|&group| b % group == 0 && group * estimator_bytes <= budget)
-        else {
-            return Ok(None);
-        };
-        let mut tensors = specs(b)?;
-        let mut scratch = if group == b { None } else { Some(specs(group)?) };
-        for start in (0..b).step_by(group) {
-            let output = scratch.as_mut().unwrap_or(&mut tensors);
-            crate::metal::build_context(
-                &gpu_weights,
-                &|name| self.tensor(name),
-                crate::metal::Shape {
-                    ensembles: group,
-                    features: h,
-                    training_rows: n,
-                },
-                &column_scales,
-                &icl_scales,
-                &grouped[start * h * n * 3..][..group * h * n * 3],
-                &column_labels[start * n * COLUMN_DIM..][..group * n * COLUMN_DIM],
-                &icl_labels[start * n * ICL_DIM..][..group * n * ICL_DIM],
-                icl_storage,
-                &output.regions(),
-            )?;
-            // Estimators are the outermost dimension, so a group's slice of
-            // each tensor is contiguous.
-            if let Some(scratch) = &scratch {
-                tensors.copy_group(scratch, start / group);
-            }
-        }
-        Ok(Some(tensors))
+        Ok(Some((grouped, column_labels, icl_labels)))
     }
 
     /// Run the training rows once and keep their attention keys and values as
@@ -603,7 +609,28 @@ impl ClassifierExecutor {
         // Reduced precision needs a GPU-built context; elsewhere every level is `Safe`.
         #[cfg(not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")))]
         let _ = optimize;
-        let (b, n, h) = (ensembles, training_rows, features);
+        let shape = (ensembles, training_rows, features);
+        let metadata = self.context_metadata(shape, x, y_train, class_permutations, feature_permutations)?;
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        if let Some(tensors) = self.build_tensors_gpu(shape, x, y_train, optimize)? {
+            // The build graph checked every value on the GPU.
+            let context = StaticContextArtifact::from_page_aligned(metadata, tensors)?;
+            return StaticClassifierExecutor::with_executor(self.clone(), context);
+        }
+        let context = StaticContextArtifact::new(metadata, self.build_tensors_cpu(shape, x, y_train)?)?;
+        StaticClassifierExecutor::with_executor(self.clone(), context)
+    }
+
+    /// Validate a context's inputs and describe it: model and content hashes,
+    /// shape, class count, and permutations.
+    fn context_metadata(
+        &self,
+        (b, n, h): (usize, usize, usize),
+        x: &[f32],
+        y_train: &[f32],
+        class_permutations: Vec<u64>,
+        feature_permutations: Vec<u64>,
+    ) -> Result<StaticContextMetadata> {
         if b == 0
             || n == 0
             || h == 0
@@ -614,7 +641,7 @@ impl ClassifierExecutor {
                 "context needs nonempty x[B, N, H] and y_train[B, N] for B={b}, N={n}, H={h}"
             )));
         }
-        let classes = validate_labels(y_train, b, n)?;
+        let class_count = validate_labels(y_train, b, n)?;
         let mut model_sha256 = [0; 32];
         let source = self.model.summary().source_sha256.as_bytes();
         for (byte, pair) in model_sha256.iter_mut().zip(source.chunks_exact(2)) {
@@ -623,38 +650,34 @@ impl ClassifierExecutor {
                 .and_then(|pair| u8::from_str_radix(pair, 16).ok())
                 .ok_or_else(|| Error::Artifact("model source SHA-256 is not hexadecimal".into()))?;
         }
-        let context_sha256 = Sha256::new()
-            .chain_update(
-                [b, n, h]
-                    .iter()
-                    .map(|&value| value as u64)
-                    .collect::<Vec<_>>()
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<_>>(),
-            )
-            .chain_update(bytemuck::cast_slice::<f32, u8>(x))
-            .chain_update(bytemuck::cast_slice::<f32, u8>(y_train))
-            .chain_update(bytemuck::cast_slice::<u64, u8>(&class_permutations))
-            .chain_update(bytemuck::cast_slice::<u64, u8>(&feature_permutations))
-            .finalize()
-            .into();
-        let metadata = StaticContextMetadata {
+        let mut context_sha256 = Sha256::new();
+        for value in [b, n, h] {
+            context_sha256.update((value as u64).to_le_bytes());
+        }
+        context_sha256.update(bytemuck::cast_slice::<f32, u8>(x));
+        context_sha256.update(bytemuck::cast_slice::<f32, u8>(y_train));
+        context_sha256.update(bytemuck::cast_slice::<u64, u8>(&class_permutations));
+        context_sha256.update(bytemuck::cast_slice::<u64, u8>(&feature_permutations));
+        Ok(StaticContextMetadata {
             model_sha256,
-            context_sha256,
+            context_sha256: context_sha256.finalize().into(),
             ensemble_count: b,
             training_rows: n,
             feature_count: h,
-            class_count: classes,
+            class_count,
             class_permutations,
             feature_permutations,
-        };
-        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-        if let Some(tensors) = self.build_tensors_gpu((b, n, h), x, y_train, optimize)? {
-            // The build graph checked every value on the GPU.
-            let context = StaticContextArtifact::from_page_aligned(metadata, tensors, true)?;
-            return StaticClassifierExecutor::with_executor(self.clone(), context);
-        }
+        })
+    }
+
+    /// Build every estimator's keys and values on the CPU, in the order of
+    /// [`context_tensors`].
+    fn build_tensors_cpu(
+        &self,
+        (b, n, h): (usize, usize, usize),
+        x: &[f32],
+        y_train: &[f32],
+    ) -> Result<Vec<StaticContextTensor>> {
         let streams = h + RESERVED;
         let column_elements = HEADS * INDUCING * 16;
         // The context is the one allocation that grows with N x B; running
@@ -679,9 +702,9 @@ impl ClassifierExecutor {
         // is 2-3x the measured peak, so the budget is four activation limits.
         // Equal groups keep the last one from running alone.
         let fit = (4 * MAX_ACTIVATION_ELEMENTS / request_activation_elements(1, n, h, n)?.max(1)).clamp(1, b);
-        let workers = b.div_ceil(b.div_ceil(fit));
-        for group in (0..b).collect::<Vec<_>>().chunks(workers) {
-            let estimators: Vec<EstimatorCaches> = group
+        let group = b.div_ceil(b.div_ceil(fit));
+        for members in (0..b).collect::<Vec<_>>().chunks(group) {
+            let estimators: Vec<EstimatorCaches> = members
                 .par_iter()
                 .map(|&ensemble| {
                     let x = &x[ensemble * n * h..][..n * h];
@@ -719,24 +742,17 @@ impl ClassifierExecutor {
                 }
             }
         }
-        let mut tensors = Vec::with_capacity(30);
-        let as_u64 = |values: &[usize]| values.iter().map(|&value| value as u64).collect::<Vec<_>>();
-        for (stage, caches, dimensions) in [
-            ("column", column, as_u64(&[b, streams, HEADS, INDUCING, 16])),
-            ("icl", icl, as_u64(&[b, HEADS, n, ICL_DIM / HEADS])),
-        ] {
-            for (layer, (keys, values)) in caches.into_iter().enumerate() {
-                for (kind, values) in [("key", keys), ("value", values)] {
-                    tensors.push(StaticContextTensor {
-                        name: format!("{stage}.{layer}.{kind}"),
-                        dimensions: dimensions.clone(),
-                        values,
-                    });
-                }
-            }
-        }
-        let context = StaticContextArtifact::new(metadata, tensors)?;
-        StaticClassifierExecutor::with_executor(self.clone(), context)
+        Ok(column
+            .into_iter()
+            .chain(icl)
+            .flat_map(|(keys, values)| [keys, values])
+            .zip(context_tensors(b, n, h))
+            .map(|(values, (name, dimensions))| StaticContextTensor {
+                name,
+                dimensions,
+                values,
+            })
+            .collect())
     }
 
     /// Execute the complete FP32 classifier forward graph without persistent caches.
@@ -1434,10 +1450,11 @@ impl StaticClassifierExecutor {
         }
         let qass_base_scales = (0..12)
             .map(|block| {
-                Self::build_qass_base_scale(
+                qass_base_scale(
                     &model,
                     &format!("icl_predictor.tf_icl.blocks.{block}.attn"),
                     context.metadata().training_rows,
+                    ICL_DIM,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1660,9 +1677,12 @@ impl StaticClassifierExecutor {
             metadata.class_count,
         );
         // Rows are independent, so a large query runs in chunks that fit the
-        // activation budget. One row always fits.
+        // activation budget. Only a single row that does not fit is an error.
         let mut rows = q.min(QUERY_CHUNK_ROWS);
-        while rows > 1 && self.admit_query(rows).is_err() {
+        while let Err(error) = self.admit_query(rows) {
+            if rows == 1 {
+                return Err(error);
+            }
             rows /= 2;
         }
         if rows == q {
@@ -1687,10 +1707,19 @@ impl StaticClassifierExecutor {
         })
     }
 
+    /// The execution plan, and whether `IRONICL_LAYER_MAJOR` runs it one layer
+    /// at a time across estimators.
+    fn plan(&self) -> (ExecutionPlan, bool) {
+        let ensembles = self.context.metadata().ensemble_count;
+        (
+            static_execution_plan(ensembles, executor_threads()),
+            ensembles > 1 && std::env::var_os("IRONICL_LAYER_MAJOR").is_some(),
+        )
+    }
+
     fn admit_query(&self, rows: usize) -> Result<()> {
         let metadata = self.context.metadata();
-        let plan = static_execution_plan(metadata.ensemble_count, executor_threads());
-        let layer_major = metadata.ensemble_count > 1 && std::env::var_os("IRONICL_LAYER_MAJOR").is_some();
+        let (plan, layer_major) = self.plan();
         admit_static_request(
             metadata.ensemble_count,
             rows,
@@ -1704,21 +1733,16 @@ impl StaticClassifierExecutor {
         )
     }
 
-    /// Run one admitted query chunk.
+    /// Run one query chunk that [`Self::admit_query`] accepted.
     fn predict_chunk(&self, request: ClassifierQueryRequest<'_>) -> Result<ClassifierLogits> {
         let metadata = self.context.metadata();
-        let plan = static_execution_plan(metadata.ensemble_count, executor_threads());
-        let layer_major = metadata.ensemble_count > 1 && std::env::var_os("IRONICL_LAYER_MAJOR").is_some();
-        self.admit_query(request.query_rows())?;
-        let output_elements = checked_product(
-            &[
-                metadata.ensemble_count,
-                request.query_rows(),
-                metadata.class_count,
-            ],
-            "static classifier output",
-        )?;
-        let mut values = vec![0.0; output_elements];
+        let (plan, layer_major) = self.plan();
+        let shape = [
+            metadata.ensemble_count,
+            request.query_rows(),
+            metadata.class_count,
+        ];
+        let mut values = vec![0.0; checked_product(&shape, "static classifier output")?];
         let ensemble_output_elements = checked_product(
             &[request.query_rows(), metadata.class_count],
             "static ensemble output",
@@ -1727,14 +1751,7 @@ impl StaticClassifierExecutor {
         if let Some(gpu) = &self.gpu
             && self.predict_logits_gpu(gpu, request, &mut values)?
         {
-            return Ok(ClassifierLogits {
-                shape: [
-                    metadata.ensemble_count,
-                    request.query_rows(),
-                    metadata.class_count,
-                ],
-                values,
-            });
+            return Ok(ClassifierLogits { shape, values });
         }
         if layer_major {
             self.predict_layer_major(request, plan.inner_workers, &mut values)?;
@@ -1781,14 +1798,7 @@ impl StaticClassifierExecutor {
                 Ok(())
             })?;
         }
-        Ok(ClassifierLogits {
-            shape: [
-                metadata.ensemble_count,
-                request.query_rows(),
-                metadata.class_count,
-            ],
-            values,
-        })
+        Ok(ClassifierLogits { shape, values })
     }
 
     fn predict_layer_major(
@@ -3351,11 +3361,6 @@ impl StaticClassifierExecutor {
         packed.insert(name, affine);
         Ok(())
     }
-
-    #[allow(clippy::cast_precision_loss)]
-    fn build_qass_base_scale(model: &ClassifierExecutor, prefix: &str, source: usize) -> Result<Vec<f32>> {
-        qass_base_scale(model, prefix, source, HEADS * 64)
-    }
 }
 
 /// `QASSMax` base scales for `source` keys: `[heads * head_dim]`, the same for
@@ -3576,6 +3581,27 @@ fn model_hash_matches(model_hash: &[u8], context_hash: &[u8; 32]) -> bool {
     model_hash == crate::model_artifact::encode_sha256(context_hash).as_bytes()
 }
 
+/// A context's cache tensors in order: each column block's key and value as
+/// `[B, H + 4, 8, 128, 16]`, then each ICL block's as `[B, 8, N, 64]`.
+fn context_tensors(b: usize, n: usize, h: usize) -> Vec<(String, Vec<u64>)> {
+    let dimensions = |values: &[usize]| values.iter().map(|&value| value as u64).collect::<Vec<_>>();
+    [
+        (
+            "column",
+            3,
+            dimensions(&[b, h + RESERVED, HEADS, INDUCING, COLUMN_DIM / HEADS]),
+        ),
+        ("icl", 12, dimensions(&[b, HEADS, n, ICL_DIM / HEADS])),
+    ]
+    .into_iter()
+    .flat_map(|(stage, blocks, dimensions)| {
+        (0..blocks).flat_map(move |block| {
+            ["key", "value"].map(|kind| (format!("{stage}.{block}.{kind}"), dimensions.clone()))
+        })
+    })
+    .collect()
+}
+
 fn validate_static_cache_contract(context: &StaticContextArtifact) -> Result<()> {
     let metadata = context.metadata();
     if !(2..=10).contains(&metadata.class_count) {
@@ -3584,33 +3610,19 @@ fn validate_static_cache_contract(context: &StaticContextArtifact) -> Result<()>
             metadata.class_count
         )));
     }
-    for (stage, layers, sources, head_dim) in
-        [("column", 3, 128, 16), ("icl", 12, metadata.training_rows, 64)]
-    {
-        for layer in 0..layers {
-            for kind in ["key", "value"] {
-                let name = format!("{stage}.{layer}.{kind}");
-                let tensor = context.tensor(&name).ok_or_else(|| {
-                    Error::Artifact(format!("static context cache tensor '{name}' is missing"))
-                })?;
-                let expected_shape = if stage == "column" {
-                    vec![
-                        metadata.ensemble_count as u64,
-                        (metadata.feature_count + RESERVED) as u64,
-                        8,
-                        sources as u64,
-                        head_dim,
-                    ]
-                } else {
-                    vec![metadata.ensemble_count as u64, 8, sources as u64, head_dim]
-                };
-                if tensor.dimensions != expected_shape {
-                    return Err(Error::Artifact(format!(
-                        "static context cache tensor '{name}' has shape {:?}; expected {:?}",
-                        tensor.dimensions, expected_shape
-                    )));
-                }
-            }
+    for (name, expected_shape) in context_tensors(
+        metadata.ensemble_count,
+        metadata.training_rows,
+        metadata.feature_count,
+    ) {
+        let tensor = context
+            .tensor(&name)
+            .ok_or_else(|| Error::Artifact(format!("static context cache tensor '{name}' is missing")))?;
+        if tensor.dimensions != expected_shape {
+            return Err(Error::Artifact(format!(
+                "static context cache tensor '{name}' has shape {:?}; expected {expected_shape:?}",
+                tensor.dimensions
+            )));
         }
     }
     validate_sparse_index_contract(context)
