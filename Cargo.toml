@@ -28,6 +28,13 @@ metal = [
 # Force the scalar reference GELU, softmax, and LayerNorm instead of the bounded
 # native approximations, for exact PyTorch parity debugging and control runs.
 exact-math = []
+# Dormant experiments, off by default and never activated by a runtime flag.
+# Build with one to compile its code path back in. See docs/experiments.md.
+bf16-dense = []
+bf16-value-dot = []
+sparse-attention = []
+attention-stats = []
+experimental = ["bf16-dense", "bf16-value-dot", "sparse-attention", "attention-stats"]
 profile = []
 python = ["checkpoint", "dep:pyo3"]
 

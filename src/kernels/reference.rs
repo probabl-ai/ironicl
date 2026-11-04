@@ -1467,14 +1467,12 @@ fn attention_score_maximum(backend: super::native::AttentionBackend, scores: &[f
     Ok(maximum)
 }
 
-fn bf16_attention_value_dot_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("IRONICL_BF16_VALUE_DOT").is_some())
+const fn bf16_attention_value_dot_enabled() -> bool {
+    cfg!(feature = "bf16-value-dot")
 }
 
-fn attention_stats_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("IRONICL_ATTENTION_STATS").is_some())
+const fn attention_stats_enabled() -> bool {
+    cfg!(feature = "attention-stats")
 }
 
 fn report_attention_stats(mut scores: Vec<f32>) {

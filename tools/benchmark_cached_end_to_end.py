@@ -52,11 +52,9 @@ def latency_summary(samples: list[int]) -> dict[str, float]:
 
 
 def sparse_max_omitted_mass() -> float:
-    try:
-        value = float(os.environ.get("IRONICL_SPARSE_MAX_OMITTED_MASS", "1e-5"))
-    except ValueError:
-        return 1e-5
-    return value if math.isfinite(value) and 0.0 < value <= 1.0 else 1e-5
+    # Sparse attention is a build feature (`--features sparse-attention`) with a
+    # fixed 1e-5 omitted-mass certificate; it is no longer a runtime knob.
+    return 1e-5
 
 
 def parse_args() -> argparse.Namespace:

@@ -37,6 +37,11 @@ Exact-math control runs (scalar GELU, softmax, and LayerNorm for parity
 debugging) are a build-time choice: build with `--features exact-math` rather
 than a runtime flag.
 
+The dormant experiments are also build-time only, never runtime flags. Build
+with `--features bf16-dense`, `bf16-value-dot`, `sparse-attention`,
+`attention-stats`, or the `experimental` umbrella to compile one back in. See
+[experiments.md](experiments.md).
+
 The test and benchmark harnesses also read `IRONICL_CHECKPOINT_FIXTURES`,
 `IRONICL_ORACLE_FIXTURES`, `IRONICL_TABICL_SOURCE`, and the `IRONICL_BENCH_*`
 variables; these are not engine runtime flags.
