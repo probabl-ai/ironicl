@@ -40,6 +40,7 @@ fn grouped_gpu_build_matches_one_graph_run() {
                 (0..b).flat_map(|_| 0..3).collect(),
                 (0..b).flat_map(|_| 0..h as u64).collect(),
                 optimize,
+                None,
             )
             .expect("build context")
             .predict_logits(ClassifierQueryRequest::new(b, q, h, &query).expect("valid query"))

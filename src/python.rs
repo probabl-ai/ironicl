@@ -51,6 +51,7 @@ impl Model {
     /// Run FP32 training rows `x[B, N, H]` with labels `y_train[B, N]` once and
     /// keep their attention keys and values. Permutations are `[B, C]` and
     /// `[B, H]`; `optimize` is `"safe"`, `"auto"`, or `"fast"`.
+    #[allow(clippy::too_many_arguments)]
     fn build_context(
         &self,
         py: Python<'_>,
@@ -59,6 +60,7 @@ impl Model {
         class_permutations: PyBuffer<u64>,
         feature_permutations: PyBuffer<u64>,
         optimize: &str,
+        threads: Option<usize>,
     ) -> PyResult<Context> {
         let optimize = optimize.parse::<Optimize>().map_err(py_error)?;
         let &[ensembles, rows, features] = x.shape() else {
@@ -77,6 +79,7 @@ impl Model {
                 class_permutations,
                 feature_permutations,
                 optimize,
+                threads,
             )
         })
         .map(Context)
