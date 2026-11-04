@@ -9,10 +9,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use sha2::{Digest, Sha256};
-
+#[cfg(feature = "checkpoint")]
+use crate::artifact::{pad_to_alignment, usize_to_u32, write_u16, write_u32, write_u64};
 use crate::{
     TaskKind,
+    artifact::{
+        ByteReader, CHECKSUM_BYTES, TENSOR_ALIGNMENT, align_up, artifact_error, encode_sha256,
+        sha256, u64_to_usize, usize_to_u64,
+    },
     error::{Error, Result},
 };
 
@@ -21,8 +25,6 @@ pub const MODEL_ARTIFACT_VERSION: u32 = 1;
 
 const MODEL_ARTIFACT_KIND: u32 = 1;
 const HEADER_BYTES: usize = 144;
-const CHECKSUM_BYTES: usize = 32;
-const TENSOR_ALIGNMENT: usize = 64;
 const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_DIRECTORY_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_TENSOR_COUNT: usize = 4096;
@@ -38,8 +40,6 @@ const REGRESSOR_SHA256: [u8; 32] = [
     0x0d, 0xb9, 0xcb, 0x53, 0x8f, 0x11, 0x4e, 0x79, 0x02, 0x6b, 0xf0, 0x8f, 0x45, 0xf4, 0x1a, 0xd8, 0xdd,
     0x7a, 0xd2, 0xde, 0x2a, 0xac, 0xa9, 0xa5, 0xca, 0x8c, 0xd3, 0xbd, 0x97, 0x48, 0xae, 0x7a,
 ];
-const HEX: &[u8; 16] = b"0123456789abcdef";
-
 /// A released model identity or an otherwise valid custom model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModelProfile {
@@ -920,121 +920,8 @@ fn usable_parent(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-#[cfg(feature = "checkpoint")]
-fn pad_to_alignment(bytes: &mut Vec<u8>, alignment: usize) -> Result<()> {
-    let aligned = align_up(bytes.len(), alignment)?;
-    bytes.resize(aligned, 0);
-    Ok(())
-}
-
-fn align_up(value: usize, alignment: usize) -> Result<usize> {
-    let remainder = value % alignment;
-    if remainder == 0 {
-        Ok(value)
-    } else {
-        value
-            .checked_add(alignment - remainder)
-            .ok_or_else(|| Error::Artifact("alignment calculation overflows usize".into()))
-    }
-}
-
 fn required_config(value: Option<u64>, name: &str) -> Result<u64> {
     value.ok_or_else(|| Error::Artifact(format!("model configuration '{name}' is missing")))
-}
-
-#[cfg(feature = "checkpoint")]
-fn write_u16(bytes: &mut Vec<u8>, value: u16) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-
-#[cfg(feature = "checkpoint")]
-fn write_u32(bytes: &mut Vec<u8>, value: u32) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-
-#[cfg(feature = "checkpoint")]
-fn write_u64(bytes: &mut Vec<u8>, value: u64) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-
-#[cfg(feature = "checkpoint")]
-fn usize_to_u32(value: usize, name: &str) -> Result<u32> {
-    u32::try_from(value).map_err(|_| Error::Artifact(format!("{name} exceeds u32")))
-}
-
-fn usize_to_u64(value: usize, name: &str) -> Result<u64> {
-    u64::try_from(value).map_err(|_| Error::Artifact(format!("{name} exceeds u64")))
-}
-
-fn u64_to_usize(value: u64, name: &str) -> Result<usize> {
-    usize::try_from(value).map_err(|_| Error::Artifact(format!("{name} exceeds usize")))
-}
-
-fn sha256(bytes: &[u8]) -> [u8; 32] {
-    Sha256::digest(bytes).into()
-}
-
-pub(crate) fn encode_sha256(digest: &[u8; 32]) -> String {
-    let mut encoded = String::with_capacity(64);
-    for byte in digest {
-        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
-        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
-    }
-    encoded
-}
-
-fn artifact_error(error: impl fmt::Display) -> Error {
-    Error::Artifact(error.to_string())
-}
-
-struct ByteReader<'a> {
-    bytes: &'a [u8],
-    position: usize,
-}
-
-impl<'a> ByteReader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, position: 0 }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.position == self.bytes.len()
-    }
-
-    fn read_u8(&mut self) -> Result<u8> {
-        Ok(self.read_array::<1>()?[0])
-    }
-
-    fn read_u16(&mut self) -> Result<u16> {
-        Ok(u16::from_le_bytes(self.read_array()?))
-    }
-
-    fn read_u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(self.read_array()?))
-    }
-
-    fn read_u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.read_array()?))
-    }
-
-    fn read_array<const N: usize>(&mut self) -> Result<[u8; N]> {
-        self.read_bytes(N)?
-            .try_into()
-            .map_err(|_| Error::Artifact("artifact field has an invalid length".into()))
-    }
-
-    fn read_bytes(&mut self, length: usize) -> Result<&'a [u8]> {
-        let end = self
-            .position
-            .checked_add(length)
-            .ok_or_else(|| Error::Artifact("artifact offset overflows usize".into()))?;
-        let bytes = self
-            .bytes
-            .get(self.position..end)
-            .ok_or_else(|| Error::Artifact("artifact is truncated".into()))?;
-        self.position = end;
-        Ok(bytes)
-    }
 }
 
 #[cfg(all(test, feature = "checkpoint"))]

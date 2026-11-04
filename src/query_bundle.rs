@@ -2,9 +2,10 @@
 
 use std::{fs::File, io::Read, path::Path};
 
-use sha2::{Digest, Sha256};
-
-use crate::{ClassifierQueryRequest, Error, Result};
+use crate::{
+    ClassifierQueryRequest, Error, Result,
+    artifact::{ByteReader, CHECKSUM_BYTES, sha256},
+};
 
 /// Magic bytes at the start of a static-context query bundle.
 pub const STATIC_QUERY_BUNDLE_MAGIC: [u8; 8] = *b"IRQUERY\0";
@@ -13,7 +14,6 @@ pub const STATIC_QUERY_BUNDLE_VERSION: u32 = 1;
 
 const STATIC_QUERY_BUNDLE_KIND: u32 = 1;
 const HEADER_BYTES: usize = 112;
-const CHECKSUM_BYTES: usize = 32;
 const MAX_BUNDLE_BYTES: usize = 512 * 1024 * 1024;
 const MAX_ENSEMBLE_COUNT: usize = 4096;
 const MAX_QUERY_ROWS: usize = 1_000_000;
@@ -146,54 +146,12 @@ impl StaticQueryBundle {
     }
 }
 
-fn sha256(bytes: &[u8]) -> [u8; 32] {
-    Sha256::digest(bytes).into()
-}
-
 fn to_usize(value: u64, name: &str) -> Result<usize> {
     usize::try_from(value).map_err(|_| query_error(format!("{name} exceeds usize")))
 }
 
 fn query_error(message: impl std::fmt::Display) -> Error {
     Error::InputBundle(format!("static query: {message}"))
-}
-
-struct ByteReader<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-}
-
-impl<'a> ByteReader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
-    }
-
-    fn read_array<const N: usize>(&mut self) -> Result<[u8; N]> {
-        let end = self
-            .offset
-            .checked_add(N)
-            .ok_or_else(|| query_error("query offset overflows usize"))?;
-        let value = self
-            .bytes
-            .get(self.offset..end)
-            .ok_or_else(|| query_error("query bundle is truncated"))?;
-        self.offset = end;
-        value
-            .try_into()
-            .map_err(|_| query_error("query field length is invalid"))
-    }
-
-    fn read_u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(self.read_array()?))
-    }
-
-    fn read_u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.read_array()?))
-    }
-
-    fn is_empty(&self) -> bool {
-        self.offset == self.bytes.len()
-    }
 }
 
 #[cfg(test)]

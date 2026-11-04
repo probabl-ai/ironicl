@@ -8,9 +8,14 @@
 use std::{collections::BTreeMap, fs::File, path::Path, sync::Arc};
 
 use memmap2::{Mmap, MmapMut, MmapOptions};
-use sha2::{Digest, Sha256};
 
-use crate::error::{Error, Result};
+use crate::{
+    artifact::{
+        ByteReader, CHECKSUM_BYTES, TENSOR_ALIGNMENT, align_up, pad_to_alignment, sha256, write_u16,
+        write_u32, write_u64,
+    },
+    error::{Error, Result},
+};
 
 /// Magic bytes at the start of a static-context artifact.
 pub const STATIC_CONTEXT_MAGIC: [u8; 8] = *b"IRONICL\0";
@@ -23,8 +28,6 @@ const STATIC_CONTEXT_BF16_VERSION: u32 = 2;
 const TENSOR_DTYPE_FP32: u16 = 1;
 const TENSOR_DTYPE_BF16: u16 = 2;
 const HEADER_BYTES: usize = 164;
-const CHECKSUM_BYTES: usize = 32;
-const TENSOR_ALIGNMENT: usize = 64;
 const MAX_ARTIFACT_BYTES: usize = 48 * 1024 * 1024 * 1024;
 const MAX_OWNED_ARTIFACT_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const MAX_DIRECTORY_BYTES: usize = 4 * 1024 * 1024;
@@ -1201,76 +1204,14 @@ fn decode_f32(bytes: &[u8]) -> Result<Vec<f32>> {
     Ok(values)
 }
 
-fn align_up(value: usize, alignment: usize) -> Result<usize> {
-    value
-        .checked_add(alignment - 1)
-        .map(|value| value / alignment * alignment)
-        .ok_or_else(|| artifact_error("alignment overflows usize"))
-}
-fn pad_to_alignment(bytes: &mut Vec<u8>, alignment: usize) -> Result<()> {
-    let end = align_up(bytes.len(), alignment)?;
-    bytes.resize(end, 0);
-    Ok(())
-}
 fn read_permutation(reader: &mut ByteReader<'_>, count: usize) -> Result<Vec<u64>> {
     (0..count).map(|_| reader.read_u64()).collect()
-}
-fn sha256(bytes: &[u8]) -> [u8; 32] {
-    Sha256::digest(bytes).into()
-}
-fn write_u16(bytes: &mut Vec<u8>, value: u16) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-fn write_u32(bytes: &mut Vec<u8>, value: u32) {
-    bytes.extend_from_slice(&value.to_le_bytes());
-}
-fn write_u64(bytes: &mut Vec<u8>, value: u64) {
-    bytes.extend_from_slice(&value.to_le_bytes());
 }
 fn to_usize(value: u64, name: &str) -> Result<usize> {
     usize::try_from(value).map_err(|_| artifact_error(format!("{name} exceeds usize")))
 }
 fn artifact_error(message: impl std::fmt::Display) -> Error {
     Error::Artifact(format!("static context: {message}"))
-}
-
-struct ByteReader<'a> {
-    bytes: &'a [u8],
-    position: usize,
-}
-impl<'a> ByteReader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, position: 0 }
-    }
-    fn is_empty(&self) -> bool {
-        self.position == self.bytes.len()
-    }
-    fn read_u16(&mut self) -> Result<u16> {
-        Ok(u16::from_le_bytes(self.read_array()?))
-    }
-    fn read_u32(&mut self) -> Result<u32> {
-        Ok(u32::from_le_bytes(self.read_array()?))
-    }
-    fn read_u64(&mut self) -> Result<u64> {
-        Ok(u64::from_le_bytes(self.read_array()?))
-    }
-    fn read_array<const N: usize>(&mut self) -> Result<[u8; N]> {
-        self.read_bytes(N)?
-            .try_into()
-            .map_err(|_| artifact_error("static context field length is invalid"))
-    }
-    fn read_bytes(&mut self, length: usize) -> Result<&'a [u8]> {
-        let end = self
-            .position
-            .checked_add(length)
-            .ok_or_else(|| artifact_error("static context offset overflows usize"))?;
-        let bytes = self
-            .bytes
-            .get(self.position..end)
-            .ok_or_else(|| artifact_error("static context is truncated"))?;
-        self.position = end;
-        Ok(bytes)
-    }
 }
 
 #[cfg(test)]
