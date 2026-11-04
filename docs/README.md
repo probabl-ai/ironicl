@@ -1,8 +1,10 @@
 # Reference Design Index
 
-These documents define the initial Ironicl design. They separate facts derived
-from the current TabICLv2 implementation from hypotheses that require
-measurement on the Ryzen 7 9800X3D system.
+These documents define the Ironicl design. They separate facts derived from the
+current TabICLv2 implementation from hypotheses that require measurement. The two
+measured backends are the Ryzen 7 9800X3D CPU path and the Apple Silicon
+(Accelerate, NEON, and Metal GPU) path; the [experiments log](experiments.md)
+records what each has verified.
 
 | Document | Purpose |
 |---|---|
@@ -20,8 +22,9 @@ measurement on the Ryzen 7 9800X3D system.
 | [memory-and-io.md](memory-and-io.md) | RAM sizing, bandwidth model, and NVMe use |
 | [validation.md](validation.md) | PyTorch parity and accuracy gates |
 | [benchmarking.md](benchmarking.md) | Reproducible performance methodology |
-| [pytorch-cpu-comparison.md](pytorch-cpu-comparison.md) | Point-by-point PyTorch CPU comparison and failed optimization results |
-| [cached-fp32-optimization.md](cached-fp32-optimization.md) | Retained cached FP32 optimizations and rejected experiments |
+| [experiments.md](experiments.md) | Authoritative experiments-and-tests log: retained and rejected work (CPU and Apple Silicon), acceptance gates, and claim-to-test mapping |
+| [real-dataset-benchmarks.md](real-dataset-benchmarks.md) | Raw real-dataset scaling measurements the experiments log cites |
+| [pytorch-cpu-comparison.md](pytorch-cpu-comparison.md) | Cross-engine PyTorch CPU comparison and failed optimization results |
 | [security.md](security.md) | Artifact parsing and untrusted-input requirements |
 | [roadmap.md](roadmap.md) | Ordered implementation milestones |
 | [references.md](references.md) | Upstream sources, checkpoints, and licenses |

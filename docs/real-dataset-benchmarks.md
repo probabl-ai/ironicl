@@ -29,14 +29,14 @@ uses AMP. Large points use one timed iteration for CPU and Ironicl.
 | 1,800 | 51 | 16.721 s | 1.021 s | 24.7 ms | 380 MiB |
 | 2,048 | 52 | rejected | 1.169 s | 27.6 ms | admission only |
 
-Ironicl rejects the 2,048-row request before allocation because its uncached
-attention buffer would exceed 32 million FP32 scores. The exact constraint is:
-
-```text
-8 * total_rows * training_rows <= 32 * 1024 * 1024
-```
-
-The 60 GiB host cannot change this software limit.
+Ironicl admits an uncached request only when its estimated FP32 activation set
+fits a fixed software limit, and rejects it before allocation otherwise. The
+limit is now `MAX_ACTIVATION_BYTES` (1.5 GiB), checked by `admit_request` in
+`src/executor.rs` against a per-ensemble activation estimate. The 60 GiB host
+cannot raise this software limit. The `rejected` row above was measured under an
+earlier, tighter limit and has not been re-measured against the current one; the
+cached static-context build path handles large training sets separately (it now
+schedules estimators into memory-bounded groups rather than rejecting them).
 
 ## Wide Fashion-MNIST
 
