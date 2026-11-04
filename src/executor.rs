@@ -51,6 +51,9 @@ const ATTENTION_QUERY_BLOCK_ROWS: usize = 16;
 const ATTENTION_KEY_TILE_ROWS: usize = 128;
 const MAX_ACTIVATION_BYTES: usize = 1536 * 1024 * 1024;
 const MAX_ACTIVATION_ELEMENTS: usize = MAX_ACTIVATION_BYTES / std::mem::size_of::<f32>();
+/// Cached prediction splits larger queries. The GPU keeps the compiled graph
+/// of every query bucket up to this size.
+const QUERY_CHUNK_ROWS: usize = 1024;
 const SPARSE_INDEX_TENSORS: [&str; 4] = [
     "icl.index.centroids",
     "icl.index.radii",
@@ -1629,11 +1632,47 @@ impl StaticClassifierExecutor {
                 metadata.feature_count
             )));
         }
+        let (b, q, h, classes) = (
+            metadata.ensemble_count,
+            request.query_rows(),
+            metadata.feature_count,
+            metadata.class_count,
+        );
+        // Rows are independent, so a large query runs in chunks that fit the
+        // activation budget. One row always fits.
+        let mut rows = q.min(QUERY_CHUNK_ROWS);
+        while rows > 1 && self.admit_query(rows).is_err() {
+            rows /= 2;
+        }
+        if rows == q {
+            return self.predict_chunk(request);
+        }
+        let mut values = vec![0.0; checked_product(&[b, q, classes], "static classifier output")?];
+        let mut x = Vec::with_capacity(checked_product(&[b, rows, h], "query chunk")?);
+        for start in (0..q).step_by(rows) {
+            let len = rows.min(q - start);
+            x.clear();
+            for ensemble in 0..b {
+                x.extend_from_slice(&request.x()[(ensemble * q + start) * h..][..len * h]);
+            }
+            let logits = self.predict_chunk(ClassifierQueryRequest::new(b, len, h, &x)?)?;
+            for (ensemble, chunk) in logits.values.chunks_exact(len * classes).enumerate() {
+                values[(ensemble * q + start) * classes..][..len * classes].copy_from_slice(chunk);
+            }
+        }
+        Ok(ClassifierLogits {
+            shape: [b, q, classes],
+            values,
+        })
+    }
+
+    fn admit_query(&self, rows: usize) -> Result<()> {
+        let metadata = self.context.metadata();
         let plan = static_execution_plan(metadata.ensemble_count, executor_threads());
         let layer_major = metadata.ensemble_count > 1 && std::env::var_os("IRONICL_LAYER_MAJOR").is_some();
         admit_static_request(
             metadata.ensemble_count,
-            request.query_rows(),
+            rows,
             metadata.feature_count,
             metadata.class_count,
             if layer_major || plan.flat_pool_ensembles {
@@ -1641,7 +1680,15 @@ impl StaticClassifierExecutor {
             } else {
                 plan.ensemble_workers
             },
-        )?;
+        )
+    }
+
+    /// Run one admitted query chunk.
+    fn predict_chunk(&self, request: ClassifierQueryRequest<'_>) -> Result<ClassifierLogits> {
+        let metadata = self.context.metadata();
+        let plan = static_execution_plan(metadata.ensemble_count, executor_threads());
+        let layer_major = metadata.ensemble_count > 1 && std::env::var_os("IRONICL_LAYER_MAJOR").is_some();
+        self.admit_query(request.query_rows())?;
         let output_elements = checked_product(
             &[
                 metadata.ensemble_count,
