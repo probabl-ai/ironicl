@@ -19,20 +19,27 @@ IRONICL_THREADS=8 cargo run --release --no-default-features -- benchmark \
   --warmup 5 --iterations 50
 ```
 
-Without `IRONICL_THREADS`, the executor uses half the logical CPUs on x86-64,
-the performance-core count on Apple Silicon, and all logical CPUs elsewhere.
-
 Add `--probabilities` to cached mode to time class-permutation correction,
-estimator averaging, and final probability production. Set
-`IRONICL_SERIAL_ENSEMBLES=1` only for a control run that disables automatic
-estimator-level parallelism. `IRONICL_ENSEMBLE_WORKERS=N` selects an explicit
-estimator concurrency for scheduler tuning; each estimator receives
-`IRONICL_THREADS / N` inner workers. The executor ignores override combinations
-that can exhaust the shared pool while nested work is pending.
-`IRONICL_INNER_WORKERS=N` overrides the per-estimator budget for controlled
-oversubscription experiments.
-`IRONICL_EXACT_GELU=1` and `IRONICL_EXACT_SOFTMAX=1` restore scalar control
-paths for accuracy and latency comparisons on native targets.
+estimator averaging, and final probability production.
+
+## Environment variables
+
+Ironicl exposes a small set of general-use runtime flags:
+
+| Variable | Effect |
+|---|---|
+| `IRONICL_OPTIMIZE` | precision/speed level `safe\|auto\|fast` (also set through the Python API) |
+| `IRONICL_NO_METAL` | set to `1` to disable the Apple Silicon Metal GPU path |
+| `IRONICL_THREADS` | executor thread count; without it, half the logical CPUs on x86-64, the performance-core count on Apple Silicon, and all logical CPUs elsewhere |
+| `IRONICL_GPU_BUILD_BUDGET` | per-group GPU build working-set budget in bytes (Apple Silicon) |
+
+Exact-math control runs (scalar GELU, softmax, and LayerNorm for parity
+debugging) are a build-time choice: build with `--features exact-math` rather
+than a runtime flag.
+
+The test and benchmark harnesses also read `IRONICL_CHECKPOINT_FIXTURES`,
+`IRONICL_ORACLE_FIXTURES`, `IRONICL_TABICL_SOURCE`, and the `IRONICL_BENCH_*`
+variables; these are not engine runtime flags.
 
 The command reads and validates the input bundle and model artifact. Cached mode
 also reads and validates the context. It constructs the executor, runs untimed

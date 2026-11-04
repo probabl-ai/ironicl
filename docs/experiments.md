@@ -118,11 +118,11 @@ paths for those stages.
 ### Precision Policy
 
 - LayerNorm remains FP32.
-- AVX-512 GELU uses a bounded vector erf/exp approximation. Set
-  `IRONICL_EXACT_GELU=1` to restore the scalar `libm::erff` path.
+- AVX-512 GELU uses a bounded vector erf/exp approximation. Build with
+  `--features exact-math` to restore the scalar `libm::erff` path.
 - The cached executor keeps reference QASS GELU and `tanh` arithmetic.
-- AVX-512 online softmax uses the native bounded exponential path. Set
-  `IRONICL_EXACT_SOFTMAX=1` for the scalar control path.
+- AVX-512 online softmax uses the native bounded exponential path. The
+  `exact-math` feature restores the scalar control path.
 - Online-softmax maximum, denominator, and weighted output remain FP32.
 - Decoder and residual operations remain FP32.
 
