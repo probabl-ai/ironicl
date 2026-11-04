@@ -119,20 +119,20 @@ pub struct ClassifierLogits {
 
 /// How far Ironicl may trade exactness for speed.
 ///
-/// Reduced-precision levels apply to contexts built on the GPU (the `metal`
-/// feature on Apple Silicon); elsewhere every level behaves like `Safe`.
+/// On the Apple Silicon GPU, `Auto` and `Fast` store ICL caches in FP16. On a
+/// BF16-capable CPU (`AVX512_BF16`), `Fast` stores ICL values in BF16. Elsewhere
+/// every level is FP32.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Optimize {
     /// FP32 throughout; matches `TabICL` within `1e-4`.
     #[default]
     Safe,
-    /// ICL keys and values stored in FP16, and ICL attention computed in
-    /// FP16 when building the context and when predicting; everything else
-    /// FP32. Measured probability errors stayed below
-    /// 5e-4 with unchanged labels.
+    /// On the Apple GPU: ICL keys and values in FP16, ICL attention in FP16;
+    /// everything else FP32 (measured probability error below 5e-4, labels
+    /// unchanged). On the CPU: FP32, same as `Safe`.
     Auto,
-    /// Everything `Auto` does; further reduced-precision work will be
-    /// allowed here first.
+    /// Everything `Auto` does, plus, on a BF16-capable CPU, ICL values stored in
+    /// BF16 (FP32 keys). Further reduced-precision work is allowed here first.
     Fast,
 }
 
@@ -543,7 +543,8 @@ impl ClassifierExecutor {
     /// `[B, N]` class-permuted labels. The permutations are stored as context
     /// metadata; `class_permutations` is used to undo each estimator's class
     /// order when probabilities are aggregated. `optimize` selects the ICL
-    /// key and value storage of GPU-built contexts.
+    /// cache storage: FP16 on the Apple GPU under `Auto`/`Fast`, BF16 values on
+    /// a BF16-capable CPU under `Fast`, FP32 otherwise.
     ///
     /// # Errors
     ///
@@ -560,15 +561,19 @@ impl ClassifierExecutor {
         feature_permutations: Vec<u64>,
         optimize: Optimize,
     ) -> Result<StaticClassifierExecutor> {
-        // Reduced precision needs a GPU-built context; elsewhere every level is `Safe`.
-        #[cfg(not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")))]
-        let _ = optimize;
         let shape = (ensembles, training_rows, features);
         let metadata = self.context_metadata(shape, x, y_train, class_permutations, feature_permutations)?;
         #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
         if let Some(tensors) = self.build_tensors_gpu(shape, x, y_train, optimize)? {
             // The build graph checked every value on the GPU.
             let context = StaticContextArtifact::from_page_aligned(metadata, tensors)?;
+            return StaticClassifierExecutor::with_executor(self.clone(), context);
+        }
+        // On a BF16-capable CPU, `fast` stores the ICL values in BF16 (FP32
+        // keys, the retained serving layout); every other case is FP32.
+        if optimize == Optimize::Fast && crate::kernels::native::bf16_storage_supported() {
+            let tensors = self.build_tensors_cpu(shape, x, y_train)?;
+            let context = StaticContextArtifact::from_page_aligned(metadata, bf16v_page_aligned(&tensors)?)?;
             return StaticClassifierExecutor::with_executor(self.clone(), context);
         }
         let context = StaticContextArtifact::new(metadata, self.build_tensors_cpu(shape, x, y_train)?)?;
@@ -3436,6 +3441,48 @@ fn model_hash_matches(model_hash: &[u8], context_hash: &[u8; 32]) -> bool {
 
 /// A context's cache tensors in order: each column block's key and value as
 /// `[B, H + 4, 8, 128, 16]`, then each ICL block's as `[B, 8, N, 64]`.
+/// Pack FP32 context tensors into a page-aligned context whose ICL values are
+/// stored in BF16 (FP32 keys), the retained CPU serving layout for `fast`.
+fn bf16v_page_aligned(tensors: &[StaticContextTensor]) -> Result<crate::static_context::PageAlignedTensors> {
+    use crate::static_context::{PageAlignedTensors, TensorStorage};
+    let is_bf16 = |name: &str| name.starts_with("icl.") && name.rsplit('.').next() == Some("value");
+    let mut page = PageAlignedTensors::new(
+        tensors
+            .iter()
+            .map(|tensor| {
+                let storage = if is_bf16(&tensor.name) {
+                    TensorStorage::Bf16
+                } else {
+                    TensorStorage::Fp32
+                };
+                (tensor.name.clone(), tensor.dimensions.clone(), storage)
+            })
+            .collect(),
+    )?;
+    for (index, tensor) in tensors.iter().enumerate() {
+        if tensor.values.iter().any(|value| !value.is_finite()) {
+            return Err(Error::InvalidArgument(
+                "static context tensor has a non-finite value".into(),
+            ));
+        }
+        let bytes: Vec<u8> = if is_bf16(&tensor.name) {
+            tensor
+                .values
+                .iter()
+                .flat_map(|value| crate::kernels::native::f32_to_bf16_rne(*value).to_le_bytes())
+                .collect()
+        } else {
+            tensor
+                .values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect()
+        };
+        page.fill(index, &bytes);
+    }
+    Ok(page)
+}
+
 fn context_tensors(b: usize, n: usize, h: usize) -> Vec<(String, Vec<u64>)> {
     let dimensions = |values: &[usize]| values.iter().map(|&value| value as u64).collect::<Vec<_>>();
     [
