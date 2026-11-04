@@ -21,9 +21,10 @@ const ORACLE_INPUT_SHA256: &str = "dfaa40fda773a7de5c1216ca0051e447b05f16e4fafa3
 const ORACLE_LOGITS_SHA256: &str = "be53800fb2262a0c4a5d2179514c5fe9cfbaf0dc3baf7269c780a8de93ccd2c1";
 
 #[test]
+#[ignore = "needs official checkpoint fixtures; run with --ignored once IRONICL_CHECKPOINT_FIXTURES is set. See CONTRIBUTING.md"]
 fn inspects_official_classifier_when_fixture_is_available() {
     let Some(path) = fixture("tabicl-classifier-v2-20260212.ckpt") else {
-        return;
+        panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
     let summary = inspect_checkpoint(&path).expect("official classifier checkpoint");
 
@@ -40,9 +41,10 @@ fn inspects_official_classifier_when_fixture_is_available() {
 }
 
 #[test]
+#[ignore = "needs official checkpoint fixtures; run with --ignored once IRONICL_CHECKPOINT_FIXTURES is set. See CONTRIBUTING.md"]
 fn inspects_official_regressor_when_fixture_is_available() {
     let Some(path) = fixture("tabicl-regressor-v2-20260212.ckpt") else {
-        return;
+        panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
     let summary = inspect_checkpoint(&path).expect("official regressor checkpoint");
 
@@ -59,9 +61,10 @@ fn inspects_official_regressor_when_fixture_is_available() {
 }
 
 #[test]
+#[ignore = "needs official checkpoint fixtures; run with --ignored once IRONICL_CHECKPOINT_FIXTURES is set. See CONTRIBUTING.md"]
 fn imports_official_classifier_and_reuses_automatic_cache() {
     let Some(checkpoint) = fixture("tabicl-classifier-v2-20260212.ckpt") else {
-        return;
+        panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
     let directory = tempdir().expect("temporary cache directory");
     let explicit_model = directory.path().join("classifier.ironicl");
@@ -100,9 +103,10 @@ fn imports_official_classifier_and_reuses_automatic_cache() {
 }
 
 #[test]
+#[ignore = "needs official checkpoint fixtures; run with --ignored once IRONICL_CHECKPOINT_FIXTURES is set. See CONTRIBUTING.md"]
 fn loads_official_classifier_artifact_when_fixture_is_available() {
     let Some(path) = fixture("tabicl-classifier-v2.ironicl") else {
-        return;
+        panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
     let model = load_model_artifact(&path).expect("load official classifier artifact");
 
@@ -116,9 +120,10 @@ fn loads_official_classifier_artifact_when_fixture_is_available() {
 }
 
 #[test]
+#[ignore = "needs official checkpoint fixtures; run with --ignored once IRONICL_CHECKPOINT_FIXTURES is set. See CONTRIBUTING.md"]
 fn runs_official_classifier_artifact_when_fixture_is_available() {
     let Some(path) = fixture("tabicl-classifier-v2.ironicl") else {
-        return;
+        panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
     let directory = tempdir().expect("temporary input directory");
     let input_path = directory.path().join("request.irinput");
@@ -146,12 +151,13 @@ fn runs_official_classifier_artifact_when_fixture_is_available() {
 }
 
 #[test]
+#[ignore = "needs official checkpoint fixtures; run with --ignored once IRONICL_CHECKPOINT_FIXTURES is set. See CONTRIBUTING.md"]
 fn matches_python_classifier_oracle_when_fixtures_are_available() {
     let Some(oracle) = oracle_fixtures() else {
-        return;
+        panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
     let Some(model_path) = fixture("tabicl-classifier-v2.ironicl") else {
-        return;
+        panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
 
     let input_bytes = fs::read(&oracle.input).expect("read Python oracle input");
@@ -197,6 +203,7 @@ fn matches_python_classifier_oracle_when_fixtures_are_available() {
 }
 
 #[test]
+#[ignore = "needs official checkpoint fixtures; run with --ignored once IRONICL_CHECKPOINT_FIXTURES is set. See CONTRIBUTING.md"]
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
@@ -204,7 +211,7 @@ fn matches_python_classifier_oracle_when_fixtures_are_available() {
 )]
 fn built_context_matches_the_uncached_forward_pass() {
     let Some(model_path) = fixture("tabicl-classifier-v2.ironicl") else {
-        return;
+        panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
     let executor =
         ClassifierExecutor::new(load_model_artifact(&model_path).expect("load classifier artifact"));
@@ -288,10 +295,11 @@ fn built_context_matches_the_uncached_forward_pass() {
 }
 
 #[test]
+#[ignore = "needs official checkpoint fixtures; run with --ignored once IRONICL_CHECKPOINT_FIXTURES is set. See CONTRIBUTING.md"]
 #[allow(clippy::cast_precision_loss, clippy::many_single_char_names)]
 fn large_cached_query_runs_in_chunks() {
     let Some(model_path) = fixture("tabicl-classifier-v2.ironicl") else {
-        return;
+        panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
     let executor =
         ClassifierExecutor::new(load_model_artifact(&model_path).expect("load classifier artifact"));
@@ -341,10 +349,11 @@ fn large_cached_query_runs_in_chunks() {
 /// A query row whose grouped features are all the missing marker runs on the
 /// CPU, which must read the FP16 caches of an `Auto` context.
 #[test]
+#[ignore = "needs official checkpoint fixtures; run with --ignored once IRONICL_CHECKPOINT_FIXTURES is set. See CONTRIBUTING.md"]
 #[allow(clippy::cast_precision_loss, clippy::many_single_char_names)]
 fn reduced_precision_context_predicts_all_missing_rows() {
     let Some(model_path) = fixture("tabicl-classifier-v2.ironicl") else {
-        return;
+        panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
     let executor =
         ClassifierExecutor::new(load_model_artifact(&model_path).expect("load classifier artifact"));
@@ -384,9 +393,10 @@ fn reduced_precision_context_predicts_all_missing_rows() {
 }
 
 #[test]
+#[ignore = "needs official checkpoint fixtures; run with --ignored once IRONICL_CHECKPOINT_FIXTURES is set. See CONTRIBUTING.md"]
 fn no_cache_validates_without_writing() {
     let Some(checkpoint) = fixture("tabicl-classifier-v2-20260212.ckpt") else {
-        return;
+        panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
     let prepared = prepare_checkpoint(
         &checkpoint,
@@ -407,18 +417,14 @@ fn no_cache_validates_without_writing() {
 }
 
 fn fixture(name: &str) -> Option<PathBuf> {
-    if let Some(directory) = std::env::var_os("IRONICL_CHECKPOINT_FIXTURES") {
-        let path = Path::new(&directory).join(name);
-        assert!(
-            path.is_file(),
-            "checkpoint fixture is missing: {}",
-            path.display()
-        );
-        return Some(path);
-    }
-
-    let path = Path::new("/var/folders/j1/kv9f5d_54c93f3qry1pw9xh00000gn/T/opencode").join(name);
-    path.is_file().then_some(path)
+    let directory = std::env::var_os("IRONICL_CHECKPOINT_FIXTURES")?;
+    let path = Path::new(&directory).join(name);
+    assert!(
+        path.is_file(),
+        "checkpoint fixture is missing: {}",
+        path.display()
+    );
+    Some(path)
 }
 
 struct OracleFixtures {
@@ -427,25 +433,18 @@ struct OracleFixtures {
 }
 
 fn oracle_fixtures() -> Option<OracleFixtures> {
-    let explicitly_configured = std::env::var_os("IRONICL_ORACLE_FIXTURES");
-    let directory = explicitly_configured.as_deref().map_or_else(
-        || PathBuf::from("/var/folders/j1/kv9f5d_54c93f3qry1pw9xh00000gn/T/opencode/ironicl-oracle"),
-        PathBuf::from,
-    );
+    let directory = PathBuf::from(std::env::var_os("IRONICL_ORACLE_FIXTURES")?);
     let fixtures = OracleFixtures {
         input: directory.join("input.irinput"),
         logits: directory.join("logits.irlogits"),
     };
-    if fixtures.input.is_file() && fixtures.logits.is_file() {
-        return Some(fixtures);
-    }
     assert!(
-        explicitly_configured.is_none(),
+        fixtures.input.is_file() && fixtures.logits.is_file(),
         "oracle fixtures are missing: {} and {}",
         fixtures.input.display(),
         fixtures.logits.display()
     );
-    None
+    Some(fixtures)
 }
 
 struct OracleLogits {

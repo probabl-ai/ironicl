@@ -16,11 +16,11 @@ use ironicl::{ClassifierExecutor, ClassifierQueryRequest, Optimize, load_model_a
 /// other kernels. On an M1 Max: 2.4e-5 apart for `Safe` and 1.2e-4 for
 /// `Fast`; a group copied to the wrong place is 1.6e-2 apart.
 #[test]
+#[ignore = "needs official checkpoint fixtures; run with --ignored once IRONICL_CHECKPOINT_FIXTURES is set. See CONTRIBUTING.md"]
 #[allow(clippy::cast_precision_loss, clippy::many_single_char_names)]
 fn grouped_gpu_build_matches_one_graph_run() {
-    let Some(directory) = std::env::var_os("IRONICL_CHECKPOINT_FIXTURES") else {
-        return;
-    };
+    let directory = std::env::var_os("IRONICL_CHECKPOINT_FIXTURES")
+        .expect("set IRONICL_CHECKPOINT_FIXTURES to run this ignored test; see CONTRIBUTING.md");
     let model = load_model_artifact(&Path::new(&directory).join("tabicl-classifier-v2.ironicl"))
         .expect("load classifier artifact");
     let executor = ClassifierExecutor::new(model);
