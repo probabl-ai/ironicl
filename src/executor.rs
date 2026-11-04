@@ -575,7 +575,7 @@ impl ClassifierExecutor {
         if optimize == Optimize::Fast && crate::kernels::native::bf16_storage_supported() {
             let tensors = self.build_tensors_cpu(shape, x, y_train)?;
             let context = StaticContextArtifact::from_page_aligned(metadata, bf16v_page_aligned(&tensors)?)?;
-            return StaticClassifierExecutor::with_executor(self.clone(), context);
+            return StaticClassifierExecutor::with_executor(self.clone(), context, threads);
         }
         let context = StaticContextArtifact::new(metadata, self.build_tensors_cpu(shape, x, y_train)?)?;
         StaticClassifierExecutor::with_executor(self.clone(), context, threads)
