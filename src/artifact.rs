@@ -53,7 +53,6 @@ pub(crate) fn write_u64(bytes: &mut Vec<u8>, value: u64) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }
 
-#[cfg(feature = "checkpoint")] // Only the model-artifact writer narrows usize to u32.
 pub(crate) fn usize_to_u32(value: usize, name: &str) -> Result<u32> {
     u32::try_from(value).map_err(|_| artifact_error(format!("{name} exceeds u32")))
 }

@@ -1,5 +1,3 @@
-#![cfg(feature = "checkpoint")]
-
 use std::{
     fmt::Write as _,
     fs,

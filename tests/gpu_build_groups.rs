@@ -1,9 +1,4 @@
-#![cfg(all(
-    feature = "checkpoint",
-    feature = "metal",
-    target_os = "macos",
-    target_arch = "aarch64"
-))]
+#![cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
 // The only test in this binary, so changing the environment races nothing.
 #![allow(unsafe_code)]
 

@@ -123,7 +123,6 @@ fn inspect_model_file(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "checkpoint")]
 fn inspect_checkpoint_file(path: &std::path::Path) -> Result<()> {
     let summary = ironicl::inspect_checkpoint(path)?;
     println!("Ironicl checkpoint inspection");
@@ -156,18 +155,10 @@ fn inspect_checkpoint_file(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "checkpoint"))]
-fn inspect_checkpoint_file(_path: &std::path::Path) -> Result<()> {
-    Err(Error::NotImplemented(
-        "checkpoint inspection is disabled; rebuild with the 'checkpoint' feature".into(),
-    ))
-}
-
 fn optional_display<T: std::fmt::Display>(value: Option<T>) -> String {
     value.map_or_else(|| "unknown".into(), |value| value.to_string())
 }
 
-#[cfg(feature = "checkpoint")]
 fn import(args: &ImportArgs) -> Result<()> {
     let summary = ironicl::import_checkpoint(&args.checkpoint, &args.output)?;
     println!("Imported Ironicl model");
@@ -179,13 +170,6 @@ fn import(args: &ImportArgs) -> Result<()> {
     println!("parameters:    {}", summary.parameter_count);
     println!("tensor bytes:  {}", ByteSize(summary.tensor_bytes));
     Ok(())
-}
-
-#[cfg(not(feature = "checkpoint"))]
-fn import(_args: &ImportArgs) -> Result<()> {
-    Err(Error::NotImplemented(
-        "checkpoint import is disabled; rebuild with the 'checkpoint' feature".into(),
-    ))
 }
 
 fn run_model(args: RunArgs) -> Result<()> {

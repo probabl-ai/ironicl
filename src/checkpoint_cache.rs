@@ -1,16 +1,12 @@
-use std::path::{Path, PathBuf};
-
-#[cfg(feature = "checkpoint")]
-use std::env;
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
 use crate::{
     CheckpointCacheOptions, ModelArtifactSummary, ModelProfile,
-    error::{Error, Result},
-};
-
-#[cfg(feature = "checkpoint")]
-use crate::{
     checkpoint::{checkpoint_sha256, inspect_checkpoint},
+    error::{Error, Result},
     import_checkpoint, inspect_model_artifact,
 };
 
@@ -34,7 +30,6 @@ pub enum PreparedCheckpoint {
 ///
 /// Returns an error when checkpoint validation, cache path resolution, import,
 /// or cached artifact verification fails.
-#[cfg(feature = "checkpoint")]
 pub fn prepare_checkpoint(path: &Path, options: &CheckpointCacheOptions) -> Result<PreparedCheckpoint> {
     if options.no_cache {
         let checkpoint = inspect_checkpoint(path)?;
@@ -74,19 +69,6 @@ pub fn prepare_checkpoint(path: &Path, options: &CheckpointCacheOptions) -> Resu
     })
 }
 
-/// Return an explicit error when checkpoint support is disabled.
-///
-/// # Errors
-///
-/// Always returns [`Error::NotImplemented`].
-#[cfg(not(feature = "checkpoint"))]
-pub fn prepare_checkpoint(_path: &Path, _options: &CheckpointCacheOptions) -> Result<PreparedCheckpoint> {
-    Err(Error::NotImplemented(
-        "checkpoint import/cache is disabled; rebuild with the 'checkpoint' feature".into(),
-    ))
-}
-
-#[cfg(feature = "checkpoint")]
 fn default_cache_dir() -> Result<PathBuf> {
     if let Some(path) = env::var_os("XDG_CACHE_HOME").filter(|path| !path.is_empty()) {
         return Ok(PathBuf::from(path).join("ironicl"));
@@ -99,7 +81,6 @@ fn default_cache_dir() -> Result<PathBuf> {
     ))
 }
 
-#[cfg(any(feature = "checkpoint", test))]
 fn cache_model_path(cache_root: &Path, source_sha256: &str) -> Result<PathBuf> {
     if source_sha256.len() != 64
         || !source_sha256
@@ -114,7 +95,6 @@ fn cache_model_path(cache_root: &Path, source_sha256: &str) -> Result<PathBuf> {
         .join(format!("{source_sha256}.ironicl")))
 }
 
-#[cfg(feature = "checkpoint")]
 impl From<crate::CheckpointProfile> for ModelProfile {
     fn from(profile: crate::CheckpointProfile) -> Self {
         match profile {
