@@ -615,7 +615,7 @@ impl ClassifierExecutor {
     /// # Errors
     ///
     /// Returns an error for inconsistent dimensions or labels, invalid
-    /// permutations, or a training set beyond the uncached activation limit.
+    /// permutations, or when the context does not fit in memory.
     pub fn build_context(
         &self,
         ensembles: usize,
@@ -682,61 +682,68 @@ impl ClassifierExecutor {
             let context = StaticContextArtifact::from_page_aligned(metadata, tensors, true)?;
             return StaticClassifierExecutor::with_executor(self.clone(), context);
         }
-        admit_request(b, n, h, n)?;
         let streams = h + RESERVED;
         let column_elements = HEADS * INDUCING * 16;
-        let mut column: Vec<KeyValue> = (0..3)
-            .map(|_| {
-                let capacity = b * streams * column_elements;
-                (Vec::with_capacity(capacity), Vec::with_capacity(capacity))
-            })
-            .collect();
-        let mut icl: Vec<KeyValue> = (0..12)
-            .map(|_| {
-                (
-                    Vec::with_capacity(b * n * ICL_DIM),
-                    Vec::with_capacity(b * n * ICL_DIM),
-                )
-            })
-            .collect();
-        // ponytail: one rayon task per estimator; peak memory grows with the
-        // number of estimators built at once. Bound the concurrency if large
-        // contexts run out of memory.
-        let estimators: Vec<EstimatorCaches> = (0..b)
-            .into_par_iter()
-            .map(|ensemble| {
-                let x = &x[ensemble * n * h..][..n * h];
-                let labels = &y_train[ensemble * n..][..n];
-                let (columns, feature_caches) = self.column_embeddings(x, labels, n, h, n, true)?;
-                let rows = self.row_embeddings(&columns, n, streams)?;
-                let mut caches = Vec::with_capacity(12);
-                self.icl_rows(rows, labels, n, n, Some(&mut caches))?;
-                // Per block, every feature's keys and values in feature order.
-                let column = (0..3)
-                    .map(|block| {
-                        let keys = feature_caches
-                            .iter()
-                            .flat_map(|caches| caches[block].0.iter().copied());
-                        let values = feature_caches
-                            .iter()
-                            .flat_map(|caches| caches[block].1.iter().copied());
-                        (keys.collect(), values.collect())
-                    })
-                    .collect();
-                Ok((column, caches))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        for (column_caches, caches) in estimators {
-            for ((keys, values), (key, value)) in column.iter_mut().zip(column_caches) {
-                // The cached path never reads the reserved CLS streams.
-                keys.resize(keys.len() + RESERVED * column_elements, 0.0);
-                values.resize(values.len() + RESERVED * column_elements, 0.0);
-                keys.extend(key);
-                values.extend(value);
+        // The context is the one allocation that grows with N x B; running
+        // out of memory for it is an error, not an abort.
+        let reserve = |capacity: usize| -> Result<KeyValue> {
+            let (mut keys, mut values) = (Vec::new(), Vec::new());
+            for buffer in [&mut keys, &mut values] {
+                buffer.try_reserve_exact(capacity).map_err(|_| {
+                    Error::InvalidArgument(format!("not enough memory for a {b} x {n} x {h} context"))
+                })?;
             }
-            for ((key, value), (keys, values)) in caches.into_iter().zip(&mut icl) {
-                keys.extend(key);
-                values.extend(value);
+            Ok((keys, values))
+        };
+        let mut column = (0..3)
+            .map(|_| reserve(b * streams * column_elements))
+            .collect::<Result<Vec<_>>>()?;
+        let mut icl = (0..12)
+            .map(|_| reserve(b * n * ICL_DIM))
+            .collect::<Result<Vec<_>>>()?;
+        // Build as many estimators at once as fit the budget, and at least
+        // one: a large context runs serially instead of failing. The estimate
+        // is 2-3x the measured peak, so the budget is four activation limits.
+        // Equal groups keep the last one from running alone.
+        let fit = (4 * MAX_ACTIVATION_ELEMENTS / request_activation_elements(1, n, h, n)?.max(1)).clamp(1, b);
+        let workers = b.div_ceil(b.div_ceil(fit));
+        for group in (0..b).collect::<Vec<_>>().chunks(workers) {
+            let estimators: Vec<EstimatorCaches> = group
+                .par_iter()
+                .map(|&ensemble| {
+                    let x = &x[ensemble * n * h..][..n * h];
+                    let labels = &y_train[ensemble * n..][..n];
+                    let (columns, feature_caches) = self.column_embeddings(x, labels, n, h, n, true)?;
+                    let rows = self.row_embeddings(&columns, n, streams)?;
+                    let mut caches = Vec::with_capacity(12);
+                    self.icl_rows(rows, labels, n, n, Some(&mut caches))?;
+                    // Per block, every feature's keys and values in feature order.
+                    let column = (0..3)
+                        .map(|block| {
+                            let keys = feature_caches
+                                .iter()
+                                .flat_map(|caches| caches[block].0.iter().copied());
+                            let values = feature_caches
+                                .iter()
+                                .flat_map(|caches| caches[block].1.iter().copied());
+                            (keys.collect(), values.collect())
+                        })
+                        .collect();
+                    Ok((column, caches))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for (column_caches, caches) in estimators {
+                for ((keys, values), (key, value)) in column.iter_mut().zip(column_caches) {
+                    // The cached path never reads the reserved CLS streams.
+                    keys.resize(keys.len() + RESERVED * column_elements, 0.0);
+                    values.resize(values.len() + RESERVED * column_elements, 0.0);
+                    keys.extend(key);
+                    values.extend(value);
+                }
+                for ((key, value), (keys, values)) in caches.into_iter().zip(&mut icl) {
+                    keys.extend(key);
+                    values.extend(value);
+                }
             }
         }
         let mut tensors = Vec::with_capacity(30);
@@ -4264,6 +4271,16 @@ fn checked_product(values: &[usize], name: &'static str) -> Result<usize> {
 /// The executor processes ensembles sequentially. The estimates intentionally retain
 /// all operands that can coexist during each stage rather than assuming allocator reuse.
 fn admit_request(b: usize, t: usize, h: usize, n: usize) -> Result<()> {
+    if request_activation_elements(b, t, h, n)? > MAX_ACTIVATION_ELEMENTS {
+        return Err(Error::InvalidArgument(format!(
+            "request exceeds the uncached scalar activation limit of {MAX_ACTIVATION_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// The FP32 activation elements that [`admit_request`] checks.
+fn request_activation_elements(b: usize, t: usize, h: usize, n: usize) -> Result<usize> {
     let streams = h
         .checked_add(RESERVED)
         .ok_or(Error::ArithmeticOverflow("column streams"))?;
@@ -4305,14 +4322,7 @@ fn admit_request(b: usize, t: usize, h: usize, n: usize) -> Result<()> {
         ],
         "ICL activation peak",
     )?;
-    let activation_peak = checked_sum(&[output, column_peak, row_peak, icl_peak], "activation peak")?;
-    if activation_peak > MAX_ACTIVATION_ELEMENTS {
-        return Err(Error::InvalidArgument(format!(
-            "request exceeds the uncached scalar activation limit of {MAX_ACTIVATION_BYTES} bytes"
-        )));
-    }
-
-    Ok(())
+    checked_sum(&[output, column_peak, row_peak, icl_peak], "activation peak")
 }
 
 fn admit_static_request(
