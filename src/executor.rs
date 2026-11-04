@@ -352,6 +352,14 @@ impl std::fmt::Debug for GpuContext {
 #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
 const GPU_MIN_BUILD_ROWS: usize = 160;
 
+/// An upper bound on one estimator's share of the GPU build's peak memory.
+/// Measured on an M1 Max: the peak grows linearly in N, with no N x N term,
+/// by about 1.7 GB per estimator at 8192 x 54; this estimates 2.2 GB.
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+fn gpu_build_estimator_bytes(n: usize, h: usize) -> usize {
+    n.saturating_mul((h + RESERVED) * COLUMN_DIM * 4 * 8 + ICL_DIM * 4 * 16)
+}
+
 /// Attention keys and values in head-major `[heads, rows, head_dim]` order.
 type KeyValue = (Vec<f32>, Vec<f32>);
 
@@ -457,8 +465,9 @@ impl ClassifierExecutor {
 
     /// Build every estimator's keys and values on the GPU, straight into
     /// page-aligned context tensors. Returns `None` without a GPU, below
-    /// `GPU_MIN_BUILD_ROWS`, or when a grouped triple is the all-missing marker
-    /// that only the CPU path handles.
+    /// `GPU_MIN_BUILD_ROWS`, when a grouped triple is the all-missing marker
+    /// that only the CPU path handles, or when one estimator exceeds the
+    /// build's memory budget.
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
     fn build_tensors_gpu(
         &self,
@@ -524,40 +533,73 @@ impl ClassifierExecutor {
             })
             .collect::<Result<Vec<_>>>()?;
         let as_u64 = |values: &[usize]| values.iter().map(|&value| value as u64).collect::<Vec<_>>();
-        let mut specs = Vec::with_capacity(30);
-        // Only the ICL caches, almost all of a context, take the reduced type.
-        for (stage, blocks, dimensions, storage) in [
-            (
-                "column",
-                3,
-                as_u64(&[b, h + RESERVED, HEADS, INDUCING, 16]),
-                TensorStorage::Fp32,
-            ),
-            ("icl", 12, as_u64(&[b, HEADS, n, ICL_DIM / HEADS]), icl_storage),
-        ] {
-            for block in 0..blocks {
-                for kind in ["key", "value"] {
-                    specs.push((format!("{stage}.{block}.{kind}"), dimensions.clone(), storage));
+        // Each context tensor for `ensembles` estimators. Only the ICL
+        // caches, almost all of a context, take the reduced type.
+        let specs = |ensembles: usize| {
+            let mut specs = Vec::with_capacity(30);
+            for (stage, blocks, dimensions, storage) in [
+                (
+                    "column",
+                    3,
+                    as_u64(&[ensembles, h + RESERVED, HEADS, INDUCING, 16]),
+                    TensorStorage::Fp32,
+                ),
+                (
+                    "icl",
+                    12,
+                    as_u64(&[ensembles, HEADS, n, ICL_DIM / HEADS]),
+                    icl_storage,
+                ),
+            ] {
+                for block in 0..blocks {
+                    for kind in ["key", "value"] {
+                        specs.push((format!("{stage}.{block}.{kind}"), dimensions.clone(), storage));
+                    }
                 }
             }
+            crate::static_context::PageAlignedTensors::new(specs)
+        };
+        // Run as many estimators per graph as fit Metal's working set, or
+        // IRONICL_GPU_BUILD_BUDGET bytes, in equal groups so every run has the
+        // same shape. When one estimator does not fit, the CPU builds the
+        // context.
+        let budget = std::env::var("IRONICL_GPU_BUILD_BUDGET")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| graph.0.gpu().working_set_bytes());
+        let estimator_bytes = gpu_build_estimator_bytes(n, h);
+        let Some(group) = (1..=b)
+            .rev()
+            .find(|&group| b % group == 0 && group * estimator_bytes <= budget)
+        else {
+            return Ok(None);
+        };
+        let mut tensors = specs(b)?;
+        let mut scratch = if group == b { None } else { Some(specs(group)?) };
+        for start in (0..b).step_by(group) {
+            let output = scratch.as_mut().unwrap_or(&mut tensors);
+            crate::metal::build_context(
+                &graph.0,
+                &|name| self.tensor(name),
+                crate::metal::Shape {
+                    ensembles: group,
+                    features: h,
+                    training_rows: n,
+                },
+                &column_scales,
+                &icl_scales,
+                &grouped[start * h * n * 3..][..group * h * n * 3],
+                &column_labels[start * n * COLUMN_DIM..][..group * n * COLUMN_DIM],
+                &icl_labels[start * n * ICL_DIM..][..group * n * ICL_DIM],
+                icl_storage,
+                &output.regions(),
+            )?;
+            // Estimators are the outermost dimension, so a group's slice of
+            // each tensor is contiguous.
+            if let Some(scratch) = &scratch {
+                tensors.copy_group(scratch, start / group);
+            }
         }
-        let mut tensors = crate::static_context::PageAlignedTensors::new(specs)?;
-        crate::metal::build_context(
-            &graph.0,
-            &|name| self.tensor(name),
-            crate::metal::Shape {
-                ensembles: b,
-                features: h,
-                training_rows: n,
-            },
-            &column_scales,
-            &icl_scales,
-            &grouped,
-            &column_labels,
-            &icl_labels,
-            icl_storage,
-            &tensors.regions(),
-        )?;
         Ok(Some(tensors))
     }
 
@@ -599,7 +641,6 @@ impl ClassifierExecutor {
                 "context needs nonempty x[B, N, H] and y_train[B, N] for B={b}, N={n}, H={h}"
             )));
         }
-        admit_request(b, n, h, n)?;
         let classes = validate_labels(y_train, b, n)?;
         let mut model_sha256 = [0; 32];
         let source = self.model.summary().source_sha256.as_bytes();
@@ -641,6 +682,7 @@ impl ClassifierExecutor {
             let context = StaticContextArtifact::from_page_aligned(metadata, tensors, true)?;
             return StaticClassifierExecutor::with_executor(self.clone(), context);
         }
+        admit_request(b, n, h, n)?;
         let streams = h + RESERVED;
         let column_elements = HEADS * INDUCING * 16;
         let mut column: Vec<KeyValue> = (0..3)

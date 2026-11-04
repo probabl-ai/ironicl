@@ -220,6 +220,16 @@ impl PageAlignedTensors {
         Ok(Self { mapping, layout })
     }
 
+    /// Copy every tensor of `group`, which holds the same tensors with a
+    /// smaller outermost dimension, into slot `index` of that dimension.
+    pub(crate) fn copy_group(&mut self, group: &Self, index: usize) {
+        for ((.., offset, bytes), (.., source, length)) in self.layout.iter().zip(&group.layout) {
+            debug_assert!((index + 1) * length <= *bytes);
+            self.mapping[offset + index * length..][..*length]
+                .copy_from_slice(&group.mapping[*source..][..*length]);
+        }
+    }
+
     /// Each tensor's page-aligned start and page-padded byte length, in the
     /// order given to [`Self::new`]. The pointers stay valid while `self` and
     /// the artifact made from it live.

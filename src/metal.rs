@@ -156,6 +156,11 @@ impl Gpu {
         )
     }
 
+    /// The memory Metal recommends the device use without paging.
+    pub(crate) fn working_set_bytes(&self) -> usize {
+        usize::try_from(self.device.recommendedMaxWorkingSetSize()).unwrap_or(usize::MAX)
+    }
+
     fn empty(&self, elements: usize) -> Result<Buffer> {
         self.device
             .newBufferWithLength_options(elements * 4, MTLResourceOptions::StorageModeShared)
