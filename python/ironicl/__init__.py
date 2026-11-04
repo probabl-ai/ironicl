@@ -1,4 +1,4 @@
-"""TabICLv2 inference on CPU, without PyTorch."""
+"""TabICLv2 inference without PyTorch."""
 
 from ironicl.classifier import TabICLClassifier
 

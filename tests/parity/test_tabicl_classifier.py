@@ -1,7 +1,7 @@
 """Live classifier parity against a pinned, unmodified TabICL checkout.
 
 Setup matches test_tabicl_preprocessing.py. The released classifier checkpoint
-is downloaded once through upstream's Hugging Face cache and shared by both.
+is downloaded once through TabICL's Hugging Face cache and shared by both.
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ class TabICLClassifierParityTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         load_upstream()  # Verifies the pinned checkout and imports the tabicl package.
-        cls.upstream = importlib.import_module("tabicl._sklearn.classifier").TabICLClassifier
+        cls.tabicl = importlib.import_module("tabicl._sklearn.classifier").TabICLClassifier
         hub = importlib.import_module("huggingface_hub")
         cls.checkpoint = hub.hf_hub_download("jingang/TabICL", CHECKPOINT)
 
@@ -34,7 +34,7 @@ class TabICLClassifierParityTest(unittest.TestCase):
         extras = {"__init__": [("optimize", None)]}
         for name in ("__init__", "fit", "predict_proba", "predict"):
             ours = inspect.signature(getattr(TabICLClassifier, name)).parameters.values()
-            theirs = inspect.signature(getattr(self.upstream, name)).parameters.values()
+            theirs = inspect.signature(getattr(self.tabicl, name)).parameters.values()
             self.assertEqual(
                 [(p.name, p.default) for p in ours],
                 [(p.name, p.default) for p in theirs] + extras.get(name, []),
@@ -56,7 +56,7 @@ class TabICLClassifierParityTest(unittest.TestCase):
                     x, y, train_size=train_size, test_size=test_size, random_state=0, stratify=y
                 )
                 ours = TabICLClassifier(model_path=self.checkpoint, **params).fit(x_train, y_train)
-                theirs = self.upstream(model_path=self.checkpoint, device="cpu", **params)
+                theirs = self.tabicl(model_path=self.checkpoint, device="cpu", **params)
                 theirs.fit(x_train, y_train)
                 np.testing.assert_allclose(
                     ours.predict_proba(x_test), theirs.predict_proba(x_test), rtol=0, atol=1e-4

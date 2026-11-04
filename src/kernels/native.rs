@@ -19,7 +19,7 @@ const BF16_AFFINE_MAX_ROWS: usize = 8;
 const MAX_PACKED_ATTENTION_QUERY_ROWS: usize = 16;
 const SQRT_2: f32 = core::f32::consts::SQRT_2;
 /// Smallest affine row count that goes to Accelerate on Apple Silicon. Thresholds
-/// from 4 to 64 rows and 1024 to 16384 scores measured the same on an M1 Max.
+/// from 4 to 64 rows measured the same on an M1 Max.
 const SGEMM_MIN_ROWS: usize = 16;
 
 /// Whether an affine layer with `rows` input rows runs as one Accelerate
@@ -179,7 +179,8 @@ unsafe fn small_attention_neon(
     }
 }
 
-/// Smallest `query_rows * source_rows` per head that goes to Accelerate on Apple Silicon.
+/// Smallest `query_rows * source_rows` per head that goes to Accelerate on Apple
+/// Silicon. Thresholds from 1024 to 16384 scores measured the same on an M1 Max.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const SGEMM_MIN_ATTENTION_SCORES: usize = 4096;
 

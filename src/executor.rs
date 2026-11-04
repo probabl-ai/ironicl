@@ -1534,8 +1534,8 @@ impl StaticClassifierExecutor {
         .with_gpu()
     }
 
-    /// Copy the ICL keys and values to the GPU when Metal is available. FP32
-    /// unpacked contexts only; `IRONICL_NO_METAL` keeps everything on the CPU.
+    /// Build the context's GPU predict graph when Metal is available. Packed
+    /// contexts and contexts with mixed ICL storage stay on the CPU.
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
     fn with_gpu(mut self) -> Result<Self> {
         if std::env::var_os("IRONICL_NO_METAL").is_some() || self.context.has_packed_icl_keys() {
