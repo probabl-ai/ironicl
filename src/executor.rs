@@ -560,6 +560,7 @@ impl ClassifierExecutor {
         class_permutations: Vec<u64>,
         feature_permutations: Vec<u64>,
         optimize: Optimize,
+        threads: Option<usize>,
     ) -> Result<StaticClassifierExecutor> {
         let shape = (ensembles, training_rows, features);
         let metadata = self.context_metadata(shape, x, y_train, class_permutations, feature_permutations)?;
@@ -567,7 +568,7 @@ impl ClassifierExecutor {
         if let Some(tensors) = self.build_tensors_gpu(shape, x, y_train, optimize)? {
             // The build graph checked every value on the GPU.
             let context = StaticContextArtifact::from_page_aligned(metadata, tensors)?;
-            return StaticClassifierExecutor::with_executor(self.clone(), context);
+            return StaticClassifierExecutor::with_executor(self.clone(), context, threads);
         }
         // On a BF16-capable CPU, `fast` stores the ICL values in BF16 (FP32
         // keys, the retained serving layout); every other case is FP32.
@@ -577,7 +578,7 @@ impl ClassifierExecutor {
             return StaticClassifierExecutor::with_executor(self.clone(), context);
         }
         let context = StaticContextArtifact::new(metadata, self.build_tensors_cpu(shape, x, y_train)?)?;
-        StaticClassifierExecutor::with_executor(self.clone(), context)
+        StaticClassifierExecutor::with_executor(self.clone(), context, threads)
     }
 
     /// Validate a context's inputs and describe it: model and content hashes,
@@ -1394,11 +1395,16 @@ impl StaticClassifierExecutor {
     /// Returns an artifact error if the model identity, architecture, or required
     /// cache tensor names and shapes do not match the serving contract.
     pub fn new(model: ModelArtifact, context: StaticContextArtifact) -> Result<Self> {
-        Self::with_executor(ClassifierExecutor::new(model), context)
+        Self::with_executor(ClassifierExecutor::new(model), context, None)
     }
 
     /// Pair a context with an executor whose model weights it shares.
-    fn with_executor(model: ClassifierExecutor, context: StaticContextArtifact) -> Result<Self> {
+    fn with_executor(
+        model: ClassifierExecutor,
+        context: StaticContextArtifact,
+        threads: Option<usize>,
+    ) -> Result<Self> {
+        let threads = threads.map_or_else(executor_threads, |threads| threads.max(1));
         validate_static_context(&model.model, &context)?;
         let input_weight = model.tensor("col_embedder.in_linear.weight")?;
         let mut column_input_weight = vec![0.0; input_weight.len()];
@@ -1451,7 +1457,7 @@ impl StaticClassifierExecutor {
             None
         };
         let affine_pool = ThreadPoolBuilder::new()
-            .num_threads(executor_threads())
+            .num_threads(threads)
             .thread_name(|index| format!("ironicl-affine-{index}"))
             .build()
             .map_err(|error| Error::InvalidArgument(format!("cannot create affine worker pool: {error}")))?;
@@ -1658,7 +1664,7 @@ impl StaticClassifierExecutor {
 
     fn plan(&self) -> ExecutionPlan {
         let ensembles = self.context.metadata().ensemble_count;
-        static_execution_plan(ensembles, executor_threads())
+        static_execution_plan(ensembles, self.affine_pool.current_num_threads())
     }
 
     fn admit_query(&self, rows: usize) -> Result<()> {

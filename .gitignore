@@ -9,3 +9,6 @@ __pycache__/
 /dist/
 /.venv/
 .DS_Store
+
+# maturin-built extension (editable install)
+python/ironicl/_core*.so

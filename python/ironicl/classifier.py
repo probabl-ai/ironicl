@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import urllib.request
+import warnings
 from functools import cache
 from pathlib import Path
 
@@ -30,11 +31,15 @@ def _model(checkpoint: Path) -> Model:
 class TabICLClassifier(ClassifierMixin, BaseEstimator):
     """TabICLv2 classifier with Ironicl's Rust inference engine.
 
-    Parameters keep TabICL's names and defaults. ``batch_size``, ``kv_cache``,
-    ``use_amp``, ``use_fa3``, ``offload_mode``, ``disk_offload_dir``,
-    ``n_jobs``, and ``verbose`` control PyTorch execution and have no effect.
-    ``support_many_classes`` has no effect because more than 10 classes are not
-    supported yet.
+    Parameters keep TabICL's names and defaults. ``n_jobs`` sets the executor
+    thread count (``None`` leaves Ironicl's default; negative values follow
+    TabICL, so ``-1`` is all logical cores). ``batch_size``, ``verbose``, and
+    ``support_many_classes`` have no effect and warn if changed (the last because
+    more than 10 classes are not supported yet). Parameters that request an
+    unimplemented feature raise ``NotImplementedError``: ``use_amp=True``,
+    ``use_fa3=True``, a non-default ``offload_mode``/``disk_offload_dir``,
+    ``kv_cache="repr"``, ``norm_methods`` other than ``"none"``/``"power"``, and a
+    non-default ``checkpoint_version``.
 
     ``optimize`` is Ironicl's own parameter, after TabICL's. It sets how far
     Ironicl may trade exactness for speed on Apple Silicon GPUs:
@@ -102,16 +107,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
 
     def fit(self, X, y) -> TabICLClassifier:
         """Fit preprocessing and build the training context in Rust."""
-        for name, supported in (
-            ("feat_shuffle_method", ("latin",)),
-            ("class_shuffle_method", ("shift",)),
-            ("device", (None, "cpu")),
-            ("inference_config", (None,)),
-        ):
-            if getattr(self, name) not in supported:
-                raise NotImplementedError(f"{name}={getattr(self, name)!r} is not supported")
-        if self.random_state is None:
-            raise NotImplementedError("random_state=None is not supported")
+        self._validate_params()
         if y is None:
             raise ValueError("This classifier requires y to be passed, but the target y is None.")
         optimize = self._optimize()
@@ -134,6 +130,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
             np.ascontiguousarray(preprocessor.class_permutations_, dtype=np.uint64),
             np.ascontiguousarray(preprocessor.feature_permutations_, dtype=np.uint64),
             optimize,
+            self._resolve_threads(),
         )
         self.preprocessor_ = preprocessor
         self.checkpoint_path_ = checkpoint
@@ -158,6 +155,47 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         """Return the most probable class label for each sample."""
         probabilities = self.predict_proba(X)  # Checks that the classifier is fitted.
         return self.preprocessor_.decode_labels(np.argmax(probabilities, axis=1))
+
+    def _validate_params(self) -> None:
+        # Values that would change results or request an unimplemented feature raise.
+        for name, supported in (
+            ("feat_shuffle_method", ("latin",)),
+            ("class_shuffle_method", ("shift",)),
+            ("device", (None, "cpu")),
+            ("inference_config", (None,)),
+            ("use_amp", ("auto", False)),
+            ("use_fa3", ("auto", False)),
+            ("offload_mode", ("auto", False)),
+            ("disk_offload_dir", (None,)),
+            ("kv_cache", (False, True, "kv")),
+            ("checkpoint_version", ("tabicl-classifier-v2-20260212.ckpt",)),
+        ):
+            if getattr(self, name) not in supported:
+                raise NotImplementedError(f"{name}={getattr(self, name)!r} is not supported")
+        if self.random_state is None:
+            raise NotImplementedError("random_state=None is not supported")
+        methods = self.norm_methods
+        if methods is not None:
+            methods = (methods,) if isinstance(methods, str) else methods
+            unsupported = sorted(set(methods) - {"none", "power"})
+            if unsupported:
+                raise NotImplementedError(
+                    f"norm_methods {unsupported} are not supported; only 'none' and 'power'"
+                )
+        # Genuine no-ops: warn when changed so the caller knows they are ignored.
+        for name, default in (("batch_size", 8), ("verbose", False), ("support_many_classes", True)):
+            if getattr(self, name) != default:
+                warnings.warn(
+                    f"{name}={getattr(self, name)!r} has no effect in Ironicl",
+                    UserWarning,
+                    stacklevel=3,
+                )
+
+    def _resolve_threads(self) -> int | None:
+        """Map ``n_jobs`` to an executor thread count (``None`` keeps the default)."""
+        if self.n_jobs is None or self.n_jobs > 0:
+            return self.n_jobs
+        return max(1, (os.cpu_count() or 1) + 1 + self.n_jobs)
 
     def _optimize(self) -> str:
         optimize = self.optimize if self.optimize is not None else os.environ.get("IRONICL_OPTIMIZE", "safe")

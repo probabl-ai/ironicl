@@ -262,6 +262,7 @@ fn built_context_matches_the_uncached_forward_pass() {
                 shifts.concat(),
                 (0..b).flat_map(|_| 0..h as u64).collect(),
                 optimize,
+                None,
             )
             .expect("build context");
         let actual = context
@@ -320,6 +321,7 @@ fn large_cached_query_runs_in_chunks() {
             (0..b).flat_map(|_| 0..3).collect(),
             (0..b).flat_map(|_| 0..h as u64).collect(),
             Optimize::Safe,
+            None,
         )
         .expect("build context");
     let all = context
@@ -376,6 +378,7 @@ fn reduced_precision_context_predicts_all_missing_rows() {
                 (0..b).flat_map(|_| 0..3).collect(),
                 (0..b).flat_map(|_| 0..h as u64).collect(),
                 optimize,
+                None,
             )
             .expect("build context")
             .predict_logits(ClassifierQueryRequest::new(b, q, h, &query).expect("valid query"))
