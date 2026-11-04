@@ -86,6 +86,7 @@ live upstream comparisons.
 | `make test-rust` | Rust tests with default features and with `--no-default-features`, using `Cargo.lock`. |
 | `make lint-rust` | Formatting and Clippy for all feature configurations; warnings are errors. |
 | `make audit` | `Cargo.lock` against the RustSec advisory database; needs `cargo install cargo-audit`. |
+| `make lint-python` | Ruff pyflakes (`F`) checks for `python/ironicl` and `tools`; needs `pip install ruff` (or `uvx ruff`). |
 | `make test-python` | Standalone preprocessing and exporter tests, including the frozen upstream oracle. |
 | `make test-parity` | Direct comparisons with the pinned TabICL checkout; requires a separate environment. |
 
