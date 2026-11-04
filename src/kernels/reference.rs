@@ -613,16 +613,8 @@ pub(crate) fn tiled_online_scaled_dot_product_attention_with_backend_f32(
     require_length(key, source_elements, "attention key")?;
     require_length(value, source_elements, "attention value")?;
     require_length(output, query_elements, "attention output")?;
-    if super::native::attention_sgemm(
-        query,
-        query_rows,
-        key,
-        value,
-        source_rows,
-        heads,
-        head_dim,
-        output,
-    ) || super::native::small_attention(
+    if super::native::attention_f32(
+        backend,
         query,
         query_rows,
         key,
@@ -813,7 +805,8 @@ pub(crate) fn source_major_online_attention_with_backend_f32(
     require_length(value, source_elements, "attention value")?;
     require_length(output, query_elements, "attention output")?;
     if !key_is_packed
-        && (super::native::attention_sgemm(
+        && super::native::attention_f32(
+            backend,
             query,
             query_rows,
             key,
@@ -822,16 +815,7 @@ pub(crate) fn source_major_online_attention_with_backend_f32(
             heads,
             head_dim,
             output,
-        ) || super::native::small_attention(
-            query,
-            query_rows,
-            key,
-            value,
-            source_rows,
-            heads,
-            head_dim,
-            output,
-        ))
+        )
     {
         return Ok(());
     }
