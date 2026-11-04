@@ -13,6 +13,7 @@ records what each has verified.
 | [architecture.md](architecture.md) | Engine components and request lifecycle |
 | [cli.md](cli.md) | Stable command and model-source conventions |
 | [python.md](python.md) | Python preprocessing package |
+| [native-preprocessing.md](native-preprocessing.md) | Pure-Rust preprocessing plan and parity surfaces |
 | [static-context.md](static-context.md) | Training-time precomputation and invalidation |
 | [artifact-format.md](artifact-format.md) | Persistent model and context artifact design |
 | [precision.md](precision.md) | FP32, BF16, and INT8 numerical policy |
