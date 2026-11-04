@@ -36,7 +36,6 @@ use crate::{
             source_major_online_attention_bf16_with_backend_f32,
             source_major_online_attention_f32_key_bf16_value_with_backend_f32,
             source_major_online_attention_with_backend_f32, tiled_online_scaled_dot_product_attention_f32,
-            tiled_online_scaled_dot_product_attention_with_backend_f32,
         },
     },
     profile::{self, Category},
@@ -1285,7 +1284,7 @@ impl ClassifierExecutor {
         }
         let mut attended = vec![0.0; q_heads.len()];
         if rope.is_some() && row_source_major_attention_enabled() {
-            let query_block_rows = small_attention_query_block_rows();
+            let query_block_rows = ATTENTION_QUERY_BLOCK_ROWS;
             let scratch_rows = q_rows.min(query_block_rows);
             let scratch_sources = source_rows.min(ATTENTION_KEY_TILE_ROWS);
             let mut scores = vec![0.0; scratch_rows * scratch_sources];
@@ -1707,25 +1706,20 @@ impl StaticClassifierExecutor {
         })
     }
 
-    /// The execution plan, and whether `IRONICL_LAYER_MAJOR` runs it one layer
-    /// at a time across estimators.
-    fn plan(&self) -> (ExecutionPlan, bool) {
+    fn plan(&self) -> ExecutionPlan {
         let ensembles = self.context.metadata().ensemble_count;
-        (
-            static_execution_plan(ensembles, executor_threads()),
-            ensembles > 1 && std::env::var_os("IRONICL_LAYER_MAJOR").is_some(),
-        )
+        static_execution_plan(ensembles, executor_threads())
     }
 
     fn admit_query(&self, rows: usize) -> Result<()> {
         let metadata = self.context.metadata();
-        let (plan, layer_major) = self.plan();
+        let plan = self.plan();
         admit_static_request(
             metadata.ensemble_count,
             rows,
             metadata.feature_count,
             metadata.class_count,
-            if layer_major || plan.flat_pool_ensembles {
+            if plan.flat_pool_ensembles {
                 metadata.ensemble_count
             } else {
                 plan.ensemble_workers
@@ -1736,7 +1730,7 @@ impl StaticClassifierExecutor {
     /// Run one query chunk that [`Self::admit_query`] accepted.
     fn predict_chunk(&self, request: ClassifierQueryRequest<'_>) -> Result<ClassifierLogits> {
         let metadata = self.context.metadata();
-        let (plan, layer_major) = self.plan();
+        let plan = self.plan();
         let shape = [
             metadata.ensemble_count,
             request.query_rows(),
@@ -1753,9 +1747,7 @@ impl StaticClassifierExecutor {
         {
             return Ok(ClassifierLogits { shape, values });
         }
-        if layer_major {
-            self.predict_layer_major(request, plan.inner_workers, &mut values)?;
-        } else if plan.ensemble_workers == 1 {
+        if plan.ensemble_workers == 1 {
             for (ensemble, output) in values.chunks_mut(ensemble_output_elements).enumerate() {
                 self.predict_estimator(request, ensemble, plan.inner_workers, output)?;
             }
@@ -1799,48 +1791,6 @@ impl StaticClassifierExecutor {
             })?;
         }
         Ok(ClassifierLogits { shape, values })
-    }
-
-    fn predict_layer_major(
-        &self,
-        request: ClassifierQueryRequest<'_>,
-        workers: usize,
-        output: &mut [f32],
-    ) -> Result<()> {
-        let metadata = self.context.metadata();
-        let q = request.query_rows();
-        let mut rows = vec![Vec::new(); metadata.ensemble_count];
-        self.affine_pool.install(|| {
-            rows.par_iter_mut().enumerate().try_for_each(|(ensemble, rows)| {
-                *rows = self.cached_frontend(request, ensemble, workers)?;
-                Ok(())
-            })
-        })?;
-
-        let _profile = profile::scope(Category::Icl);
-        for block in 0..12 {
-            self.affine_pool.install(|| {
-                rows.par_iter_mut().enumerate().try_for_each(|(ensemble, rows)| {
-                    *rows = self.cached_icl_block(rows, ensemble, q, block, workers)?;
-                    Ok(())
-                })
-            })?;
-        }
-
-        let ensemble_output_elements = checked_product(&[q, metadata.class_count], "static ensemble output")?;
-        self.affine_pool.install(|| {
-            output
-                .par_chunks_mut(ensemble_output_elements)
-                .zip(rows.par_iter())
-                .try_for_each(|(output, rows)| {
-                    let logits = self.cached_icl_decoder(rows, q, workers)?;
-                    for row in 0..q {
-                        output[row * metadata.class_count..][..metadata.class_count]
-                            .copy_from_slice(&logits[row * 10..][..metadata.class_count]);
-                    }
-                    Ok(())
-                })
-        })
     }
 
     fn predict_estimator(
@@ -2323,7 +2273,7 @@ impl StaticClassifierExecutor {
                 ));
             };
             if column_source_major_attention_enabled(self.attention_backend) {
-                let query_block_rows = small_attention_query_block_rows();
+                let query_block_rows = ATTENTION_QUERY_BLOCK_ROWS;
                 let scratch_query_rows = q_rows.min(query_block_rows);
                 let scratch_source_rows = source_rows.min(ATTENTION_KEY_TILE_ROWS);
                 let mut scores = vec![0.0; scratch_query_rows * scratch_source_rows];
@@ -3690,38 +3640,12 @@ const fn performance_cores() -> Option<usize> {
     None
 }
 
-fn cached_attention_key_tile_rows() -> usize {
-    static KEY_TILE_ROWS: OnceLock<usize> = OnceLock::new();
-    *KEY_TILE_ROWS.get_or_init(|| {
-        std::env::var_os("IRONICL_ATTENTION_KEY_TILE_ROWS")
-            .and_then(|value| value.to_string_lossy().parse::<usize>().ok())
-            .filter(|rows| matches!(rows, 64 | 128 | 256 | 512 | 1024))
-            .unwrap_or(ATTENTION_KEY_TILE_ROWS)
-    })
-}
-
 fn column_source_major_attention_enabled(backend: crate::kernels::native::AttentionBackend) -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
     backend == crate::kernels::native::AttentionBackend::Avx512
-        && *ENABLED.get_or_init(|| std::env::var_os("IRONICL_COLUMN_QUERY_MAJOR").is_none())
 }
 
 fn row_source_major_attention_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        crate::kernels::native::attention_backend() == crate::kernels::native::AttentionBackend::Avx512
-            && std::env::var_os("IRONICL_ROW_QUERY_MAJOR").is_none()
-    })
-}
-
-fn small_attention_query_block_rows() -> usize {
-    static QUERY_BLOCK_ROWS: OnceLock<usize> = OnceLock::new();
-    *QUERY_BLOCK_ROWS.get_or_init(|| {
-        std::env::var_os("IRONICL_SMALL_ATTENTION_QUERY_ROWS")
-            .and_then(|value| value.to_string_lossy().parse::<usize>().ok())
-            .filter(|rows| matches!(rows, 8 | 16))
-            .unwrap_or(16)
-    })
+    crate::kernels::native::attention_backend() == crate::kernels::native::AttentionBackend::Avx512
 }
 
 fn sparse_attention_enabled() -> bool {
@@ -3730,37 +3654,7 @@ fn sparse_attention_enabled() -> bool {
 }
 
 fn static_execution_plan(ensembles: usize, total_threads: usize) -> ExecutionPlan {
-    let force_serial = std::env::var_os("IRONICL_SERIAL_ENSEMBLES").is_some();
-    if !force_serial {
-        let requested_inner = std::env::var_os("IRONICL_INNER_WORKERS")
-            .and_then(|value| value.to_string_lossy().parse::<usize>().ok())
-            .filter(|workers| *workers > 0 && *workers <= total_threads);
-        let requested = std::env::var_os("IRONICL_ENSEMBLE_WORKERS")
-            .and_then(|value| value.to_string_lossy().parse::<usize>().ok())
-            .filter(|workers| {
-                if *workers == 0 || *workers > ensembles || *workers > total_threads {
-                    return false;
-                }
-                let inner_workers = total_threads / *workers;
-                total_threads >= 16 || inner_workers == 1 || *workers == 1
-            });
-        if let Some(ensemble_workers) = requested {
-            return ExecutionPlan {
-                ensemble_workers,
-                inner_workers: requested_inner.unwrap_or_else(|| (total_threads / ensemble_workers).max(1)),
-                flat_pool_ensembles: false,
-            };
-        }
-    }
-    let mut plan = ExecutionPlan::automatic(ensembles, total_threads, force_serial);
-    if plan.flat_pool_ensembles
-        && let Some(inner_workers) = std::env::var_os("IRONICL_INNER_WORKERS")
-            .and_then(|value| value.to_string_lossy().parse::<usize>().ok())
-            .filter(|workers| *workers > 0 && *workers <= total_threads)
-    {
-        plan.inner_workers = inner_workers;
-    }
-    plan
+    ExecutionPlan::automatic(ensembles, total_threads, false)
 }
 
 #[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
@@ -3909,38 +3803,12 @@ fn parallel_cached_attention(
     output: &mut [f32],
     workers: usize,
 ) -> Result<()> {
-    static QUERY_MAJOR: OnceLock<bool> = OnceLock::new();
-    let query_major =
-        *QUERY_MAJOR.get_or_init(|| std::env::var_os("IRONICL_QUERY_MAJOR_ATTENTION").is_some());
     let query_head_elements = checked_product(&[query_rows, head_dim], "cached query head")?;
     let source_head_elements = checked_product(&[source_rows, head_dim], "cached source head")?;
     let workers = workers.min(HEADS);
     if workers == 1 {
         let scratch_query_rows = query_rows.min(ATTENTION_QUERY_BLOCK_ROWS);
         let scratch_source_rows = source_rows.min(ATTENTION_KEY_TILE_ROWS);
-        if query_major && !key_is_packed {
-            let mut scores = vec![0.0; HEADS * scratch_query_rows * scratch_source_rows];
-            let mut maximum = vec![0.0; HEADS * scratch_query_rows];
-            let mut denominator = vec![0.0; HEADS * scratch_query_rows];
-            return tiled_online_scaled_dot_product_attention_with_backend_f32(
-                query,
-                query_rows,
-                key,
-                value,
-                source_rows,
-                HEADS,
-                head_dim,
-                ATTENTION_QUERY_BLOCK_ROWS,
-                ATTENTION_KEY_TILE_ROWS,
-                backend,
-                &mut OnlineAttentionScratch {
-                    scores: &mut scores,
-                    maximum: &mut maximum,
-                    denominator: &mut denominator,
-                },
-                output,
-            );
-        }
         let mut scores = vec![0.0; scratch_query_rows * scratch_source_rows];
         let mut maximum = vec![0.0; HEADS * query_rows];
         let mut denominator = vec![0.0; HEADS * query_rows];
@@ -3980,52 +3848,28 @@ fn parallel_cached_attention(
             handles.push(scope.spawn(move || {
                 let scratch_query_rows = query_rows.min(ATTENTION_QUERY_BLOCK_ROWS);
                 let scratch_source_rows = source_rows.min(ATTENTION_KEY_TILE_ROWS);
-                if query_major && !key_is_packed {
-                    let mut scores = vec![0.0; heads * scratch_query_rows * scratch_source_rows];
-                    let mut maximum = vec![0.0; heads * scratch_query_rows];
-                    let mut denominator = vec![0.0; heads * scratch_query_rows];
-                    tiled_online_scaled_dot_product_attention_with_backend_f32(
-                        query,
-                        query_rows,
-                        key,
-                        value,
-                        source_rows,
-                        heads,
-                        head_dim,
-                        ATTENTION_QUERY_BLOCK_ROWS,
-                        ATTENTION_KEY_TILE_ROWS,
-                        backend,
-                        &mut OnlineAttentionScratch {
-                            scores: &mut scores,
-                            maximum: &mut maximum,
-                            denominator: &mut denominator,
-                        },
-                        worker_output,
-                    )
-                } else {
-                    let mut scores = vec![0.0; scratch_query_rows * scratch_source_rows];
-                    let mut maximum = vec![0.0; heads * query_rows];
-                    let mut denominator = vec![0.0; heads * query_rows];
-                    source_major_online_attention_with_backend_f32(
-                        query,
-                        query_rows,
-                        key,
-                        value,
-                        source_rows,
-                        heads,
-                        head_dim,
-                        ATTENTION_QUERY_BLOCK_ROWS,
-                        ATTENTION_KEY_TILE_ROWS,
-                        key_is_packed,
-                        backend,
-                        &mut OnlineAttentionScratch {
-                            scores: &mut scores,
-                            maximum: &mut maximum,
-                            denominator: &mut denominator,
-                        },
-                        worker_output,
-                    )
-                }
+                let mut scores = vec![0.0; scratch_query_rows * scratch_source_rows];
+                let mut maximum = vec![0.0; heads * query_rows];
+                let mut denominator = vec![0.0; heads * query_rows];
+                source_major_online_attention_with_backend_f32(
+                    query,
+                    query_rows,
+                    key,
+                    value,
+                    source_rows,
+                    heads,
+                    head_dim,
+                    ATTENTION_QUERY_BLOCK_ROWS,
+                    ATTENTION_KEY_TILE_ROWS,
+                    key_is_packed,
+                    backend,
+                    &mut OnlineAttentionScratch {
+                        scores: &mut scores,
+                        maximum: &mut maximum,
+                        denominator: &mut denominator,
+                    },
+                    worker_output,
+                )
             }));
         }
         for handle in handles {
@@ -4049,11 +3893,7 @@ fn parallel_cached_attention_bf16(
 ) -> Result<()> {
     let query_head_elements = checked_product(&[query_rows, head_dim], "cached query head")?;
     let source_head_elements = checked_product(&[source_rows, head_dim], "cached source head")?;
-    let key_tile_rows = if key_is_packed {
-        ATTENTION_KEY_TILE_ROWS
-    } else {
-        cached_attention_key_tile_rows()
-    };
+    let key_tile_rows = ATTENTION_KEY_TILE_ROWS;
     let workers = workers.min(HEADS);
     if workers == 1 {
         let scratch_query_rows = query_rows.min(ATTENTION_QUERY_BLOCK_ROWS);
@@ -4144,11 +3984,7 @@ fn parallel_cached_attention_f32_key_bf16_value(
 ) -> Result<()> {
     let query_head_elements = checked_product(&[query_rows, head_dim], "cached query head")?;
     let source_head_elements = checked_product(&[source_rows, head_dim], "cached source head")?;
-    let key_tile_rows = if key_is_packed {
-        ATTENTION_KEY_TILE_ROWS
-    } else {
-        cached_attention_key_tile_rows()
-    };
+    let key_tile_rows = ATTENTION_KEY_TILE_ROWS;
     let workers = workers.min(HEADS);
     if workers == 1 {
         let scratch_query_rows = query_rows.min(ATTENTION_QUERY_BLOCK_ROWS);
@@ -4390,7 +4226,7 @@ fn attention_scratch_state(q_rows: usize) -> Result<usize> {
 }
 
 fn attention_scratch_elements() -> Result<usize> {
-    let query_block_rows = small_attention_query_block_rows();
+    let query_block_rows = ATTENTION_QUERY_BLOCK_ROWS;
     checked_sum(
         &[
             attention_scratch_scores(query_block_rows, ATTENTION_KEY_TILE_ROWS)?,
