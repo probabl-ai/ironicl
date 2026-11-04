@@ -15,6 +15,8 @@ pub mod executor;
 pub mod ffi;
 pub mod input_bundle;
 pub mod kernels;
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+mod metal;
 pub mod model_artifact;
 pub mod platform;
 pub mod profile;
@@ -38,7 +40,8 @@ pub use config::{CacheMode, ExecutionConfig, StorageDType, TabIclV2Model, TaskKi
 pub use error::{Error, Result};
 pub use executor::{
     ClassifierAggregation, ClassifierExecutor, ClassifierLogits, ClassifierLogitsTrace,
-    ClassifierProbabilities, ClassifierTraceStage, SparseAttentionStatistics, StaticClassifierExecutor,
+    ClassifierProbabilities, ClassifierTraceStage, Optimize, SparseAttentionStatistics,
+    StaticClassifierExecutor,
 };
 pub use input_bundle::{
     CLASSIFIER_INPUT_BUNDLE_KIND, CLASSIFIER_INPUT_BUNDLE_MAGIC, CLASSIFIER_INPUT_BUNDLE_VERSION,

@@ -11,7 +11,7 @@
 use crate::error::{Error, Result};
 use crate::profile::{self, Category};
 
-const LAYER_NORM_EPSILON: f32 = 1e-5;
+pub(super) const LAYER_NORM_EPSILON: f32 = 1e-5;
 const SQRT_2: f32 = core::f32::consts::SQRT_2;
 
 /// Borrowed FP32 parameters for elementwise QASSMax.
@@ -613,6 +613,19 @@ pub(crate) fn tiled_online_scaled_dot_product_attention_with_backend_f32(
     require_length(key, source_elements, "attention key")?;
     require_length(value, source_elements, "attention value")?;
     require_length(output, query_elements, "attention output")?;
+    if super::native::attention_f32(
+        backend,
+        query,
+        query_rows,
+        key,
+        value,
+        source_rows,
+        heads,
+        head_dim,
+        output,
+    ) {
+        return Ok(());
+    }
     let block_rows = query_rows.min(query_block_rows);
     let tile_rows = source_rows.min(key_tile_rows);
     let score_elements = checked_elements(
@@ -791,6 +804,21 @@ pub(crate) fn source_major_online_attention_with_backend_f32(
     require_length(key, source_elements, "attention key")?;
     require_length(value, source_elements, "attention value")?;
     require_length(output, query_elements, "attention output")?;
+    if !key_is_packed
+        && super::native::attention_f32(
+            backend,
+            query,
+            query_rows,
+            key,
+            value,
+            source_rows,
+            heads,
+            head_dim,
+            output,
+        )
+    {
+        return Ok(());
+    }
     let block_rows = query_rows.min(query_block_rows);
     let tile_rows = source_rows.min(key_tile_rows);
     let packed_tile_rows = tile_rows.div_ceil(16) * 16;

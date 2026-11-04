@@ -10,7 +10,7 @@ lint-rust:
 	cargo fmt --all -- --check
 	cargo clippy --locked --all-targets -- -D warnings
 	cargo clippy --locked --all-targets --no-default-features -- -D warnings
-	cargo clippy --locked --all-targets --features python -- -D warnings
+	cargo clippy --locked --all-targets --features python,metal -- -D warnings
 
 # RUSTSEC-2024-0436: paste is unmaintained; it comes through candle-core.
 audit:
