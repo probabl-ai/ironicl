@@ -71,7 +71,13 @@ The native module also contains approximate GELU and QASS modulation kernels,
 but the accepted cached executor does not use them. It keeps the reference FP32
 GELU and QASS arithmetic because the approximate path failed the latency gate.
 
-### Planned Reduced-Precision Kernels
+### Reduced-Precision Kernels
+
+Reduced precision already ships: the cached CPU path stores ICL values in BF16
+with FP32 accumulation, and the Metal GPU path stores FP16 ICL caches and runs
+FP16 ICL attention under `optimize=auto`/`fast` (see
+[experiments.md](experiments.md#apple-silicon-experiments)). The remaining
+planned x86 kernels are:
 
 - BF16 dot product with FP32 accumulation through `VDPBF16PS`.
 - INT8 VNNI projection kernels with INT32 accumulation.

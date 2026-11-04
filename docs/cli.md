@@ -11,6 +11,7 @@ ironicl plan [options]
 ironicl inspect (--checkpoint FILE | --model FILE)
 ironicl import --checkpoint FILE --output FILE
 ironicl run (--checkpoint FILE | --model FILE) --input FILE [cache options]
+ironicl benchmark --model FILE --input FILE [--context FILE] [--probabilities] [--warmup N] [--iterations N]
 ```
 
 Use `ironicl help COMMAND` or `ironicl COMMAND --help` for command-specific
@@ -87,8 +88,9 @@ ironicl run \
 
 When `--context` is present, `--input` must be an `IRQUERY` v1 bundle. Its model
 and context identities, ensemble count, and feature count must match the static
-context. Cached execution returns per-estimator `[B,Q,C]` logits. It does not
-apply class permutations or ensemble aggregation.
+context. Cached execution returns per-estimator `[B,Q,C]` logits by default. With
+`--probabilities` it reverses each estimator's class permutation and aggregates
+the estimators into final `[Q,C]` probabilities.
 
 Direct checkpoint execution may convert weights in memory and is not the
 deployment performance path. By default, `run --checkpoint` imports to a
@@ -107,6 +109,23 @@ Checkpoint cache options:
 text result. The first line is `shape: B test_rows C`. Each remaining line is
 `logits[ensemble,test_row]:` followed by one FP32 logit per class in scientific
 notation.
+
+Output options:
+
+- `--probabilities` aggregates per-estimator logits into final probabilities
+  (reversing class permutations and applying the softmax temperature) instead of
+  printing raw logits.
+- `--trace-stages` emits per-stage intermediate outputs for debugging.
+
+The `optimize=safe|auto|fast` levels are not a CLI flag; set them through the
+Python API or the `IRONICL_OPTIMIZE` environment variable.
+
+## Benchmark
+
+`ironicl benchmark` times a prepared request with `--warmup` and `--iterations`
+and reports latency percentiles. It takes `--model` and `--input`, an optional
+`--context` for the cached query-only path, and `--probabilities` to time the
+aggregated output. It does not import checkpoints; use an Ironicl model artifact.
 
 ## Stability
 

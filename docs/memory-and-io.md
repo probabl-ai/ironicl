@@ -40,16 +40,17 @@ the engine must rerun all 12 ICL blocks for each request.
 
 For `H=100`, `B=8`:
 
-| Rows | FP32 full K/V | BF16 full K/V | INT8 payload |
-|---:|---:|---:|---:|
-| 1,000 | 0.67 GiB | 0.34 GiB | 0.17 GiB |
-| 10,000 | 3.97 GiB | 1.98 GiB | 0.99 GiB |
-| 48,000 | 17.88 GiB | 8.94 GiB | 4.47 GiB |
-| 50,000 | 18.62 GiB | 9.31 GiB | 4.65 GiB |
-| 100,000 | 36.93 GiB | 18.46 GiB | 9.23 GiB |
+| Rows | FP32 full K/V | BF16 full K/V | FP16 full K/V | INT8 payload |
+|---:|---:|---:|---:|---:|
+| 1,000 | 0.67 GiB | 0.34 GiB | 0.34 GiB | 0.17 GiB |
+| 10,000 | 3.97 GiB | 1.98 GiB | 1.98 GiB | 0.99 GiB |
+| 48,000 | 17.88 GiB | 8.94 GiB | 8.94 GiB | 4.47 GiB |
+| 50,000 | 18.62 GiB | 9.31 GiB | 9.31 GiB | 4.65 GiB |
+| 100,000 | 36.93 GiB | 18.46 GiB | 18.46 GiB | 9.23 GiB |
 
-INT8 values exclude scale metadata and alignment. The planner currently reports
-payload bytes only.
+FP16 uses the same two bytes per element as BF16; it is the Apple Silicon GPU
+cache policy under `optimize=auto`/`fast`. INT8 values exclude scale metadata and
+alignment. The planner currently reports payload bytes only.
 
 ## RAM Budget
 
@@ -68,6 +69,17 @@ On the nominal 64 GB host, which exposes about 60 GiB to the operating system,
 50K-row FP32 and BF16 contexts fit comfortably. A 100K-row FP32 context fits by
 payload but leaves less room for duplicated build buffers. The context builder
 must stream into preallocated final storage.
+
+## GPU Build Memory
+
+On Apple Silicon with the `metal` feature, the Metal build graph needs a transient
+working set beyond the final context payload: about 2.2 GB per estimator at
+8192 x 54. The builder runs only as many estimators per graph as fit Metal's
+recommended working set, in equal groups, and copies each group into the context;
+`IRONICL_GPU_BUILD_BUDGET` sets the budget in bytes. A single estimator larger
+than the budget builds on the CPU instead. Predict-time GPU query buffers are kept
+between calls for buckets up to 1024 rows, and large cached queries are split into
+chunks so GPU scratch stays bounded.
 
 ## Bandwidth Lower Bound
 

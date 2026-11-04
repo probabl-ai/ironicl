@@ -40,15 +40,18 @@ pickle. The portable cache is separate from dataset-specific static context.
 
 ### Command Interface
 
-The single `ironicl` binary exposes checkpoint inspection, artifact import, and
-execution. The parser is independent of the checkpoint dependency so builds can
-disable direct checkpoint support while retaining artifact execution.
+The single `ironicl` binary exposes checkpoint inspection, artifact import,
+execution, and benchmarking. The parser is independent of the checkpoint
+dependency so builds can disable direct checkpoint support while retaining
+artifact execution.
 
 ### Planner
 
-Selects a backend and reports model/cache payload sizes. With a bandwidth input,
-it also reports ideal full-cache scan floors. Scratch-memory and detailed K/V
-traffic reports are not yet exposed.
+Selects a CPU backend and reports model/cache payload sizes. With a bandwidth
+input, it also reports ideal full-cache scan floors. The Metal GPU path is
+chosen separately at execution time (feature-gated and runtime-togglable), not
+by this planner. Scratch-memory and detailed K/V traffic reports are not yet
+exposed.
 
 ### Portable Backend
 
@@ -61,12 +64,22 @@ Provides AVX-512 FP32 affine and cached-attention kernels selected through
 runtime CPUID checks. Current model weights remain in the portable canonical
 layout. Native dispatch has no effect on artifact semantics.
 
+### Apple Silicon Backend
+
+Provides Accelerate `cblas_sgemm` dense and attention kernels on the matrix
+coprocessor, NEON LayerNorm and short-source attention, and a Metal GPU path
+(behind the `metal` feature) that builds static contexts and runs the predict
+graph per estimator. Under `optimize=auto`/`fast` the GPU stores ICL caches and
+runs ICL attention in FP16. This backend is not represented in the `BackendKind`
+enum, which currently names only the portable and AMD Zen 5 CPU backends; the
+GPU path is selected at execution time rather than by the planner.
+
 ### Request Executor
 
 Owns one persistent dense-work pool and request-local activation buffers. It
 executes preprocessed query variants against an immutable static context and
-returns per-estimator FP32 logits. Class permutation and ensemble aggregation
-remain outside the current cached executor.
+returns per-estimator FP32 logits. When probabilities are requested, it also
+reverses each estimator's class permutation and aggregates the estimators.
 
 ## Offline Lifecycle
 
@@ -100,9 +113,10 @@ preprocessed variants -> column cache -> row transformer -> ICL K/V scan
                               decoder -> per-estimator logits
 ```
 
-Current Rust serving does not preprocess raw rows, reverse class permutations,
-or aggregate estimators. Static contexts are mmap-backed. Model mmap and explicit
-prefaulting remain future loading modes.
+Current Rust serving does not preprocess raw rows; that stays in the Python
+exporter. It does reverse class permutations and aggregate estimators when
+probabilities are requested (raw per-estimator logits otherwise). Static contexts
+are mmap-backed. Model mmap and explicit prefaulting remain future loading modes.
 
 ## Parallelism
 
