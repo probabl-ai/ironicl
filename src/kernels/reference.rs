@@ -11,7 +11,7 @@
 use crate::error::{Error, Result};
 use crate::profile::{self, Category};
 
-const LAYER_NORM_EPSILON: f32 = 1e-5;
+pub(super) const LAYER_NORM_EPSILON: f32 = 1e-5;
 const SQRT_2: f32 = core::f32::consts::SQRT_2;
 
 /// Borrowed FP32 parameters for elementwise QASSMax.
