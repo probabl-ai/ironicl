@@ -117,12 +117,15 @@ results across classification and regression datasets.
 On the x86 Zen 5 path FP16 is not used: BF16 offers more exponent range and
 matches the intended dot-product path.
 
-On Apple Silicon, FP16 is a shipped GPU storage policy, selected by the
-`optimize` level:
+The `optimize` level selects the reduced-precision ICL cache storage on each
+backend:
 
-- `safe` keeps FP32 arithmetic and the FP32/BF16 storage above;
-- `auto` and `fast` store the ICL keys and values in FP16 and run ICL attention
-  in FP16 on the Metal GPU, converting only the queries.
+- `safe` keeps FP32 everywhere.
+- `auto` stores ICL keys and values in FP16 on the Apple GPU and runs ICL
+  attention in FP16 there, converting only the queries; the CPU stays FP32.
+- `fast` does everything `auto` does, and on a BF16-capable CPU (`AVX512_BF16`)
+  also stores the ICL values in BF16 with FP32 keys — the retained serving
+  layout. Without `AVX512_BF16`, the CPU stays FP32.
 
 The level is set through the Python API or the `IRONICL_OPTIMIZE` environment
 variable. FP16 overflows above 65504, so the reduced-precision levels carry their

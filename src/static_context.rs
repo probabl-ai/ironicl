@@ -245,6 +245,18 @@ impl PageAlignedTensors {
             })
             .collect()
     }
+
+    /// Write a tensor's already-encoded storage bytes into its region. The
+    /// caller converts to the tensor's [`TensorStorage`] and must pass exactly
+    /// the region's byte length.
+    pub(crate) fn fill(&mut self, index: usize, bytes: &[u8]) {
+        let (offset, length) = {
+            let (.., offset, length) = &self.layout[index];
+            (*offset, *length)
+        };
+        assert_eq!(bytes.len(), length, "page-aligned tensor length mismatch");
+        self.mapping[offset..offset + length].copy_from_slice(bytes);
+    }
 }
 
 /// A verified static context backed by owned or read-only mapped tensor storage.
