@@ -123,16 +123,27 @@ installed wheel built from the source distribution, rather than the editable
 checkout used for local development. It runs standalone and live parity tests in
 separate Linux/Python 3.12 environments.
 
-Rust CI does not provision official model or oracle fixtures. Tests in
-`tests/checkpoint_fixtures.rs` return early when those files are absent, even though
-Cargo reports them as passed. To exercise them locally, provide:
+Rust CI does not provision official model or oracle fixtures. The tests in
+`tests/checkpoint_fixtures.rs` and `tests/gpu_build_groups.rs` are marked
+`#[ignore]`, so a normal `make test-rust` reports them as *ignored*, not passed.
+To run them, provide the fixtures and pass `--ignored`:
 
 - `IRONICL_CHECKPOINT_FIXTURES`: a directory containing both official v2 checkpoints
   and the imported classifier artifact `tabicl-classifier-v2.ironicl`.
 - `IRONICL_ORACLE_FIXTURES`: a directory containing `input.irinput` and
   `logits.irlogits` from the upstream exporter.
 
+```sh
+IRONICL_CHECKPOINT_FIXTURES=/path/to/checkpoints \
+IRONICL_ORACLE_FIXTURES=/path/to/oracle \
+  cargo test --locked -- --ignored
+```
+
+With the variables set, these tests fail loudly when a fixture is missing instead
+of skipping silently.
+
 See [the validation guide](docs/validation.md) for fixture generation and numerical
-requirements. Hardware-gated kernel tests may also return early when CPU features
-are unavailable, and benchmarks marked `#[ignore]` do not run by default. Green CI
-is not proof of upstream model parity or Zen 5 performance.
+requirements. CPU-feature-gated kernel tests run automatically where the CPU feature
+is present and no-op where it is not (a current harness limitation); benchmarks
+marked `#[ignore]` do not run by default. Green CI is not proof of upstream model
+parity or Zen 5 performance.
