@@ -9,7 +9,7 @@ use std::{
 
 use ironicl::{
     CheckpointCacheOptions, CheckpointProfile, ClassifierExecutor, ClassifierInputBundle,
-    ClassifierQueryRequest, PreparedCheckpoint, TaskKind, import_checkpoint, inspect_checkpoint,
+    ClassifierQueryRequest, Optimize, PreparedCheckpoint, TaskKind, import_checkpoint, inspect_checkpoint,
     inspect_model_artifact, load_model_artifact, prepare_checkpoint,
 };
 use sha2::{Digest, Sha256};
@@ -208,7 +208,9 @@ fn built_context_matches_the_uncached_forward_pass() {
     };
     let executor =
         ClassifierExecutor::new(load_model_artifact(&model_path).expect("load classifier artifact"));
-    let (b, n, q, h, classes) = (2, 40, 8, 5, 3_u64);
+    // With the `metal` feature, 240 training rows build on the GPU, and 250
+    // query rows are padded to the GPU's 256-row bucket.
+    let (b, n, q, h, classes) = (2, 240, 250, 5, 3_u64);
     let mut state = 0x2545_f491_u32;
     let mut x = vec![0.0_f32; b * (n + q) * h];
     for value in &mut x {
@@ -233,27 +235,150 @@ fn built_context_matches_the_uncached_forward_pass() {
     let expected = executor
         .predict_logits(bundle.request())
         .expect("uncached logits");
+    let query = rows(n, q);
+    // Logit tolerances per level; reduced levels only differ from `Safe` on
+    // GPU-built contexts. Probability errors are several times smaller.
+    let mut safe = Vec::new();
+    for (optimize, tolerance) in [
+        (Optimize::Safe, 1e-4),
+        // Measured on an M1 Max with FP16 caches and attention: 4.6e-3.
+        (Optimize::Auto, 1e-2),
+        (Optimize::Fast, 5e-2),
+    ] {
+        let context = executor
+            .build_context(
+                b,
+                n,
+                h,
+                &rows(0, n),
+                &y,
+                shifts.concat(),
+                (0..b).flat_map(|_| 0..h as u64).collect(),
+                optimize,
+            )
+            .expect("build context");
+        let actual = context
+            .predict_logits(ClassifierQueryRequest::new(b, q, h, &query).expect("valid query"))
+            .expect("cached logits");
+        assert_eq!(actual.shape(), expected.shape());
+        for (index, (actual, expected)) in actual.values().iter().zip(expected.values()).enumerate() {
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "{optimize:?} logit {index}: cached {actual}, uncached {expected}"
+            );
+        }
+        if optimize == Optimize::Safe {
+            safe = actual.values().to_vec();
+        } else if cfg!(all(
+            feature = "metal",
+            target_os = "macos",
+            target_arch = "aarch64"
+        )) && std::env::var_os("IRONICL_NO_METAL").is_none()
+        {
+            assert!(
+                actual
+                    .values()
+                    .iter()
+                    .zip(&safe)
+                    .any(|(left, right)| left.to_bits() != right.to_bits()),
+                "{optimize:?} must store reduced-precision keys and values"
+            );
+        }
+    }
+}
+
+#[test]
+#[allow(clippy::cast_precision_loss, clippy::many_single_char_names)]
+fn large_cached_query_runs_in_chunks() {
+    let Some(model_path) = fixture("tabicl-classifier-v2.ironicl") else {
+        return;
+    };
+    let executor =
+        ClassifierExecutor::new(load_model_artifact(&model_path).expect("load classifier artifact"));
+    // 3000 query rows exceed the chunk size; each estimator's rows must land
+    // in place when the chunks are joined.
+    let (b, n, q, h) = (2, 240, 3000, 5);
+    let value = |index: usize| ((index * 7919) % 1000) as f32 / 250.0 - 2.0;
+    let train: Vec<f32> = (0..b * n * h).map(value).collect();
+    let query: Vec<f32> = (0..b * q * h).map(|index| value(index + 17)).collect();
+    let y: Vec<f32> = (0..b * n).map(|row| (row % 3) as f32).collect();
     let context = executor
         .build_context(
             b,
             n,
             h,
-            &rows(0, n),
+            &train,
             &y,
-            shifts.concat(),
+            (0..b).flat_map(|_| 0..3).collect(),
             (0..b).flat_map(|_| 0..h as u64).collect(),
+            Optimize::Safe,
         )
         .expect("build context");
-    let query = rows(n, q);
-    let actual = context
+    let all = context
         .predict_logits(ClassifierQueryRequest::new(b, q, h, &query).expect("valid query"))
-        .expect("cached logits");
+        .expect("chunked logits");
+    let part = q / 3;
+    for start in (0..q).step_by(part) {
+        let rows: Vec<f32> = (0..b)
+            .flat_map(|e| query[(e * q + start) * h..][..part * h].to_vec())
+            .collect();
+        let expected = context
+            .predict_logits(ClassifierQueryRequest::new(b, part, h, &rows).expect("valid query"))
+            .expect("part logits");
+        for e in 0..b {
+            let actual = &all.values()[(e * q + start) * 3..][..part * 3];
+            let expected = &expected.values()[e * part * 3..][..part * 3];
+            for (actual, expected) in actual.iter().zip(expected) {
+                assert!(
+                    (actual - expected).abs() <= 1e-4,
+                    "chunked {actual}, alone {expected}"
+                );
+            }
+        }
+    }
+}
 
-    assert_eq!(actual.shape(), expected.shape());
-    for (index, (actual, expected)) in actual.values().iter().zip(expected.values()).enumerate() {
+/// A query row whose grouped features are all the missing marker runs on the
+/// CPU, which must read the FP16 caches of an `Auto` context.
+#[test]
+#[allow(clippy::cast_precision_loss, clippy::many_single_char_names)]
+fn reduced_precision_context_predicts_all_missing_rows() {
+    let Some(model_path) = fixture("tabicl-classifier-v2.ironicl") else {
+        return;
+    };
+    let executor =
+        ClassifierExecutor::new(load_model_artifact(&model_path).expect("load classifier artifact"));
+    let (b, n, q, h) = (2, 240, 4, 5);
+    let value = |index: usize| ((index * 7919) % 1000) as f32 / 250.0 - 2.0;
+    let train: Vec<f32> = (0..b * n * h).map(value).collect();
+    let mut query: Vec<f32> = (0..b * q * h).map(|index| value(index + 17)).collect();
+    for e in 0..b {
+        query[e * q * h..][..h].fill(-100.0);
+    }
+    let y: Vec<f32> = (0..b * n).map(|row| (row % 3) as f32).collect();
+    let logits = |optimize| {
+        executor
+            .build_context(
+                b,
+                n,
+                h,
+                &train,
+                &y,
+                (0..b).flat_map(|_| 0..3).collect(),
+                (0..b).flat_map(|_| 0..h as u64).collect(),
+                optimize,
+            )
+            .expect("build context")
+            .predict_logits(ClassifierQueryRequest::new(b, q, h, &query).expect("valid query"))
+            .expect("logits")
+            .values()
+            .to_vec()
+    };
+    let safe = logits(Optimize::Safe);
+    for (index, (auto, safe)) in logits(Optimize::Auto).iter().zip(&safe).enumerate() {
         assert!(
-            (actual - expected).abs() <= 1e-4,
-            "logit {index}: cached {actual}, uncached {expected}"
+            (auto - safe).abs() <= 1e-2,
+            "logit {index}: auto {auto}, safe {safe}"
         );
     }
 }

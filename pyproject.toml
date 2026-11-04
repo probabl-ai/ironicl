@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "ironicl"
 version = "0.1.0"
-description = "TabICLv2 classifier inference on CPU, without PyTorch"
+description = "TabICLv2 classifier inference without PyTorch"
 readme = "README.md"
 requires-python = ">=3.12"
 # Floors are the oldest releases that pass the frozen upstream oracle.
@@ -21,4 +21,4 @@ license-files = ["LICENSE", "LICENSES/TabICL-BSD-3-Clause.txt"]
 [tool.maturin]
 python-source = "python"
 module-name = "ironicl._core"
-features = ["python"]
+features = ["python", "metal"]

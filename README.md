@@ -4,23 +4,25 @@
 [![Python preprocessing](https://github.com/probabl-ai/ironicl/actions/workflows/python.yml/badge.svg)](https://github.com/probabl-ai/ironicl/actions/workflows/python.yml)
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
 
-Ironicl is a CPU inference engine for [TabICLv2](https://github.com/soda-inria/tabicl),
-written in Rust. It is built for a training table that does not change: Ironicl
-computes the training context once, stores it, and then answers new test rows
-against it.
+Ironicl is an inference engine for [TabICLv2](https://github.com/soda-inria/tabicl),
+written in Rust. It runs without PyTorch on the compute built into the host. It
+is built for a training table that does not change: Ironicl computes the
+training context once, stores it, and then answers new test rows against it.
 
 > [!WARNING]
 > Ironicl is experimental. Formats, commands, and APIs can change without notice.
-> The optimized path targets AMD Zen 5 (Ryzen 7 9800X3D). Other CPUs, including
-> Apple Silicon, use a slower portable path.
+> The optimized paths target AMD Zen 5 (Ryzen 7 9800X3D) and Apple Silicon, where
+> dense layers and attention use Apple Accelerate. Other CPUs, including Intel
+> Macs, use a slower portable path.
 
 ## Status
 
 | Works now | Not yet |
 |---|---|
-| Safe checkpoint import in pure Rust (no pickle execution) | Fast context building on non-Zen 5 CPUs |
+| Safe checkpoint import in pure Rust (no pickle execution) | Overlapping CPU and GPU work |
 | FP32 classifier inference on any CPU | Regression |
 | Static training context with AVX-512 kernels on Zen 5 | Categorical features and missing values |
+| Accelerate kernels and Metal prediction and context building on Apple Silicon | Pickling a fitted estimator |
 | Python `TabICLClassifier`, a drop-in for TabICL's | Published packages on crates.io or PyPI |
 
 ## Quickstart

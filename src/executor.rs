@@ -42,15 +42,19 @@ use crate::{
     profile::{self, Category},
 };
 
-const COLUMN_DIM: usize = 128;
-const ICL_DIM: usize = 512;
-const HEADS: usize = 8;
-const INDUCING: usize = 128;
-const RESERVED: usize = 4;
+pub(crate) const COLUMN_DIM: usize = 128;
+pub(crate) const ICL_DIM: usize = 512;
+pub(crate) const HEADS: usize = 8;
+pub(crate) const INDUCING: usize = 128;
+/// CLS streams ahead of the features in the row stage.
+pub(crate) const RESERVED: usize = 4;
 const ATTENTION_QUERY_BLOCK_ROWS: usize = 16;
 const ATTENTION_KEY_TILE_ROWS: usize = 128;
 const MAX_ACTIVATION_BYTES: usize = 1536 * 1024 * 1024;
 const MAX_ACTIVATION_ELEMENTS: usize = MAX_ACTIVATION_BYTES / std::mem::size_of::<f32>();
+/// Cached prediction splits larger queries. The GPU keeps the buffers and
+/// compiled graph of every query bucket up to this size.
+pub(crate) const QUERY_CHUNK_ROWS: usize = 1024;
 const SPARSE_INDEX_TENSORS: [&str; 4] = [
     "icl.index.centroids",
     "icl.index.radii",
@@ -157,6 +161,40 @@ impl Bf16DensePolicy {
 pub struct ClassifierLogits {
     shape: [usize; 3],
     values: Vec<f32>,
+}
+
+/// How far Ironicl may trade exactness for speed.
+///
+/// Reduced-precision levels apply to contexts built on the GPU (the `metal`
+/// feature on Apple Silicon); elsewhere every level behaves like `Safe`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Optimize {
+    /// FP32 throughout; matches `TabICL` within `1e-4`.
+    #[default]
+    Safe,
+    /// ICL keys and values stored in FP16, and ICL attention computed in
+    /// FP16 when building the context and when predicting; everything else
+    /// FP32. Measured probability errors stayed below
+    /// 5e-4 with unchanged labels.
+    Auto,
+    /// Everything `Auto` does; further reduced-precision work will be
+    /// allowed here first.
+    Fast,
+}
+
+impl std::str::FromStr for Optimize {
+    type Err = Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "safe" => Ok(Self::Safe),
+            "auto" => Ok(Self::Auto),
+            "fast" => Ok(Self::Fast),
+            _ => Err(Error::InvalidArgument(format!(
+                "optimize must be \"safe\", \"auto\", or \"fast\", not {value:?}"
+            ))),
+        }
+    }
 }
 
 /// How ensemble logits become class probabilities, matching `TabICLClassifier`.
@@ -275,10 +313,31 @@ impl ClassifierLogits {
 #[derive(Debug, Clone)]
 pub struct ClassifierExecutor {
     model: Arc<ModelArtifact>,
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    gpu_weights: Arc<OnceLock<Option<Arc<crate::metal::ModelWeights>>>>,
+}
+
+/// One context's Metal buffers and the graph that reads them.
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+struct GpuContext {
+    predict: crate::metal::PredictGraph,
+    /// Keeps page-aligned context memory alive while GPU buffers wrap it.
+    _storage: Option<Arc<memmap2::Mmap>>,
+}
+
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+impl std::fmt::Debug for GpuContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GpuContext")
+    }
 }
 
 /// Attention keys and values in head-major `[heads, rows, head_dim]` order.
 type KeyValue = (Vec<f32>, Vec<f32>);
+
+/// One estimator's captured keys and values: per column block, every feature's
+/// in feature order; per ICL block, the training rows'.
+type EstimatorCaches = (Vec<KeyValue>, Vec<KeyValue>);
 
 /// One embedded column stream, with its keys and values when captured.
 type ColumnStream = (usize, Vec<f32>, Vec<KeyValue>);
@@ -300,6 +359,8 @@ pub struct StaticClassifierExecutor {
     bf16_dense_compensation: Bf16AffineCompensation,
     attention_backend: crate::kernels::native::AttentionBackend,
     sparse_attention_stats: Arc<SparseAttentionStats>,
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    gpu: Option<Arc<GpuContext>>,
 }
 
 /// Sparse ICL attention decisions since the last reset.
@@ -354,7 +415,171 @@ impl ClassifierExecutor {
     pub fn new(model: ModelArtifact) -> Self {
         Self {
             model: Arc::new(model),
+            #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+            gpu_weights: Arc::default(),
         }
+    }
+
+    /// The GPU and the model's weights in shared GPU buffers, created on first
+    /// use and shared by every context of the model. `None` without a GPU or
+    /// with `IRONICL_NO_METAL` set.
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    fn gpu_weights(&self) -> Option<Arc<crate::metal::ModelWeights>> {
+        if std::env::var_os("IRONICL_NO_METAL").is_some() {
+            return None;
+        }
+        self.gpu_weights
+            .get_or_init(|| {
+                let gpu = crate::metal::Gpu::new().ok().flatten()?;
+                Some(Arc::new(crate::metal::ModelWeights::new(gpu)))
+            })
+            .clone()
+    }
+
+    /// Build every estimator's keys and values on the GPU, straight into
+    /// page-aligned context tensors. Returns `None` without a GPU, below
+    /// `metal::GPU_MIN_BUILD_ROWS`, when a grouped triple is the all-missing
+    /// marker that only the CPU path handles, or when one estimator exceeds the
+    /// build's memory budget.
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    fn build_tensors_gpu(
+        &self,
+        (b, n, h): (usize, usize, usize),
+        x: &[f32],
+        y_train: &[f32],
+        optimize: Optimize,
+    ) -> Result<Option<crate::static_context::PageAlignedTensors>> {
+        use crate::static_context::{PageAlignedTensors, TensorStorage};
+        let icl_storage = match optimize {
+            Optimize::Safe => TensorStorage::Fp32,
+            // BF16 had no native GPU arithmetic on an M1 Max: slower and less
+            // accurate than FP16, so `Fast` uses FP16 until it gets more.
+            Optimize::Auto | Optimize::Fast => TensorStorage::F16,
+        };
+        if n < crate::metal::GPU_MIN_BUILD_ROWS {
+            return Ok(None);
+        }
+        let Some(gpu_weights) = self.gpu_weights() else {
+            return Ok(None);
+        };
+        let Some((grouped, column_labels, icl_labels)) = self.gpu_build_inputs((b, n, h), x, y_train)? else {
+            return Ok(None);
+        };
+        // Run as many estimators per graph as fit Metal's working set, or
+        // IRONICL_GPU_BUILD_BUDGET bytes, in equal groups so every run has the
+        // same shape. When one estimator does not fit, the CPU builds the
+        // context.
+        let budget = std::env::var("IRONICL_GPU_BUILD_BUDGET")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_else(|| gpu_weights.gpu().working_set_bytes());
+        let estimator_bytes = crate::metal::gpu_build_estimator_bytes(n, h);
+        let Some(group) = (1..=b)
+            .rev()
+            .find(|&group| b % group == 0 && group * estimator_bytes <= budget)
+        else {
+            return Ok(None);
+        };
+        let column_scales = (0..3)
+            .map(|block| {
+                qass_base_scale(
+                    self,
+                    &format!("col_embedder.tf_col.blocks.{block}.multihead_attn1.attn"),
+                    n,
+                    COLUMN_DIM,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let icl_scales = (0..12)
+            .map(|block| {
+                qass_base_scale(
+                    self,
+                    &format!("icl_predictor.tf_icl.blocks.{block}.attn"),
+                    n,
+                    ICL_DIM,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // Only the ICL caches, almost all of a context, take the reduced type.
+        let tensors = |ensembles: usize| {
+            PageAlignedTensors::new(
+                context_tensors(ensembles, n, h)
+                    .into_iter()
+                    .map(|(name, dimensions)| {
+                        let storage = if name.starts_with("icl.") {
+                            icl_storage
+                        } else {
+                            TensorStorage::Fp32
+                        };
+                        (name, dimensions, storage)
+                    })
+                    .collect(),
+            )
+        };
+        let mut context = tensors(b)?;
+        let mut scratch = if group == b { None } else { Some(tensors(group)?) };
+        for start in (0..b).step_by(group) {
+            let output = scratch.as_mut().unwrap_or(&mut context);
+            crate::metal::build_context(
+                &gpu_weights,
+                &|name| self.tensor(name),
+                crate::metal::Shape {
+                    ensembles: group,
+                    features: h,
+                    training_rows: n,
+                },
+                &column_scales,
+                &icl_scales,
+                &grouped[start * h * n * 3..][..group * h * n * 3],
+                &column_labels[start * n * COLUMN_DIM..][..group * n * COLUMN_DIM],
+                &icl_labels[start * n * ICL_DIM..][..group * n * ICL_DIM],
+                icl_storage,
+                &output.regions(),
+            )?;
+            // Estimators are the outermost dimension, so a group's slice of
+            // each tensor is contiguous.
+            if let Some(scratch) = &scratch {
+                context.copy_group(scratch, start / group);
+            }
+        }
+        Ok(Some(context))
+    }
+
+    /// The GPU build's inputs: each feature grouped with its neighbors as
+    /// `[B * H, N, 3]`, and the column and ICL label embeddings as
+    /// `[B, N, 128]` and `[B, N, 512]`. `None` on the all-missing marker.
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    #[allow(clippy::type_complexity)]
+    fn gpu_build_inputs(
+        &self,
+        (b, n, h): (usize, usize, usize),
+        x: &[f32],
+        y_train: &[f32],
+    ) -> Result<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>> {
+        let mut grouped = Vec::with_capacity(b * h * n * 3);
+        let mut column_labels = vec![0.0; b * n * COLUMN_DIM];
+        let mut icl_labels = vec![0.0; b * n * ICL_DIM];
+        for ensemble in 0..b {
+            let Some(group) = crate::metal::group_features(&x[ensemble * n * h..][..n * h], n, h) else {
+                return Ok(None);
+            };
+            grouped.extend(group);
+            let labels = label_indices(&y_train[ensemble * n..][..n])?;
+            for (prefix, width, output) in [
+                ("col_embedder", COLUMN_DIM, &mut column_labels),
+                ("icl_predictor", ICL_DIM, &mut icl_labels),
+            ] {
+                one_hot_linear_f32(
+                    &labels,
+                    self.tensor(&format!("{prefix}.y_encoder.weight"))?,
+                    self.tensor(&format!("{prefix}.y_encoder.bias"))?,
+                    10,
+                    width,
+                    &mut output[ensemble * n * width..][..n * width],
+                )?;
+            }
+        }
+        Ok(Some((grouped, column_labels, icl_labels)))
     }
 
     /// Run the training rows once and keep their attention keys and values as
@@ -363,12 +588,13 @@ impl ClassifierExecutor {
     /// `x` holds preprocessed FP32 `[B, N, H]` training rows and `y_train` the
     /// `[B, N]` class-permuted labels. The permutations are stored as context
     /// metadata; `class_permutations` is used to undo each estimator's class
-    /// order when probabilities are aggregated.
+    /// order when probabilities are aggregated. `optimize` selects the ICL
+    /// key and value storage of GPU-built contexts.
     ///
     /// # Errors
     ///
     /// Returns an error for inconsistent dimensions or labels, invalid
-    /// permutations, or a training set beyond the uncached activation limit.
+    /// permutations, or when the context does not fit in memory.
     pub fn build_context(
         &self,
         ensembles: usize,
@@ -378,8 +604,33 @@ impl ClassifierExecutor {
         y_train: &[f32],
         class_permutations: Vec<u64>,
         feature_permutations: Vec<u64>,
+        optimize: Optimize,
     ) -> Result<StaticClassifierExecutor> {
-        let (b, n, h) = (ensembles, training_rows, features);
+        // Reduced precision needs a GPU-built context; elsewhere every level is `Safe`.
+        #[cfg(not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")))]
+        let _ = optimize;
+        let shape = (ensembles, training_rows, features);
+        let metadata = self.context_metadata(shape, x, y_train, class_permutations, feature_permutations)?;
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        if let Some(tensors) = self.build_tensors_gpu(shape, x, y_train, optimize)? {
+            // The build graph checked every value on the GPU.
+            let context = StaticContextArtifact::from_page_aligned(metadata, tensors)?;
+            return StaticClassifierExecutor::with_executor(self.clone(), context);
+        }
+        let context = StaticContextArtifact::new(metadata, self.build_tensors_cpu(shape, x, y_train)?)?;
+        StaticClassifierExecutor::with_executor(self.clone(), context)
+    }
+
+    /// Validate a context's inputs and describe it: model and content hashes,
+    /// shape, class count, and permutations.
+    fn context_metadata(
+        &self,
+        (b, n, h): (usize, usize, usize),
+        x: &[f32],
+        y_train: &[f32],
+        class_permutations: Vec<u64>,
+        feature_permutations: Vec<u64>,
+    ) -> Result<StaticContextMetadata> {
         if b == 0
             || n == 0
             || h == 0
@@ -390,70 +641,7 @@ impl ClassifierExecutor {
                 "context needs nonempty x[B, N, H] and y_train[B, N] for B={b}, N={n}, H={h}"
             )));
         }
-        admit_request(b, n, h, n)?;
-        let classes = validate_labels(y_train, b, n)?;
-        let streams = h + RESERVED;
-        let column_elements = HEADS * INDUCING * 16;
-        let mut column: Vec<KeyValue> = (0..3)
-            .map(|_| {
-                let capacity = b * streams * column_elements;
-                (Vec::with_capacity(capacity), Vec::with_capacity(capacity))
-            })
-            .collect();
-        let mut icl: Vec<KeyValue> = (0..12)
-            .map(|_| {
-                (
-                    Vec::with_capacity(b * n * ICL_DIM),
-                    Vec::with_capacity(b * n * ICL_DIM),
-                )
-            })
-            .collect();
-        // ponytail: one rayon task per estimator; peak memory grows with the
-        // number of estimators built at once. Bound the concurrency if large
-        // contexts run out of memory.
-        let estimators = (0..b)
-            .into_par_iter()
-            .map(|ensemble| {
-                let x = &x[ensemble * n * h..][..n * h];
-                let labels = &y_train[ensemble * n..][..n];
-                let (columns, feature_caches) = self.column_embeddings(x, labels, n, h, n, true)?;
-                let rows = self.row_embeddings(&columns, n, streams)?;
-                let mut caches = Vec::with_capacity(12);
-                self.icl_rows(rows, labels, n, n, Some(&mut caches))?;
-                Ok((feature_caches, caches))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        for (feature_caches, caches) in estimators {
-            for (block, (keys, values)) in column.iter_mut().enumerate() {
-                // The cached path never reads the reserved CLS streams.
-                keys.resize(keys.len() + RESERVED * column_elements, 0.0);
-                values.resize(values.len() + RESERVED * column_elements, 0.0);
-                for caches in &feature_caches {
-                    keys.extend_from_slice(&caches[block].0);
-                    values.extend_from_slice(&caches[block].1);
-                }
-            }
-            for ((key, value), (keys, values)) in caches.into_iter().zip(&mut icl) {
-                keys.extend(key);
-                values.extend(value);
-            }
-        }
-        let mut tensors = Vec::with_capacity(30);
-        let as_u64 = |values: &[usize]| values.iter().map(|&value| value as u64).collect::<Vec<_>>();
-        for (stage, caches, dimensions) in [
-            ("column", column, as_u64(&[b, streams, HEADS, INDUCING, 16])),
-            ("icl", icl, as_u64(&[b, HEADS, n, ICL_DIM / HEADS])),
-        ] {
-            for (layer, (keys, values)) in caches.into_iter().enumerate() {
-                for (kind, values) in [("key", keys), ("value", values)] {
-                    tensors.push(StaticContextTensor {
-                        name: format!("{stage}.{layer}.{kind}"),
-                        dimensions: dimensions.clone(),
-                        values,
-                    });
-                }
-            }
-        }
+        let class_count = validate_labels(y_train, b, n)?;
         let mut model_sha256 = [0; 32];
         let source = self.model.summary().source_sha256.as_bytes();
         for (byte, pair) in model_sha256.iter_mut().zip(source.chunks_exact(2)) {
@@ -462,33 +650,109 @@ impl ClassifierExecutor {
                 .and_then(|pair| u8::from_str_radix(pair, 16).ok())
                 .ok_or_else(|| Error::Artifact("model source SHA-256 is not hexadecimal".into()))?;
         }
-        let context_sha256 = Sha256::new()
-            .chain_update(
-                as_u64(&[b, n, h])
-                    .iter()
-                    .flat_map(|value| value.to_le_bytes())
-                    .collect::<Vec<_>>(),
-            )
-            .chain_update(bytemuck::cast_slice::<f32, u8>(x))
-            .chain_update(bytemuck::cast_slice::<f32, u8>(y_train))
-            .chain_update(bytemuck::cast_slice::<u64, u8>(&class_permutations))
-            .chain_update(bytemuck::cast_slice::<u64, u8>(&feature_permutations))
-            .finalize()
-            .into();
-        let context = StaticContextArtifact::new(
-            StaticContextMetadata {
-                model_sha256,
-                context_sha256,
-                ensemble_count: b,
-                training_rows: n,
-                feature_count: h,
-                class_count: classes,
-                class_permutations,
-                feature_permutations,
-            },
-            tensors,
-        )?;
-        StaticClassifierExecutor::with_executor(self.clone(), context)
+        let mut context_sha256 = Sha256::new();
+        for value in [b, n, h] {
+            context_sha256.update((value as u64).to_le_bytes());
+        }
+        context_sha256.update(bytemuck::cast_slice::<f32, u8>(x));
+        context_sha256.update(bytemuck::cast_slice::<f32, u8>(y_train));
+        context_sha256.update(bytemuck::cast_slice::<u64, u8>(&class_permutations));
+        context_sha256.update(bytemuck::cast_slice::<u64, u8>(&feature_permutations));
+        Ok(StaticContextMetadata {
+            model_sha256,
+            context_sha256: context_sha256.finalize().into(),
+            ensemble_count: b,
+            training_rows: n,
+            feature_count: h,
+            class_count,
+            class_permutations,
+            feature_permutations,
+        })
+    }
+
+    /// Build every estimator's keys and values on the CPU, in the order of
+    /// [`context_tensors`].
+    fn build_tensors_cpu(
+        &self,
+        (b, n, h): (usize, usize, usize),
+        x: &[f32],
+        y_train: &[f32],
+    ) -> Result<Vec<StaticContextTensor>> {
+        let streams = h + RESERVED;
+        let column_elements = HEADS * INDUCING * 16;
+        // The context is the one allocation that grows with N x B; running
+        // out of memory for it is an error, not an abort.
+        let reserve = |capacity: usize| -> Result<KeyValue> {
+            let (mut keys, mut values) = (Vec::new(), Vec::new());
+            for buffer in [&mut keys, &mut values] {
+                buffer.try_reserve_exact(capacity).map_err(|_| {
+                    Error::InvalidArgument(format!("not enough memory for a {b} x {n} x {h} context"))
+                })?;
+            }
+            Ok((keys, values))
+        };
+        let mut column = (0..3)
+            .map(|_| reserve(b * streams * column_elements))
+            .collect::<Result<Vec<_>>>()?;
+        let mut icl = (0..12)
+            .map(|_| reserve(b * n * ICL_DIM))
+            .collect::<Result<Vec<_>>>()?;
+        // Build as many estimators at once as fit the budget, and at least
+        // one: a large context runs serially instead of failing. The estimate
+        // is 2-3x the measured peak, so the budget is four activation limits.
+        // Equal groups keep the last one from running alone.
+        let fit = (4 * MAX_ACTIVATION_ELEMENTS / request_activation_elements(1, n, h, n)?.max(1)).clamp(1, b);
+        let group = b.div_ceil(b.div_ceil(fit));
+        for members in (0..b).collect::<Vec<_>>().chunks(group) {
+            let estimators: Vec<EstimatorCaches> = members
+                .par_iter()
+                .map(|&ensemble| {
+                    let x = &x[ensemble * n * h..][..n * h];
+                    let labels = &y_train[ensemble * n..][..n];
+                    let (columns, feature_caches) = self.column_embeddings(x, labels, n, h, n, true)?;
+                    let rows = self.row_embeddings(&columns, n, streams)?;
+                    let mut caches = Vec::with_capacity(12);
+                    self.icl_rows(rows, labels, n, n, Some(&mut caches))?;
+                    // Per block, every feature's keys and values in feature order.
+                    let column = (0..3)
+                        .map(|block| {
+                            let keys = feature_caches
+                                .iter()
+                                .flat_map(|caches| caches[block].0.iter().copied());
+                            let values = feature_caches
+                                .iter()
+                                .flat_map(|caches| caches[block].1.iter().copied());
+                            (keys.collect(), values.collect())
+                        })
+                        .collect();
+                    Ok((column, caches))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            for (column_caches, caches) in estimators {
+                for ((keys, values), (key, value)) in column.iter_mut().zip(column_caches) {
+                    // The cached path never reads the reserved CLS streams.
+                    keys.resize(keys.len() + RESERVED * column_elements, 0.0);
+                    values.resize(values.len() + RESERVED * column_elements, 0.0);
+                    keys.extend(key);
+                    values.extend(value);
+                }
+                for ((key, value), (keys, values)) in caches.into_iter().zip(&mut icl) {
+                    keys.extend(key);
+                    values.extend(value);
+                }
+            }
+        }
+        Ok(column
+            .into_iter()
+            .chain(icl)
+            .flat_map(|(keys, values)| [keys, values])
+            .zip(context_tensors(b, n, h))
+            .map(|(values, (name, dimensions))| StaticContextTensor {
+                name,
+                dimensions,
+                values,
+            })
+            .collect())
     }
 
     /// Execute the complete FP32 classifier forward graph without persistent caches.
@@ -1186,10 +1450,11 @@ impl StaticClassifierExecutor {
         }
         let qass_base_scales = (0..12)
             .map(|block| {
-                Self::build_qass_base_scale(
+                qass_base_scale(
                     &model,
                     &format!("icl_predictor.tf_icl.blocks.{block}.attn"),
                     context.metadata().training_rows,
+                    ICL_DIM,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
@@ -1241,7 +1506,7 @@ impl StaticClassifierExecutor {
             .thread_name(|index| format!("ironicl-affine-{index}"))
             .build()
             .map_err(|error| Error::InvalidArgument(format!("cannot create affine worker pool: {error}")))?;
-        Ok(Self {
+        Self {
             model,
             context,
             affine_pool: Arc::new(affine_pool),
@@ -1253,7 +1518,125 @@ impl StaticClassifierExecutor {
             bf16_dense_compensation,
             attention_backend: crate::kernels::native::attention_backend(),
             sparse_attention_stats: Arc::new(SparseAttentionStats::default()),
-        })
+            #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+            gpu: None,
+        }
+        .with_gpu()
+    }
+
+    /// Build the context's GPU predict graph when Metal is available. Packed
+    /// contexts and contexts with mixed ICL storage stay on the CPU.
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    fn with_gpu(mut self) -> Result<Self> {
+        if self.context.has_packed_icl_keys() {
+            return Ok(self);
+        }
+        let model = &self.model;
+        let weights = |name: &str| model.tensor(name);
+        let Some(gpu_weights) = model.gpu_weights() else {
+            return Ok(self);
+        };
+        let column = |kind: &str| -> Option<Vec<&[f32]>> {
+            (0..3)
+                .map(|block| {
+                    self.context
+                        .tensor(&format!("column.{block}.{kind}"))?
+                        .fp32_values()
+                })
+                .collect()
+        };
+        // ICL caches in whatever type the context stores, as raw bytes.
+        let icl = |kind: &str| -> Option<(Vec<&[u8]>, crate::static_context::TensorStorage)> {
+            use crate::static_context::TensorStorage;
+            let mut storage = None;
+            let blocks = (0..12)
+                .map(|block| {
+                    let (bytes, block_storage) =
+                        match self.context.tensor(&format!("icl.{block}.{kind}"))?.data {
+                            StaticContextTensorData::Fp32(values) => {
+                                (bytemuck::cast_slice(values), TensorStorage::Fp32)
+                            }
+                            StaticContextTensorData::F16(values) => {
+                                (bytemuck::cast_slice(values), TensorStorage::F16)
+                            }
+                            StaticContextTensorData::Bf16(values) => {
+                                (bytemuck::cast_slice(values), TensorStorage::Bf16)
+                            }
+                        };
+                    (*storage.get_or_insert(block_storage) == block_storage).then_some(bytes)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Some((blocks, storage?))
+        };
+        let (
+            Some((keys, icl_storage)),
+            Some((values, value_storage)),
+            Some(column_keys),
+            Some(column_values),
+        ) = (icl("key"), icl("value"), column("key"), column("value"))
+        else {
+            return Ok(self);
+        };
+        if icl_storage != value_storage {
+            return Ok(self);
+        }
+        let metadata = self.context.metadata();
+        let predict = crate::metal::PredictGraph::new(
+            &gpu_weights,
+            &weights,
+            crate::metal::Shape {
+                ensembles: metadata.ensemble_count,
+                features: metadata.feature_count,
+                training_rows: metadata.training_rows,
+            },
+            &column_keys,
+            &column_values,
+            (&keys, &values, icl_storage),
+            &self.qass_base_scales,
+            self.context.page_aligned_storage().is_some(),
+        )?;
+        self.gpu = Some(Arc::new(GpuContext {
+            predict,
+            _storage: self.context.page_aligned_storage().cloned(),
+        }));
+        Ok(self)
+    }
+
+    #[cfg(not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")))]
+    #[allow(clippy::unnecessary_wraps)]
+    fn with_gpu(self) -> Result<Self> {
+        Ok(self)
+    }
+
+    /// Run every stage for every estimator on the GPU in one graph run. The
+    /// CPU only groups each feature with its neighbors. Returns false, with nothing written,
+    /// when a grouped triple is the all-missing marker that only the CPU path
+    /// handles.
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    fn predict_logits_gpu(
+        &self,
+        gpu: &GpuContext,
+        request: ClassifierQueryRequest<'_>,
+        values: &mut [f32],
+    ) -> Result<bool> {
+        let metadata = self.context.metadata();
+        let (q, h, classes) = (request.query_rows(), metadata.feature_count, metadata.class_count);
+        let x = request.x();
+        let Some(logits) = gpu.predict.run(q, |input, stride| {
+            input
+                .chunks_exact_mut(h * stride * 3)
+                .enumerate()
+                .all(|(ensemble, input)| {
+                    crate::metal::group_features_into(&x[ensemble * q * h..][..q * h], (q, h), stride, input)
+                })
+        })?
+        else {
+            return Ok(false);
+        };
+        for (output, logits) in values.chunks_exact_mut(classes).zip(logits.chunks_exact(10)) {
+            output.copy_from_slice(&logits[..classes]);
+        }
+        Ok(true)
     }
 
     /// Reset sparse-attention decisions collected by this executor.
@@ -1287,11 +1670,59 @@ impl StaticClassifierExecutor {
                 metadata.feature_count
             )));
         }
-        let plan = static_execution_plan(metadata.ensemble_count, executor_threads());
-        let layer_major = metadata.ensemble_count > 1 && std::env::var_os("IRONICL_LAYER_MAJOR").is_some();
-        admit_static_request(
+        let (b, q, h, classes) = (
             metadata.ensemble_count,
             request.query_rows(),
+            metadata.feature_count,
+            metadata.class_count,
+        );
+        // Rows are independent, so a large query runs in chunks that fit the
+        // activation budget. Only a single row that does not fit is an error.
+        let mut rows = q.min(QUERY_CHUNK_ROWS);
+        while let Err(error) = self.admit_query(rows) {
+            if rows == 1 {
+                return Err(error);
+            }
+            rows /= 2;
+        }
+        if rows == q {
+            return self.predict_chunk(request);
+        }
+        let mut values = vec![0.0; checked_product(&[b, q, classes], "static classifier output")?];
+        let mut x = Vec::with_capacity(checked_product(&[b, rows, h], "query chunk")?);
+        for start in (0..q).step_by(rows) {
+            let len = rows.min(q - start);
+            x.clear();
+            for ensemble in 0..b {
+                x.extend_from_slice(&request.x()[(ensemble * q + start) * h..][..len * h]);
+            }
+            let logits = self.predict_chunk(ClassifierQueryRequest::new(b, len, h, &x)?)?;
+            for (ensemble, chunk) in logits.values.chunks_exact(len * classes).enumerate() {
+                values[(ensemble * q + start) * classes..][..len * classes].copy_from_slice(chunk);
+            }
+        }
+        Ok(ClassifierLogits {
+            shape: [b, q, classes],
+            values,
+        })
+    }
+
+    /// The execution plan, and whether `IRONICL_LAYER_MAJOR` runs it one layer
+    /// at a time across estimators.
+    fn plan(&self) -> (ExecutionPlan, bool) {
+        let ensembles = self.context.metadata().ensemble_count;
+        (
+            static_execution_plan(ensembles, executor_threads()),
+            ensembles > 1 && std::env::var_os("IRONICL_LAYER_MAJOR").is_some(),
+        )
+    }
+
+    fn admit_query(&self, rows: usize) -> Result<()> {
+        let metadata = self.context.metadata();
+        let (plan, layer_major) = self.plan();
+        admit_static_request(
+            metadata.ensemble_count,
+            rows,
             metadata.feature_count,
             metadata.class_count,
             if layer_major || plan.flat_pool_ensembles {
@@ -1299,20 +1730,29 @@ impl StaticClassifierExecutor {
             } else {
                 plan.ensemble_workers
             },
-        )?;
-        let output_elements = checked_product(
-            &[
-                metadata.ensemble_count,
-                request.query_rows(),
-                metadata.class_count,
-            ],
-            "static classifier output",
-        )?;
-        let mut values = vec![0.0; output_elements];
+        )
+    }
+
+    /// Run one query chunk that [`Self::admit_query`] accepted.
+    fn predict_chunk(&self, request: ClassifierQueryRequest<'_>) -> Result<ClassifierLogits> {
+        let metadata = self.context.metadata();
+        let (plan, layer_major) = self.plan();
+        let shape = [
+            metadata.ensemble_count,
+            request.query_rows(),
+            metadata.class_count,
+        ];
+        let mut values = vec![0.0; checked_product(&shape, "static classifier output")?];
         let ensemble_output_elements = checked_product(
             &[request.query_rows(), metadata.class_count],
             "static ensemble output",
         )?;
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        if let Some(gpu) = &self.gpu
+            && self.predict_logits_gpu(gpu, request, &mut values)?
+        {
+            return Ok(ClassifierLogits { shape, values });
+        }
         if layer_major {
             self.predict_layer_major(request, plan.inner_workers, &mut values)?;
         } else if plan.ensemble_workers == 1 {
@@ -1358,14 +1798,7 @@ impl StaticClassifierExecutor {
                 Ok(())
             })?;
         }
-        Ok(ClassifierLogits {
-            shape: [
-                metadata.ensemble_count,
-                request.query_rows(),
-                metadata.class_count,
-            ],
-            values,
-        })
+        Ok(ClassifierLogits { shape, values })
     }
 
     fn predict_layer_major(
@@ -1858,6 +2291,24 @@ impl StaticClassifierExecutor {
                         )?;
                     }
                 }
+                // Only queries the GPU hands back reach this: widen the
+                // block's FP16 caches and run the FP32 kernel.
+                (StaticContextTensorData::F16(key), StaticContextTensorData::F16(value)) => {
+                    let widen =
+                        |values: &[u16]| values.iter().map(|&bits| f16_to_f32(bits)).collect::<Vec<_>>();
+                    parallel_cached_attention(
+                        self.attention_backend,
+                        &q_heads,
+                        q_rows,
+                        &widen(key),
+                        &widen(value),
+                        source_rows,
+                        head_dim,
+                        self.context.has_packed_icl_keys(),
+                        &mut attended,
+                        workers,
+                    )?;
+                }
                 _ => {
                     return Err(Error::Artifact(
                         "static context attention K/V dtypes do not match".into(),
@@ -2150,7 +2601,9 @@ impl StaticClassifierExecutor {
         workers: usize,
     ) -> Result<()> {
         let workers = workers.min(self.affine_pool.current_num_threads()).min(rows);
-        if workers <= 1 || rows < 16 {
+        // Apple Silicon always returns here: fewer than 16 rows run on one
+        // thread, and more run as one Accelerate `sgemm`.
+        if workers <= 1 || rows < 16 || crate::kernels::native::affine_uses_sgemm(rows) {
             return affine_f32(input, rows, input_dim, weight, bias, output_dim, output);
         }
         let rows_per_job = rows.div_ceil(workers);
@@ -2910,33 +3363,42 @@ impl StaticClassifierExecutor {
         packed.insert(name, affine);
         Ok(())
     }
+}
 
-    #[allow(clippy::cast_precision_loss)]
-    fn build_qass_base_scale(model: &ClassifierExecutor, prefix: &str, source: usize) -> Result<Vec<f32>> {
-        let name = |part: &str| format!("{prefix}.ssmax_layer.{part}");
-        let first_weight = model.tensor(&name("base_mlp.0.weight"))?;
-        let first_bias = model.tensor(&name("base_mlp.0.bias"))?;
-        let second_weight = model.tensor(&name("base_mlp.2.weight"))?;
-        let second_bias = model.tensor(&name("base_mlp.2.bias"))?;
-        let log_source = (source.max(1) as f32).ln();
-        let mut hidden = [0.0; 64];
-        for index in 0..64 {
-            let value = first_weight[index].mul_add(log_source, first_bias[index]);
-            hidden[index] = 0.5 * value * (1.0 + libm::erff(value / core::f32::consts::SQRT_2));
-        }
-        let mut scale = vec![0.0; HEADS * 64];
-        affine_f32(
-            &hidden,
-            1,
-            64,
-            second_weight,
-            Some(second_bias),
-            HEADS * 64,
-            &mut scale,
-        )?;
-        Ok(scale)
+/// `QASSMax` base scales for `source` keys: `[heads * head_dim]`, the same for
+/// every query, so they are computed once per source length.
+#[allow(clippy::cast_precision_loss)] // ln(source) needs no more precision.
+fn qass_base_scale(
+    model: &ClassifierExecutor,
+    prefix: &str,
+    source: usize,
+    width: usize,
+) -> Result<Vec<f32>> {
+    let name = |part: &str| format!("{prefix}.ssmax_layer.{part}");
+    let first_weight = model.tensor(&name("base_mlp.0.weight"))?;
+    let first_bias = model.tensor(&name("base_mlp.0.bias"))?;
+    let second_weight = model.tensor(&name("base_mlp.2.weight"))?;
+    let second_bias = model.tensor(&name("base_mlp.2.bias"))?;
+    let log_source = (source.max(1) as f32).ln();
+    let mut hidden = [0.0; 64];
+    for index in 0..64 {
+        let value = first_weight[index].mul_add(log_source, first_bias[index]);
+        hidden[index] = 0.5 * value * (1.0 + libm::erff(value / core::f32::consts::SQRT_2));
     }
+    let mut scale = vec![0.0; width];
+    affine_f32(
+        &hidden,
+        1,
+        64,
+        second_weight,
+        Some(second_bias),
+        width,
+        &mut scale,
+    )?;
+    Ok(scale)
+}
 
+impl StaticClassifierExecutor {
     #[allow(clippy::cast_precision_loss)]
     fn qass(
         &self,
@@ -2993,6 +3455,19 @@ impl StaticClassifierExecutor {
             }
         }
         Ok(())
+    }
+}
+
+/// IEEE half-precision bits as `f32`, exactly. `f16` is not stable Rust yet.
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
+    let exponent = (bits >> 10) & 0x1f;
+    let mantissa = f32::from(bits & 0x3ff);
+    sign * match exponent {
+        0 => mantissa * (-24.0_f32).exp2(),
+        31 if mantissa == 0.0 => f32::INFINITY,
+        31 => f32::NAN,
+        _ => (1.0 + mantissa / 1024.0) * (f32::from(exponent) - 15.0).exp2(),
     }
 }
 
@@ -3108,6 +3583,27 @@ fn model_hash_matches(model_hash: &[u8], context_hash: &[u8; 32]) -> bool {
     model_hash == crate::model_artifact::encode_sha256(context_hash).as_bytes()
 }
 
+/// A context's cache tensors in order: each column block's key and value as
+/// `[B, H + 4, 8, 128, 16]`, then each ICL block's as `[B, 8, N, 64]`.
+fn context_tensors(b: usize, n: usize, h: usize) -> Vec<(String, Vec<u64>)> {
+    let dimensions = |values: &[usize]| values.iter().map(|&value| value as u64).collect::<Vec<_>>();
+    [
+        (
+            "column",
+            3,
+            dimensions(&[b, h + RESERVED, HEADS, INDUCING, COLUMN_DIM / HEADS]),
+        ),
+        ("icl", 12, dimensions(&[b, HEADS, n, ICL_DIM / HEADS])),
+    ]
+    .into_iter()
+    .flat_map(|(stage, blocks, dimensions)| {
+        (0..blocks).flat_map(move |block| {
+            ["key", "value"].map(|kind| (format!("{stage}.{block}.{kind}"), dimensions.clone()))
+        })
+    })
+    .collect()
+}
+
 fn validate_static_cache_contract(context: &StaticContextArtifact) -> Result<()> {
     let metadata = context.metadata();
     if !(2..=10).contains(&metadata.class_count) {
@@ -3116,33 +3612,19 @@ fn validate_static_cache_contract(context: &StaticContextArtifact) -> Result<()>
             metadata.class_count
         )));
     }
-    for (stage, layers, sources, head_dim) in
-        [("column", 3, 128, 16), ("icl", 12, metadata.training_rows, 64)]
-    {
-        for layer in 0..layers {
-            for kind in ["key", "value"] {
-                let name = format!("{stage}.{layer}.{kind}");
-                let tensor = context.tensor(&name).ok_or_else(|| {
-                    Error::Artifact(format!("static context cache tensor '{name}' is missing"))
-                })?;
-                let expected_shape = if stage == "column" {
-                    vec![
-                        metadata.ensemble_count as u64,
-                        (metadata.feature_count + RESERVED) as u64,
-                        8,
-                        sources as u64,
-                        head_dim,
-                    ]
-                } else {
-                    vec![metadata.ensemble_count as u64, 8, sources as u64, head_dim]
-                };
-                if tensor.dimensions != expected_shape {
-                    return Err(Error::Artifact(format!(
-                        "static context cache tensor '{name}' has shape {:?}; expected {:?}",
-                        tensor.dimensions, expected_shape
-                    )));
-                }
-            }
+    for (name, expected_shape) in context_tensors(
+        metadata.ensemble_count,
+        metadata.training_rows,
+        metadata.feature_count,
+    ) {
+        let tensor = context
+            .tensor(&name)
+            .ok_or_else(|| Error::Artifact(format!("static context cache tensor '{name}' is missing")))?;
+        if tensor.dimensions != expected_shape {
+            return Err(Error::Artifact(format!(
+                "static context cache tensor '{name}' has shape {:?}; expected {expected_shape:?}",
+                tensor.dimensions
+            )));
         }
     }
     validate_sparse_index_contract(context)
@@ -3158,6 +3640,9 @@ fn executor_threads() -> usize {
                 .filter(|threads| *threads > 0)
                 .unwrap_or(1);
         }
+        if let Some(cores) = performance_cores() {
+            return cores;
+        }
         let logical = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
         if cfg!(target_arch = "x86_64") {
             logical.div_ceil(2)
@@ -3165,6 +3650,44 @@ fn executor_threads() -> usize {
             logical
         }
     })
+}
+
+/// Performance-core count on Apple Silicon. Using only these cores keeps workers off
+/// the efficiency cores, and on an M1 Max (8 + 2 cores) it lets 8 estimators
+/// run in parallel instead of one at a time with each split 10 ways.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[allow(unsafe_code)] // One libSystem call; std has no portable equivalent.
+fn performance_cores() -> Option<usize> {
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const std::ffi::c_char,
+            value: *mut std::ffi::c_void,
+            length: *mut usize,
+            new_value: *const std::ffi::c_void,
+            new_length: usize,
+        ) -> i32;
+    }
+    let mut cores = 0_i32;
+    let mut length = std::mem::size_of::<i32>();
+    // SAFETY: the name is NUL-terminated and `cores` holds `length` bytes.
+    let status = unsafe {
+        sysctlbyname(
+            c"hw.perflevel0.physicalcpu".as_ptr(),
+            (&raw mut cores).cast(),
+            &raw mut length,
+            std::ptr::null(),
+            0,
+        )
+    };
+    (status == 0 && length == std::mem::size_of::<i32>())
+        .then(|| usize::try_from(cores).ok())
+        .flatten()
+        .filter(|cores| *cores > 0)
+}
+
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+const fn performance_cores() -> Option<usize> {
+    None
 }
 
 fn cached_attention_key_tile_rows() -> usize {
@@ -3738,6 +4261,16 @@ fn checked_product(values: &[usize], name: &'static str) -> Result<usize> {
 /// The executor processes ensembles sequentially. The estimates intentionally retain
 /// all operands that can coexist during each stage rather than assuming allocator reuse.
 fn admit_request(b: usize, t: usize, h: usize, n: usize) -> Result<()> {
+    if request_activation_elements(b, t, h, n)? > MAX_ACTIVATION_ELEMENTS {
+        return Err(Error::InvalidArgument(format!(
+            "request exceeds the uncached scalar activation limit of {MAX_ACTIVATION_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// The FP32 activation elements that [`admit_request`] checks.
+fn request_activation_elements(b: usize, t: usize, h: usize, n: usize) -> Result<usize> {
     let streams = h
         .checked_add(RESERVED)
         .ok_or(Error::ArithmeticOverflow("column streams"))?;
@@ -3779,14 +4312,7 @@ fn admit_request(b: usize, t: usize, h: usize, n: usize) -> Result<()> {
         ],
         "ICL activation peak",
     )?;
-    let activation_peak = checked_sum(&[output, column_peak, row_peak, icl_peak], "activation peak")?;
-    if activation_peak > MAX_ACTIVATION_ELEMENTS {
-        return Err(Error::InvalidArgument(format!(
-            "request exceeds the uncached scalar activation limit of {MAX_ACTIVATION_BYTES} bytes"
-        )));
-    }
-
-    Ok(())
+    checked_sum(&[output, column_peak, row_peak, icl_peak], "activation peak")
 }
 
 fn admit_static_request(
@@ -4303,5 +4829,25 @@ mod tests {
     fn admission_rejects_huge_dimensions_without_input_allocation() {
         assert!(admit_request(1, 1_000_000, 1, 1).is_err());
         assert!(admit_request(1, usize::MAX, usize::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn widens_half_precision_exactly() {
+        for (bits, expected) in [
+            (0x3c00, 1.0),
+            (0xc000, -2.0),
+            (0x3555, 0.333_251_95),
+            (0x7bff, 65504.0),
+            (0x0001, 5.960_464_5e-8),
+            (0x0000, 0.0),
+            (0x7c00, f32::INFINITY),
+        ] {
+            assert_eq!(
+                super::f16_to_f32(bits).to_bits(),
+                f32::to_bits(expected),
+                "{bits:#06x}"
+            );
+        }
+        assert!(super::f16_to_f32(0x7e00).is_nan());
     }
 }
