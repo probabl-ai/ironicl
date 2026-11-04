@@ -62,7 +62,8 @@ Completed:
 
 Remaining:
 
-- fixed native preprocessing schema and implementation;
+- fixed native preprocessing schema and implementation
+  (see [native-preprocessing.md](native-preprocessing.md));
 - representation-cache execution;
 - no steady-state allocations.
 
