@@ -208,10 +208,6 @@ mod accelerate {
             c: *mut f32,
             ldc: i32,
         );
-    }
-
-    #[link(name = "Accelerate", kind = "framework")]
-    unsafe extern "C" {
         fn vvexpf(output: *mut f32, input: *const f32, count: *const i32);
         fn vDSP_maxv(input: *const f32, stride: isize, output: *mut f32, count: usize);
         fn vDSP_vsadd(
@@ -254,16 +250,15 @@ mod accelerate {
         assert!(query.len() >= heads * q_rows * head_dim && output.len() >= heads * q_rows * head_dim);
         assert!(key.len() >= heads * source_rows * head_dim && value.len() >= heads * source_rows * head_dim);
         let scale = (head_dim as f32).sqrt().recip();
-        let tile_rows = ATTENTION_TILE;
-        let mut scores = vec![0.0_f32; q_rows.min(tile_rows) * source_rows];
-        let mut sums = vec![0.0_f32; q_rows.min(tile_rows)];
+        let mut scores = vec![0.0_f32; q_rows.min(ATTENTION_TILE) * source_rows];
+        let mut sums = vec![0.0_f32; q_rows.min(ATTENTION_TILE)];
         for head in 0..heads {
             let query = &query[head * q_rows * head_dim..];
             let key = &key[head * source_rows * head_dim..];
             let value = &value[head * source_rows * head_dim..];
             let output = &mut output[head * q_rows * head_dim..];
-            for start in (0..q_rows).step_by(tile_rows) {
-                let rows = (q_rows - start).min(tile_rows);
+            for start in (0..q_rows).step_by(ATTENTION_TILE) {
+                let rows = (q_rows - start).min(ATTENTION_TILE);
                 let scores = &mut scores[..rows * source_rows];
                 let tile = i32::try_from(rows).expect("tile rows fit i32");
                 // SAFETY: the assertions above keep every BLAS access inside the slices.
@@ -691,7 +686,7 @@ pub(crate) fn layer_norm_f32(
     bias: Option<&[f32]>,
     output: &mut [f32],
 ) -> bool {
-    layer_norm_for_target(input, rows, width, weight, bias, output)
+    width.is_multiple_of(16) && layer_norm_for_target(input, rows, width, weight, bias, output)
 }
 
 /// Calculate FP32 `LayerNorm` row means and inverse standard deviations.
@@ -2459,7 +2454,7 @@ fn layer_norm_for_target(
     bias: Option<&[f32]>,
     output: &mut [f32],
 ) -> bool {
-    if width.is_multiple_of(16) && std::is_x86_feature_detected!("avx512f") {
+    if std::is_x86_feature_detected!("avx512f") {
         unsafe { layer_norm_avx512(input, rows, width, weight, bias, output) }
         true
     } else {
@@ -2492,10 +2487,9 @@ fn layer_norm_for_target(
     bias: Option<&[f32]>,
     output: &mut [f32],
 ) -> bool {
-    if !width.is_multiple_of(16) {
-        return false;
-    }
-    // Advanced SIMD is mandatory for AArch64.
+    // SAFETY: NEON is mandatory on AArch64. `layer_norm_f32` checked
+    // `width % 16 == 0`, and its caller that `input` and `output` hold
+    // `rows * width` values and `weight` and `bias` hold `width`.
     unsafe { layer_norm_neon(input, rows, width, weight, bias, output) }
     true
 }
@@ -2543,7 +2537,11 @@ unsafe fn layer_norm_neon(
                     *square = vfmaq_f32(*square, centered, centered);
                 }
             }
-            let scale = vdupq_n_f32((reduce(squares) / width as f32 + 1e-5_f32).sqrt().recip());
+            let scale = vdupq_n_f32(
+                (reduce(squares) / width as f32 + super::reference::LAYER_NORM_EPSILON)
+                    .sqrt()
+                    .recip(),
+            );
             for column in (0..width).step_by(4) {
                 let normalized = vmulq_f32(vsubq_f32(vld1q_f32(input.add(column)), mean_vector), scale);
                 let mut result = vmulq_f32(normalized, vld1q_f32(weight.as_ptr().add(column)));
@@ -2945,12 +2943,13 @@ fn affine_for_target(
     output_dim: usize,
     output: &mut [f32],
 ) -> bool {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(target_os = "macos")]
     if affine_uses_sgemm(rows) && accelerate::affine(input, rows, input_dim, weight, bias, output_dim, output)
     {
         return true;
     }
-    // Advanced SIMD is mandatory for AArch64, including Apple Silicon.
+    // SAFETY: NEON is mandatory on AArch64, including Apple Silicon; the
+    // caller validated every slice length.
     unsafe {
         affine_neon(input, rows, input_dim, weight, bias, output_dim, output);
     }
@@ -4425,13 +4424,14 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
     fn sine_values(count: usize, seed: f32) -> Vec<f32> {
         (0..count).map(|i| ((i as f32 + seed) * 0.37).sin()).collect()
     }
 
     /// Run `kernel` on `[heads, rows, head_dim]` inputs and compare it with a
     /// plain softmax attention loop.
-    #[allow(dead_code)] // Unused on targets without a fast attention kernel.
+    #[cfg(target_arch = "aarch64")]
     fn assert_attention_matches_naive(
         (heads, q_rows, source_rows, head_dim): (usize, usize, usize, usize),
         kernel: impl Fn(&[f32], &[f32], &[f32], &mut [f32]) -> bool,

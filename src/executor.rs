@@ -2601,6 +2601,8 @@ impl StaticClassifierExecutor {
         workers: usize,
     ) -> Result<()> {
         let workers = workers.min(self.affine_pool.current_num_threads()).min(rows);
+        // Apple Silicon always returns here: fewer than 16 rows run on one
+        // thread, and more run as one Accelerate `sgemm`.
         if workers <= 1 || rows < 16 || crate::kernels::native::affine_uses_sgemm(rows) {
             return affine_f32(input, rows, input_dim, weight, bias, output_dim, output);
         }
