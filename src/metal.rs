@@ -50,7 +50,7 @@ const FLOAT: MPSDataType = MPSDataType::Float32;
 type Tensor = Retained<MPSGraphTensor>;
 type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
 type Weights<'w, 'a> = dyn Fn(&str) -> Result<&'a [f32]> + 'w;
-/// A graph input or output: its tensor, buffer, and shape.
+/// A graph input or output: its tensor, buffer, shape, and data type.
 type Binding = (Tensor, Buffer, Vec<isize>, MPSDataType);
 
 fn shape(dimensions: &[isize]) -> Retained<MPSShape> {
@@ -395,7 +395,7 @@ impl<'w, 'a> Builder<'w, 'a> {
     }
 
     /// `input @ weight^T + bias` for a `[outputs, inputs]` weight stored under
-    /// `key`, optionally a row range `rows` of a larger weight.
+    /// `key`, or for block `part` of a weight that stacks several of them.
     fn affine(
         &self,
         input: &Tensor,
@@ -810,7 +810,7 @@ impl PredictGraph {
         let icl_shape = [b, HEADS as isize, n, ICL_HEAD_DIM as isize];
         for block in 0..ICL_BLOCKS {
             let prefix = format!("icl_predictor.tf_icl.blocks.{block}");
-            // 16-bit caches are converted to FP32 on load; the math stays FP32.
+            // Attention runs in the caches' stored type.
             let key = builder.bound_typed(
                 gpu.tensor_buffer(icl_keys[block], page_aligned)?,
                 &icl_shape,

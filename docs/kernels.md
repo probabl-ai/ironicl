@@ -40,17 +40,18 @@ build on the CPU. The build graph runs as many estimators at once as fit Metal's
 recommended working set, at most 2.2 GB per estimator at 8192 x 54, in equal
 groups; `IRONICL_GPU_BUILD_BUDGET` sets the budget in bytes instead. Grouped
 contexts take one graph run per group and a copy into the context, and a
-context whose single estimator exceeds the budget builds on the CPU. Model weights live once per model in shared GPU buffers and are
-fed to the graphs as placeholders. The CPU only groups each feature with its
-neighbors and embeds labels, and keeps any request whose grouped inputs contain
-the all-missing marker. A GPU-built context writes its keys and values once into
-page-aligned memory that the CPU reads as tensors and the GPU wraps without
-copying; a CPU-built context is copied to the GPU once. `IRONICL_NO_METAL=1`
-disables the GPU. Graphs compile at `MPSGraph` optimization level 0: level 1 was
-no faster, and its pass that places operations on the Neural Engine or CPU printed
-"Failed to import MPS module" on every compile. Under `optimize="auto"` or
-`"fast"`, the build graph stores the ICL keys and values in FP16, and both graphs
-run ICL attention in FP16, converting only the queries. Converting the stored FP16
+context whose single estimator exceeds the budget builds on the CPU. Model
+weights live once per model in shared GPU buffers and are fed to the graphs as
+placeholders. The CPU only groups each feature with its neighbors and embeds
+labels, and keeps any request whose grouped inputs contain the all-missing
+marker. A GPU-built context writes its keys and values once into page-aligned
+memory that the CPU reads as tensors and the GPU wraps without copying; a
+CPU-built context is copied to the GPU once. `IRONICL_NO_METAL=1` disables the
+GPU. Graphs compile at `MPSGraph` optimization level 0: level 1 was no faster,
+and its pass that places operations on the Neural Engine or CPU printed "Failed
+to import MPS module" on every compile. Under `optimize="auto"` or `"fast"`, the
+build graph stores the ICL keys and values in FP16, and both graphs run ICL
+attention in FP16, converting only the queries. Converting the stored FP16
 caches to FP32 inside the graph instead wrote a full FP32 copy on every run and
 was slower. BF16 measured slower and less accurate than FP16 on an M1 Max, and
 FP16 column and row attention added error without saving time.

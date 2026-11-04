@@ -153,7 +153,7 @@ enum StaticContextStorage {
 )] // Metal only.
 pub(crate) const TENSOR_PAGE_BYTES: usize = 16 * 1024;
 
-/// FP32 tensors being written into page-aligned anonymous memory, for
+/// FP32, FP16, or BF16 tensors being written into page-aligned anonymous memory, for
 /// [`StaticContextArtifact::from_page_aligned`].
 #[cfg_attr(
     not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
@@ -902,7 +902,7 @@ impl StaticContextArtifact {
         for (name, tensor) in &self.tensors {
             let StaticContextTensorData::Fp32(values) = self.tensor_data(tensor) else {
                 return Err(artifact_error(
-                    "cannot encode BF16 tensor as a version 1 artifact",
+                    "cannot encode a BF16 or FP16 tensor as a version 1 artifact",
                 ));
             };
             pad_to_alignment(&mut payload, TENSOR_ALIGNMENT)?;
