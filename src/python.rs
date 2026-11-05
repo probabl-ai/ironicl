@@ -85,6 +85,20 @@ impl Model {
         .map(Context)
         .map_err(py_error)
     }
+
+    /// The source-checkpoint SHA-256 that identifies this model.
+    #[getter]
+    fn source_sha256(&self) -> String {
+        self.0.source_sha256().to_owned()
+    }
+
+    /// Load a persisted static context for this model from `path`. `threads` maps
+    /// `n_jobs` to the executor thread count, like `build_context`.
+    fn load_context(&self, py: Python<'_>, path: PathBuf, threads: Option<usize>) -> PyResult<Context> {
+        py.detach(|| self.0.load_context(&path, threads))
+            .map(Context)
+            .map_err(py_error)
+    }
 }
 
 /// A fitted training context. Prediction runs only the query rows.
@@ -120,6 +134,12 @@ impl Context {
             PyBytes::new(py, bytemuck::cast_slice(probabilities.values())),
             probabilities.shape(),
         ))
+    }
+
+    /// Write this fitted context to `path` atomically, for reuse through
+    /// `Model.load_context`.
+    fn save(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
+        py.detach(|| self.0.save_context(&path)).map_err(py_error)
     }
 }
 
