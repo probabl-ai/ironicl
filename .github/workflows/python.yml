@@ -96,7 +96,10 @@ jobs:
     name: Live TabICL parity
     needs: standalone
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The live suite fits the real PyTorch TabICL across datasets and precision
+    # levels; it legitimately runs ~20-25 min, so give it headroom over a slow
+    # runner or HF download instead of cancelling mid-run.
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
