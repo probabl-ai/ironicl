@@ -22,8 +22,8 @@ use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    ClassifierQueryRequest, ClassifierRequest, Error, ModelArtifact, Result, StaticContextArtifact,
-    StaticContextMetadata, StaticContextTensor, StaticContextTensorData, StaticQueryBundle,
+    Error, ModelArtifact, QueryRequest, Request, Result, StaticContextArtifact, StaticContextMetadata,
+    StaticContextTensor, StaticContextTensorData, StaticQueryBundle,
     execution_plan::ExecutionPlan,
     kernels::{
         native::{
@@ -112,7 +112,7 @@ impl Bf16DensePolicy {
 
 /// Owned classifier logits in row-major `[B, test_rows, C]` order.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ClassifierLogits {
+pub struct DecoderOutputs {
     shape: [usize; 3],
     values: Vec<f32>,
 }
@@ -192,12 +192,12 @@ impl ClassifierProbabilities {
 
 /// Owned FP32 values for a traced classifier stage in row-major order.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ClassifierTraceStage<const D: usize> {
+pub struct TraceStage<const D: usize> {
     shape: [usize; D],
     values: Vec<f32>,
 }
 
-impl<const D: usize> ClassifierTraceStage<D> {
+impl<const D: usize> TraceStage<D> {
     /// Stage dimensions in row-major order.
     #[must_use]
     pub fn shape(&self) -> [usize; D] {
@@ -216,40 +216,40 @@ impl<const D: usize> ClassifierTraceStage<D> {
 /// This diagnostic result retains all requested ensemble stage outputs. Use it
 /// only for small requests because it increases the activation memory needed.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ClassifierLogitsTrace {
-    column_embeddings: ClassifierTraceStage<4>,
-    row_representations: ClassifierTraceStage<3>,
-    decoder_logits: ClassifierTraceStage<3>,
-    logits: ClassifierLogits,
+pub struct ForwardTrace {
+    column_embeddings: TraceStage<4>,
+    row_representations: TraceStage<3>,
+    decoder_logits: TraceStage<3>,
+    logits: DecoderOutputs,
 }
 
-impl ClassifierLogitsTrace {
+impl ForwardTrace {
     /// Column embeddings with shape `[B, T, H + 4, 128]`.
     #[must_use]
-    pub fn column_embeddings(&self) -> &ClassifierTraceStage<4> {
+    pub fn column_embeddings(&self) -> &TraceStage<4> {
         &self.column_embeddings
     }
 
     /// Row representations with shape `[B, T, 512]`, before ICL label injection.
     #[must_use]
-    pub fn row_representations(&self) -> &ClassifierTraceStage<3> {
+    pub fn row_representations(&self) -> &TraceStage<3> {
         &self.row_representations
     }
 
     /// Decoder logits with shape `[B, T, 10]`, before test-row and class slicing.
     #[must_use]
-    pub fn decoder_logits(&self) -> &ClassifierTraceStage<3> {
+    pub fn decoder_logits(&self) -> &TraceStage<3> {
         &self.decoder_logits
     }
 
     /// Final prediction logits with shape `[B, test_rows, classes]`.
     #[must_use]
-    pub fn logits(&self) -> &ClassifierLogits {
+    pub fn logits(&self) -> &DecoderOutputs {
         &self.logits
     }
 }
 
-impl ClassifierLogits {
+impl DecoderOutputs {
     /// Output dimensions `[B, test_rows, C]`.
     #[must_use]
     pub fn shape(&self) -> [usize; 3] {
@@ -265,7 +265,7 @@ impl ClassifierLogits {
 
 /// Immutable, uncached executor for a validated official classifier artifact.
 #[derive(Debug, Clone)]
-pub struct ClassifierExecutor {
+pub struct Executor {
     model: Arc<ModelArtifact>,
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
     gpu_weights: Arc<OnceLock<Option<Arc<crate::metal::ModelWeights>>>>,
@@ -301,8 +301,8 @@ type ColumnStream = (usize, Vec<f32>, Vec<KeyValue>);
 /// It can return raw estimator logits in `[B, Q, C]` order or aggregate them
 /// into final class probabilities in `[Q, C]` order.
 #[derive(Debug, Clone)]
-pub struct StaticClassifierExecutor {
-    model: ClassifierExecutor,
+pub struct StaticExecutor {
+    model: Executor,
     context: StaticContextArtifact,
     affine_pool: Arc<ThreadPool>,
     column_input_weight: Arc<Vec<f32>>,
@@ -359,11 +359,11 @@ impl SparseAttentionStats {
 }
 
 enum PredictionResult {
-    Logits(ClassifierLogits),
-    Trace(ClassifierLogitsTrace),
+    Logits(DecoderOutputs),
+    Trace(ForwardTrace),
 }
 
-impl ClassifierExecutor {
+impl Executor {
     /// Take ownership of an exact-manifest validated classifier model.
     #[must_use]
     pub fn new(model: ModelArtifact) -> Self {
@@ -382,13 +382,9 @@ impl ClassifierExecutor {
     ///
     /// Returns an error if the file is unreadable or invalid, or if the context
     /// does not match this model's serving contract.
-    pub fn load_context(
-        &self,
-        path: &std::path::Path,
-        threads: Option<usize>,
-    ) -> Result<StaticClassifierExecutor> {
+    pub fn load_context(&self, path: &std::path::Path, threads: Option<usize>) -> Result<StaticExecutor> {
         let context = StaticContextArtifact::read_mapped_prefault(path)?;
-        StaticClassifierExecutor::with_executor(self.clone(), context, threads)
+        StaticExecutor::with_executor(self.clone(), context, threads)
     }
 
     /// The source-checkpoint SHA-256 that identifies this model.
@@ -584,24 +580,24 @@ impl ClassifierExecutor {
         feature_permutations: Vec<u64>,
         optimize: Optimize,
         threads: Option<usize>,
-    ) -> Result<StaticClassifierExecutor> {
+    ) -> Result<StaticExecutor> {
         let shape = (ensembles, training_rows, features);
         let metadata = self.context_metadata(shape, x, y_train, class_permutations, feature_permutations)?;
         #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
         if let Some(tensors) = self.build_tensors_gpu(shape, x, y_train, optimize)? {
             // The build graph checked every value on the GPU.
             let context = StaticContextArtifact::from_page_aligned(metadata, tensors)?;
-            return StaticClassifierExecutor::with_executor(self.clone(), context, threads);
+            return StaticExecutor::with_executor(self.clone(), context, threads);
         }
         // On a BF16-capable CPU, `fast` stores the ICL values in BF16 (FP32
         // keys, the retained serving layout); every other case is FP32.
         if optimize == Optimize::Fast && crate::kernels::native::bf16_storage_supported() {
             let tensors = self.build_tensors_cpu(shape, x, y_train)?;
             let context = StaticContextArtifact::from_page_aligned(metadata, bf16v_page_aligned(&tensors)?)?;
-            return StaticClassifierExecutor::with_executor(self.clone(), context, threads);
+            return StaticExecutor::with_executor(self.clone(), context, threads);
         }
         let context = StaticContextArtifact::new(metadata, self.build_tensors_cpu(shape, x, y_train)?)?;
-        StaticClassifierExecutor::with_executor(self.clone(), context, threads)
+        StaticExecutor::with_executor(self.clone(), context, threads)
     }
 
     /// Validate a context's inputs and describe it: model and content hashes,
@@ -746,7 +742,7 @@ impl ClassifierExecutor {
     /// baseline activation memory or an
     /// unavailable validated model tensor. This uncached scalar executor is
     /// intended for small baseline runs, not 50K-row serving workloads.
-    pub fn predict_logits(&self, request: ClassifierRequest<'_>) -> Result<ClassifierLogits> {
+    pub fn predict_logits(&self, request: Request<'_>) -> Result<DecoderOutputs> {
         match self.predict_logits_inner(request, false)? {
             PredictionResult::Logits(logits) => Ok(logits),
             PredictionResult::Trace(_) => unreachable!("normal prediction cannot produce a trace"),
@@ -762,14 +758,14 @@ impl ClassifierExecutor {
     ///
     /// Returns the same errors as [`Self::predict_logits`], including a resource
     /// error when retained trace outputs exceed the activation limit.
-    pub fn predict_logits_with_trace(&self, request: ClassifierRequest<'_>) -> Result<ClassifierLogitsTrace> {
+    pub fn predict_logits_with_trace(&self, request: Request<'_>) -> Result<ForwardTrace> {
         match self.predict_logits_inner(request, true)? {
             PredictionResult::Logits(_) => unreachable!("traced prediction must produce a trace"),
             PredictionResult::Trace(trace) => Ok(trace),
         }
     }
 
-    fn predict_logits_inner(&self, request: ClassifierRequest<'_>, trace: bool) -> Result<PredictionResult> {
+    fn predict_logits_inner(&self, request: Request<'_>, trace: bool) -> Result<PredictionResult> {
         let (b, t, h, n) = (
             request.ensemble_count(),
             request.total_rows(),
@@ -807,22 +803,22 @@ impl ClassifierExecutor {
                 values.extend_from_slice(&logits[row * 10..][..classes]);
             }
         }
-        let logits = ClassifierLogits {
+        let logits = DecoderOutputs {
             shape: [b, test, classes],
             values,
         };
         match (column_values, row_values, decoder_values) {
             (Some(column_embeddings), Some(row_representations), Some(decoder_logits)) => {
-                Ok(PredictionResult::Trace(ClassifierLogitsTrace {
-                    column_embeddings: ClassifierTraceStage {
+                Ok(PredictionResult::Trace(ForwardTrace {
+                    column_embeddings: TraceStage {
                         shape: [b, t, h + RESERVED, COLUMN_DIM],
                         values: column_embeddings,
                     },
-                    row_representations: ClassifierTraceStage {
+                    row_representations: TraceStage {
                         shape: [b, t, ICL_DIM],
                         values: row_representations,
                     },
-                    decoder_logits: ClassifierTraceStage {
+                    decoder_logits: TraceStage {
                         shape: [b, t, 10],
                         values: decoder_logits,
                     },
@@ -1410,7 +1406,7 @@ impl ClassifierExecutor {
     }
 }
 
-impl StaticClassifierExecutor {
+impl StaticExecutor {
     /// Pair an official classifier model with its matching exact full-K/V context.
     ///
     /// # Errors
@@ -1418,10 +1414,10 @@ impl StaticClassifierExecutor {
     /// Returns an artifact error if the model identity, architecture, or required
     /// cache tensor names and shapes do not match the serving contract.
     pub fn new(model: ModelArtifact, context: StaticContextArtifact) -> Result<Self> {
-        Self::with_executor(ClassifierExecutor::new(model), context, None)
+        Self::with_executor(Executor::new(model), context, None)
     }
 
-    /// Write this context to `path` atomically, for reuse by [`ClassifierExecutor::load_context`].
+    /// Write this context to `path` atomically, for reuse by [`Executor::load_context`].
     ///
     /// # Errors
     ///
@@ -1432,7 +1428,7 @@ impl StaticClassifierExecutor {
 
     /// Pair a context with an executor whose model weights it shares.
     fn with_executor(
-        model: ClassifierExecutor,
+        model: Executor,
         context: StaticContextArtifact,
         threads: Option<usize>,
     ) -> Result<Self> {
@@ -1603,7 +1599,7 @@ impl StaticClassifierExecutor {
     fn predict_logits_gpu(
         &self,
         gpu: &GpuContext,
-        request: ClassifierQueryRequest<'_>,
+        request: QueryRequest<'_>,
         values: &mut [f32],
     ) -> Result<bool> {
         let metadata = self.context.metadata();
@@ -1643,7 +1639,7 @@ impl StaticClassifierExecutor {
     ///
     /// Returns an error when the query shape does not match the static context
     /// or a checked kernel cannot execute the request.
-    pub fn predict_logits(&self, request: ClassifierQueryRequest<'_>) -> Result<ClassifierLogits> {
+    pub fn predict_logits(&self, request: QueryRequest<'_>) -> Result<DecoderOutputs> {
         let metadata = self.context.metadata();
         if request.ensemble_count() != metadata.ensemble_count
             || request.feature_count() != metadata.feature_count
@@ -1683,12 +1679,12 @@ impl StaticClassifierExecutor {
             for ensemble in 0..b {
                 x.extend_from_slice(&request.x()[(ensemble * q + start) * h..][..len * h]);
             }
-            let logits = self.predict_chunk(ClassifierQueryRequest::new(b, len, h, &x)?)?;
+            let logits = self.predict_chunk(QueryRequest::new(b, len, h, &x)?)?;
             for (ensemble, chunk) in logits.values.chunks_exact(len * classes).enumerate() {
                 values[(ensemble * q + start) * classes..][..len * classes].copy_from_slice(chunk);
             }
         }
-        Ok(ClassifierLogits {
+        Ok(DecoderOutputs {
             shape: [b, q, classes],
             values,
         })
@@ -1716,7 +1712,7 @@ impl StaticClassifierExecutor {
     }
 
     /// Run one query chunk that [`Self::admit_query`] accepted.
-    fn predict_chunk(&self, request: ClassifierQueryRequest<'_>) -> Result<ClassifierLogits> {
+    fn predict_chunk(&self, request: QueryRequest<'_>) -> Result<DecoderOutputs> {
         let metadata = self.context.metadata();
         let plan = self.plan();
         let shape = [
@@ -1733,7 +1729,7 @@ impl StaticClassifierExecutor {
         if let Some(gpu) = &self.gpu
             && self.predict_logits_gpu(gpu, request, &mut values)?
         {
-            return Ok(ClassifierLogits { shape, values });
+            return Ok(DecoderOutputs { shape, values });
         }
         if plan.ensemble_workers == 1 {
             for (ensemble, output) in values.chunks_mut(ensemble_output_elements).enumerate() {
@@ -1778,12 +1774,12 @@ impl StaticClassifierExecutor {
                 Ok(())
             })?;
         }
-        Ok(ClassifierLogits { shape, values })
+        Ok(DecoderOutputs { shape, values })
     }
 
     fn predict_estimator(
         &self,
-        request: ClassifierQueryRequest<'_>,
+        request: QueryRequest<'_>,
         ensemble: usize,
         workers: usize,
         output: &mut [f32],
@@ -1800,7 +1796,7 @@ impl StaticClassifierExecutor {
 
     fn cached_frontend(
         &self,
-        request: ClassifierQueryRequest<'_>,
+        request: QueryRequest<'_>,
         ensemble: usize,
         workers: usize,
     ) -> Result<Vec<f32>> {
@@ -1829,7 +1825,7 @@ impl StaticClassifierExecutor {
     /// invalid softmax temperature.
     pub fn predict_probabilities(
         &self,
-        request: ClassifierQueryRequest<'_>,
+        request: QueryRequest<'_>,
         aggregation: ClassifierAggregation,
     ) -> Result<ClassifierProbabilities> {
         let logits = self.predict_logits(request)?;
@@ -1847,7 +1843,7 @@ impl StaticClassifierExecutor {
     /// the combined request exceeds the normal static-request admission limits.
     pub fn predict_probabilities_batch(
         &self,
-        requests: &[ClassifierQueryRequest<'_>],
+        requests: &[QueryRequest<'_>],
         aggregation: ClassifierAggregation,
     ) -> Result<Vec<ClassifierProbabilities>> {
         if requests.is_empty() {
@@ -1858,7 +1854,7 @@ impl StaticClassifierExecutor {
         let metadata = self.context.metadata();
         let (total_rows, packed) =
             pack_query_microbatch(requests, metadata.ensemble_count, metadata.feature_count)?;
-        let packed_request = ClassifierQueryRequest::new(
+        let packed_request = QueryRequest::new(
             metadata.ensemble_count,
             total_rows,
             metadata.feature_count,
@@ -1889,7 +1885,7 @@ impl StaticClassifierExecutor {
     ///
     /// Returns an error when the query references another model or static
     /// context, or when normal query execution fails.
-    pub fn predict_bundle(&self, query: &StaticQueryBundle) -> Result<ClassifierLogits> {
+    pub fn predict_bundle(&self, query: &StaticQueryBundle) -> Result<DecoderOutputs> {
         if query.model_sha256() != &self.context.metadata().model_sha256
             || query.context_sha256() != &self.context.metadata().context_sha256
         {
@@ -2936,7 +2932,7 @@ impl StaticClassifierExecutor {
         Ok(&values[offset..][..stream_elements])
     }
 
-    fn build_packed_f32_row_affines(model: &ClassifierExecutor) -> Result<BTreeMap<String, PackedF32Affine>> {
+    fn build_packed_f32_row_affines(model: &Executor) -> Result<BTreeMap<String, PackedF32Affine>> {
         let mut packed = BTreeMap::new();
         for block in 0..3 {
             let prefix = format!("row_interactor.tf_row.blocks.{block}");
@@ -2985,7 +2981,7 @@ impl StaticClassifierExecutor {
     }
 
     fn build_packed_f32_affines(
-        model: &ClassifierExecutor,
+        model: &Executor,
         policy: Bf16DensePolicy,
     ) -> Result<BTreeMap<String, PackedF32Affine>> {
         let mut packed = BTreeMap::new();
@@ -3051,7 +3047,7 @@ impl StaticClassifierExecutor {
     #[allow(clippy::fn_params_excessive_bools)]
     fn pack_f32_cached_block(
         packed: &mut BTreeMap<String, PackedF32Affine>,
-        model: &ClassifierExecutor,
+        model: &Executor,
         prefix: &str,
         attention: &str,
         dim: usize,
@@ -3087,7 +3083,7 @@ impl StaticClassifierExecutor {
 
     fn pack_f32_model_affine(
         packed: &mut BTreeMap<String, PackedF32Affine>,
-        model: &ClassifierExecutor,
+        model: &Executor,
         name: &str,
         input_dim: usize,
         output_dim: usize,
@@ -3118,7 +3114,7 @@ impl StaticClassifierExecutor {
     }
 
     fn build_packed_bf16_affines(
-        model: &ClassifierExecutor,
+        model: &Executor,
         policy: Bf16DensePolicy,
         column_blocks: [bool; 3],
         icl_blocks: [bool; 12],
@@ -3192,7 +3188,7 @@ impl StaticClassifierExecutor {
     #[allow(clippy::fn_params_excessive_bools)]
     fn pack_cached_block_affines(
         packed: &mut BTreeMap<String, PackedBf16Affine>,
-        model: &ClassifierExecutor,
+        model: &Executor,
         prefix: &str,
         attention: &str,
         dim: usize,
@@ -3228,7 +3224,7 @@ impl StaticClassifierExecutor {
 
     fn pack_model_affine(
         packed: &mut BTreeMap<String, PackedBf16Affine>,
-        model: &ClassifierExecutor,
+        model: &Executor,
         name: &str,
         input_dim: usize,
         output_dim: usize,
@@ -3262,12 +3258,7 @@ impl StaticClassifierExecutor {
 /// `QASSMax` base scales for `source` keys: `[heads * head_dim]`, the same for
 /// every query, so they are computed once per source length.
 #[allow(clippy::cast_precision_loss)] // ln(source) needs no more precision.
-fn qass_base_scale(
-    model: &ClassifierExecutor,
-    prefix: &str,
-    source: usize,
-    width: usize,
-) -> Result<Vec<f32>> {
+fn qass_base_scale(model: &Executor, prefix: &str, source: usize, width: usize) -> Result<Vec<f32>> {
     let name = |part: &str| format!("{prefix}.ssmax_layer.{part}");
     let first_weight = model.tensor(&name("base_mlp.0.weight"))?;
     let first_bias = model.tensor(&name("base_mlp.0.bias"))?;
@@ -3292,7 +3283,7 @@ fn qass_base_scale(
     Ok(scale)
 }
 
-impl StaticClassifierExecutor {
+impl StaticExecutor {
     #[allow(clippy::cast_precision_loss)]
     fn qass(
         &self,
@@ -3366,7 +3357,7 @@ fn f16_to_f32(bits: u16) -> f32 {
 }
 
 fn aggregate_classifier_probabilities(
-    logits: &ClassifierLogits,
+    logits: &DecoderOutputs,
     class_permutations: &[u64],
     aggregation: ClassifierAggregation,
 ) -> Result<ClassifierProbabilities> {
@@ -3427,7 +3418,7 @@ fn softmax(values: &mut [f32], temperature: f32) {
 }
 
 fn pack_query_microbatch(
-    requests: &[ClassifierQueryRequest<'_>],
+    requests: &[QueryRequest<'_>],
     ensemble_count: usize,
     feature_count: usize,
 ) -> Result<(usize, Vec<f32>)> {
@@ -4361,7 +4352,7 @@ fn heads_to_tokens_into(input: &[f32], rows: usize, dim: usize, heads: usize, ou
 #[cfg(test)]
 mod tests {
     use super::{
-        ClassifierAggregation, ClassifierLogits, admit_request, admit_static_request,
+        ClassifierAggregation, DecoderOutputs, admit_request, admit_static_request,
         aggregate_classifier_probabilities, attention_scratch_scores, attention_scratch_state,
         model_hash_matches, pack_query_microbatch, parallel_cached_attention_f32_key_bf16_value,
         tokens_to_heads, validate_labels, validate_static_cache_contract,
@@ -4369,7 +4360,7 @@ mod tests {
     use crate::kernels::reference::{
         OnlineAttentionScratch, affine_f32, tiled_online_scaled_dot_product_attention_f32,
     };
-    use crate::{ClassifierQueryRequest, StaticContextArtifact, StaticContextMetadata, StaticContextTensor};
+    use crate::{QueryRequest, StaticContextArtifact, StaticContextMetadata, StaticContextTensor};
 
     fn context(tensors: Vec<StaticContextTensor>) -> StaticContextArtifact {
         StaticContextArtifact::new(
@@ -4432,9 +4423,9 @@ mod tests {
 
     #[test]
     fn query_microbatch_packs_each_ensemble_contiguously() {
-        let first = ClassifierQueryRequest::new(2, 1, 2, &[1.0, 2.0, 3.0, 4.0]).expect("first request");
-        let second = ClassifierQueryRequest::new(2, 2, 2, &[5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0])
-            .expect("second request");
+        let first = QueryRequest::new(2, 1, 2, &[1.0, 2.0, 3.0, 4.0]).expect("first request");
+        let second =
+            QueryRequest::new(2, 2, 2, &[5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).expect("second request");
         let (rows, packed) = pack_query_microbatch(&[first, second], 2, 2).expect("packed microbatch");
         assert_eq!(rows, 3);
         assert_eq!(
@@ -4576,7 +4567,7 @@ mod tests {
 
     #[test]
     fn probabilities_reverse_class_permutations_and_follow_aggregation_options() {
-        let logits = ClassifierLogits {
+        let logits = DecoderOutputs {
             shape: [2, 1, 3],
             values: vec![1.0, 2.0, 3.0, 4.0, 8.0, 6.0],
         };

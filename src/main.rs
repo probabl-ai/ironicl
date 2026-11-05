@@ -1,9 +1,9 @@
 use std::{env, process, time::Instant};
 
 use ironicl::{
-    BenchmarkArgs, BenchmarkStats, ClassifierAggregation, ClassifierExecutor, ClassifierInputBundle, Command,
-    CpuCapabilities, HelpTopic, ImportArgs, InspectArgs, ModelSource, PlanArgs, RunArgs,
-    StaticClassifierExecutor, StaticContextArtifact, StaticQueryBundle,
+    BenchmarkArgs, BenchmarkStats, ClassifierAggregation, Command, CpuCapabilities, Executor, HelpTopic,
+    ImportArgs, InputBundle, InspectArgs, ModelSource, PlanArgs, RunArgs, StaticContextArtifact,
+    StaticExecutor, StaticQueryBundle,
     cache::ByteSize,
     error::{Error, Result},
     estimate_memory, parse_cli, resolve_backend,
@@ -188,7 +188,7 @@ fn run_model(args: RunArgs) -> Result<()> {
     if let Some(context_path) = args.context {
         let query = StaticQueryBundle::read(&args.input)?;
         let context = StaticContextArtifact::read(&context_path)?;
-        let executor = StaticClassifierExecutor::new(model, context)?;
+        let executor = StaticExecutor::new(model, context)?;
         if args.probabilities {
             print_probabilities(
                 &executor.predict_bundle_probabilities(&query, ClassifierAggregation::default())?,
@@ -198,8 +198,8 @@ fn run_model(args: RunArgs) -> Result<()> {
         }
         return Ok(());
     }
-    let input = ClassifierInputBundle::read(&args.input)?;
-    let executor = ClassifierExecutor::new(model);
+    let input = InputBundle::read(&args.input)?;
+    let executor = Executor::new(model);
     if args.trace_stages {
         let trace = executor.predict_logits_with_trace(input.request())?;
         print_trace_stage("column_embeddings", trace.column_embeddings());
@@ -215,22 +215,17 @@ fn run_model(args: RunArgs) -> Result<()> {
 fn benchmark(args: &BenchmarkArgs) -> Result<()> {
     let input_start = Instant::now();
     let cached = args.context.is_some();
-    let input = (!cached)
-        .then(|| ClassifierInputBundle::read(&args.input))
-        .transpose()?;
+    let input = (!cached).then(|| InputBundle::read(&args.input)).transpose()?;
     let query = cached.then(|| StaticQueryBundle::read(&args.input)).transpose()?;
     let input_load_ms = input_start.elapsed().as_secs_f64() * 1_000.0;
     let model_start = Instant::now();
     let model = ironicl::load_model_artifact(&args.model)?;
     let model_load_ms = model_start.elapsed().as_secs_f64() * 1_000.0;
-    let executor = (!cached).then(|| ClassifierExecutor::new(model.clone()));
+    let executor = (!cached).then(|| Executor::new(model.clone()));
     let static_executor = args
         .context
         .as_ref()
-        .map(|path| {
-            StaticContextArtifact::read(path)
-                .and_then(|context| StaticClassifierExecutor::new(model, context))
-        })
+        .map(|path| StaticContextArtifact::read(path).and_then(|context| StaticExecutor::new(model, context)))
         .transpose()?;
 
     let mut durations = Vec::with_capacity(args.iterations as usize);
@@ -312,7 +307,7 @@ fn benchmark(args: &BenchmarkArgs) -> Result<()> {
 }
 
 enum BenchmarkPrediction {
-    Logits(ironicl::ClassifierLogits),
+    Logits(ironicl::DecoderOutputs),
     Probabilities(ironicl::ClassifierProbabilities),
 }
 
@@ -337,9 +332,9 @@ impl BenchmarkPrediction {
 
 fn benchmark_prediction(
     probabilities: bool,
-    executor: Option<&ClassifierExecutor>,
-    input: Option<&ClassifierInputBundle>,
-    static_executor: Option<&StaticClassifierExecutor>,
+    executor: Option<&Executor>,
+    input: Option<&InputBundle>,
+    static_executor: Option<&StaticExecutor>,
     query: Option<&StaticQueryBundle>,
 ) -> Result<BenchmarkPrediction> {
     if probabilities {
@@ -379,7 +374,7 @@ fn check_benchmark_prediction(
     Ok(output.values().iter().map(|value| f64::from(*value)).sum())
 }
 
-fn print_trace_stage<const D: usize>(name: &str, stage: &ironicl::ClassifierTraceStage<D>) {
+fn print_trace_stage<const D: usize>(name: &str, stage: &ironicl::TraceStage<D>) {
     let values = stage.values();
     let min = values.iter().copied().fold(f32::INFINITY, f32::min);
     let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -399,7 +394,7 @@ fn print_trace_stage<const D: usize>(name: &str, stage: &ironicl::ClassifierTrac
     println!("trace {name}: shape: {shape}; min: {min:.9e}; max: {max:.9e}; sum: {sum:.9e}; first8: {first}");
 }
 
-fn print_logits(logits: &ironicl::ClassifierLogits) {
+fn print_logits(logits: &ironicl::DecoderOutputs) {
     let [ensembles, test_rows, classes] = logits.shape();
     println!("shape: {ensembles} {test_rows} {classes}");
     for ensemble in 0..ensembles {

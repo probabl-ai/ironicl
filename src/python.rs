@@ -15,8 +15,8 @@ use pyo3::{
 };
 
 use crate::{
-    CheckpointCacheOptions, ClassifierAggregation, ClassifierExecutor, ClassifierQueryRequest, Error,
-    Optimize, PreparedCheckpoint, StaticClassifierExecutor, load_model_artifact, prepare_checkpoint,
+    CheckpointCacheOptions, ClassifierAggregation, Error, Executor, Optimize, PreparedCheckpoint,
+    QueryRequest, StaticExecutor, load_model_artifact, prepare_checkpoint,
 };
 
 fn py_error(error: Error) -> PyErr {
@@ -30,7 +30,7 @@ fn py_error(error: Error) -> PyErr {
 
 /// A loaded `TabICLv2` classifier.
 #[pyclass(frozen)]
-struct Model(ClassifierExecutor);
+struct Model(Executor);
 
 #[pymethods]
 impl Model {
@@ -43,7 +43,7 @@ impl Model {
             else {
                 unreachable!("the default options always use the cache");
             };
-            Ok(Self(ClassifierExecutor::new(load_model_artifact(&path)?)))
+            Ok(Self(Executor::new(load_model_artifact(&path)?)))
         })
         .map_err(py_error)
     }
@@ -103,7 +103,7 @@ impl Model {
 
 /// A fitted training context. Prediction runs only the query rows.
 #[pyclass(frozen)]
-struct Context(StaticClassifierExecutor);
+struct Context(StaticExecutor);
 
 #[pymethods]
 impl Context {
@@ -126,7 +126,7 @@ impl Context {
         };
         let probabilities = py
             .detach(|| {
-                let request = ClassifierQueryRequest::new(ensembles, rows, features, &x)?;
+                let request = QueryRequest::new(ensembles, rows, features, &x)?;
                 self.0.predict_probabilities(request, aggregation)
             })
             .map_err(py_error)?;
