@@ -1844,53 +1844,6 @@ impl StaticExecutor {
         aggregate_classifier_probabilities(&logits, &self.context.metadata().class_permutations, aggregation)
     }
 
-    /// Execute independent prepared-query requests as one cache-sharing microbatch.
-    ///
-    /// Requests must use the same `[B, H]` shape as this static context. Results
-    /// preserve request order and are equivalent to executing each request alone.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when requests are empty, have incompatible dimensions, or
-    /// the combined request exceeds the normal static-request admission limits.
-    pub fn predict_probabilities_batch(
-        &self,
-        requests: &[QueryRequest<'_>],
-        aggregation: ClassifierAggregation,
-    ) -> Result<Vec<ClassifierProbabilities>> {
-        if requests.is_empty() {
-            return Err(Error::InvalidArgument(
-                "query microbatch must not be empty".into(),
-            ));
-        }
-        let metadata = self.context.metadata();
-        let (total_rows, packed) =
-            pack_query_microbatch(requests, metadata.ensemble_count, metadata.feature_count)?;
-        let packed_request = QueryRequest::new(
-            metadata.ensemble_count,
-            total_rows,
-            metadata.feature_count,
-            &packed,
-        )?;
-        let probabilities = self.predict_probabilities(packed_request, aggregation)?;
-        let mut offset = 0_usize;
-        requests
-            .iter()
-            .map(|request| {
-                let elements = request
-                    .query_rows()
-                    .checked_mul(metadata.class_count)
-                    .ok_or(Error::ArithmeticOverflow("query microbatch output elements"))?;
-                let values = probabilities.values[offset..][..elements].to_vec();
-                offset += elements;
-                Ok(ClassifierProbabilities {
-                    shape: [request.query_rows(), metadata.class_count],
-                    values,
-                })
-            })
-            .collect()
-    }
-
     /// Validate artifact identities and execute one owned query bundle.
     ///
     /// # Errors
@@ -3430,41 +3383,6 @@ fn softmax(values: &mut [f32], temperature: f32) {
     }
 }
 
-fn pack_query_microbatch(
-    requests: &[QueryRequest<'_>],
-    ensemble_count: usize,
-    feature_count: usize,
-) -> Result<(usize, Vec<f32>)> {
-    let total_rows = requests.iter().try_fold(0_usize, |sum, request| {
-        if request.ensemble_count() != ensemble_count || request.feature_count() != feature_count {
-            return Err(Error::InvalidArgument(
-                "all query microbatch requests must match the static context B and H".into(),
-            ));
-        }
-        sum.checked_add(request.query_rows())
-            .ok_or(Error::ArithmeticOverflow("query microbatch rows"))
-    })?;
-    let mut packed = Vec::with_capacity(
-        ensemble_count
-            .checked_mul(total_rows)
-            .and_then(|values| values.checked_mul(feature_count))
-            .ok_or(Error::ArithmeticOverflow("query microbatch elements"))?,
-    );
-    for ensemble in 0..ensemble_count {
-        for request in requests {
-            let elements = request
-                .query_rows()
-                .checked_mul(feature_count)
-                .ok_or(Error::ArithmeticOverflow("query microbatch request elements"))?;
-            let offset = ensemble
-                .checked_mul(elements)
-                .ok_or(Error::ArithmeticOverflow("query microbatch request offset"))?;
-            packed.extend_from_slice(&request.x()[offset..][..elements]);
-        }
-    }
-    Ok((total_rows, packed))
-}
-
 fn validate_static_context(model: &ModelArtifact, context: &StaticContextArtifact) -> Result<()> {
     if !model_hash_matches(
         model.summary().source_sha256.as_bytes(),
@@ -4377,13 +4295,13 @@ mod tests {
     use super::{
         ClassifierAggregation, DecoderOutputs, admit_request, admit_static_request,
         aggregate_classifier_probabilities, attention_scratch_scores, attention_scratch_state,
-        model_hash_matches, pack_query_microbatch, parallel_cached_attention_f32_key_bf16_value,
-        tokens_to_heads, validate_class_count, validate_labels, validate_static_cache_contract,
+        model_hash_matches, parallel_cached_attention_f32_key_bf16_value, tokens_to_heads,
+        validate_class_count, validate_labels, validate_static_cache_contract,
     };
     use crate::kernels::reference::{
         OnlineAttentionScratch, affine_f32, tiled_online_scaled_dot_product_attention_f32,
     };
-    use crate::{QueryRequest, StaticContextArtifact, StaticContextMetadata, StaticContextTensor};
+    use crate::{StaticContextArtifact, StaticContextMetadata, StaticContextTensor};
 
     fn context(tensors: Vec<StaticContextTensor>) -> StaticContextArtifact {
         StaticContextArtifact::new(
@@ -4454,19 +4372,6 @@ mod tests {
         assert!(admit_static_request(1, 64, 54, 7, 1).is_ok());
         assert!(admit_static_request(8, 64, 54, 7, 8).is_ok());
         assert!(admit_static_request(1, 1_000_000, 1, 2, 1).is_err());
-    }
-
-    #[test]
-    fn query_microbatch_packs_each_ensemble_contiguously() {
-        let first = QueryRequest::new(2, 1, 2, &[1.0, 2.0, 3.0, 4.0]).expect("first request");
-        let second =
-            QueryRequest::new(2, 2, 2, &[5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]).expect("second request");
-        let (rows, packed) = pack_query_microbatch(&[first, second], 2, 2).expect("packed microbatch");
-        assert_eq!(rows, 3);
-        assert_eq!(
-            packed,
-            vec![1.0, 2.0, 5.0, 6.0, 7.0, 8.0, 3.0, 4.0, 9.0, 10.0, 11.0, 12.0]
-        );
     }
 
     #[test]

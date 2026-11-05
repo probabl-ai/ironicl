@@ -11,7 +11,6 @@ pub mod config;
 pub mod error;
 mod execution_plan;
 pub mod executor;
-pub mod ffi;
 pub mod input_bundle;
 pub mod kernels;
 #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]

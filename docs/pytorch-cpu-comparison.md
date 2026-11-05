@@ -121,7 +121,7 @@ with a public PyTorch `predict_proba()` timing.
 
 | Area | Official PyTorch CPU | Ironicl CPU |
 |---|---|---|
-| Interface | Public sklearn-compatible `fit()` and `predict_proba()` | Rust executor and C ABI consume prepared `[B,Q,H]` FP32 arrays |
+| Interface | Public sklearn-compatible `fit()` and `predict_proba()` | Rust executor and PyO3 bindings consume prepared `[B,Q,H]` FP32 arrays |
 | Supported scope | General released classifier configuration and input handling | Validated TabICLv2 static classifier path, with 2 through 10 classes |
 | Cache lifecycle | `fit()` creates Python `TabICLCache` objects | Offline export creates a restart-safe static-context artifact |
 | Cache storage | Torch tensors in their normal operator layouts | Checked tensor manifest with explicit dtype and packed layouts |
