@@ -236,7 +236,7 @@ impl ForwardTrace {
         &self.row_representations
     }
 
-    /// Decoder logits with shape `[B, T, 10]`, before test-row and class slicing.
+    /// Decoder outputs with shape `[B, T, width]`, before test-row and class slicing.
     #[must_use]
     pub fn decoder_logits(&self) -> &TraceStage<3> {
         &self.decoder_logits
@@ -680,7 +680,7 @@ impl Executor {
         // one: a large context runs serially instead of failing. The estimate
         // is 2-3x the measured peak, so the budget is four activation limits.
         // Equal groups keep the last one from running alone.
-        let fit = (4 * MAX_ACTIVATION_ELEMENTS / request_activation_elements(1, n, h, n)?.max(1)).clamp(1, b);
+        let fit = (4 * MAX_ACTIVATION_ELEMENTS / request_activation_elements(1, n, h, n, self.decoder_width()?)?.max(1)).clamp(1, b);
         let group = b.div_ceil(b.div_ceil(fit));
         for members in (0..b).collect::<Vec<_>>().chunks(group) {
             let estimators: Vec<EstimatorCaches> = members
@@ -772,9 +772,10 @@ impl Executor {
             request.feature_count(),
             request.training_rows(),
         );
-        admit_request(b, t, h, n)?;
+        let width = self.decoder_width()?;
+        admit_request(b, t, h, n, width)?;
         if trace {
-            admit_trace_request(b, t, h)?;
+            admit_trace_request(b, t, h, width)?;
         }
         let classes = validate_labels(request.y_train(), b, n)?;
         let test = t.checked_sub(n).ok_or(Error::ArithmeticOverflow("test rows"))?;
@@ -800,7 +801,7 @@ impl Executor {
                 trace_values.extend_from_slice(&logits);
             }
             for row in n..t {
-                values.extend_from_slice(&logits[row * 10..][..classes]);
+                values.extend_from_slice(&logits[row * width..][..classes]);
             }
         }
         let logits = DecoderOutputs {
@@ -819,7 +820,7 @@ impl Executor {
                         values: row_representations,
                     },
                     decoder_logits: TraceStage {
-                        shape: [b, t, 10],
+                        shape: [b, t, width],
                         values: decoder_logits,
                     },
                     logits,
@@ -1106,14 +1107,15 @@ impl Executor {
         )?;
         let mut activated = vec![0.0; hidden.len()];
         gelu_f32(&hidden, &mut activated)?;
-        let mut logits = vec![0.0; checked_product(&[t, 10], "decoder logits")?];
+        let width = self.decoder_width()?;
+        let mut logits = vec![0.0; checked_product(&[t, width], "decoder logits")?];
         affine_f32(
             &activated,
             t,
             1024,
             self.tensor("icl_predictor.decoder.2.weight")?,
             Some(self.tensor("icl_predictor.decoder.2.bias")?),
-            10,
+            width,
             &mut logits,
         )?;
         Ok(logits)
@@ -1404,6 +1406,12 @@ impl Executor {
     fn tensor(&self, name: &str) -> Result<&[f32]> {
         Ok(self.model.tensor_f32(name)?.values())
     }
+
+    /// Outputs per decoded row: the classifier's class capacity or the
+    /// regressor's quantile count.
+    fn decoder_width(&self) -> Result<usize> {
+        Ok(self.tensor("icl_predictor.decoder.2.bias")?.len())
+    }
 }
 
 impl StaticExecutor {
@@ -1616,7 +1624,8 @@ impl StaticExecutor {
         else {
             return Ok(false);
         };
-        for (output, logits) in values.chunks_exact_mut(classes).zip(logits.chunks_exact(10)) {
+        let width = self.model.decoder_width()?;
+        for (output, logits) in values.chunks_exact_mut(classes).zip(logits.chunks_exact(width)) {
             output.copy_from_slice(&logits[..classes]);
         }
         Ok(true)
@@ -1787,9 +1796,10 @@ impl StaticExecutor {
         let rows = self.cached_frontend(request, ensemble, workers)?;
         let logits = self.cached_icl_logits(rows, ensemble, request.query_rows(), workers)?;
         let metadata = self.context.metadata();
+        let width = self.model.decoder_width()?;
         for row in 0..request.query_rows() {
             output[row * metadata.class_count..][..metadata.class_count]
-                .copy_from_slice(&logits[row * 10..][..metadata.class_count]);
+                .copy_from_slice(&logits[row * width..][..metadata.class_count]);
         }
         Ok(())
     }
@@ -2092,14 +2102,15 @@ impl StaticExecutor {
         )?;
         let mut activated = vec![0.0; hidden.len()];
         self.parallel_gelu(&hidden, &mut activated, workers)?;
-        let mut logits = vec![0.0; q * 10];
+        let width = self.model.decoder_width()?;
+        let mut logits = vec![0.0; q * width];
         self.parallel_affine(
             &activated,
             q,
             1024,
             self.tensor("icl_predictor.decoder.2.weight")?,
             Some(self.tensor("icl_predictor.decoder.2.bias")?),
-            10,
+            width,
             &mut logits,
             workers,
         )?;
@@ -4067,8 +4078,8 @@ fn checked_product(values: &[usize], name: &'static str) -> Result<usize> {
 ///
 /// The executor processes ensembles sequentially. The estimates intentionally retain
 /// all operands that can coexist during each stage rather than assuming allocator reuse.
-fn admit_request(b: usize, t: usize, h: usize, n: usize) -> Result<()> {
-    if request_activation_elements(b, t, h, n)? > MAX_ACTIVATION_ELEMENTS {
+fn admit_request(b: usize, t: usize, h: usize, n: usize, width: usize) -> Result<()> {
+    if request_activation_elements(b, t, h, n, width)? > MAX_ACTIVATION_ELEMENTS {
         return Err(Error::InvalidArgument(format!(
             "request exceeds the uncached scalar activation limit of {MAX_ACTIVATION_BYTES} bytes"
         )));
@@ -4077,13 +4088,13 @@ fn admit_request(b: usize, t: usize, h: usize, n: usize) -> Result<()> {
 }
 
 /// The FP32 activation elements that [`admit_request`] checks.
-fn request_activation_elements(b: usize, t: usize, h: usize, n: usize) -> Result<usize> {
+fn request_activation_elements(b: usize, t: usize, h: usize, n: usize, width: usize) -> Result<usize> {
     let streams = h
         .checked_add(RESERVED)
         .ok_or(Error::ArithmeticOverflow("column streams"))?;
     let test = t.checked_sub(n).ok_or(Error::ArithmeticOverflow("test rows"))?;
 
-    let output = checked_product(&[b, test, 10], "classifier output")?;
+    let output = checked_product(&[b, test, width], "decoder output")?;
     let columns = checked_product(&[t, streams, COLUMN_DIM], "column embeddings")?;
     let column_targets = checked_product(&[n, COLUMN_DIM], "column target embeddings")?;
     let rows = checked_product(&[t, ICL_DIM], "row embeddings")?;
@@ -4160,7 +4171,7 @@ fn admit_static_request(
 }
 
 /// Trace buffers retain every ensemble's coarse stage output at once.
-fn admit_trace_request(b: usize, t: usize, h: usize) -> Result<()> {
+fn admit_trace_request(b: usize, t: usize, h: usize, width: usize) -> Result<()> {
     let streams = h
         .checked_add(RESERVED)
         .ok_or(Error::ArithmeticOverflow("column streams"))?;
@@ -4168,7 +4179,7 @@ fn admit_trace_request(b: usize, t: usize, h: usize) -> Result<()> {
         &[
             checked_product(&[b, t, streams, COLUMN_DIM], "trace column embeddings")?,
             checked_product(&[b, t, ICL_DIM], "trace row representations")?,
-            checked_product(&[b, t, 10], "trace decoder logits")?,
+            checked_product(&[b, t, width], "trace decoder logits")?,
         ],
         "trace outputs",
     )?;
@@ -4622,20 +4633,20 @@ mod tests {
 
     #[test]
     fn admission_allows_a_small_baseline_run() {
-        assert!(admit_request(8, 1024, 100, 512).is_ok());
+        assert!(admit_request(8, 1024, 100, 512, 10).is_ok());
     }
 
     #[test]
     fn admission_allows_bounded_attention_scratch() {
         // The former [heads, query_rows, source_rows] score allocation here
         // exceeded the attention limit; the remaining activation estimate fits.
-        assert!(admit_request(1, 11_000, 1, 3_000).is_ok());
+        assert!(admit_request(1, 11_000, 1, 3_000, 10).is_ok());
     }
 
     #[test]
     fn admission_rejects_huge_dimensions_without_input_allocation() {
-        assert!(admit_request(1, 1_000_000, 1, 1).is_err());
-        assert!(admit_request(1, usize::MAX, usize::MAX, 1).is_err());
+        assert!(admit_request(1, 1_000_000, 1, 1, 10).is_err());
+        assert!(admit_request(1, usize::MAX, usize::MAX, 1, 10).is_err());
     }
 
     #[test]
