@@ -53,7 +53,7 @@ pub struct StaticContextMetadata {
     pub training_rows: usize,
     /// Feature count `H`.
     pub feature_count: usize,
-    /// Class count.
+    /// Class count; 0 for a regression context, which has no class order.
     pub class_count: usize,
     /// Estimator-major class orders with shape `[B, class_count]`.
     pub class_permutations: Vec<u64>,
@@ -1184,7 +1184,6 @@ fn validate_metadata(metadata: &StaticContextMetadata) -> Result<()> {
         || metadata.training_rows > MAX_TRAINING_ROWS
         || metadata.feature_count == 0
         || metadata.feature_count > MAX_FEATURE_COUNT
-        || metadata.class_count == 0
         || metadata.class_count > MAX_CLASS_COUNT
     {
         return Err(artifact_error(
@@ -1219,8 +1218,10 @@ fn validate_estimator_permutations(
             "{name} permutation count does not match estimator metadata"
         )));
     }
-    for permutation in values.chunks_exact(width) {
-        validate_permutation(permutation, width, name)?;
+    if width > 0 {
+        for permutation in values.chunks_exact(width) {
+            validate_permutation(permutation, width, name)?;
+        }
     }
     Ok(())
 }
@@ -1331,20 +1332,24 @@ mod tests {
                 class_permutations: vec![2, 0, 1, 1, 2, 0],
                 feature_permutations: vec![1, 0, 0, 1],
             },
-            vec![
-                StaticContextTensor {
-                    name: "column.k.0".into(),
-                    dimensions: vec![2, 8, 3, 16],
-                    values: vec![1.0; 768],
-                },
-                StaticContextTensor {
-                    name: "icl.v.0".into(),
-                    dimensions: vec![2, 8, 3, 64],
-                    values: vec![2.0; 3072],
-                },
-            ],
+            fixture_tensors(),
         )
         .expect("valid fixture")
+    }
+
+    fn fixture_tensors() -> Vec<StaticContextTensor> {
+        vec![
+            StaticContextTensor {
+                name: "column.k.0".into(),
+                dimensions: vec![2, 8, 3, 16],
+                values: vec![1.0; 768],
+            },
+            StaticContextTensor {
+                name: "icl.v.0".into(),
+                dimensions: vec![2, 8, 3, 64],
+                values: vec![2.0; 3072],
+            },
+        ]
     }
 
     fn resign(bytes: &mut [u8]) {
@@ -1368,6 +1373,31 @@ mod tests {
                 .expect("FP32")[0]
                 .to_bits(),
             2.0_f32.to_bits()
+        );
+    }
+
+    #[test]
+    fn regression_context_without_classes_round_trips() {
+        let artifact = StaticContextArtifact::new(
+            StaticContextMetadata {
+                class_count: 0,
+                class_permutations: Vec::new(),
+                ..fixture().metadata().clone()
+            },
+            fixture_tensors(),
+        )
+        .expect("valid regression context");
+        let bytes = artifact.to_bytes().expect("encode");
+        assert_eq!(
+            StaticContextArtifact::from_bytes(&bytes).expect("decode"),
+            artifact
+        );
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("context.irctx");
+        std::fs::write(&path, &bytes).expect("write context");
+        assert_eq!(
+            StaticContextArtifact::read_mapped(&path).expect("map context"),
+            artifact
         );
     }
 
