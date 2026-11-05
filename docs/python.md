@@ -1,6 +1,7 @@
 # Python Package
 
-The `ironicl` Python package replaces TabICL's `TabICLClassifier`. It requires
+The `ironicl` Python package replaces TabICL's `TabICLClassifier` and
+`TabICLRegressor`. It requires
 Python 3.12+, NumPy, scikit-learn, and SciPy. It does not depend on TabICL or
 PyTorch. Building it from source requires Rust, because maturin compiles the
 private `ironicl._core` extension module.
@@ -75,15 +76,39 @@ at RAM speed from the first query. A corrupt or mismatched entry is silently
 rebuilt, and a write failure never fails `fit`. There is no automatic eviction;
 remove files to reclaim space.
 
+## Regressor
+
+```python
+from ironicl import TabICLRegressor
+
+reg = TabICLRegressor(n_estimators=8, random_state=42).fit(X_train, y_train)
+mean = reg.predict(X_test)
+stats = reg.predict(X_test, output_type=["median", "variance", "quantiles"], alphas=[0.05, 0.95])
+```
+
+The constructor, `fit`, and `predict` have TabICL 2.1.1's parameter names and
+defaults, plus the trailing `optimize` and `cache_dir` described above. The
+unsupported and no-op parameters are the classifier's, without the class ones.
+
+The model predicts 999 quantiles of the standardized target per row. `predict`
+turns them into `mean`, `median`, `variance`, `quantiles` (at `alphas`, default
+0.1 to 0.9), or `raw_quantiles` in Rust, as TabICL's `QuantileToDistribution`
+does: sorted quantiles, linear interpolation, and exponential tails beyond the
+levels 0.001 and 0.999. Results match TabICL within `1e-4` target standard
+deviations, with one deliberate difference: `variance` is scaled back by the
+target variance `σ²`. TabICL applies `σ·v + μ` to it, as it does to the mean,
+which is wrong unless the target is already standardized
+([soda-inria/tabicl#180](https://github.com/soda-inria/tabicl/issues/180)).
+
 ## Preprocessing
 
-`ironicl.preprocessing.ClassifierPreprocessor` exposes the preprocessing step
+`ironicl.preprocessing.Preprocessor` exposes the preprocessing step
 on its own:
 
 ```python
-from ironicl.preprocessing import ClassifierPreprocessor
+from ironicl.preprocessing import Preprocessor
 
-preprocessor = ClassifierPreprocessor(n_estimators=8, random_state=42)
+preprocessor = Preprocessor(n_estimators=8, random_state=42)
 training_groups = preprocessor.fit_transform(X_train, y_train)
 training_labels = preprocessor.encode_labels(y_train)
 query_groups = preprocessor.transform(X_query)
@@ -138,7 +163,7 @@ IRONICL_TABICL_SOURCE=/path/to/tabicl/src \
 
 This dedicated suite compares independently fitted preprocessing chains, using
 synthetic inputs and bundled scikit-learn datasets. It also compares
-`TabICLClassifier` signatures and `predict_proba` within `1e-4`, and downloads the
-released checkpoint for that. Missing prerequisites fail rather than skip. See
+`TabICLClassifier` and `TabICLRegressor` signatures and predictions within `1e-4`,
+and downloads the released checkpoints for that. Missing prerequisites fail rather than skip. See
 [validation](validation.md#python-preprocessing-parity) for setup, coverage, and
 numerical requirements.

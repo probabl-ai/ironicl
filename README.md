@@ -20,10 +20,10 @@ training context once, stores it, and then answers new test rows against it.
 | Works now | Not yet |
 |---|---|
 | Safe checkpoint import in pure Rust (no pickle execution) | Overlapping CPU and GPU work |
-| FP32 classifier inference on any CPU | Regression |
+| FP32 classifier and regressor inference on any CPU | More than 10 classes |
 | Static training context with AVX-512 kernels on Zen 5 | Categorical features and missing values |
 | Accelerate kernels and Metal prediction and context building on Apple Silicon | Pickling a fitted estimator |
-| Python `TabICLClassifier`, a drop-in for TabICL's | Published packages on crates.io or PyPI |
+| Python `TabICLClassifier` and `TabICLRegressor`, drop-ins for TabICL's | Published packages on crates.io or PyPI |
 
 ## Quickstart
 
@@ -74,18 +74,21 @@ and `benchmark`.
 
 ## Python Package
 
-The `ironicl` Python package replaces TabICL's classifier without PyTorch.
-Change only the import:
+The `ironicl` Python package replaces TabICL's classifier and regressor without
+PyTorch. Change only the import:
 
 ```python
-from ironicl import TabICLClassifier  # was: from tabicl import TabICLClassifier
+from ironicl import TabICLClassifier, TabICLRegressor  # was: from tabicl import ...
 
 clf = TabICLClassifier(n_estimators=8, random_state=42).fit(X_train, y_train)
 proba = clf.predict_proba(X_test)
+
+reg = TabICLRegressor().fit(X_train, y_train)
+mean, q = reg.predict(X_test), reg.predict(X_test, output_type="quantiles", alphas=[0.05, 0.95])
 ```
 
 Building the package needs Rust. `fit` builds the training context in Rust,
-and `predict_proba` runs only the query rows against it. See
+and prediction runs only the query rows against it. See
 [Python package](docs/python.md) for supported inputs.
 
 ## Documentation

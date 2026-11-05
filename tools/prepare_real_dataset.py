@@ -106,7 +106,7 @@ def encode_bundle(x: np.ndarray, y: np.ndarray) -> bytes:
 
 def main() -> None:
     args = parse_args()
-    from ironicl.preprocessing import ClassifierPreprocessor
+    from ironicl.preprocessing import Preprocessor
 
     x, labels, source = load_dataset(args.dataset)
     source_shape = [int(x.shape[0]), int(x.shape[1])]
@@ -115,7 +115,7 @@ def main() -> None:
     )
     x_train, x_test, selected_features = select_features(x_train, x_test, args.features)
 
-    preprocessor = ClassifierPreprocessor(n_estimators=args.estimators, random_state=args.seed)
+    preprocessor = Preprocessor(n_estimators=args.estimators, random_state=args.seed)
     train_groups = preprocessor.fit_transform(x_train, y_train_raw)
     test_groups = preprocessor.transform(x_test)
     y_train = preprocessor.encode_labels(y_train_raw)
