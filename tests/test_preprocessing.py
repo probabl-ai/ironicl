@@ -23,7 +23,7 @@ from numpy.testing import assert_allclose, assert_array_equal
 from sklearn.base import clone
 from sklearn.exceptions import NotFittedError
 
-from ironicl.preprocessing import ClassifierPreprocessor, _feature_shuffles
+from ironicl.preprocessing import Preprocessor, _feature_shuffles
 
 FIXTURE = Path(__file__).parent / "fixtures" / "preprocessing.json"
 
@@ -56,7 +56,7 @@ class PreprocessingTest(unittest.TestCase):
             with self.subTest(dtype=case["dtype"]):
                 x = np.asarray(fixture["training"], dtype=case["dtype"])
                 q = np.asarray(fixture["query"], dtype=case["dtype"])
-                preprocessor = ClassifierPreprocessor(random_state=42).fit(x, fixture["labels"])
+                preprocessor = Preprocessor(random_state=42).fit(x, fixture["labels"])
                 self.assertEqual(list(preprocessor.group_names_), case["group_names"])
                 for attribute in (
                     "classes_",
@@ -73,7 +73,7 @@ class PreprocessingTest(unittest.TestCase):
                     assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
 
     def test_grouped_layout_and_label_metadata(self):
-        preprocessor = ClassifierPreprocessor().fit(self.x, self.y)
+        preprocessor = Preprocessor().fit(self.x, self.y)
         groups = preprocessor.transform(self.q)
         self.assertEqual(preprocessor.n_features_in_, 5)
         self.assertEqual(preprocessor.n_features_out_, 4)
@@ -106,11 +106,11 @@ class PreprocessingTest(unittest.TestCase):
     def test_requested_and_actual_ensemble_counts(self):
         x = np.arange(20).reshape(-1, 1)
         y = np.arange(20) % 2
-        preprocessor = ClassifierPreprocessor(n_estimators=32).fit(x, y)
+        preprocessor = Preprocessor(n_estimators=32).fit(x, y)
         self.assertEqual(preprocessor.n_estimators, 32)
         self.assertEqual(preprocessor.n_estimators_, 4)
         self.assertEqual(len(preprocessor.transform(x)), 2)
-        single = ClassifierPreprocessor(n_estimators=1).fit(self.x, self.y)
+        single = Preprocessor(n_estimators=1).fit(self.x, self.y)
         self.assertEqual(single.group_names_, ("none",))
         assert_array_equal(single.feature_permutations_, [np.arange(4)])
         assert_array_equal(single.class_permutations_, [np.arange(3)])
@@ -119,7 +119,7 @@ class PreprocessingTest(unittest.TestCase):
         for dtype in (np.float32, np.float64, np.int64):
             x = (self.x * 10).astype(dtype)
             with self.subTest(dtype=dtype):
-                preprocessor = ClassifierPreprocessor().fit(x, self.y)
+                preprocessor = Preprocessor().fit(x, self.y)
                 view = x[::2]
                 self.assertFalse(view.flags.c_contiguous)
                 for actual, expected in zip(
@@ -128,7 +128,7 @@ class PreprocessingTest(unittest.TestCase):
                     assert_array_equal(actual, expected)
 
     def test_training_only_statistics_and_batching(self):
-        preprocessor = ClassifierPreprocessor().fit(self.x, self.y)
+        preprocessor = Preprocessor().fit(self.x, self.y)
         original_x, original_q = self.x.copy(), self.q.copy()
         before = pickle.dumps(preprocessor)
         batched = preprocessor.transform(self.q)
@@ -144,7 +144,7 @@ class PreprocessingTest(unittest.TestCase):
             assert_array_equal(actual, expected)
 
     def test_no_training_arrays_retained(self):
-        preprocessor = ClassifierPreprocessor().fit(self.x, self.y)
+        preprocessor = Preprocessor().fit(self.x, self.y)
         self.assertFalse(hasattr(preprocessor, "X_"))
         self.assertFalse(hasattr(preprocessor, "y_"))
         for normalizer in preprocessor.normalizers_:
@@ -157,23 +157,23 @@ class PreprocessingTest(unittest.TestCase):
 
     def test_named_features_and_refitting(self):
         names = ["a", "b", "c", "d", "e"]
-        preprocessor = ClassifierPreprocessor().fit(NamedArray(self.x, names), self.y)
+        preprocessor = Preprocessor().fit(NamedArray(self.x, names), self.y)
         preprocessor.transform(NamedArray(self.q, names))
         for invalid in (self.q, NamedArray(self.q, names[::-1])):
             with self.assertRaisesRegex(ValueError, "feature names"):
                 preprocessor.transform(invalid)
         for invalid_names in (["a"] * 5, list(range(5))):
             with self.assertRaises(ValueError):
-                ClassifierPreprocessor().fit(NamedArray(self.x, invalid_names), self.y)
+                Preprocessor().fit(NamedArray(self.x, invalid_names), self.y)
         preprocessor.fit(self.x, self.y)
         self.assertFalse(hasattr(preprocessor, "feature_names_in_"))
         preprocessor.transform(self.q)
 
     def test_invalid_data_and_unfitted_use(self):
         with self.assertRaises(NotFittedError):
-            ClassifierPreprocessor().transform(self.q)
+            Preprocessor().transform(self.q)
         with self.assertRaises(NotFittedError):
-            ClassifierPreprocessor().encode_labels(self.y)
+            Preprocessor().encode_labels(self.y)
         invalid_x = (
             np.ones((40, 5)),
             self.x[:, 0],
@@ -187,7 +187,7 @@ class PreprocessingTest(unittest.TestCase):
         )
         for x in invalid_x:
             with self.subTest(shape=x.shape, dtype=x.dtype), self.assertRaises((ValueError, TypeError)):
-                ClassifierPreprocessor().fit(x, self.y)
+                Preprocessor().fit(x, self.y)
         for y in (
             self.y[:-1],
             self.y[:, None],
@@ -197,8 +197,8 @@ class PreprocessingTest(unittest.TestCase):
             np.full(40, np.nan),
         ):
             with self.subTest(y=y), self.assertRaises(ValueError):
-                ClassifierPreprocessor().fit(self.x, y)
-        preprocessor = ClassifierPreprocessor().fit(self.x, self.y)
+                Preprocessor().fit(self.x, y)
+        preprocessor = Preprocessor().fit(self.x, self.y)
         with self.assertRaisesRegex(ValueError, "features"):
             preprocessor.transform(self.q[:, :3])
         for invalid in (np.full_like(self.q, np.nan), np.full_like(self.q, np.inf)):
@@ -209,7 +209,7 @@ class PreprocessingTest(unittest.TestCase):
         from scipy.sparse import csr_matrix
 
         with self.assertRaises(TypeError):
-            ClassifierPreprocessor().fit(csr_matrix(self.x), self.y)
+            Preprocessor().fit(csr_matrix(self.x), self.y)
 
     def test_parameter_validation_and_sklearn_clone(self):
         invalid = (
@@ -231,14 +231,14 @@ class PreprocessingTest(unittest.TestCase):
         )
         for parameters in invalid:
             with self.subTest(parameters=parameters), self.assertRaises(ValueError):
-                ClassifierPreprocessor(**parameters).fit(self.x, self.y)
-        fitted = ClassifierPreprocessor(n_estimators=3, norm_methods=("power",)).fit(self.x, self.y)
+                Preprocessor(**parameters).fit(self.x, self.y)
+        fitted = Preprocessor(n_estimators=3, norm_methods=("power",)).fit(self.x, self.y)
         copied = clone(fitted)
         self.assertEqual(copied.get_params(), fitted.get_params())
         self.assertFalse(hasattr(copied, "normalizers_"))
 
     def test_failed_fit_preserves_previous_state(self):
-        preprocessor = ClassifierPreprocessor().fit(self.x, self.y)
+        preprocessor = Preprocessor().fit(self.x, self.y)
         before = pickle.dumps(preprocessor)
         with self.assertRaises(ValueError):
             preprocessor.fit(np.ones_like(self.x), self.y)
@@ -267,9 +267,9 @@ class BlockImports(importlib.abc.MetaPathFinder):
             raise AssertionError("Unexpected dependency: " + fullname)
 sys.meta_path.insert(0, BlockImports())
 import numpy as np
-from ironicl.preprocessing import ClassifierPreprocessor
+from ironicl.preprocessing import Preprocessor
 x = np.arange(120, dtype=np.float64).reshape(40, 3)
-p = ClassifierPreprocessor().fit(x, np.arange(40) % 3)
+p = Preprocessor().fit(x, np.arange(40) % 3)
 print(json.dumps({"groups": p.group_names_, "indices": p.ensemble_groups_.tolist(),
                   "features": p.feature_permutations_.tolist(), "classes": p.class_permutations_.tolist(),
                   "data": [group.tolist() for group in p.transform(x[:2])]}))
@@ -320,7 +320,7 @@ assert not any(name.split(".")[0] in {"torch", "tabicl"} for name in sys.modules
         header = struct.unpack_from("<8sIIQQQQQQQQ", encoded)
         self.assertEqual(header[:3], (b"IRINPUT\0", 1, 1))
         x_train, x_test, y_train, _ = exporter.stratified_rows(self.x, self.y, 25, 9, 42)
-        p = ClassifierPreprocessor(random_state=42).fit(x_train, y_train)
+        p = Preprocessor(random_state=42).fit(x_train, y_train)
         train, query = p.transform(x_train), p.transform(x_test)
         x_values = np.frombuffer(encoded, dtype="<f4", count=header[7], offset=80).reshape(8, 34, 4)
         y_values = np.frombuffer(encoded, dtype="<f4", count=header[8], offset=80 + header[9]).reshape(8, 25)

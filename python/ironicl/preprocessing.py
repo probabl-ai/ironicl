@@ -1,11 +1,11 @@
-"""PyTorch-free classifier preprocessing with grouped, unpermuted FP32 output.
+"""PyTorch-free TabICL preprocessing with grouped, unpermuted FP32 output.
 
 The scaling, outlier handling, and ensemble algorithms are adapted from TabICL
 2.1.1, commit bd030d47ff7d9f987f0f33431d743a3003bfe0d3.
 Copyright (c) 2025, Soda team @ Inria. See LICENSES/TabICL-BSD-3-Clause.txt.
 
-Ironicl limits this implementation to finite numeric features, classification,
-and the ``none``/``power`` normalization policies. Unlike upstream, it retains
+Ironicl limits this implementation to finite numeric features and the
+``none``/``power`` normalization policies. Unlike upstream, it retains
 no training arrays, uses deterministic normalization-group order, and returns
 one matrix per group instead of expanding every ensemble member. Latin-square
 construction is iterative and does not change the process recursion limit.
@@ -125,11 +125,13 @@ def _labels(y) -> np.ndarray:
     return values
 
 
-class ClassifierPreprocessor(BaseEstimator):
-    """Fit TabICLv2's default numeric classification preprocessing without torch.
+class Preprocessor(BaseEstimator):
+    """Fit TabICLv2's default numeric preprocessing without torch.
 
     Inputs must be finite, dense numeric matrices with at least two training
-    rows and 2–10 classes. Categorical values, missing values, and all-constant
+    rows and, for classification, 2–10 classes. Regression (``classification=False``)
+    has no class shuffles, so ``class_permutations_`` is ``[B, 0]`` and no labels
+    are encoded. Categorical values, missing values, and all-constant
     training features are rejected. Named inputs require the same feature names
     and order at transform time.
 
@@ -155,6 +157,8 @@ class ClassifierPreprocessor(BaseEstimator):
         and ``power`` are supported. Unused groups are not fitted or returned.
     outlier_threshold : float, default=4.0
         Positive, finite threshold for upstream's two-pass outlier transform.
+    classification : bool, default=True
+        Whether to shuffle classes per ensemble member, as TabICL's classifier does.
     """
 
     def __init__(
@@ -163,11 +167,13 @@ class ClassifierPreprocessor(BaseEstimator):
         random_state: int = 0,
         norm_methods: tuple[str, ...] = ("none", "power"),
         outlier_threshold: float = 4.0,
+        classification: bool = True,
     ):
         self.n_estimators = n_estimators
         self.random_state = random_state
         self.norm_methods = norm_methods
         self.outlier_threshold = outlier_threshold
+        self.classification = classification
 
     def fit(self, X, y):
         """Fit training-only state. Failed fitting leaves previous state intact."""
@@ -196,13 +202,16 @@ class ClassifierPreprocessor(BaseEstimator):
             raise ValueError("outlier_threshold must be positive and finite")
 
         x, names = _features(X)
-        labels = _labels(y)
+        if self.classification:
+            labels = _labels(y)
+            encoder = LabelEncoder().fit(labels)
+            classes = len(encoder.classes_)
+            if not 2 <= classes <= 10:
+                raise ValueError("The classifier requires 2..10 classes")
+        else:
+            labels = check_array(y, ensure_2d=False, dtype=None)
         if len(x) != len(labels) or len(x) < 2:
             raise ValueError("X and y must have the same length and at least two training rows")
-        encoder = LabelEncoder().fit(labels)
-        classes = len(encoder.classes_)
-        if not 2 <= classes <= 10:
-            raise ValueError("The classifier requires 2..10 classes")
         # Inputs are finite: comparing to the first row is equivalent to counting
         # unique values, without sorting every feature.
         mask = np.any(x != x[0], axis=0)
@@ -211,10 +220,13 @@ class ClassifierPreprocessor(BaseEstimator):
         filtered = x[:, mask]
         seed = int(self.random_state)
         features = _feature_shuffles(filtered.shape[1], int(self.n_estimators), seed)
-        indices = list(range(classes))
-        permutations = (
-            [indices] if self.n_estimators == 1 else [indices[-i:] + indices[:-i] for i in range(classes)]
-        )
+        if not self.classification:
+            permutations = [[]]  # TabICL's single ``None`` target pattern.
+        elif self.n_estimators == 1:
+            permutations = [list(range(classes))]
+        else:
+            indices = list(range(classes))
+            permutations = [indices[-i:] + indices[:-i] for i in range(classes)]
         combinations = list(itertools.product(features, permutations))
         random.Random(seed).shuffle(combinations)
         selected = list(itertools.islice(itertools.product(combinations, methods), int(self.n_estimators)))
@@ -234,8 +246,6 @@ class ClassifierPreprocessor(BaseEstimator):
             "n_features_in_": x.shape[1],
             "n_features_out_": filtered.shape[1],
             "feature_mask_": mask,
-            "classes_": encoder.classes_,
-            "label_encoder_": encoder,
             "group_names_": group_names,
             "ensemble_groups_": _indices(groups),
             "feature_permutations_": _indices(feature_orders),
@@ -243,6 +253,9 @@ class ClassifierPreprocessor(BaseEstimator):
             "n_estimators_": len(groups),
             "normalizers_": normalizers,
         }
+        if self.classification:
+            state["classes_"] = encoder.classes_
+            state["label_encoder_"] = encoder
         if names is not None:
             state["feature_names_in_"] = np.asarray(names, dtype=object)
         for key in tuple(self.__dict__):

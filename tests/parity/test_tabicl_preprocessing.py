@@ -25,7 +25,7 @@ from sklearn.datasets import load_breast_cancer, load_digits, load_iris
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 
-from ironicl.preprocessing import ClassifierPreprocessor, _feature_shuffles
+from ironicl.preprocessing import Preprocessor, _feature_shuffles
 
 UPSTREAM_COMMIT = "bd030d47ff7d9f987f0f33431d743a3003bfe0d3"
 SETUP_HELP = (
@@ -196,7 +196,7 @@ class TabICLPreprocessingParityTest(unittest.TestCase):
         expected = self.upstream.EnsembleGenerator(classification=True, **options).fit(
             upstream_x, upstream_labels
         )
-        actual = ClassifierPreprocessor(**options)
+        actual = Preprocessor(**options)
         training = actual.fit_transform(x, y)
         labels = actual.encode_labels(y)
         self.assert_equal(actual.classes_, encoder.classes_, "classes")
@@ -245,6 +245,37 @@ class TabICLPreprocessingParityTest(unittest.TestCase):
                     if classes == 3:
                         y = np.array([f"class-{label}" for label in y])
                     self.run_case("synthetic", x, q, y, n_estimators=estimators, random_state=seed)
+
+    def test_regression_has_no_class_shuffles(self):
+        for seed, estimators in ((0, 1), (42, 8), (123, 32)):
+            with self.subTest(seed=seed, estimators=estimators):
+                x, q, _ = synthetic(seed=seed)
+                y = np.random.default_rng(seed).normal(size=len(x))
+                options = {
+                    "n_estimators": estimators,
+                    "random_state": seed,
+                    "norm_methods": ("none", "power"),
+                    "outlier_threshold": 4.0,
+                }
+                self.case = f"case=regression, options={options}"
+                numerical = self.upstream.TransformToNumerical()
+                expected = self.upstream.EnsembleGenerator(classification=False, **options).fit(
+                    numerical.fit_transform(x), y
+                )
+                actual = Preprocessor(classification=False, **options)
+                training = actual.fit_transform(x, y)
+                self.assertEqual(actual.class_permutations_.shape, (actual.n_estimators_, 0))
+                self.assertFalse(hasattr(actual, "classes_"))
+                for group, method in enumerate(actual.group_names_):
+                    members = np.flatnonzero(actual.ensemble_groups_ == group)
+                    self.assert_equal(
+                        actual.feature_permutations_[members],
+                        expected.feature_shuffles_[method],
+                        f"group={method}, feature permutations",
+                    )
+                self.compare_prepared(actual, training, expected.transform(X=None, mode="train"), "training")
+                expected_queries = expected.transform(numerical.transform(q), mode="test")
+                self.compare_prepared(actual, actual.transform(q), expected_queries, "queries")
 
     def test_normalization_selection_and_order(self):
         for methods in (("none",), ("power",), ("none", "power"), ("power", "none")):

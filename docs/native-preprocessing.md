@@ -1,6 +1,6 @@
 # Native Preprocessing
 
-Preprocessing today is Python: `ironicl.preprocessing.ClassifierPreprocessor`
+Preprocessing today is Python: `ironicl.preprocessing.Preprocessor`
 ([python.md](python.md#preprocessing)) fits scaling, the power transform,
 outlier bounds, and the feature and class ensembles, then hands the Rust engine
 grouped FP32 matrices plus `uint64` permutation arrays. Native preprocessing
