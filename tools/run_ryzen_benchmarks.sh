@@ -8,7 +8,7 @@ RESULTS="$ROOT/results"
 COMMON=(
   "$HARNESS"
   --checkpoint "$ROOT/fixtures/tabicl-classifier-v2-20260212.ckpt"
-  --model "$ROOT/fixtures/tabicl-classifier-v2.ironicl"
+  --model "$ROOT/fixtures/tabicl-classifier-v2.irmodel"
   --input "$ROOT/fixtures/input.irinput"
   --tabicl-root "$ROOT/src/tabicl/src"
   --ironicl "$ROOT/bin/ironicl-znver5"

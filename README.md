@@ -48,7 +48,7 @@ You need Rust (via [rustup](https://rustup.rs)) and Python 3.12 or newer.
    ```bash
    ./target/release/ironicl import \
      --checkpoint tabicl-classifier-v2-20260212.ckpt \
-     --output classifier.ironicl
+     --output classifier.irmodel
    ```
 
 4. Prepare a small request from the Covertype dataset:
@@ -64,7 +64,7 @@ You need Rust (via [rustup](https://rustup.rs)) and Python 3.12 or newer.
 5. Run inference:
 
    ```bash
-   ./target/release/ironicl run --model classifier.ironicl --input covertype.irinput
+   ./target/release/ironicl run --model classifier.irmodel --input covertype.irinput
    ```
 
    Ironicl prints one row of class logits for each test row.

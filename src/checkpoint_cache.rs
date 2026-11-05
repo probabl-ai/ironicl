@@ -92,7 +92,7 @@ fn cache_model_path(cache_root: &Path, source_sha256: &str) -> Result<PathBuf> {
     Ok(cache_root
         .join("models")
         .join(format!("v{}", crate::MODEL_ARTIFACT_VERSION))
-        .join(format!("{source_sha256}.ironicl")))
+        .join(format!("{source_sha256}.irmodel")))
 }
 
 impl From<crate::CheckpointProfile> for ModelProfile {
@@ -114,7 +114,7 @@ mod tests {
         let digest = "a".repeat(64);
         assert_eq!(
             cache_model_path(Path::new("cache"), &digest),
-            Ok(PathBuf::from(format!("cache/models/v1/{digest}.ironicl")))
+            Ok(PathBuf::from(format!("cache/models/v1/{digest}.irmodel")))
         );
     }
 

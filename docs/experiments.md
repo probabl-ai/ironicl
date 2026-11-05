@@ -438,8 +438,8 @@ Run the exact target:
 ```bash
 IRONICL_THREADS=16 \
 $BENCH_ROOT/src/Ironicl/target/release/ironicl benchmark \
-  --model $BENCH_ROOT/fixtures/tabicl-classifier-v2.ironicl \
-  --context $BENCH_ROOT/data/covertype-h54-n4096-b8-packed-bf16v.ironiclctx \
+  --model $BENCH_ROOT/fixtures/tabicl-classifier-v2.irmodel \
+  --context $BENCH_ROOT/data/covertype-h54-n4096-b8-packed-bf16v.irctx \
   --input $BENCH_ROOT/data/covertype-h54-n4096-b8-packed-bf16v-q128.irquery \
   --probabilities --warmup 5 --iterations 50
 ```
@@ -449,15 +449,15 @@ Compare final probabilities:
 ```bash
 IRONICL_THREADS=16 \
 $BENCH_ROOT/src/Ironicl/target/release/ironicl run \
-  --model $BENCH_ROOT/fixtures/tabicl-classifier-v2.ironicl \
-  --context $BENCH_ROOT/data/covertype-h54-n4096-b8-packed-bf16v.ironiclctx \
+  --model $BENCH_ROOT/fixtures/tabicl-classifier-v2.irmodel \
+  --context $BENCH_ROOT/data/covertype-h54-n4096-b8-packed-bf16v.irctx \
   --input $BENCH_ROOT/data/covertype-h54-n4096-b8-packed-bf16v-q128.irquery \
   --probabilities > rust-probabilities.txt
 
 python tools/compare_cached_logits.py \
   --oracle covertype-h54-n4096-b8-packed-bf16v-q128.irlogits \
   --probabilities-actual rust-probabilities.txt \
-  --context covertype-h54-n4096-b8-packed-bf16v.ironiclctx \
+  --context covertype-h54-n4096-b8-packed-bf16v.irctx \
   --atol 1e-3
 ```
 

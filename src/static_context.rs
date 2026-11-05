@@ -19,7 +19,7 @@ use crate::{
 };
 
 /// Magic bytes at the start of a static-context artifact.
-pub const STATIC_CONTEXT_MAGIC: [u8; 8] = *b"IRONICL\0";
+pub const STATIC_CONTEXT_MAGIC: [u8; 8] = *b"IRCNTXT\0";
 /// Latest supported static-context artifact format version.
 pub const STATIC_CONTEXT_VERSION: u32 = 3;
 
@@ -1345,7 +1345,7 @@ mod tests {
         let artifact = fixture();
         let bytes = artifact.to_bytes().expect("encode");
         let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("context.ironiclctx");
+        let path = directory.path().join("context.irctx");
         std::fs::write(&path, &bytes).expect("write context");
 
         let mapped = StaticContextArtifact::read_mapped(&path).expect("map context");
@@ -1389,7 +1389,7 @@ mod tests {
         );
 
         let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("mixed.ironiclctx");
+        let path = directory.path().join("mixed.irctx");
         std::fs::write(&path, &bytes).expect("write context");
         let decoded = StaticContextArtifact::read_mapped_prefault(&path).expect("map context");
 

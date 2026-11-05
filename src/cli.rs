@@ -518,11 +518,11 @@ mod tests {
                 "--checkpoint",
                 "model.ckpt",
                 "--output",
-                "model.ironicl",
+                "model.irmodel",
             ])),
             Ok(Command::Import(ImportArgs {
                 checkpoint: PathBuf::from("model.ckpt"),
-                output: PathBuf::from("model.ironicl"),
+                output: PathBuf::from("model.irmodel"),
             }))
         );
     }
@@ -550,12 +550,12 @@ mod tests {
             parse_cli(&args(&[
                 "run",
                 "--model",
-                "model.ironicl",
+                "model.irmodel",
                 "--input",
                 "request.irinput"
             ])),
             Ok(Command::Run(RunArgs {
-                source: ModelSource::Model(PathBuf::from("model.ironicl")),
+                source: ModelSource::Model(PathBuf::from("model.irmodel")),
                 input: PathBuf::from("request.irinput"),
                 context: None,
                 cache: CheckpointCacheOptions::default(),
@@ -572,7 +572,7 @@ mod tests {
             "--checkpoint",
             "model.ckpt",
             "--model",
-            "model.ironicl",
+            "model.irmodel",
             "--input",
             "request.irinput",
         ]))
@@ -631,13 +631,13 @@ mod tests {
             parse_cli(&args(&[
                 "run",
                 "--model",
-                "model.ironicl",
+                "model.irmodel",
                 "--input",
                 "request.irinput",
                 "--trace-stages",
             ])),
             Ok(Command::Run(RunArgs {
-                source: ModelSource::Model(PathBuf::from("model.ironicl")),
+                source: ModelSource::Model(PathBuf::from("model.irmodel")),
                 input: PathBuf::from("request.irinput"),
                 context: None,
                 cache: CheckpointCacheOptions::default(),
@@ -653,17 +653,17 @@ mod tests {
             parse_cli(&args(&[
                 "run",
                 "--model",
-                "model.ironicl",
+                "model.irmodel",
                 "--context",
-                "context.ironiclctx",
+                "context.irctx",
                 "--input",
                 "request.irquery",
                 "--probabilities",
             ])),
             Ok(Command::Run(RunArgs {
-                source: ModelSource::Model(PathBuf::from("model.ironicl")),
+                source: ModelSource::Model(PathBuf::from("model.irmodel")),
                 input: PathBuf::from("request.irquery"),
-                context: Some(PathBuf::from("context.ironiclctx")),
+                context: Some(PathBuf::from("context.irctx")),
                 cache: CheckpointCacheOptions::default(),
                 trace_stages: false,
                 probabilities: true,
@@ -696,7 +696,7 @@ mod tests {
             &[
                 "run",
                 "--model",
-                "model.ironicl",
+                "model.irmodel",
                 "--input",
                 "request.irinput",
                 "--rebuild-cache",
@@ -721,7 +721,7 @@ mod tests {
     #[test]
     fn run_requires_input() {
         let error =
-            parse_cli(&args(&["run", "--model", "model.ironicl"])).expect_err("input must be required");
+            parse_cli(&args(&["run", "--model", "model.irmodel"])).expect_err("input must be required");
         assert!(error.to_string().contains("run requires --input"));
     }
 
@@ -731,12 +731,12 @@ mod tests {
             parse_cli(&args(&[
                 "benchmark",
                 "--model",
-                "model.ironicl",
+                "model.irmodel",
                 "--input",
                 "request.irinput"
             ])),
             Ok(Command::Benchmark(BenchmarkArgs {
-                model: PathBuf::from("model.ironicl"),
+                model: PathBuf::from("model.irmodel"),
                 input: PathBuf::from("request.irinput"),
                 context: None,
                 probabilities: false,
@@ -748,7 +748,7 @@ mod tests {
             parse_cli(&args(&[
                 "benchmark",
                 "--model",
-                "model.ironicl",
+                "model.irmodel",
                 "--input",
                 "request.irinput",
                 "--warmup",
@@ -757,7 +757,7 @@ mod tests {
                 "10000",
             ])),
             Ok(Command::Benchmark(BenchmarkArgs {
-                model: PathBuf::from("model.ironicl"),
+                model: PathBuf::from("model.irmodel"),
                 input: PathBuf::from("request.irinput"),
                 context: None,
                 probabilities: false,
@@ -769,17 +769,17 @@ mod tests {
             parse_cli(&args(&[
                 "benchmark",
                 "--model",
-                "model.ironicl",
+                "model.irmodel",
                 "--input",
                 "request.irquery",
                 "--context",
-                "context.ironiclctx",
+                "context.irctx",
                 "--probabilities",
             ])),
             Ok(Command::Benchmark(BenchmarkArgs {
-                model: PathBuf::from("model.ironicl"),
+                model: PathBuf::from("model.irmodel"),
                 input: PathBuf::from("request.irquery"),
-                context: Some(PathBuf::from("context.ironiclctx")),
+                context: Some(PathBuf::from("context.irctx")),
                 probabilities: true,
                 warmup: 2,
                 iterations: 10,
@@ -800,7 +800,7 @@ mod tests {
             &[
                 "benchmark",
                 "--model",
-                "model.ironicl",
+                "model.irmodel",
                 "--input",
                 "request.irinput",
                 "--warmup",
@@ -809,7 +809,7 @@ mod tests {
             &[
                 "benchmark",
                 "--model",
-                "model.ironicl",
+                "model.irmodel",
                 "--input",
                 "request.irinput",
                 "--iterations",
@@ -818,7 +818,7 @@ mod tests {
             &[
                 "benchmark",
                 "--model",
-                "model.ironicl",
+                "model.irmodel",
                 "--input",
                 "request.irinput",
                 "--iterations",

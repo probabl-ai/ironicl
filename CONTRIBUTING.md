@@ -130,7 +130,7 @@ Rust CI does not provision official model or oracle fixtures. The tests in
 To run them, provide the fixtures and pass `--ignored`:
 
 - `IRONICL_CHECKPOINT_FIXTURES`: a directory containing both official v2 checkpoints
-  and the imported classifier artifact `tabicl-classifier-v2.ironicl`.
+  and the imported classifier artifact `tabicl-classifier-v2.irmodel`.
 - `IRONICL_ORACLE_FIXTURES`: a directory containing `input.irinput` and
   `logits.irlogits` from the upstream exporter.
 

@@ -16,7 +16,7 @@ use ironicl::{ClassifierExecutor, ClassifierQueryRequest, Optimize, load_model_a
 fn grouped_gpu_build_matches_one_graph_run() {
     let directory = std::env::var_os("IRONICL_CHECKPOINT_FIXTURES")
         .expect("set IRONICL_CHECKPOINT_FIXTURES to run this ignored test; see CONTRIBUTING.md");
-    let model = load_model_artifact(&Path::new(&directory).join("tabicl-classifier-v2.ironicl"))
+    let model = load_model_artifact(&Path::new(&directory).join("tabicl-classifier-v2.irmodel"))
         .expect("load classifier artifact");
     let executor = ClassifierExecutor::new(model);
     let (b, n, q, h) = (4, 240, 50, 5);
