@@ -43,7 +43,6 @@ const ICL_HEAD_DIM: usize = ICL_DIM / HEADS;
 const COLUMN_HEAD_DIM: usize = COLUMN_DIM / HEADS;
 const ICL_BLOCKS: usize = 12;
 const COLUMN_BLOCKS: usize = 3;
-const DECODER_OUTPUTS: usize = 10;
 const FLOAT: MPSDataType = MPSDataType::Float32;
 
 type Tensor = Retained<MPSGraphTensor>;
@@ -757,6 +756,8 @@ pub(crate) struct PredictGraph {
     bindings: Vec<Binding>,
     grouped: Tensor,
     logits: Tensor,
+    /// Decoder outputs per row.
+    outputs: usize,
     /// Buffers and dictionaries per cached query bucket. The lock also
     /// serializes graph runs.
     prepared: Mutex<HashMap<usize, Prepared>>,
@@ -882,7 +883,8 @@ impl PredictGraph {
             ICL_DIM,
             1024,
         )?);
-        let logits = builder.linear(&hidden, "icl_predictor.decoder.2", 1024, DECODER_OUTPUTS)?;
+        let outputs = weights("icl_predictor.decoder.2.bias")?.len();
+        let logits = builder.linear(&hidden, "icl_predictor.decoder.2", 1024, outputs)?;
         Ok(Self {
             gpu: gpu.clone(),
             graph: builder.graph,
@@ -890,6 +892,7 @@ impl PredictGraph {
             bindings: builder.bindings.into_inner(),
             grouped,
             logits,
+            outputs,
             prepared: Mutex::default(),
         })
     }
@@ -902,7 +905,7 @@ impl PredictGraph {
         // Padding rows must be finite; they never mix with real rows.
         // SAFETY: the new buffer holds `b * h * rows * 3` floats.
         unsafe { std::ptr::write_bytes(input.contents().as_ptr().cast::<f32>(), 0, b * h * rows * 3) };
-        let output = self.gpu.empty(b * rows * DECODER_OUTPUTS)?;
+        let output = self.gpu.empty(b * rows * self.outputs)?;
         let input = (
             self.grouped.clone(),
             input,
@@ -912,7 +915,7 @@ impl PredictGraph {
         let output = (
             self.logits.clone(),
             output,
-            vec![b as isize, rows as isize, DECODER_OUTPUTS as isize],
+            vec![b as isize, rows as isize, self.outputs as isize],
             FLOAT,
         );
         let mut inputs = self.bindings.iter().collect::<Vec<_>>();
@@ -974,7 +977,7 @@ impl PredictGraph {
 
     /// Predict `query_rows` rows. `fill` writes the `[B * H, rows, 3]` grouped
     /// inputs, given the bucket's row count as the stride, and returns false
-    /// to cancel. Returns `[B, query_rows, 10]` logits.
+    /// to cancel. Returns `[B, query_rows, outputs]` decoder outputs.
     pub(crate) fn run(
         &self,
         query_rows: usize,
@@ -1019,17 +1022,17 @@ impl PredictGraph {
                 );
             },
         }
-        // SAFETY: the run is complete and wrote `[b, rows, 10]` floats.
+        // SAFETY: the run is complete and wrote `[b, rows, outputs]` floats.
         let output = unsafe {
             std::slice::from_raw_parts(
                 prepared.output.contents().as_ptr().cast::<f32>(),
-                b * rows * DECODER_OUTPUTS,
+                b * rows * self.outputs,
             )
         };
         Ok(Some(
             output
-                .chunks_exact(rows * DECODER_OUTPUTS)
-                .flat_map(|estimator| &estimator[..query_rows * DECODER_OUTPUTS])
+                .chunks_exact(rows * self.outputs)
+                .flat_map(|estimator| &estimator[..query_rows * self.outputs])
                 .copied()
                 .collect(),
         ))
