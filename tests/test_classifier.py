@@ -7,6 +7,8 @@ need neither a checkpoint nor a fitted model.
 import os
 import unittest
 import warnings
+from pathlib import Path
+from unittest import mock
 
 from ironicl import TabICLClassifier
 
@@ -57,6 +59,27 @@ class ResolveThreadsTest(unittest.TestCase):
         cores = os.cpu_count() or 1
         self.assertEqual(TabICLClassifier(n_jobs=-1)._resolve_threads(), max(1, cores))
         self.assertEqual(TabICLClassifier(n_jobs=-(cores * 2))._resolve_threads(), 1)
+
+
+class CacheDirTest(unittest.TestCase):
+    def test_default_is_off(self):
+        with mock.patch.dict(os.environ, {"IRONICL_CACHE_DIR": "/data/ctx"}):
+            self.assertIsNone(TabICLClassifier()._cache_dir())  # default False ignores the env
+
+    def test_false_disables(self):
+        self.assertIsNone(TabICLClassifier(cache_dir=False)._cache_dir())
+
+    def test_explicit_path(self):
+        self.assertEqual(TabICLClassifier(cache_dir="/tmp/ctx")._cache_dir(), Path("/tmp/ctx"))
+
+    def test_none_uses_ironicl_cache_dir(self):
+        with mock.patch.dict(os.environ, {"IRONICL_CACHE_DIR": "/data/ctx"}):
+            self.assertEqual(TabICLClassifier(cache_dir=None)._cache_dir(), Path("/data/ctx"))
+
+    def test_none_falls_back_to_xdg(self):
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": "/xdg"}):
+            os.environ.pop("IRONICL_CACHE_DIR", None)
+            self.assertEqual(TabICLClassifier(cache_dir=None)._cache_dir(), Path("/xdg/ironicl/contexts"))
 
 
 if __name__ == "__main__":
