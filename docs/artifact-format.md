@@ -2,7 +2,7 @@
 
 ## Static Context Versions
 
-Static-context artifacts use the separate `IRONICL\0` format. Three versions
+Static-context artifacts use the separate `IRCNTXT\0` format. Three versions
 are supported:
 
 | Version | Tensor storage | ICL K layout |

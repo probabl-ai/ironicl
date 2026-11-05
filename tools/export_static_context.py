@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export official TabICL full-KV caches into IRONICL and IRQUERY artifacts.
+"""Export official TabICL full-KV caches into IRCNTXT and IRQUERY artifacts.
 
 Run with PYTHONHASHSEED=0. Inputs are either Covertype subsets or three .npy
 arrays: X context [N,H], y context [N], and X query [Q,H].
@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 
 OFFICIAL_CHECKPOINT_SHA256 = "bdc7dbd5e4ff21f8f0456fcf90c6b7cdf72dbea960f2d05b19bec19f9b3d4ed0"
-STATIC_MAGIC, QUERY_MAGIC, LOGITS_MAGIC = b"IRONICL\0", b"IRQUERY\0", b"IRLOGITS"
+STATIC_MAGIC, QUERY_MAGIC, LOGITS_MAGIC = b"IRCNTXT\0", b"IRQUERY\0", b"IRLOGITS"
 VERSION, STATIC_BF16_VERSION, STATIC_PACKED_VERSION, ALIGNMENT = 1, 2, 3, 64
 DTYPE_FP32, DTYPE_BF16 = 1, 2
 MAX_BYTES, MAX_TENSOR_BYTES = 48 * 1024**3, 4 * 1024**3
@@ -227,7 +227,7 @@ def encode_static_context(model_hash: str, context_hash: str, classes: np.ndarra
 
 
 def write_static_context(path: Path, model_hash: str, context_hash: str, classes: np.ndarray, features: np.ndarray, tensors: list[tuple[str, Any]], kv_dtype: str = "fp32", pack_keys: bool = False) -> dict[str, Any]:
-    """Stream an IRONICL artifact without materializing a second full cache."""
+    """Stream an IRCNTXT artifact without materializing a second full cache."""
     classes, features = np.ascontiguousarray(classes, dtype="<u8"), np.ascontiguousarray(features, dtype="<u8")
     if classes.ndim != 2 or features.ndim != 2 or classes.shape[0] != features.shape[0]:
         raise ValueError("permutations must be estimator-major rank-two arrays")
@@ -337,21 +337,21 @@ def write_static_context(path: Path, model_hash: str, context_hash: str, classes
 
 
 def parse_static_context(data: bytes) -> dict[str, Any]:
-    """Dependency-free IRONICL v1 parser for exporter tests and verification."""
+    """Dependency-free IRCNTXT v1 parser for exporter tests and verification."""
     if len(data) < 196 or hashlib.sha256(data[:-32]).digest() != data[-32:]:
-        raise ValueError("invalid IRONICL checksum")
+        raise ValueError("invalid IRCNTXT checksum")
     fields = struct.unpack_from(STATIC_FORMAT, data)
     if fields[0] != STATIC_MAGIC or fields[1] not in (VERSION, STATIC_BF16_VERSION, STATIC_PACKED_VERSION) or fields[2] != 1:
-        raise ValueError("unsupported IRONICL format")
+        raise ValueError("unsupported IRCNTXT format")
     model, context, b, n, h, c = fields[3:9]
     tensors, class_count, feature_count, directory_length, payload_length, reserved = fields[14:20]
     if reserved or class_count != b * c or feature_count != b * h:
-        raise ValueError("invalid IRONICL metadata")
+        raise ValueError("invalid IRCNTXT metadata")
     directory_start = 164 + 8 * (class_count + feature_count)
     directory_end = directory_start + directory_length
     payload_start = (directory_end + ALIGNMENT - 1) // ALIGNMENT * ALIGNMENT
     if payload_start + payload_length != len(data) - 32:
-        raise ValueError("invalid IRONICL sections")
+        raise ValueError("invalid IRCNTXT sections")
     offset, result = directory_start, []
     for _ in range(tensors):
         name_len, rank, dtype, payload_offset, byte_len = struct.unpack_from("<IHHQQ", data, offset)
@@ -363,14 +363,14 @@ def parse_static_context(data: bytes) -> dict[str, Any]:
         element_bytes = 4 if fields[1] == VERSION or dtype == DTYPE_FP32 else 2
         valid_dtype = dtype == 0 if fields[1] == VERSION else dtype in (DTYPE_FP32, DTYPE_BF16)
         if not name_len or not rank or not valid_dtype or np.prod(shape, dtype=np.uint64) * element_bytes != byte_len or payload_offset + byte_len > payload_length:
-            raise ValueError("invalid IRONICL tensor")
+            raise ValueError("invalid IRCNTXT tensor")
         result.append({
             "name": name,
             "shape": list(shape),
             "dtype": "bf16" if element_bytes == 2 else "fp32",
         })
     if offset != directory_end:
-        raise ValueError("invalid IRONICL directory")
+        raise ValueError("invalid IRCNTXT directory")
     return {"version": fields[1], "model_sha256": model.hex(), "context_sha256": context.hex(), "B": b, "N": n, "H": h, "C": c, "tensors": result}
 
 
@@ -521,7 +521,7 @@ def main() -> None:
     args.query_output.parent.mkdir(parents=True, exist_ok=True); args.query_output.write_bytes(query)
     if args.raw_logits_output:
         values = np.ascontiguousarray(np.concatenate(logits), dtype="<f4"); raw = struct.pack("<8sIIQQQQ", LOGITS_MAGIC, VERSION, 1, *values.shape, values.size) + values.tobytes(); args.raw_logits_output.parent.mkdir(parents=True, exist_ok=True); args.raw_logits_output.write_bytes(raw + hashlib.sha256(raw).digest())
-    metadata = {"format": f"IRONICL static-context v{context_info['static_context_version']}", "checkpoint_sha256": checkpoint_hash, "model_source_sha256": model_hash, "model_artifact_sha256": model_file_hash, "context_sha256": context_hash, "source": source, **context_info, "sparse_index": args.sparse_index, "index_clusters": args.index_clusters if args.sparse_index else None, "query_shape": list(query_variants.shape), "query_file_sha256": hashlib.sha256(query).hexdigest()}
+    metadata = {"format": f"IRCNTXT static-context v{context_info['static_context_version']}", "checkpoint_sha256": checkpoint_hash, "model_source_sha256": model_hash, "model_artifact_sha256": model_file_hash, "context_sha256": context_hash, "source": source, **context_info, "sparse_index": args.sparse_index, "index_clusters": args.index_clusters if args.sparse_index else None, "query_shape": list(query_variants.shape), "query_file_sha256": hashlib.sha256(query).hexdigest()}
     path = args.metadata_output or args.context_output.with_suffix(args.context_output.suffix + ".json"); path.parent.mkdir(parents=True, exist_ok=True); path.write_text(json.dumps(metadata, sort_keys=True, indent=2) + "\n")
     print(json.dumps(metadata, sort_keys=True))
 

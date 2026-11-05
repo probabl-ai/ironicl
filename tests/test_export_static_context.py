@@ -82,11 +82,11 @@ class ExportFormatTest(unittest.TestCase):
             features = np.array([[0]], dtype=np.uint64)
             expected = exporter.encode_static_context("01" * 32, "02" * 32, classes, features, tensors)
             with tempfile.TemporaryDirectory() as directory:
-                path = pathlib.Path(directory) / "context.ironiclctx"
+                path = pathlib.Path(directory) / "context.irctx"
                 info = exporter.write_static_context(path, "01" * 32, "02" * 32, classes, features, tensors)
                 self.assertEqual(path.read_bytes(), expected)
                 self.assertEqual(info["context_file_bytes"], len(expected))
-                bf16_path = pathlib.Path(directory) / "context-bf16.ironiclctx"
+                bf16_path = pathlib.Path(directory) / "context-bf16.irctx"
                 bf16_info = exporter.write_static_context(
                     bf16_path, "01" * 32, "02" * 32, classes, features, tensors, "bf16"
                 )
@@ -106,7 +106,7 @@ class ExportFormatTest(unittest.TestCase):
                 expected = exporter.encode_static_context(
                     "01" * 32, "02" * 32, classes, features, combined
                 )
-                chunked_path = pathlib.Path(directory) / "context-chunked.ironiclctx"
+                chunked_path = pathlib.Path(directory) / "context-chunked.irctx"
                 exporter.write_static_context(
                     chunked_path, "01" * 32, "02" * 32, classes, features, chunked
                 )
@@ -130,7 +130,7 @@ class ExportFormatTest(unittest.TestCase):
         classes = np.array([[0, 1]], dtype=np.uint64)
         features = np.array([[0]], dtype=np.uint64)
         with tempfile.TemporaryDirectory() as directory:
-            path = pathlib.Path(directory) / "indexed.ironiclctx"
+            path = pathlib.Path(directory) / "indexed.irctx"
             exporter.write_static_context(path, "01" * 32, "02" * 32, classes, features, tensors, "bf16-v", True)
             parsed = exporter.parse_static_context(path.read_bytes())
         tensors = {item["name"]: item for item in parsed["tensors"]}
@@ -146,7 +146,7 @@ class ExportFormatTest(unittest.TestCase):
         body.extend(bytes(32))
         body.extend(hashlib.sha256(body).digest())
         with tempfile.TemporaryDirectory() as directory:
-            model = pathlib.Path(directory) / "model.ironicl"
+            model = pathlib.Path(directory) / "model.irmodel"
             model.write_bytes(body)
             self.assertEqual(exporter.model_source_sha256(model), "03" * 32)
             body[-1] ^= 1

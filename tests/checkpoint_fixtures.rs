@@ -65,7 +65,7 @@ fn imports_official_classifier_and_reuses_automatic_cache() {
         panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
     let directory = tempdir().expect("temporary cache directory");
-    let explicit_model = directory.path().join("classifier.ironicl");
+    let explicit_model = directory.path().join("classifier.irmodel");
     let imported = import_checkpoint(&checkpoint, &explicit_model).expect("import classifier");
     assert_eq!(imported.source_sha256, CLASSIFIER_SHA256);
     assert_eq!(imported.profile, ironicl::ModelProfile::TabIclV2Classifier);
@@ -103,7 +103,7 @@ fn imports_official_classifier_and_reuses_automatic_cache() {
 #[test]
 #[ignore = "needs official checkpoint fixtures; run with --ignored once IRONICL_CHECKPOINT_FIXTURES is set. See CONTRIBUTING.md"]
 fn loads_official_classifier_artifact_when_fixture_is_available() {
-    let Some(path) = fixture("tabicl-classifier-v2.ironicl") else {
+    let Some(path) = fixture("tabicl-classifier-v2.irmodel") else {
         panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
     let model = load_model_artifact(&path).expect("load official classifier artifact");
@@ -120,7 +120,7 @@ fn loads_official_classifier_artifact_when_fixture_is_available() {
 #[test]
 #[ignore = "needs official checkpoint fixtures; run with --ignored once IRONICL_CHECKPOINT_FIXTURES is set. See CONTRIBUTING.md"]
 fn runs_official_classifier_artifact_when_fixture_is_available() {
-    let Some(path) = fixture("tabicl-classifier-v2.ironicl") else {
+    let Some(path) = fixture("tabicl-classifier-v2.irmodel") else {
         panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
     let directory = tempdir().expect("temporary input directory");
@@ -154,7 +154,7 @@ fn matches_python_classifier_oracle_when_fixtures_are_available() {
     let Some(oracle) = oracle_fixtures() else {
         panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
-    let Some(model_path) = fixture("tabicl-classifier-v2.ironicl") else {
+    let Some(model_path) = fixture("tabicl-classifier-v2.irmodel") else {
         panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
 
@@ -208,7 +208,7 @@ fn matches_python_classifier_oracle_when_fixtures_are_available() {
     clippy::many_single_char_names
 )]
 fn built_context_matches_the_uncached_forward_pass() {
-    let Some(model_path) = fixture("tabicl-classifier-v2.ironicl") else {
+    let Some(model_path) = fixture("tabicl-classifier-v2.irmodel") else {
         panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
     let executor =
@@ -297,7 +297,7 @@ fn built_context_matches_the_uncached_forward_pass() {
 #[ignore = "needs official checkpoint fixtures; run with --ignored once IRONICL_CHECKPOINT_FIXTURES is set. See CONTRIBUTING.md"]
 #[allow(clippy::cast_precision_loss, clippy::many_single_char_names)]
 fn large_cached_query_runs_in_chunks() {
-    let Some(model_path) = fixture("tabicl-classifier-v2.ironicl") else {
+    let Some(model_path) = fixture("tabicl-classifier-v2.irmodel") else {
         panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
     let executor =
@@ -352,7 +352,7 @@ fn large_cached_query_runs_in_chunks() {
 #[ignore = "needs official checkpoint fixtures; run with --ignored once IRONICL_CHECKPOINT_FIXTURES is set. See CONTRIBUTING.md"]
 #[allow(clippy::cast_precision_loss, clippy::many_single_char_names)]
 fn reduced_precision_context_predicts_all_missing_rows() {
-    let Some(model_path) = fixture("tabicl-classifier-v2.ironicl") else {
+    let Some(model_path) = fixture("tabicl-classifier-v2.irmodel") else {
         panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
     let executor =

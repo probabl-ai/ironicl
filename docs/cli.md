@@ -32,7 +32,7 @@ different without changing command names.
 
 ```bash
 ironicl inspect --checkpoint tabicl-classifier-v2-20260212.ckpt
-ironicl inspect --model classifier.ironicl
+ironicl inspect --model classifier.irmodel
 ```
 
 Checkpoint inspection is implemented. It parses without executing pickle code
@@ -52,7 +52,7 @@ and checksum validation.
 ```bash
 ironicl import \
   --checkpoint tabicl-classifier-v2-20260212.ckpt \
-  --output classifier.ironicl
+  --output classifier.irmodel
 ```
 
 Import validates the checkpoint, preserves source identity, copies tensors into
@@ -74,15 +74,15 @@ ironicl run --checkpoint tabicl-classifier-v2-20260212.ckpt --input request.irin
 Optimized path:
 
 ```bash
-ironicl run --model classifier.ironicl --input request.irinput
+ironicl run --model classifier.irmodel --input request.irinput
 ```
 
 Cached query-only path:
 
 ```bash
 ironicl run \
-  --model classifier.ironicl \
-  --context context.ironiclctx \
+  --model classifier.irmodel \
+  --context context.irctx \
   --input request.irquery
 ```
 

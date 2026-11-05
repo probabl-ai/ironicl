@@ -5,7 +5,7 @@ checkpoints, because checkpoint import and conversion must stay outside
 comparable inference timing.
 
 ```bash
-cargo run --release -- benchmark --model model.ironicl --input request.irinput \
+cargo run --release -- benchmark --model model.irmodel --input request.irinput \
   --warmup 2 --iterations 10
 ```
 
@@ -13,8 +13,8 @@ For cached query-only inference:
 
 ```bash
 IRONICL_THREADS=8 cargo run --release -- benchmark \
-  --model model.ironicl \
-  --context context.ironiclctx \
+  --model model.irmodel \
+  --context context.irctx \
   --input request.irquery \
   --warmup 5 --iterations 50
 ```

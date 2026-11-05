@@ -921,7 +921,7 @@ mod tests {
     #[test]
     fn model_artifact_round_trips_and_detects_corruption() {
         let directory = tempdir().expect("temporary directory");
-        let path = directory.path().join("model.ironicl");
+        let path = directory.path().join("model.irmodel");
         let model = fixture_model();
 
         let written = write_model_artifact(&path, &model).expect("write model artifact");

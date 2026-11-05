@@ -72,7 +72,7 @@ def read_class_permutations(path: Path, shape: tuple[int, int, int]) -> np.ndarr
             raise ValueError("static-context header is truncated")
         fields = STATIC_HEADER.unpack(header)
         b, _, _, c = fields[5:9]
-        if fields[0] != b"IRONICL\0" or fields[2] != 1 or (b, c) != (shape[0], shape[2]):
+        if fields[0] != b"IRCNTXT\0" or fields[2] != 1 or (b, c) != (shape[0], shape[2]):
             raise ValueError("static context does not match IRLOGITS")
         permutations = np.fromfile(file, dtype="<u8", count=b * c)
     if permutations.size != b * c:
