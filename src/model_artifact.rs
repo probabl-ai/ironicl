@@ -205,57 +205,51 @@ impl ModelTensorF32 {
     }
 }
 
-/// An owned, executable official `TabICLv2` classifier model.
+/// An owned, executable official `TabICLv2` classifier or regressor model.
 ///
 /// The loader validates the complete official tensor manifest before it returns
 /// this type. Tensor values are stored in owned, host-native FP32 vectors.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelArtifact {
     summary: ModelArtifactSummary,
+    task: TaskKind,
     tensors: BTreeMap<String, ModelTensorF32>,
 }
 
 impl ModelArtifact {
-    /// Read, verify, and prepare the official `TabICLv2` classifier artifact.
+    /// Read, verify, and prepare an official `TabICLv2` model artifact.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Artifact`] when the file is invalid, is not the
-    /// official classifier, or does not have its exact tensor manifest.
+    /// Returns [`Error::Artifact`] when the file is invalid, is not an
+    /// official model, or does not have its exact tensor manifest.
     pub fn load(path: &Path) -> Result<Self> {
-        Self::load_tabicl_v2_classifier(path)
+        Self::from_bytes(&read_artifact_bytes(path)?)
     }
 
-    /// Read, verify, and prepare the official `TabICLv2` classifier artifact.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Artifact`] when the file is invalid, is not the
-    /// official classifier, or does not have its exact tensor manifest.
-    pub fn load_tabicl_v2_classifier(path: &Path) -> Result<Self> {
-        let bytes = read_artifact_bytes(path)?;
-        Self::from_tabicl_v2_classifier_bytes(&bytes)
-    }
-
-    /// Verify and prepare bytes from an official `TabICLv2` classifier artifact.
+    /// Verify and prepare bytes from an official `TabICLv2` model artifact.
     ///
     /// This owns decoded tensor storage, so the returned model does not borrow
-    /// the artifact bytes.
+    /// the artifact bytes. The regressor's bias-free layer norms get zero
+    /// biases, so both models run the same layer-norm code.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Artifact`] when the bytes are invalid or do not match
-    /// the official classifier manifest.
-    pub fn from_tabicl_v2_classifier_bytes(bytes: &[u8]) -> Result<Self> {
+    /// the official manifest.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let parsed = parse_model_artifact_bytes(bytes)?;
-        if parsed.summary.profile != ModelProfile::TabIclV2Classifier {
-            return Err(Error::Artifact(format!(
-                "executable model must be the official TabICLv2 classifier; found {}",
-                parsed.summary.profile
-            )));
-        }
-        validate_classifier_config(&parsed.summary.config)?;
-        validate_classifier_manifest(&parsed.tensors)?;
+        let task = match parsed.summary.profile {
+            ModelProfile::TabIclV2Classifier => TaskKind::Classifier,
+            ModelProfile::TabIclV2Regressor => TaskKind::Regressor,
+            ModelProfile::Unknown => {
+                return Err(Error::Artifact(
+                    "executable model must be an official TabICLv2 classifier or regressor".into(),
+                ));
+            }
+        };
+        validate_config(&parsed.summary.config, task)?;
+        validate_manifest(&parsed.tensors, task)?;
 
         let mut tensors = BTreeMap::new();
         for tensor in parsed.tensors {
@@ -279,10 +273,25 @@ impl ModelArtifact {
                 },
             );
         }
+        if task == TaskKind::Regressor {
+            for (name, dimensions) in tensor_manifest(TaskKind::Classifier) {
+                if let std::collections::btree_map::Entry::Vacant(entry) = tensors.entry(name) {
+                    let values = vec![0.0; u64_to_usize(dimensions.iter().product(), "layer-norm bias")?];
+                    entry.insert(ModelTensorF32 { dimensions, values });
+                }
+            }
+        }
         Ok(Self {
             summary: parsed.summary,
+            task,
             tensors,
         })
+    }
+
+    /// Whether this is the classifier or the regressor.
+    #[must_use]
+    pub fn task(&self) -> TaskKind {
+        self.task
     }
 
     /// Verified model metadata.
@@ -299,11 +308,11 @@ impl ModelArtifact {
     pub fn tensor_f32(&self, name: &str) -> Result<&ModelTensorF32> {
         self.tensors
             .get(name)
-            .ok_or_else(|| Error::Artifact(format!("official classifier tensor '{name}' is missing")))
+            .ok_or_else(|| Error::Artifact(format!("official model tensor '{name}' is missing")))
     }
 }
 
-/// Load an executable official `TabICLv2` classifier model artifact.
+/// Load an executable official `TabICLv2` model artifact.
 ///
 /// # Errors
 ///
@@ -713,11 +722,11 @@ fn checked_elements(name: &str, dimensions: &[u64]) -> Result<u64> {
     })
 }
 
-fn validate_classifier_manifest(tensors: &[ParsedTensor]) -> Result<()> {
-    let expected = classifier_tensor_manifest();
+fn validate_manifest(tensors: &[ParsedTensor], task: TaskKind) -> Result<()> {
+    let expected = tensor_manifest(task);
     if tensors.len() != expected.len() {
         return Err(Error::Artifact(format!(
-            "official classifier has {} tensors; expected {}",
+            "official {task} has {} tensors; expected {}",
             tensors.len(),
             expected.len()
         )));
@@ -725,20 +734,20 @@ fn validate_classifier_manifest(tensors: &[ParsedTensor]) -> Result<()> {
     for tensor in tensors {
         let Some(dimensions) = expected.get(&tensor.name) else {
             return Err(Error::Artifact(format!(
-                "unexpected official classifier tensor '{}'",
+                "unexpected official {task} tensor '{}'",
                 tensor.name
             )));
         };
         if tensor.dtype != ModelTensorDType::F32 {
             return Err(Error::Artifact(format!(
-                "official classifier tensor '{}' has dtype {}; expected f32",
+                "official {task} tensor '{}' has dtype {}; expected f32",
                 tensor.name,
                 tensor.dtype.as_str()
             )));
         }
         if tensor.dimensions != *dimensions {
             return Err(Error::Artifact(format!(
-                "official classifier tensor '{}' has shape {:?}; expected {:?}",
+                "official {task} tensor '{}' has shape {:?}; expected {:?}",
                 tensor.name, tensor.dimensions, dimensions
             )));
         }
@@ -746,26 +755,41 @@ fn validate_classifier_manifest(tensors: &[ParsedTensor]) -> Result<()> {
     Ok(())
 }
 
-fn validate_classifier_config(config: &ModelConfig) -> Result<()> {
+fn validate_config(config: &ModelConfig, task: TaskKind) -> Result<()> {
     let actual = config.required_values()?;
-    let expected = [10, 999, 128, 3, 3, 4, 12];
+    let max_classes = match task {
+        TaskKind::Classifier => 10,
+        TaskKind::Regressor => 0,
+    };
+    let expected = [max_classes, 999, 128, 3, 3, 4, 12];
     if actual != expected {
         return Err(Error::Artifact(format!(
-            "official classifier configuration is {actual:?}; expected {expected:?}"
+            "official {task} configuration is {actual:?}; expected {expected:?}"
         )));
     }
     Ok(())
 }
 
-fn classifier_tensor_manifest() -> BTreeMap<String, Vec<u64>> {
+/// The official tensor names and shapes. The regressor encodes a scalar
+/// target, decodes 999 quantiles, and has no layer-norm biases.
+fn tensor_manifest(task: TaskKind) -> BTreeMap<String, Vec<u64>> {
+    let (targets, outputs) = match task {
+        TaskKind::Classifier => (10, 10),
+        TaskKind::Regressor => (1, 999),
+    };
     let mut tensors = BTreeMap::new();
     let mut insert = |name: String, dimensions: &[u64]| {
+        let layer_norm_bias =
+            name.ends_with("norm1.bias") || name.ends_with("norm2.bias") || name.ends_with("ln.bias");
+        if task == TaskKind::Regressor && layer_norm_bias {
+            return;
+        }
         assert!(tensors.insert(name, dimensions.to_vec()).is_none());
     };
     insert("col_embedder.in_linear.bias".into(), &[128]);
     insert("col_embedder.in_linear.weight".into(), &[128, 3]);
     insert("col_embedder.y_encoder.bias".into(), &[128]);
-    insert("col_embedder.y_encoder.weight".into(), &[128, 10]);
+    insert("col_embedder.y_encoder.weight".into(), &[128, targets]);
     for block in 0..3 {
         let prefix = format!("col_embedder.tf_col.blocks.{block}");
         insert(format!("{prefix}.ind_vectors"), &[128, 128]);
@@ -775,12 +799,12 @@ fn classifier_tensor_manifest() -> BTreeMap<String, Vec<u64>> {
 
     insert("icl_predictor.decoder.0.bias".into(), &[1024]);
     insert("icl_predictor.decoder.0.weight".into(), &[1024, 512]);
-    insert("icl_predictor.decoder.2.bias".into(), &[10]);
-    insert("icl_predictor.decoder.2.weight".into(), &[10, 1024]);
+    insert("icl_predictor.decoder.2.bias".into(), &[outputs]);
+    insert("icl_predictor.decoder.2.weight".into(), &[outputs, 1024]);
     insert("icl_predictor.ln.bias".into(), &[512]);
     insert("icl_predictor.ln.weight".into(), &[512]);
     insert("icl_predictor.y_encoder.bias".into(), &[512]);
-    insert("icl_predictor.y_encoder.weight".into(), &[512, 10]);
+    insert("icl_predictor.y_encoder.weight".into(), &[512, targets]);
     for block in 0..12 {
         insert_attention_manifest(
             &mut insert,
@@ -802,7 +826,13 @@ fn classifier_tensor_manifest() -> BTreeMap<String, Vec<u64>> {
             false,
         );
     }
-    debug_assert_eq!(tensors.len(), 391);
+    debug_assert_eq!(
+        tensors.len(),
+        match task {
+            TaskKind::Classifier => 391,
+            TaskKind::Regressor => 347,
+        }
+    );
     tensors
 }
 
@@ -953,19 +983,29 @@ mod tests {
     }
 
     #[test]
-    fn classifier_manifest_has_all_official_tensors() {
-        let manifest = classifier_tensor_manifest();
+    fn manifests_have_all_official_tensors() {
+        let manifest = tensor_manifest(TaskKind::Classifier);
         assert_eq!(manifest.len(), 391);
         assert_eq!(
             manifest.get("icl_predictor.tf_icl.blocks.11.linear2.weight"),
             Some(&vec![512, 1024])
         );
         assert_eq!(manifest.get("row_interactor.tf_row.rope.freqs"), Some(&vec![8]));
+
+        let manifest = tensor_manifest(TaskKind::Regressor);
+        assert_eq!(manifest.len(), 347);
+        assert_eq!(
+            manifest.get("icl_predictor.decoder.2.weight"),
+            Some(&vec![999, 1024])
+        );
+        assert_eq!(manifest.get("col_embedder.y_encoder.weight"), Some(&vec![128, 1]));
+        assert!(!manifest.contains_key("icl_predictor.ln.bias"));
+        assert!(!manifest.contains_key("row_interactor.tf_row.blocks.0.norm1.bias"));
     }
 
     #[test]
-    fn classifier_manifest_rejects_wrong_shape_and_unexpected_tensor() {
-        let manifest = classifier_tensor_manifest();
+    fn manifest_rejects_wrong_shape_and_unexpected_tensor() {
+        let manifest = tensor_manifest(TaskKind::Classifier);
         let mut tensors = manifest
             .into_iter()
             .map(|(name, dimensions)| ParsedTensor {
@@ -976,29 +1016,32 @@ mod tests {
             })
             .collect::<Vec<_>>();
         tensors[0].dimensions = vec![1];
-        assert!(validate_classifier_manifest(&tensors).is_err());
+        assert!(validate_manifest(&tensors, TaskKind::Classifier).is_err());
 
-        tensors[0].dimensions = classifier_tensor_manifest()
+        tensors[0].dimensions = tensor_manifest(TaskKind::Classifier)
             .get(&tensors[0].name)
             .expect("known tensor")
             .clone();
         tensors[0].name = "unexpected.tensor".into();
-        assert!(validate_classifier_manifest(&tensors).is_err());
+        assert!(validate_manifest(&tensors, TaskKind::Classifier).is_err());
 
-        tensors[0].name = classifier_tensor_manifest()
+        tensors[0].name = tensor_manifest(TaskKind::Classifier)
             .keys()
             .next()
             .expect("manifest has tensors")
             .clone();
         tensors[0].dtype = ModelTensorDType::F64;
-        assert!(validate_classifier_manifest(&tensors).is_err());
+        assert!(validate_manifest(&tensors, TaskKind::Classifier).is_err());
     }
 
     #[test]
-    fn classifier_configuration_must_match_the_release() {
+    fn configuration_must_match_the_release() {
         let mut config = fixture_model().config;
         config.num_quantiles = Some(998);
-        assert!(validate_classifier_config(&config).is_err());
+        assert!(validate_config(&config, TaskKind::Classifier).is_err());
+        config.num_quantiles = Some(999);
+        assert!(validate_config(&config, TaskKind::Classifier).is_ok());
+        assert!(validate_config(&config, TaskKind::Regressor).is_err());
     }
 
     fn fixture_model() -> ModelArtifactData {

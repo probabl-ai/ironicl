@@ -16,7 +16,7 @@ use pyo3::{
 
 use crate::{
     CheckpointCacheOptions, ClassifierAggregation, Error, Executor, Optimize, PreparedCheckpoint,
-    QueryRequest, StaticExecutor, load_model_artifact, prepare_checkpoint,
+    QueryRequest, RegressionOutput, StaticExecutor, load_model_artifact, prepare_checkpoint,
 };
 
 fn py_error(error: Error) -> PyErr {
@@ -28,7 +28,7 @@ fn py_error(error: Error) -> PyErr {
     }
 }
 
-/// A loaded `TabICLv2` classifier.
+/// A loaded `TabICLv2` classifier or regressor.
 #[pyclass(frozen)]
 struct Model(Executor);
 
@@ -48,9 +48,11 @@ impl Model {
         .map_err(py_error)
     }
 
-    /// Run FP32 training rows `x[B, N, H]` with labels `y_train[B, N]` once and
-    /// keep their attention keys and values. Permutations are `[B, C]` and
-    /// `[B, H]`; `optimize` is `"safe"`, `"auto"`, or `"fast"`.
+    /// Run FP32 training rows `x[B, N, H]` with targets `y_train[B, N]` once and
+    /// keep their attention keys and values. Targets are class labels for the
+    /// classifier and standardized values for the regressor. Permutations are
+    /// `[B, C]` (empty for the regressor) and `[B, H]`; `optimize` is `"safe"`,
+    /// `"auto"`, or `"fast"`.
     #[allow(clippy::too_many_arguments)]
     fn build_context(
         &self,
@@ -84,6 +86,12 @@ impl Model {
         })
         .map(Context)
         .map_err(py_error)
+    }
+
+    /// `"classifier"` or `"regressor"`.
+    #[getter]
+    fn task(&self) -> String {
+        self.0.task().to_string()
     }
 
     /// The source-checkpoint SHA-256 that identifies this model.
@@ -134,6 +142,37 @@ impl Context {
             PyBytes::new(py, bytemuck::cast_slice(probabilities.values())),
             probabilities.shape(),
         ))
+    }
+
+    /// Predict FP32 query rows `x[B, Q, H]` against a regression context. Returns
+    /// each `output_types` entry as FP32 bytes and its `[Q, columns]` shape, in
+    /// standardized target units. `alphas` are the levels for `"quantiles"`.
+    fn predict_regression<'py>(
+        &self,
+        py: Python<'py>,
+        x: PyBuffer<f32>,
+        output_types: Vec<String>,
+        alphas: Vec<f32>,
+    ) -> PyResult<Vec<(Bound<'py, PyBytes>, [usize; 2])>> {
+        let &[ensembles, rows, features] = x.shape() else {
+            return Err(PyValueError::new_err("x must have shape [B, Q, H]"));
+        };
+        let outputs = output_types
+            .iter()
+            .map(|name| RegressionOutput::parse(name, &alphas))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(py_error)?;
+        let x = x.to_vec(py)?;
+        let results = py
+            .detach(|| {
+                let request = QueryRequest::new(ensembles, rows, features, &x)?;
+                self.0.predict_regression(request, &outputs)
+            })
+            .map_err(py_error)?;
+        Ok(results
+            .into_iter()
+            .map(|(values, columns)| (PyBytes::new(py, bytemuck::cast_slice(&values)), [rows, columns]))
+            .collect())
     }
 
     /// Write this fitted context to `path` atomically, for reuse through

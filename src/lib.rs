@@ -20,6 +20,7 @@ pub mod platform;
 pub mod profile;
 #[cfg(feature = "python")]
 mod python;
+pub mod quantiles;
 pub mod query_bundle;
 pub mod static_context;
 
@@ -47,6 +48,7 @@ pub use model_artifact::{
     ModelProfile, ModelTensorF32, inspect_model_artifact, load_model_artifact,
 };
 pub use platform::CpuCapabilities;
+pub use quantiles::RegressionOutput;
 pub use query_bundle::{STATIC_QUERY_BUNDLE_MAGIC, STATIC_QUERY_BUNDLE_VERSION, StaticQueryBundle};
 pub use static_context::{
     STATIC_CONTEXT_MAGIC, STATIC_CONTEXT_VERSION, StaticContextArtifact, StaticContextMetadata,
