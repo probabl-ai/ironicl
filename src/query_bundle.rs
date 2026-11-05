@@ -3,7 +3,7 @@
 use std::{fs::File, io::Read, path::Path};
 
 use crate::{
-    ClassifierQueryRequest, Error, Result,
+    Error, QueryRequest, Result,
     artifact::{ByteReader, CHECKSUM_BYTES, sha256},
 };
 
@@ -129,8 +129,8 @@ impl StaticQueryBundle {
     /// # Errors
     ///
     /// Returns an error only if internal validated dimensions cannot form a request.
-    pub fn request(&self) -> Result<ClassifierQueryRequest<'_>> {
-        ClassifierQueryRequest::new(self.ensemble_count, self.query_rows, self.feature_count, &self.x)
+    pub fn request(&self) -> Result<QueryRequest<'_>> {
+        QueryRequest::new(self.ensemble_count, self.query_rows, self.feature_count, &self.x)
     }
 
     /// Source-checkpoint identity of the required model.

@@ -13,8 +13,7 @@ use std::{
 };
 
 use crate::{
-    ClassifierAggregation, ClassifierQueryRequest, StaticClassifierExecutor, StaticContextArtifact,
-    load_model_artifact,
+    ClassifierAggregation, QueryRequest, StaticContextArtifact, StaticExecutor, load_model_artifact,
 };
 
 const SUCCESS: c_int = 0;
@@ -23,7 +22,7 @@ const EXECUTION_ERROR: c_int = 2;
 const PANIC: c_int = 3;
 
 pub struct CachedExecutor {
-    executor: StaticClassifierExecutor,
+    executor: StaticExecutor,
 }
 
 fn write_error(buffer: *mut c_char, length: usize, message: &str) {
@@ -72,7 +71,7 @@ pub unsafe extern "C" fn ironicl_static_executor_create(
         let context_path = c_path(context_path, "context")?;
         let model = load_model_artifact(&model_path).map_err(|error| error.to_string())?;
         let context = StaticContextArtifact::read(&context_path).map_err(|error| error.to_string())?;
-        let executor = StaticClassifierExecutor::new(model, context).map_err(|error| error.to_string())?;
+        let executor = StaticExecutor::new(model, context).map_err(|error| error.to_string())?;
         Ok::<_, String>(Box::into_raw(Box::new(CachedExecutor { executor })))
     }));
     match result {
@@ -128,7 +127,7 @@ pub unsafe extern "C" fn ironicl_static_executor_predict_probabilities(
             .ok_or_else(|| (INVALID_ARGUMENT, "query dimensions overflow usize".to_owned()))?;
         // The caller promises the query and output ranges are valid for this call.
         let query = unsafe { std::slice::from_raw_parts(query, query_length) };
-        let request = ClassifierQueryRequest::new(ensemble_count, query_rows, feature_count, query)
+        let request = QueryRequest::new(ensemble_count, query_rows, feature_count, query)
             .map_err(|error| (INVALID_ARGUMENT, error.to_string()))?;
         let executor = unsafe { &(*handle).executor };
         let probabilities = executor
@@ -206,7 +205,7 @@ pub unsafe extern "C" fn ironicl_static_executor_predict_probabilities_batch(
         let query = unsafe { std::slice::from_raw_parts(query, query_length) };
         let requests = query
             .chunks_exact(request_length)
-            .map(|values| ClassifierQueryRequest::new(ensemble_count, query_rows, feature_count, values))
+            .map(|values| QueryRequest::new(ensemble_count, query_rows, feature_count, values))
             .collect::<crate::Result<Vec<_>>>()
             .map_err(|error| (INVALID_ARGUMENT, error.to_string()))?;
         let executor = unsafe { &(*handle).executor };

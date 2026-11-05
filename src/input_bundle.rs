@@ -27,7 +27,7 @@ const MAX_TRAINING_ROWS: usize = 1_000_000;
 
 /// Owned, validated preprocessed tensors for one classifier request bundle.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ClassifierInputBundle {
+pub struct InputBundle {
     ensemble_count: usize,
     total_rows: usize,
     feature_count: usize,
@@ -36,7 +36,7 @@ pub struct ClassifierInputBundle {
     y_train: Vec<f32>,
 }
 
-impl ClassifierInputBundle {
+impl InputBundle {
     /// Validate and own classifier tensors with shapes `[B, T, H]` and `[B, N]`.
     ///
     /// Labels must be finite integer-valued FP32 values from 0 through 9.
@@ -207,8 +207,8 @@ impl ClassifierInputBundle {
 
     /// Borrow the tensors and dimensions needed to form a classifier request.
     #[must_use]
-    pub fn request(&self) -> ClassifierRequest<'_> {
-        ClassifierRequest {
+    pub fn request(&self) -> Request<'_> {
+        Request {
             ensemble_count: self.ensemble_count,
             total_rows: self.total_rows,
             feature_count: self.feature_count,
@@ -233,9 +233,9 @@ impl ClassifierInputBundle {
     }
 }
 
-/// Borrowed classifier tensors and dimensions from a [`ClassifierInputBundle`].
+/// Borrowed classifier tensors and dimensions from a [`InputBundle`].
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ClassifierRequest<'a> {
+pub struct Request<'a> {
     ensemble_count: usize,
     total_rows: usize,
     feature_count: usize,
@@ -246,18 +246,18 @@ pub struct ClassifierRequest<'a> {
 
 /// Borrowed preprocessed test queries with shape `[B, Q, H]`.
 ///
-/// This request is for a [`crate::StaticClassifierExecutor`]. The static
+/// This request is for a [`crate::StaticExecutor`]. The static
 /// context supplies the training rows and labels, so query execution accepts
 /// neither of them.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ClassifierQueryRequest<'a> {
+pub struct QueryRequest<'a> {
     ensemble_count: usize,
     query_rows: usize,
     feature_count: usize,
     x: &'a [f32],
 }
 
-impl<'a> ClassifierQueryRequest<'a> {
+impl<'a> QueryRequest<'a> {
     /// Validate borrowed FP32 query values with shape `[B, Q, H]`.
     ///
     /// # Errors
@@ -324,7 +324,7 @@ impl<'a> ClassifierQueryRequest<'a> {
     }
 }
 
-impl<'a> ClassifierRequest<'a> {
+impl<'a> Request<'a> {
     /// Ensemble count `B`.
     #[must_use]
     pub fn ensemble_count(self) -> usize {
@@ -441,9 +441,8 @@ fn input_error(message: impl std::fmt::Display) -> Error {
 mod tests {
     use super::*;
 
-    fn fixture() -> ClassifierInputBundle {
-        ClassifierInputBundle::new(2, 3, 2, 2, vec![0.0; 12], vec![0.0, 9.0, 1.0, 8.0])
-            .expect("valid fixture")
+    fn fixture() -> InputBundle {
+        InputBundle::new(2, 3, 2, 2, vec![0.0; 12], vec![0.0, 9.0, 1.0, 8.0]).expect("valid fixture")
     }
 
     #[test]
@@ -451,10 +450,7 @@ mod tests {
         let bundle = fixture();
         let bytes = bundle.to_bytes();
         assert_eq!(bytes, bundle.to_bytes());
-        assert_eq!(
-            ClassifierInputBundle::from_bytes(&bytes).expect("read bundle"),
-            bundle
-        );
+        assert_eq!(InputBundle::from_bytes(&bytes).expect("read bundle"), bundle);
         let request = bundle.request();
         assert_eq!(
             (
@@ -471,28 +467,28 @@ mod tests {
     fn rejects_corruption_and_truncation() {
         let mut corrupt = fixture().to_bytes();
         corrupt[HEADER_BYTES] ^= 1;
-        assert!(ClassifierInputBundle::from_bytes(&corrupt).is_err());
+        assert!(InputBundle::from_bytes(&corrupt).is_err());
         let truncated = fixture().to_bytes();
-        assert!(ClassifierInputBundle::from_bytes(&truncated[..truncated.len() - 1]).is_err());
+        assert!(InputBundle::from_bytes(&truncated[..truncated.len() - 1]).is_err());
     }
 
     #[test]
     fn rejects_invalid_shapes_and_noninteger_labels() {
-        assert!(ClassifierInputBundle::new(1, 2, 1, 2, vec![0.0; 2], vec![0.0; 2]).is_err());
-        assert!(ClassifierInputBundle::new(1, 2, 1, 1, vec![0.0; 2], vec![1.5]).is_err());
+        assert!(InputBundle::new(1, 2, 1, 2, vec![0.0; 2], vec![0.0; 2]).is_err());
+        assert!(InputBundle::new(1, 2, 1, 1, vec![0.0; 2], vec![1.5]).is_err());
 
         let mut malformed = fixture().to_bytes();
         malformed[24..32].copy_from_slice(&2_u64.to_le_bytes());
         let checksum_offset = malformed.len() - CHECKSUM_BYTES;
         let checksum = sha256(&malformed[..checksum_offset]);
         malformed[checksum_offset..].copy_from_slice(&checksum);
-        assert!(ClassifierInputBundle::from_bytes(&malformed).is_err());
+        assert!(InputBundle::from_bytes(&malformed).is_err());
     }
 
     #[test]
     fn query_request_rejects_shape_and_nonfinite_values() {
-        assert!(ClassifierQueryRequest::new(1, 2, 3, &[0.0; 6]).is_ok());
-        assert!(ClassifierQueryRequest::new(1, 2, 3, &[0.0; 5]).is_err());
-        assert!(ClassifierQueryRequest::new(1, 2, 3, &[0.0, 0.0, 0.0, 0.0, 0.0, f32::NAN]).is_err());
+        assert!(QueryRequest::new(1, 2, 3, &[0.0; 6]).is_ok());
+        assert!(QueryRequest::new(1, 2, 3, &[0.0; 5]).is_err());
+        assert!(QueryRequest::new(1, 2, 3, &[0.0, 0.0, 0.0, 0.0, 0.0, f32::NAN]).is_err());
     }
 }

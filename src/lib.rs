@@ -36,13 +36,12 @@ pub use cli::{
 pub use config::{CacheMode, ExecutionConfig, StorageDType, TabIclV2Model, TaskKind, Workload};
 pub use error::{Error, Result};
 pub use executor::{
-    ClassifierAggregation, ClassifierExecutor, ClassifierLogits, ClassifierLogitsTrace,
-    ClassifierProbabilities, ClassifierTraceStage, Optimize, SparseAttentionStatistics,
-    StaticClassifierExecutor,
+    ClassifierAggregation, ClassifierProbabilities, DecoderOutputs, Executor, ForwardTrace, Optimize,
+    SparseAttentionStatistics, StaticExecutor, TraceStage,
 };
 pub use input_bundle::{
     CLASSIFIER_INPUT_BUNDLE_KIND, CLASSIFIER_INPUT_BUNDLE_MAGIC, CLASSIFIER_INPUT_BUNDLE_VERSION,
-    ClassifierInputBundle, ClassifierQueryRequest, ClassifierRequest,
+    InputBundle, QueryRequest, Request,
 };
 pub use model_artifact::{
     MODEL_ARTIFACT_MAGIC, MODEL_ARTIFACT_VERSION, ModelArtifact, ModelArtifactSummary, ModelConfig,

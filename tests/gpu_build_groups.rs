@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use ironicl::{ClassifierExecutor, ClassifierQueryRequest, Optimize, load_model_artifact};
+use ironicl::{Executor, Optimize, QueryRequest, load_model_artifact};
 
 /// A GPU build that runs one estimator per graph must match a build that runs
 /// every estimator at once. The graph shapes differ, so the GPU may pick
@@ -18,7 +18,7 @@ fn grouped_gpu_build_matches_one_graph_run() {
         .expect("set IRONICL_CHECKPOINT_FIXTURES to run this ignored test; see CONTRIBUTING.md");
     let model = load_model_artifact(&Path::new(&directory).join("tabicl-classifier-v2.irmodel"))
         .expect("load classifier artifact");
-    let executor = ClassifierExecutor::new(model);
+    let executor = Executor::new(model);
     let (b, n, q, h) = (4, 240, 50, 5);
     let value = |index: usize| ((index * 7919) % 1000) as f32 / 250.0 - 2.0;
     let train: Vec<f32> = (0..b * n * h).map(value).collect();
@@ -38,7 +38,7 @@ fn grouped_gpu_build_matches_one_graph_run() {
                 None,
             )
             .expect("build context")
-            .predict_logits(ClassifierQueryRequest::new(b, q, h, &query).expect("valid query"))
+            .predict_logits(QueryRequest::new(b, q, h, &query).expect("valid query"))
             .expect("logits")
             .values()
             .to_vec()

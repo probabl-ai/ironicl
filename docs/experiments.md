@@ -226,7 +226,7 @@ indexed candidate search and a dense fallback for diffuse heads.
 
 ## Throughput Serving Foundation
 
-`StaticClassifierExecutor` now has a microbatch API and matching C ABI. It
+`StaticExecutor` now has a microbatch API and matching C ABI. It
 accepts equal prepared `[B,Q,H]` requests, packs them ensemble-major, executes
 one cache-sharing forward pass, and returns request-ordered `[Q,C]` outputs.
 The API is the boundary for a future bounded native request scheduler; it does

@@ -6,9 +6,9 @@ use std::{
 };
 
 use ironicl::{
-    CheckpointCacheOptions, CheckpointProfile, ClassifierExecutor, ClassifierInputBundle,
-    ClassifierQueryRequest, Optimize, PreparedCheckpoint, TaskKind, import_checkpoint, inspect_checkpoint,
-    inspect_model_artifact, load_model_artifact, prepare_checkpoint,
+    CheckpointCacheOptions, CheckpointProfile, Executor, InputBundle, Optimize, PreparedCheckpoint,
+    QueryRequest, TaskKind, import_checkpoint, inspect_checkpoint, inspect_model_artifact,
+    load_model_artifact, prepare_checkpoint,
 };
 use sha2::{Digest, Sha256};
 use tempfile::tempdir;
@@ -125,7 +125,7 @@ fn runs_official_classifier_artifact_when_fixture_is_available() {
     };
     let directory = tempdir().expect("temporary input directory");
     let input_path = directory.path().join("request.irinput");
-    let request = ClassifierInputBundle::new(1, 3, 1, 2, vec![0.0, 1.0, -1.0], vec![0.0, 1.0])
+    let request = InputBundle::new(1, 3, 1, 2, vec![0.0, 1.0, -1.0], vec![0.0, 1.0])
         .expect("tiny valid classifier request");
     std::fs::write(&input_path, request.to_bytes()).expect("write input bundle");
 
@@ -160,16 +160,15 @@ fn matches_python_classifier_oracle_when_fixtures_are_available() {
 
     let input_bytes = fs::read(&oracle.input).expect("read Python oracle input");
     assert_eq!(sha256_hex(&input_bytes), ORACLE_INPUT_SHA256);
-    let input = ClassifierInputBundle::from_bytes(&input_bytes).expect("validate Python oracle input");
+    let input = InputBundle::from_bytes(&input_bytes).expect("validate Python oracle input");
 
     let logits_bytes = fs::read(&oracle.logits).expect("read Python oracle logits");
     assert_eq!(sha256_hex(&logits_bytes), ORACLE_LOGITS_SHA256);
     let expected = read_irlogits(&logits_bytes).expect("validate Python oracle logits");
 
-    let actual =
-        ClassifierExecutor::new(load_model_artifact(&model_path).expect("load official classifier artifact"))
-            .predict_logits(input.request())
-            .expect("run official classifier artifact");
+    let actual = Executor::new(load_model_artifact(&model_path).expect("load official classifier artifact"))
+        .predict_logits(input.request())
+        .expect("run official classifier artifact");
     assert_eq!(actual.shape(), expected.shape, "logit dimensions differ");
     assert_eq!(
         actual.values().len(),
@@ -211,8 +210,7 @@ fn built_context_matches_the_uncached_forward_pass() {
     let Some(model_path) = fixture("tabicl-classifier-v2.irmodel") else {
         panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
-    let executor =
-        ClassifierExecutor::new(load_model_artifact(&model_path).expect("load classifier artifact"));
+    let executor = Executor::new(load_model_artifact(&model_path).expect("load classifier artifact"));
     // With the `metal` feature, 240 training rows build on the GPU, and 250
     // query rows are padded to the GPU's 256-row bucket.
     let (b, n, q, h, classes) = (2, 240, 250, 5, 3_u64);
@@ -236,7 +234,7 @@ fn built_context_matches_the_uncached_forward_pass() {
             .collect()
     };
 
-    let bundle = ClassifierInputBundle::new(b, n + q, h, n, x.clone(), y.clone()).expect("valid bundle");
+    let bundle = InputBundle::new(b, n + q, h, n, x.clone(), y.clone()).expect("valid bundle");
     let expected = executor
         .predict_logits(bundle.request())
         .expect("uncached logits");
@@ -264,7 +262,7 @@ fn built_context_matches_the_uncached_forward_pass() {
             )
             .expect("build context");
         let actual = context
-            .predict_logits(ClassifierQueryRequest::new(b, q, h, &query).expect("valid query"))
+            .predict_logits(QueryRequest::new(b, q, h, &query).expect("valid query"))
             .expect("cached logits");
         assert_eq!(actual.shape(), expected.shape());
         for (index, (actual, expected)) in actual.values().iter().zip(expected.values()).enumerate() {
@@ -300,8 +298,7 @@ fn large_cached_query_runs_in_chunks() {
     let Some(model_path) = fixture("tabicl-classifier-v2.irmodel") else {
         panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
-    let executor =
-        ClassifierExecutor::new(load_model_artifact(&model_path).expect("load classifier artifact"));
+    let executor = Executor::new(load_model_artifact(&model_path).expect("load classifier artifact"));
     // 3000 query rows exceed the chunk size; each estimator's rows must land
     // in place when the chunks are joined.
     let (b, n, q, h) = (2, 240, 3000, 5);
@@ -323,7 +320,7 @@ fn large_cached_query_runs_in_chunks() {
         )
         .expect("build context");
     let all = context
-        .predict_logits(ClassifierQueryRequest::new(b, q, h, &query).expect("valid query"))
+        .predict_logits(QueryRequest::new(b, q, h, &query).expect("valid query"))
         .expect("chunked logits");
     let part = q / 3;
     for start in (0..q).step_by(part) {
@@ -331,7 +328,7 @@ fn large_cached_query_runs_in_chunks() {
             .flat_map(|e| query[(e * q + start) * h..][..part * h].to_vec())
             .collect();
         let expected = context
-            .predict_logits(ClassifierQueryRequest::new(b, part, h, &rows).expect("valid query"))
+            .predict_logits(QueryRequest::new(b, part, h, &rows).expect("valid query"))
             .expect("part logits");
         for e in 0..b {
             let actual = &all.values()[(e * q + start) * 3..][..part * 3];
@@ -355,8 +352,7 @@ fn reduced_precision_context_predicts_all_missing_rows() {
     let Some(model_path) = fixture("tabicl-classifier-v2.irmodel") else {
         panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
-    let executor =
-        ClassifierExecutor::new(load_model_artifact(&model_path).expect("load classifier artifact"));
+    let executor = Executor::new(load_model_artifact(&model_path).expect("load classifier artifact"));
     let (b, n, q, h) = (2, 240, 4, 5);
     let value = |index: usize| ((index * 7919) % 1000) as f32 / 250.0 - 2.0;
     let train: Vec<f32> = (0..b * n * h).map(value).collect();
@@ -379,7 +375,7 @@ fn reduced_precision_context_predicts_all_missing_rows() {
                 None,
             )
             .expect("build context")
-            .predict_logits(ClassifierQueryRequest::new(b, q, h, &query).expect("valid query"))
+            .predict_logits(QueryRequest::new(b, q, h, &query).expect("valid query"))
             .expect("logits")
             .values()
             .to_vec()
