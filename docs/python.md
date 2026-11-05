@@ -28,9 +28,11 @@ parameter names and defaults. A live parity test checks this.
 - These values raise `NotImplementedError`: a `feat_shuffle_method` other than
   `latin`, a `class_shuffle_method` other than `shift`, a `device` other than
   `cpu`, any `inference_config`, and `random_state=None`.
-- `batch_size`, `kv_cache`, `use_amp`, `use_fa3`, `offload_mode`,
-  `disk_offload_dir`, `n_jobs`, and `verbose` control PyTorch execution and have
-  no effect.
+- `n_jobs` sets the executor thread count (negative values follow TabICL, so
+  `-1` is all logical cores). `batch_size`, `verbose`, and `support_many_classes`
+  have no effect and warn if changed; `use_amp=True`, `use_fa3=True`, a
+  non-default `offload_mode`/`disk_offload_dir`, and `kv_cache="repr"` raise
+  `NotImplementedError`.
 - `fit` runs the training rows through the model once and keeps their attention
   keys and values in memory, like upstream's `kv_cache=True`. `predict_proba`
   then runs only the query rows. The context takes about 49 KB per training row
@@ -54,6 +56,24 @@ Metal GPU, every level behaves like `"safe"`. On an M1 Max, `"auto"` made
 7071x22 fitting 16% faster, batch prediction 14% faster, and single-row
 prediction 25% faster, with a maximum probability error of `4.9e-4` across 12
 datasets.
+
+### Context cache
+
+`cache_dir` is Ironicl's second extra parameter. `fit` builds the training context
+once; with a cache it is written to disk and reused when the same data, model, and
+`optimize` level are fit again. Each context is large, so caching is opt-in:
+
+| `cache_dir` | Behavior |
+|---|---|
+| `False` (default) | caching disabled |
+| `None` | cache under `IRONICL_CACHE_DIR` if set, else `<XDG_CACHE_HOME or ~/.cache>/ironicl/contexts` |
+| str or `Path` | cache in that directory |
+
+Entries are content-addressed by the model identity, the preprocessed inputs, and
+`optimize`, with a `.irctx` name. A load prefaults the mapping so prediction runs
+at RAM speed from the first query. A corrupt or mismatched entry is silently
+rebuilt, and a write failure never fails `fit`. There is no automatic eviction;
+remove files to reclaim space.
 
 ## Preprocessing
 

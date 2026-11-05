@@ -1079,6 +1079,37 @@ impl StaticContextArtifact {
         Ok(bytes)
     }
 
+    /// Encode and write this context to `path` atomically: write a uniquely-named
+    /// temp file in the same directory, flush it, then rename it into place, so a
+    /// reader never observes a partial file and concurrent writers of the same
+    /// content do not clobber each other.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Artifact`] if encoding or any filesystem step fails.
+    pub fn write(&self, path: &Path) -> Result<()> {
+        use std::io::Write as _;
+        let bytes = self.to_bytes()?;
+        let directory = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let temp = directory.join(format!(".ironicl-{}-{nanos}.tmp", std::process::id()));
+        let result = (|| -> std::io::Result<()> {
+            let mut file = File::create(&temp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+            std::fs::rename(&temp, path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temp);
+        }
+        result.map_err(artifact_error)
+    }
+
     /// Verified context metadata.
     #[must_use]
     pub fn metadata(&self) -> &StaticContextMetadata {

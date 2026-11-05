@@ -374,6 +374,29 @@ impl ClassifierExecutor {
         }
     }
 
+    /// Load a persisted static context and pair it with this model's weights,
+    /// prefaulting the mapping so the first prediction runs at RAM speed. The
+    /// model weights are shared, not copied.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file is unreadable or invalid, or if the context
+    /// does not match this model's serving contract.
+    pub fn load_context(
+        &self,
+        path: &std::path::Path,
+        threads: Option<usize>,
+    ) -> Result<StaticClassifierExecutor> {
+        let context = StaticContextArtifact::read_mapped_prefault(path)?;
+        StaticClassifierExecutor::with_executor(self.clone(), context, threads)
+    }
+
+    /// The source-checkpoint SHA-256 that identifies this model.
+    #[must_use]
+    pub fn source_sha256(&self) -> &str {
+        &self.model.summary().source_sha256
+    }
+
     /// The GPU and the model's weights in shared GPU buffers, created on first
     /// use and shared by every context of the model. `None` without a GPU or
     /// with `IRONICL_NO_METAL` set.
@@ -1396,6 +1419,15 @@ impl StaticClassifierExecutor {
     /// cache tensor names and shapes do not match the serving contract.
     pub fn new(model: ModelArtifact, context: StaticContextArtifact) -> Result<Self> {
         Self::with_executor(ClassifierExecutor::new(model), context, None)
+    }
+
+    /// Write this context to `path` atomically, for reuse by [`ClassifierExecutor::load_context`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Artifact`] if encoding or the atomic write fails.
+    pub fn save_context(&self, path: &std::path::Path) -> Result<()> {
+        self.context.write(path)
     }
 
     /// Pair a context with an executor whose model weights it shares.
