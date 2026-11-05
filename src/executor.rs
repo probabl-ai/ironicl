@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     Error, ModelArtifact, QueryRequest, Request, Result, StaticContextArtifact, StaticContextMetadata,
-    StaticContextTensor, StaticContextTensorData, StaticQueryBundle,
+    StaticContextTensor, StaticContextTensorData, StaticQueryBundle, TaskKind,
     execution_plan::ExecutionPlan,
     kernels::{
         native::{
@@ -680,7 +680,9 @@ impl Executor {
         // one: a large context runs serially instead of failing. The estimate
         // is 2-3x the measured peak, so the budget is four activation limits.
         // Equal groups keep the last one from running alone.
-        let fit = (4 * MAX_ACTIVATION_ELEMENTS / request_activation_elements(1, n, h, n, self.decoder_width()?)?.max(1)).clamp(1, b);
+        let fit = (4 * MAX_ACTIVATION_ELEMENTS
+            / request_activation_elements(1, n, h, n, self.decoder_width()?)?.max(1))
+        .clamp(1, b);
         let group = b.div_ceil(b.div_ceil(fit));
         for members in (0..b).collect::<Vec<_>>().chunks(group) {
             let estimators: Vec<EstimatorCaches> = members
@@ -3472,7 +3474,23 @@ fn validate_static_context(model: &ModelArtifact, context: &StaticContextArtifac
             "static context model SHA-256 does not match model artifact".into(),
         ));
     }
+    validate_class_count(model.summary().config.task(), context.metadata().class_count)?;
     validate_static_cache_contract(context)
+}
+
+/// A classifier context has 2 to 10 classes; a regression context has none.
+fn validate_class_count(task: Option<TaskKind>, classes: usize) -> Result<()> {
+    let (supported, expected) = match task {
+        Some(TaskKind::Classifier) => ((2..=10).contains(&classes), "2..=10"),
+        Some(TaskKind::Regressor) => (classes == 0, "0"),
+        None => return Err(Error::Artifact("model artifact does not declare a task".into())),
+    };
+    if !supported {
+        return Err(Error::Artifact(format!(
+            "static context class count {classes} is unsupported; expected {expected}"
+        )));
+    }
+    Ok(())
 }
 
 fn model_hash_matches(model_hash: &[u8], context_hash: &[u8; 32]) -> bool {
@@ -3544,12 +3562,6 @@ fn context_tensors(b: usize, n: usize, h: usize) -> Vec<(String, Vec<u64>)> {
 
 fn validate_static_cache_contract(context: &StaticContextArtifact) -> Result<()> {
     let metadata = context.metadata();
-    if !(2..=10).contains(&metadata.class_count) {
-        return Err(Error::Artifact(format!(
-            "static context class count {} is unsupported; expected 2..=10",
-            metadata.class_count
-        )));
-    }
     for (name, expected_shape) in context_tensors(
         metadata.ensemble_count,
         metadata.training_rows,
@@ -4366,7 +4378,7 @@ mod tests {
         ClassifierAggregation, DecoderOutputs, admit_request, admit_static_request,
         aggregate_classifier_probabilities, attention_scratch_scores, attention_scratch_state,
         model_hash_matches, pack_query_microbatch, parallel_cached_attention_f32_key_bf16_value,
-        tokens_to_heads, validate_labels, validate_static_cache_contract,
+        tokens_to_heads, validate_class_count, validate_labels, validate_static_cache_contract,
     };
     use crate::kernels::reference::{
         OnlineAttentionScratch, affine_f32, tiled_online_scaled_dot_product_attention_f32,
@@ -4423,6 +4435,18 @@ mod tests {
         tensors[0].dimensions[1] = 4;
         tensors[0].values.truncate(4 * 8 * 128 * 16);
         assert!(validate_static_cache_contract(&context(tensors)).is_err());
+    }
+
+    #[test]
+    fn context_class_count_must_match_the_model_task() {
+        use crate::TaskKind::{Classifier, Regressor};
+        assert!(validate_class_count(Some(Classifier), 2).is_ok());
+        assert!(validate_class_count(Some(Classifier), 10).is_ok());
+        assert!(validate_class_count(Some(Classifier), 0).is_err());
+        assert!(validate_class_count(Some(Classifier), 11).is_err());
+        assert!(validate_class_count(Some(Regressor), 0).is_ok());
+        assert!(validate_class_count(Some(Regressor), 2).is_err());
+        assert!(validate_class_count(None, 0).is_err());
     }
 
     #[test]

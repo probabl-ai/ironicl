@@ -22,6 +22,7 @@ TabICLv2 architecture values: 3 column layers, 12 ICL layers, 8 heads, column
 head dimension 16, and ICL head dimension 64. It is followed by estimator-major
 class `[B,C]` and feature `[B,H]` permutations, a sorted named tensor directory,
 64-byte-aligned payloads, and a trailing SHA-256 digest of all preceding bytes.
+A regression context stores class count 0 and no class permutations.
 
 Each tensor directory entry contains its UTF-8 name, rank, dimensions, payload
 offset, and byte length. Versions 2 and 3 also use the existing directory
