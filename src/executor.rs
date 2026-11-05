@@ -22,8 +22,8 @@ use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use sha2::{Digest, Sha256};
 
 use crate::{
-    Error, ModelArtifact, QueryRequest, Request, Result, StaticContextArtifact, StaticContextMetadata,
-    StaticContextTensor, StaticContextTensorData, StaticQueryBundle, TaskKind,
+    Error, ModelArtifact, QueryRequest, RegressionOutput, Request, Result, StaticContextArtifact,
+    StaticContextMetadata, StaticContextTensor, StaticContextTensorData, StaticQueryBundle, TaskKind,
     execution_plan::ExecutionPlan,
     kernels::{
         native::{
@@ -39,6 +39,7 @@ use crate::{
         },
     },
     profile::{self, Category},
+    quantiles::summarize,
 };
 
 pub(crate) const COLUMN_DIM: usize = 128;
@@ -250,6 +251,20 @@ impl ForwardTrace {
 }
 
 impl DecoderOutputs {
+    /// Wrap row-major `[B, rows, outputs]` values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] when `values` does not fill `shape`.
+    pub fn new(shape: [usize; 3], values: Vec<f32>) -> Result<Self> {
+        if checked_product(&shape, "decoder outputs")? != values.len() {
+            return Err(Error::InvalidArgument(
+                "decoder output values do not match their shape".into(),
+            ));
+        }
+        Ok(Self { shape, values })
+    }
+
     /// Output dimensions `[B, test_rows, C]`.
     #[must_use]
     pub fn shape(&self) -> [usize; 3] {
@@ -385,6 +400,12 @@ impl Executor {
     pub fn load_context(&self, path: &std::path::Path, threads: Option<usize>) -> Result<StaticExecutor> {
         let context = StaticContextArtifact::read_mapped_prefault(path)?;
         StaticExecutor::with_executor(self.clone(), context, threads)
+    }
+
+    /// Whether the model is the classifier or the regressor.
+    #[must_use]
+    pub fn task(&self) -> TaskKind {
+        self.model.task()
     }
 
     /// The source-checkpoint SHA-256 that identifies this model.
@@ -537,16 +558,13 @@ impl Executor {
                 return Ok(None);
             };
             grouped.extend(group);
-            let labels = label_indices(&y_train[ensemble * n..][..n])?;
             for (prefix, width, output) in [
                 ("col_embedder", COLUMN_DIM, &mut column_labels),
                 ("icl_predictor", ICL_DIM, &mut icl_labels),
             ] {
-                one_hot_linear_f32(
-                    &labels,
-                    self.tensor(&format!("{prefix}.y_encoder.weight"))?,
-                    self.tensor(&format!("{prefix}.y_encoder.bias"))?,
-                    10,
+                self.target_embeddings(
+                    prefix,
+                    &y_train[ensemble * n..][..n],
                     width,
                     &mut output[ensemble * n * width..][..n * width],
                 )?;
@@ -620,7 +638,7 @@ impl Executor {
                 "context needs nonempty x[B, N, H] and y_train[B, N] for B={b}, N={n}, H={h}"
             )));
         }
-        let class_count = validate_labels(y_train, b, n)?;
+        let class_count = self.validate_targets(y_train, b, n)?;
         let mut model_sha256 = [0; 32];
         let source = self.model.summary().source_sha256.as_bytes();
         for (byte, pair) in model_sha256.iter_mut().zip(source.chunks_exact(2)) {
@@ -779,9 +797,13 @@ impl Executor {
         if trace {
             admit_trace_request(b, t, h, width)?;
         }
-        let classes = validate_labels(request.y_train(), b, n)?;
+        // A regression fit keeps every decoded quantile.
+        let classes = match self.validate_targets(request.y_train(), b, n)? {
+            0 => width,
+            classes => classes,
+        };
         let test = t.checked_sub(n).ok_or(Error::ArithmeticOverflow("test rows"))?;
-        let output_len = checked_product(&[b, test, classes], "classifier output")?;
+        let output_len = checked_product(&[b, test, classes], "decoder output")?;
         let mut values = Vec::with_capacity(output_len);
         let mut column_values = trace.then(Vec::new);
         let mut row_values = trace.then(Vec::new);
@@ -858,11 +880,8 @@ impl Executor {
         }
         let in_weight = self.tensor("col_embedder.in_linear.weight")?;
         let in_bias = self.tensor("col_embedder.in_linear.bias")?;
-        let y_weight = self.tensor("col_embedder.y_encoder.weight")?;
-        let y_bias = self.tensor("col_embedder.y_encoder.bias")?;
-        let label_indices = label_indices(labels)?;
         let mut y = vec![0.0; checked_product(&[n, COLUMN_DIM], "column target embeddings")?];
-        one_hot_linear_f32(&label_indices, y_weight, y_bias, 10, COLUMN_DIM, &mut y)?;
+        self.target_embeddings("col_embedder", labels, COLUMN_DIM, &mut y)?;
         // RowInteraction replaces the reserved streams with CLS tokens before
         // its first block, so running the column transformer for them is dead work.
         let workers = executor_threads().min(h);
@@ -1058,16 +1077,8 @@ impl Executor {
         n: usize,
         mut capture: Option<&mut Vec<KeyValue>>,
     ) -> Result<Vec<f32>> {
-        let indices = label_indices(labels)?;
         let mut targets = vec![0.0; checked_product(&[n, ICL_DIM], "ICL target embeddings")?];
-        one_hot_linear_f32(
-            &indices,
-            self.tensor("icl_predictor.y_encoder.weight")?,
-            self.tensor("icl_predictor.y_encoder.bias")?,
-            10,
-            ICL_DIM,
-            &mut targets,
-        )?;
+        self.target_embeddings("icl_predictor", labels, ICL_DIM, &mut targets)?;
         for row in 0..n {
             for dim in 0..ICL_DIM {
                 rows[row * ICL_DIM + dim] += targets[row * ICL_DIM + dim];
@@ -1414,6 +1425,42 @@ impl Executor {
     fn decoder_width(&self) -> Result<usize> {
         Ok(self.tensor("icl_predictor.decoder.2.bias")?.len())
     }
+
+    /// Embed `[N]` training targets with `{prefix}.y_encoder` into `[N, width]`:
+    /// one-hot classes for the classifier, the scalar target for the regressor.
+    fn target_embeddings(
+        &self,
+        prefix: &str,
+        targets: &[f32],
+        width: usize,
+        output: &mut [f32],
+    ) -> Result<()> {
+        let weight = self.tensor(&format!("{prefix}.y_encoder.weight"))?;
+        let bias = self.tensor(&format!("{prefix}.y_encoder.bias"))?;
+        match self.model.task() {
+            TaskKind::Classifier => {
+                one_hot_linear_f32(&label_indices(targets)?, weight, bias, 10, width, output)
+            }
+            TaskKind::Regressor => {
+                for (row, &target) in output.chunks_exact_mut(width).zip(targets) {
+                    for ((value, &weight), &bias) in row.iter_mut().zip(weight).zip(bias) {
+                        *value = target * weight + bias;
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Check `[B, N]` training targets and return the class count: 2..=10
+    /// contiguous labels for the classifier, 0 for the regressor's finite targets.
+    fn validate_targets(&self, targets: &[f32], b: usize, n: usize) -> Result<usize> {
+        match self.model.task() {
+            TaskKind::Classifier => validate_labels(targets, b, n),
+            TaskKind::Regressor if targets.iter().all(|target| target.is_finite()) => Ok(0),
+            TaskKind::Regressor => Err(Error::InvalidArgument("regression targets must be finite".into())),
+        }
+    }
 }
 
 impl StaticExecutor {
@@ -1613,7 +1660,7 @@ impl StaticExecutor {
         values: &mut [f32],
     ) -> Result<bool> {
         let metadata = self.context.metadata();
-        let (q, h, classes) = (request.query_rows(), metadata.feature_count, metadata.class_count);
+        let (q, h, classes) = (request.query_rows(), metadata.feature_count, self.outputs()?);
         let x = request.x();
         let Some(logits) = gpu.predict.run(q, |input, stride| {
             input
@@ -1668,7 +1715,7 @@ impl StaticExecutor {
             metadata.ensemble_count,
             request.query_rows(),
             metadata.feature_count,
-            metadata.class_count,
+            self.outputs()?,
         );
         // Rows are independent, so a large query runs in chunks that fit the
         // activation budget. Only a single row that does not fit is an error.
@@ -1682,15 +1729,11 @@ impl StaticExecutor {
         if rows == q {
             return self.predict_chunk(request);
         }
-        let mut values = vec![0.0; checked_product(&[b, q, classes], "static classifier output")?];
+        let mut values = vec![0.0; checked_product(&[b, q, classes], "static decoder output")?];
         let mut x = Vec::with_capacity(checked_product(&[b, rows, h], "query chunk")?);
         for start in (0..q).step_by(rows) {
             let len = rows.min(q - start);
-            x.clear();
-            for ensemble in 0..b {
-                x.extend_from_slice(&request.x()[(ensemble * q + start) * h..][..len * h]);
-            }
-            let logits = self.predict_chunk(QueryRequest::new(b, len, h, &x)?)?;
+            let logits = self.predict_chunk(query_rows(request, start, len, &mut x)?)?;
             for (ensemble, chunk) in logits.values.chunks_exact(len * classes).enumerate() {
                 values[(ensemble * q + start) * classes..][..len * classes].copy_from_slice(chunk);
             }
@@ -1699,6 +1742,15 @@ impl StaticExecutor {
             shape: [b, q, classes],
             values,
         })
+    }
+
+    /// Decoder outputs kept per query row: the class count, or every quantile
+    /// for a regression context.
+    fn outputs(&self) -> Result<usize> {
+        match self.context.metadata().class_count {
+            0 => self.model.decoder_width(),
+            classes => Ok(classes),
+        }
     }
 
     fn plan(&self) -> ExecutionPlan {
@@ -1713,7 +1765,7 @@ impl StaticExecutor {
             metadata.ensemble_count,
             rows,
             metadata.feature_count,
-            metadata.class_count,
+            self.outputs()?,
             if plan.flat_pool_ensembles {
                 metadata.ensemble_count
             } else {
@@ -1726,16 +1778,10 @@ impl StaticExecutor {
     fn predict_chunk(&self, request: QueryRequest<'_>) -> Result<DecoderOutputs> {
         let metadata = self.context.metadata();
         let plan = self.plan();
-        let shape = [
-            metadata.ensemble_count,
-            request.query_rows(),
-            metadata.class_count,
-        ];
-        let mut values = vec![0.0; checked_product(&shape, "static classifier output")?];
-        let ensemble_output_elements = checked_product(
-            &[request.query_rows(), metadata.class_count],
-            "static ensemble output",
-        )?;
+        let shape = [metadata.ensemble_count, request.query_rows(), self.outputs()?];
+        let mut values = vec![0.0; checked_product(&shape, "static decoder output")?];
+        let ensemble_output_elements =
+            checked_product(&[request.query_rows(), shape[2]], "static ensemble output")?;
         #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
         if let Some(gpu) = &self.gpu
             && self.predict_logits_gpu(gpu, request, &mut values)?
@@ -1797,11 +1843,9 @@ impl StaticExecutor {
     ) -> Result<()> {
         let rows = self.cached_frontend(request, ensemble, workers)?;
         let logits = self.cached_icl_logits(rows, ensemble, request.query_rows(), workers)?;
-        let metadata = self.context.metadata();
-        let width = self.model.decoder_width()?;
+        let (width, outputs) = (self.model.decoder_width()?, self.outputs()?);
         for row in 0..request.query_rows() {
-            output[row * metadata.class_count..][..metadata.class_count]
-                .copy_from_slice(&logits[row * width..][..metadata.class_count]);
+            output[row * outputs..][..outputs].copy_from_slice(&logits[row * width..][..outputs]);
         }
         Ok(())
     }
@@ -1828,6 +1872,40 @@ impl StaticExecutor {
         )
     }
 
+    /// Predict each requested regression output for `[B, Q, H]` query rows,
+    /// in the standardized target units the model works in. Rows run in
+    /// chunks, so the `[B, rows, 999]` quantiles stay small.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::predict_logits`], and an error when
+    /// the context is not a regression fit.
+    pub fn predict_regression(
+        &self,
+        request: QueryRequest<'_>,
+        outputs: &[RegressionOutput],
+    ) -> Result<Vec<(Vec<f32>, usize)>> {
+        if self.context.metadata().class_count != 0 {
+            return Err(Error::InvalidArgument(
+                "the context is a classification fit".into(),
+            ));
+        }
+        let q = request.query_rows();
+        let mut results = vec![(Vec::new(), 0); outputs.len()];
+        let mut x = Vec::new();
+        for start in (0..q).step_by(QUERY_CHUNK_ROWS) {
+            let len = QUERY_CHUNK_ROWS.min(q - start);
+            let decoded = self.predict_logits(query_rows(request, start, len, &mut x)?)?;
+            for ((values, columns), (chunk, chunk_columns)) in
+                results.iter_mut().zip(summarize(&decoded, outputs)?)
+            {
+                values.extend(chunk);
+                *columns = chunk_columns;
+            }
+        }
+        Ok(results)
+    }
+
     /// Execute cached inference, undo class permutations, and aggregate the
     /// ensemble with temperature-scaled softmax.
     ///
@@ -1840,6 +1918,9 @@ impl StaticExecutor {
         request: QueryRequest<'_>,
         aggregation: ClassifierAggregation,
     ) -> Result<ClassifierProbabilities> {
+        if self.context.metadata().class_count == 0 {
+            return Err(Error::InvalidArgument("the context is a regression fit".into()));
+        }
         let logits = self.predict_logits(request)?;
         aggregate_classifier_probabilities(&logits, &self.context.metadata().class_permutations, aggregation)
     }
@@ -3383,6 +3464,25 @@ fn softmax(values: &mut [f32], temperature: f32) {
     }
 }
 
+/// Copy rows `start..start + len` of every estimator into `x` as a `[B, len, H]` request.
+fn query_rows<'a>(
+    request: QueryRequest<'_>,
+    start: usize,
+    len: usize,
+    x: &'a mut Vec<f32>,
+) -> Result<QueryRequest<'a>> {
+    let (b, q, h) = (
+        request.ensemble_count(),
+        request.query_rows(),
+        request.feature_count(),
+    );
+    x.clear();
+    for ensemble in 0..b {
+        x.extend_from_slice(&request.x()[(ensemble * q + start) * h..][..len * h]);
+    }
+    QueryRequest::new(b, len, h, x)
+}
+
 fn validate_static_context(model: &ModelArtifact, context: &StaticContextArtifact) -> Result<()> {
     if !model_hash_matches(
         model.summary().source_sha256.as_bytes(),
@@ -3392,16 +3492,15 @@ fn validate_static_context(model: &ModelArtifact, context: &StaticContextArtifac
             "static context model SHA-256 does not match model artifact".into(),
         ));
     }
-    validate_class_count(model.summary().config.task(), context.metadata().class_count)?;
+    validate_class_count(model.task(), context.metadata().class_count)?;
     validate_static_cache_contract(context)
 }
 
 /// A classifier context has 2 to 10 classes; a regression context has none.
-fn validate_class_count(task: Option<TaskKind>, classes: usize) -> Result<()> {
+fn validate_class_count(task: TaskKind, classes: usize) -> Result<()> {
     let (supported, expected) = match task {
-        Some(TaskKind::Classifier) => ((2..=10).contains(&classes), "2..=10"),
-        Some(TaskKind::Regressor) => (classes == 0, "0"),
-        None => return Err(Error::Artifact("model artifact does not declare a task".into())),
+        TaskKind::Classifier => ((2..=10).contains(&classes), "2..=10"),
+        TaskKind::Regressor => (classes == 0, "0"),
     };
     if !supported {
         return Err(Error::Artifact(format!(
@@ -4358,13 +4457,12 @@ mod tests {
     #[test]
     fn context_class_count_must_match_the_model_task() {
         use crate::TaskKind::{Classifier, Regressor};
-        assert!(validate_class_count(Some(Classifier), 2).is_ok());
-        assert!(validate_class_count(Some(Classifier), 10).is_ok());
-        assert!(validate_class_count(Some(Classifier), 0).is_err());
-        assert!(validate_class_count(Some(Classifier), 11).is_err());
-        assert!(validate_class_count(Some(Regressor), 0).is_ok());
-        assert!(validate_class_count(Some(Regressor), 2).is_err());
-        assert!(validate_class_count(None, 0).is_err());
+        assert!(validate_class_count(Classifier, 2).is_ok());
+        assert!(validate_class_count(Classifier, 10).is_ok());
+        assert!(validate_class_count(Classifier, 0).is_err());
+        assert!(validate_class_count(Classifier, 11).is_err());
+        assert!(validate_class_count(Regressor, 0).is_ok());
+        assert!(validate_class_count(Regressor, 2).is_err());
     }
 
     #[test]
