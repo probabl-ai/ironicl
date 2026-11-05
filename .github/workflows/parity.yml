@@ -1,0 +1,50 @@
+name: TabICL parity
+
+# The live parity suite fits the real PyTorch TabICL across datasets and
+# precision levels: it is slow (~20-25 min) and heavy (installs torch, downloads
+# the checkpoint). It is not part of the per-push flow; run it on demand from the
+# Actions tab ("Run workflow") or with `gh workflow run parity.yml --ref <branch>`.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tabicl-parity:
+    name: Live TabICL parity
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: soda-inria/tabicl
+          ref: bd030d47ff7d9f987f0f33431d743a3003bfe0d3
+          path: upstream-tabicl
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install --no-self-update
+      - name: Build the wheel
+        run: |
+          python -m pip install build
+          # The default build creates the wheel from the sdist, not the checkout.
+          python -m build
+      - name: Create isolated parity environment
+        run: |
+          python -m venv "$RUNNER_TEMP/parity"
+          echo "$RUNNER_TEMP/parity/bin" >> "$GITHUB_PATH"
+      - name: Install the wheel and upstream dependencies
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install dist/*.whl ./upstream-tabicl
+      - name: Compare directly with pinned TabICL
+        env:
+          PYTHONPATH: ""
+          IRONICL_TABICL_SOURCE: ${{ github.workspace }}/upstream-tabicl/src
+        run: make test-parity PYTHON=python
