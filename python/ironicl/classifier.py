@@ -7,6 +7,7 @@ but are not implemented yet raise ``NotImplementedError``.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import urllib.request
 import warnings
@@ -53,6 +54,13 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
     ``None`` (default) reads the ``IRONICL_OPTIMIZE`` environment variable and
     falls back to ``"safe"``. Without a Metal GPU, every level behaves like
     ``"safe"``.
+
+    ``cache_dir`` persists the built context so refitting the same data reuses it
+    instead of rerunning the forward pass. ``False`` (default) disables it;
+    ``None`` caches under ``IRONICL_CACHE_DIR`` if set, else
+    ``<XDG_CACHE_HOME or ~/.cache>/ironicl/contexts``; a path caches there (each
+    context is large, so caching is opt-in). Entries are keyed by the model,
+    inputs, and ``optimize``, and a corrupt entry is silently rebuilt.
     """
 
     def __init__(
@@ -80,6 +88,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         verbose: bool = False,
         inference_config: dict | None = None,
         optimize: str | None = None,
+        cache_dir: str | Path | bool | None = False,
     ):
         self.n_estimators = n_estimators
         self.norm_methods = norm_methods
@@ -104,6 +113,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         self.verbose = verbose
         self.inference_config = inference_config
         self.optimize = optimize
+        self.cache_dir = cache_dir
 
     def fit(self, X, y) -> TabICLClassifier:
         """Fit preprocessing and build the training context in Rust."""
@@ -122,15 +132,14 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         train_groups = preprocessor.fit_transform(X, y)
         labels = preprocessor.encode_labels(y)
         checkpoint = self._checkpoint()
+        train_rows = _ensemble_rows(preprocessor, train_groups)
+        labels_matrix = preprocessor.class_permutations_[:, labels].astype(np.float32)
+        class_perms = np.ascontiguousarray(preprocessor.class_permutations_, dtype=np.uint64)
+        feature_perms = np.ascontiguousarray(preprocessor.feature_permutations_, dtype=np.uint64)
         # Fitted attributes are set only once the context exists, so a failed
         # fit never looks fitted.
-        self.context_ = _model(checkpoint).build_context(
-            _ensemble_rows(preprocessor, train_groups),
-            preprocessor.class_permutations_[:, labels].astype(np.float32),
-            np.ascontiguousarray(preprocessor.class_permutations_, dtype=np.uint64),
-            np.ascontiguousarray(preprocessor.feature_permutations_, dtype=np.uint64),
-            optimize,
-            self._resolve_threads(),
+        self.context_ = self._context(
+            _model(checkpoint), optimize, train_rows, labels_matrix, class_perms, feature_perms
         )
         self.preprocessor_ = preprocessor
         self.checkpoint_path_ = checkpoint
@@ -196,6 +205,59 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         if self.n_jobs is None or self.n_jobs > 0:
             return self.n_jobs
         return max(1, (os.cpu_count() or 1) + 1 + self.n_jobs)
+
+    def _context(self, model, optimize, train_rows, labels_matrix, class_perms, feature_perms):
+        """Build the Rust context, or load it from ``cache_dir`` when available."""
+        threads = self._resolve_threads()
+
+        def build():
+            return model.build_context(train_rows, labels_matrix, class_perms, feature_perms, optimize, threads)
+
+        cache_dir = self._cache_dir()
+        if cache_dir is None:
+            return build()
+        key = self._cache_key(model, optimize, train_rows, labels_matrix, class_perms, feature_perms)
+        path = cache_dir / f"{key}.irctx"
+        if path.exists():
+            try:
+                return model.load_context(str(path), threads)
+            except (OSError, ValueError, RuntimeError):
+                pass  # Corrupt, truncated, or mismatched cache entry: rebuild it.
+        context = build()
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            context.save(str(path))
+        except OSError:
+            pass  # Caching is best-effort; a write failure must not fail fit.
+        return context
+
+    def _cache_dir(self) -> Path | None:
+        """Resolve ``cache_dir`` HuggingFace-style.
+
+        ``None``/``True`` use ``IRONICL_CACHE_DIR`` or ``<cache root>/ironicl/contexts``;
+        ``False`` disables caching; a string or path is used directly.
+        """
+        cache_dir = self.cache_dir
+        if cache_dir is False:
+            return None
+        if cache_dir is None or cache_dir is True:
+            override = os.environ.get("IRONICL_CACHE_DIR")
+            if override:
+                return Path(override)
+            root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+            return root / "ironicl" / "contexts"
+        return Path(cache_dir)
+
+    def _cache_key(self, model, optimize, train_rows, labels_matrix, class_perms, feature_perms) -> str:
+        """Content hash of everything the built context depends on."""
+        digest = hashlib.sha256(b"ironicl-context-cache-v1\0")
+        digest.update(model.source_sha256.encode("ascii"))
+        digest.update(optimize.encode("ascii"))
+        for array in (train_rows, labels_matrix, class_perms, feature_perms):
+            array = np.ascontiguousarray(array)
+            digest.update(f"{array.shape}{array.dtype.str}".encode("ascii"))
+            digest.update(array.tobytes())
+        return digest.hexdigest()
 
     def _optimize(self) -> str:
         optimize = self.optimize if self.optimize is not None else os.environ.get("IRONICL_OPTIMIZE", "safe")
