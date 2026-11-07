@@ -49,7 +49,9 @@ For `H=100`, `B=8`:
 | 100,000 | 36.93 GiB | 18.46 GiB | 18.46 GiB | 9.23 GiB |
 
 FP16 uses the same two bytes per element as BF16; it is the Apple Silicon GPU
-cache policy under `optimize=auto`/`fast`. INT8 values exclude scale metadata and
+cache policy under `optimize=auto`/`fast`. The table assumes one storage type for the whole
+context; in practice only the ICL caches take the reduced type and the column
+caches stay FP32, which adds `0.31 GiB` at `H=100`, `B=8`. INT8 values exclude scale metadata and
 alignment. The planner currently reports payload bytes only.
 
 ## RAM Budget
