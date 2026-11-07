@@ -7,7 +7,9 @@
 
 use std::{collections::BTreeMap, fs::File, path::Path, sync::Arc};
 
-use memmap2::{Advice, Mmap, MmapMut, MmapOptions};
+#[cfg(unix)]
+use memmap2::Advice;
+use memmap2::{Mmap, MmapMut, MmapOptions};
 
 use crate::{
     artifact::{
@@ -672,11 +674,14 @@ impl StaticContextArtifact {
         // SAFETY: the mapping is read-only and retained by the artifact for every
         // tensor borrow. Serving artifacts must remain immutable while mapped.
         let mapping = unsafe { MmapOptions::new().map(file) }.map_err(artifact_error)?;
+        // Fault the pages in now so the first prediction runs at RAM speed.
+        // Advisory only; elsewhere the checksum below reads every page anyway.
+        #[cfg(unix)]
         if prefault {
-            // Fault the pages in now so the first prediction runs at RAM speed.
-            // Advisory only: ignored where the platform has no equivalent hint.
             let _ = mapping.advise(Advice::WillNeed);
         }
+        #[cfg(not(unix))]
+        let _ = prefault;
         let checksum_offset = mapping.len() - CHECKSUM_BYTES;
         if sha256(&mapping[..checksum_offset]).as_slice() != &mapping[checksum_offset..] {
             return Err(artifact_error("static context checksum does not match"));
