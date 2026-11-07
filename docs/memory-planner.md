@@ -86,9 +86,51 @@ shown by default) and continues; `"error"` raises `IroniclMemoryError` (a
 |---|---|
 | A | Pools, platform probes, demand, plan, and the `ironicl plan` report. No behavior change |
 | B | The GPU and CPU builds use the plan's group sizes; a peak-memory fixture test at 10,000 rows and 100 features |
-| C | The Python API above, with warnings and errors |
+| C | The Python API above, with warnings and errors, and the "cannot complete" verdict below |
 | D | Prediction buffers bounded by the plan, and large query buckets released after use |
 
-Later, as separate plans: building straight into the final storage, out-of-core
-prediction from a memory-mapped file, per-layer normalized states for streamed
-contexts, checkpointed layers, and Windows CI.
+Later, as separate plans:
+
+| Phase | Capability |
+|---|---|
+| E | Build straight into a file-backed context, one estimator at a time, with feature and row chunks, so the build never holds the whole context in RAM |
+| F | Out-of-core prediction from the mapped file: one ICL layer at a time with prefetch, per-layer normalized states (half the bytes of K and V), and request batching |
+| G | A representation cache, and checkpointed layers between it and full K/V |
+
+Also later: Windows CI, and measuring whether the prefetch hints
+(`madvise(WILLNEED)`, `PrefetchVirtualMemory`) speed up cold loads; keep both
+or drop both.
+
+## When nothing fits
+
+Some fits cannot complete on a machine at all. 100,000 training rows with 100
+features and 8 estimators need a 36.9 GiB context in FP32, 18.5 GiB in FP16, and
+9.2 GiB in INT8; one estimator alone needs 4.6 GiB plus its build. On an 8 GB
+machine no setting fits, and proceeding does not just slow down: macOS swaps for
+hours, Linux's out-of-memory killer stops the process, and Windows fails an
+allocation at the commit limit.
+
+PR C therefore distinguishes two verdicts:
+
+- **Overflow:** the peak exceeds available memory but stays within what the
+  system can back with swap. `memory_overflow` applies: warn, raise, or ignore.
+- **Cannot complete:** the peak exceeds a hard limit (a cgroup or job limit, the
+  Windows commit limit, or physical memory plus swap), or, until phases E and F
+  exist, the context alone exceeds physical memory. This raises
+  `IroniclMemoryError` even under `"warn"`, before any work starts. Only
+  `"ignore"` proceeds anyway.
+
+The error says what is possible on this machine:
+
+```
+IroniclMemoryError: this fit cannot complete on this machine. The context needs
+36.9 GiB (8 estimators x 100,000 rows x 100 features, FP32); about 5.5 GiB is
+available.
+Even the smallest settings do not fit:
+  - optimize="fast" (FP16 caches): 18.5 GiB
+  - n_estimators=1: 4.6 GiB, plus its build
+What fits: at most 9,000 training rows (subsample X, y before fit).
+```
+
+(Numbers illustrative.) Once phases E-G exist, the planner offers streaming from
+a file and the representation cache instead, and "cannot complete" becomes rare.
