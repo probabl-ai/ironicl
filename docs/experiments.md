@@ -337,10 +337,11 @@ training-row counts fixed.
 - The build graph runs the training rows through every stage once and captures
   each column and ICL block's keys and values. Its setup costs about 250 ms, so
   contexts with fewer than 160 training rows build on the CPU.
-- The build graph runs as many estimators at once as fit Metal's recommended
-  working set, at most 2.2 GB per estimator at 8192 x 54, in equal groups.
-  `IRONICL_GPU_BUILD_BUDGET` sets the budget in bytes instead; a single estimator
-  that exceeds the budget builds on the CPU.
+- The build graph runs as many estimators at once as fit half the host's
+  available memory and Metal's recommended working set (about 2.2 GB per
+  estimator at 8192 x 54), in equal groups; `IRONICL_MEMORY_LIMIT` lowers the
+  memory planned for. A single estimator that exceeds the working set builds on
+  the CPU.
 - Model weights live once per model in shared GPU buffers and are fed as graph
   placeholders. A GPU-built context writes its keys and values once into
   page-aligned memory that the CPU reads as tensors and the GPU wraps without
@@ -473,7 +474,7 @@ separate upstream environment.
 |---|---|
 | Cached FP32 logits match the PyTorch oracle within `1e-4` | `checkpoint_fixtures.rs::matches_python_classifier_oracle_when_fixtures_are_available`; oracle built by `tools/export_tabicl_oracle.py` |
 | `optimize=auto`/`fast` FP16 stays within its gate, labels flip only on near-ties | `checkpoint_fixtures.rs::built_context_matches_the_uncached_forward_pass`; `test_tabicl_classifier.py::test_optimize_levels_stay_within_their_bounds` |
-| Grouped/budgeted GPU build matches a single-graph build | `gpu_build_groups.rs::grouped_gpu_build_matches_one_graph_run` (sets `IRONICL_GPU_BUILD_BUDGET`) |
+| Grouped/budgeted GPU build matches a single-graph build | `gpu_build_groups.rs::grouped_gpu_build_matches_one_graph_run` (passes a 40 MiB memory limit) |
 | Large cached queries chunk to identical logits | `checkpoint_fixtures.rs::large_cached_query_runs_in_chunks` |
 | All-missing query rows fall back to CPU and still read the FP16 `auto` caches | `checkpoint_fixtures.rs::reduced_precision_context_predicts_all_missing_rows` |
 | Public `predict_proba` matches upstream TabICL within `atol=1e-4`, identical labels | `test_tabicl_classifier.py::test_predictions_match` (live parity CI job) |

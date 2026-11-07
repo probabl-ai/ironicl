@@ -36,11 +36,12 @@ new batch sizes rarely trigger a 150–400 ms graph compile; buckets up to 1024 
 keep their buffers between calls. The build graph runs the training rows through
 every stage once and captures each column and ICL block's keys and values; its
 graph setup costs about 250 ms, so contexts with fewer than 160 training rows
-build on the CPU. The build graph runs as many estimators at once as fit Metal's
-recommended working set, at most 2.2 GB per estimator at 8192 x 54, in equal
-groups; `IRONICL_GPU_BUILD_BUDGET` sets the budget in bytes instead. Grouped
-contexts take one graph run per group and a copy into the context, and a
-context whose single estimator exceeds the budget builds on the CPU. Model
+build on the CPU. The build graph runs as many estimators at once as fit half
+the host's available memory and Metal's recommended working set (about 2.2 GB
+per estimator at 8192 x 54), in equal groups; see the
+[memory planner](memory-planner.md). Grouped contexts take one graph run per
+group and a copy into the context, and a context whose single estimator exceeds
+the working set builds on the CPU. Model
 weights live once per model in shared GPU buffers and are fed to the graphs as
 placeholders. The CPU only groups each feature with its neighbors and embeds
 labels, and keeps any request whose grouped inputs contain the all-missing

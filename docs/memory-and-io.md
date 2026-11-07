@@ -78,16 +78,18 @@ On Apple Silicon with the `metal` feature, the Metal build graph needs a transie
 working set beyond the final context payload: about 2.2 GB per estimator at
 8192 x 54, and about 4 GB at 10,000 x 100. The [memory planner](memory-planner.md)
 sizes the groups of estimators built per graph: the largest group that divides
-the estimator count and stays under the smallest of 6 GiB, half the available
-memory, and Metal's recommended working set. Each group is copied into the
-context. Only an estimator larger than the working set builds on the CPU.
-`IRONICL_GPU_BUILD_BUDGET` overrides the plan with an exact byte cap, building
-on the CPU when one estimator exceeds it.
+the estimator count and stays under half the host's available memory (unified
+memory is the host's RAM) and Metal's recommended working set. Each group is
+copied into the context. Only an estimator larger than the working set builds
+on the CPU. `IRONICL_MEMORY_LIMIT` (or `memory_limit=` in Python) lowers the
+memory the plan uses.
 
 Before the planner, groups filled the whole working set, which on unified memory
 is most of the machine's RAM: at 10,000 x 100 on an M1 Max (32 GB) the build
-peaked at 21.4 GiB for a 2 GiB context. It now peaks at 7.1 GiB, with fit 8%
-slower; `tests/build_memory.rs` guards it. Predict-time GPU query buffers are kept
+peaked at 21.4 GiB for a 2 GiB context. With 19 GiB free it now builds two
+estimators at a time and peaks at 12.0 GiB; under an 8 GiB limit, one at a time
+at 7.1 GiB. `tests/build_memory.rs` checks the peak against the plan.
+Predict-time GPU query buffers are kept
 between calls for buckets up to 1024 rows, and large cached queries are split into
 chunks so GPU scratch stays bounded.
 

@@ -11,14 +11,17 @@ while building, for a 2 GiB context.
 
 ### Pools, by sharing rather than vendor
 
-| Pool | Shares the host's RAM | Available memory |
-|---|---|---|
-| Host | (is the host) | Per platform, below |
-| Shared device (an Apple GPU) | Yes | The host's figure, capped by the device's limit (Metal's working set) |
-| Separate device (a discrete GPU, future) | No | The device's own query |
+| Pool | Shares the host's RAM | Available memory | A build may use | Limited by |
+|---|---|---|---|---|
+| Host (CPU build) | (is the host) | Per platform, below | Half | `memory_limit` |
+| Shared device (an Apple GPU) | Yes | The host's figure, capped by the device's limit (Metal's working set) | Half the host's, up to the device's limit | `memory_limit` |
+| Separate device (a discrete GPU, future) | No | The device's own query | All of it, less 5% (at least 256 MiB) | `device_memory_limit` |
 
 A plan asks each pool only how much is available and whether it shares the
 host's memory. Any device that fits those two questions fits the planner.
+Memory shared with the rest of the machine is shared with the operating system
+and other programs, so a build takes half of it; a separate device's memory is
+the build's own.
 
 ### Host memory per platform
 
@@ -46,47 +49,87 @@ The peak is weights + context + one build group + headroom.
 
 ### Build groups
 
-The GPU builds the largest group of estimators that divides the estimator
-count and stays under the smallest of 6 GiB, half the available memory, and the
-device's limit. Measured on an M1 Max at 10,000 rows:
+The GPU builds the largest group of estimators that divides the estimator count
+and stays under the pool's share above. The CPU builds equal groups under half
+the host's available memory. Measured on an M1 Max (32 GB) with
+`optimize="auto"`, about 19 GiB free:
 
-| Features | Estimators per group | Fit | Peak |
-|---|---|---|---|
-| 100 | 1 / 2 / 4 | 11.5 / 11.2 / 11.3 s | 7.0 / 12.0 / 21.4 GiB |
-| 20 | 1 / 2 / 8 | 6.9 / 6.0 / 5.3 s | 4.1 / 5.9 / 9.7 GiB |
+| Rows x features | Limit | Estimators per group | Fit | Peak (planned) |
+|---|---|---|---|---|
+| 10,000 x 100 | None | 2 | 11.0 s | 12.0 GiB (11.3) |
+| 10,000 x 100 | 8 GiB | 1 | 11.7 s | 7.1 GiB (7.0) |
+| 10,000 x 20 | None | 8 | 5.3 s | 9.7 GiB (12.3) |
+| 10,000 x 20 | 8 GiB | 2 | 6.1 s | 5.9 GiB (5.0) |
+| 2,000 x 20 | Either | 8 | 1.2 s | 3.1 GiB (3.0) |
 
-One wide estimator already keeps the GPU busy, so wide tables build one at a
-time; narrow ones group.
+Narrow tables gain most from grouping; one wide estimator already keeps the GPU
+busy. The planned peak is within about 1 GiB of the measured one.
+
+### Limits
+
+| Python | Environment | Limits |
+|---|---|---|
+| `memory_limit` | `IRONICL_MEMORY_LIMIT` | The host's RAM, and any device that shares it |
+| `device_memory_limit` | `IRONICL_DEVICE_MEMORY_LIMIT` | A separate device's own memory; reported as not applicable where memory is shared |
+
+A value is a number of bytes or a size with a binary suffix: `512M`, `16G`,
+`1.5GiB`, `2T` (`K`, `M`, `G`, `T`, any case, optionally followed by `B` or
+`iB`). The argument wins over the environment, which wins over detection.
+Limits only lower the memory detected, and they plan memory rather than enforce
+it: a fit past its limit warns or raises as `memory_overflow` says. Changing a
+limit changes build groups, not results, so it is not part of the `cache_dir`
+key.
 
 ### Plan
 
 `memory::plan` returns the context size, build group, peak, available memory,
-whether it fits, and, when it does not, the changes that would: at most this
-many training rows, fewer estimators, or a smaller storage type the caller
-offers. Every suggestion is checked to fit. `ironicl plan` prints the report.
+the limits that applied, and a verdict:
 
-## Python API (PR C)
+- **Fits.**
+- **Overflow:** the peak exceeds available memory or the memory limit, but the
+  system can page.
+- **Cannot complete:** the peak exceeds a hard limit (a cgroup or job limit, or
+  the Windows commit limit), or the context alone exceeds physical memory.
+- **Unknown:** no probe for this platform and no limit.
 
-Two trailing Ironicl-only parameters on both estimators, after `cache_dir`:
+When it does not fit, the plan lists the changes that would: at most this many
+training rows, fewer estimators, or a faster `optimize` level with smaller
+storage. Every suggestion is checked to fit. `ironicl::plan_context` plans with
+the storage, builder, and pools the build itself would use; `ironicl plan`
+prints the report.
 
-- `memory_limit=None`: a byte cap, or automatic. Default from
-  `IRONICL_MEMORY_LIMIT`.
+## Python API
+
+Three trailing Ironicl-only parameters on both estimators, after `cache_dir`:
+
+- `memory_limit=None` and `device_memory_limit=None`: an int number of bytes or
+  a size string, as above.
 - `memory_overflow=None`: `"warn"`, `"error"`, or `"ignore"`, default from
   `IRONICL_MEMORY_OVERFLOW`, then `"warn"`.
 
-`fit` plans after preprocessing, when the real shape is known, and before any
-build work. `"warn"` emits `IroniclMemoryWarning` (a `UserWarning`, so it is
-shown by default) and continues; `"error"` raises `IroniclMemoryError` (a
-`MemoryError`) and leaves the estimator unfitted. The plan is kept as
-`memory_plan_`, and `ironicl.plan_memory(...)` plans without data.
+`fit` plans after preprocessing, when the real shape is known, and before
+loading the model or building. On overflow, `"warn"` emits
+`IroniclMemoryWarning` (a `UserWarning`, so it is shown by default) and
+continues; `"error"` raises `IroniclMemoryError` (a `MemoryError`) and leaves
+the estimator unfitted; `"ignore"` continues silently. A fit that cannot
+complete raises under `"warn"` too. The plan is kept as `memory_plan_`, and
+`ironicl.plan_memory(n_samples, n_features, ...)` plans without data:
+
+```python
+>>> print(ironicl.plan_memory(30_000, 100, memory_limit="8G"))
+Context: 11.3 GiB (8 estimators x 30000 rows x 100 features, ICL caches in FP32).
+Peak while building on the GPU: 24.7 GiB, including 12.8 GiB for 1 estimator(s) at a time; available: about 8.0 GiB.
+Memory limit: 8.0 GiB (set by memory_limit).
+Any one of these fits:
+  - at most 8938 training rows (subsample X, y before fit)
+```
 
 ## Phases
 
 | PR | Scope |
 |---|---|
-| A | Pools, platform probes, demand, plan, and the `ironicl plan` report. No behavior change |
-| B | The GPU and CPU builds use the plan's group sizes; a peak-memory fixture test at 10,000 rows and 100 features |
-| C | The Python API above, with warnings and errors, and the "cannot complete" verdict below |
+| A (#27) | Pools, platform probes, demand, plan, and the `ironicl plan` report. No behavior change |
+| B (#28) | The builds use the plan's group sizes by pool; memory limits; the Python API with warnings, errors, and the "cannot complete" verdict; a peak-memory fixture test against the plan |
 | D | Prediction buffers bounded by the plan, and large query buckets released after use |
 
 Later, as separate plans:
@@ -110,27 +153,21 @@ machine no setting fits, and proceeding does not just slow down: macOS swaps for
 hours, Linux's out-of-memory killer stops the process, and Windows fails an
 allocation at the commit limit.
 
-PR C therefore distinguishes two verdicts:
-
-- **Overflow:** the peak exceeds available memory but stays within what the
-  system can back with swap. `memory_overflow` applies: warn, raise, or ignore.
-- **Cannot complete:** the peak exceeds a hard limit (a cgroup or job limit, the
-  Windows commit limit, or physical memory plus swap), or, until phases E and F
-  exist, the context alone exceeds physical memory. This raises
-  `IroniclMemoryError` even under `"warn"`, before any work starts. Only
-  `"ignore"` proceeds anyway.
-
-The error says what is possible on this machine:
+The planner therefore separates overflow, which `memory_overflow` governs, from
+"cannot complete", which raises even under `"warn"`, before any work starts.
+Until phases E and F exist, a context larger than physical memory cannot
+complete. The error says what is possible on this machine (32 GB, about 20 GiB
+free):
 
 ```
-IroniclMemoryError: this fit cannot complete on this machine. The context needs
-36.9 GiB (8 estimators x 100,000 rows x 100 features, FP32); about 5.5 GiB is
-available.
-Even the smallest settings do not fit:
-  - optimize="fast" (FP16 caches): 18.5 GiB
-  - n_estimators=1: 4.6 GiB, plus its build
-What fits: at most 9,000 training rows (subsample X, y before fit).
+IroniclMemoryError: This fit cannot complete on this machine.
+Context: 36.9 GiB (8 estimators x 100000 rows x 100 features, ICL caches in FP32).
+Peak while building on the CPU: 49.0 GiB, including 11.5 GiB for 1 estimator(s) at a time; available: about 20.1 GiB.
+Any one of these fits:
+  - at most 24145 training rows (subsample X, y before fit)
+  - n_estimators=1
+Pass memory_overflow='ignore' to try anyway.
 ```
 
-(Numbers illustrative.) Once phases E-G exist, the planner offers streaming from
-a file and the representation cache instead, and "cannot complete" becomes rare.
+Once phases E-G exist, the planner offers streaming from a file and the
+representation cache instead, and "cannot complete" becomes rare.

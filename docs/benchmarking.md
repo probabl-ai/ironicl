@@ -31,7 +31,9 @@ Ironicl exposes a small set of general-use runtime flags:
 | `IRONICL_OPTIMIZE` | precision/speed level `safe\|auto\|fast` (also set through the Python API) |
 | `IRONICL_NO_METAL` | set to `1` to disable the Apple Silicon Metal GPU path |
 | `IRONICL_THREADS` | executor thread count; without it, half the logical CPUs on x86-64, the performance-core count on Apple Silicon, and all logical CPUs elsewhere |
-| `IRONICL_GPU_BUILD_BUDGET` | per-group GPU build working-set budget in bytes (Apple Silicon) |
+| `IRONICL_MEMORY_LIMIT` | the most host RAM to plan for, such as `16G` or `512M`; also covers GPUs that share RAM (also set through the Python API) |
+| `IRONICL_DEVICE_MEMORY_LIMIT` | the same for a GPU's own dedicated memory; no effect where memory is shared |
+| `IRONICL_MEMORY_OVERFLOW` | `warn\|error\|ignore` when a fit's plan exceeds memory (also set through the Python API) |
 
 Exact-math control runs (scalar GELU, softmax, and LayerNorm for parity
 debugging) are a build-time choice: build with `--features exact-math` rather
