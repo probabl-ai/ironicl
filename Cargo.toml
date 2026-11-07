@@ -48,10 +48,12 @@ rayon = "1.12.0"
 sha2 = "0.11.1"
 zip = { version = "9.3.0", default-features = false }
 
-# The memory planner's Windows probe (memory status, job limits, commit charge).
+# Windows memory: the planner's probe (memory status, job limits, commit
+# charge) and prefetching mapped contexts.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_System_JobObjects",
+    "Win32_System_Memory",
     "Win32_System_ProcessStatus",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",

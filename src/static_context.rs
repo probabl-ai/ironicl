@@ -674,13 +674,17 @@ impl StaticContextArtifact {
         // SAFETY: the mapping is read-only and retained by the artifact for every
         // tensor borrow. Serving artifacts must remain immutable while mapped.
         let mapping = unsafe { MmapOptions::new().map(file) }.map_err(artifact_error)?;
-        // Fault the pages in now so the first prediction runs at RAM speed.
-        // Advisory only; elsewhere the checksum below reads every page anyway.
+        // Start reading the pages in now so the first prediction runs at RAM
+        // speed. Advisory only; elsewhere the checksum below reads every page anyway.
         #[cfg(unix)]
         if prefault {
             let _ = mapping.advise(Advice::WillNeed);
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        if prefault {
+            prefetch(&mapping);
+        }
+        #[cfg(not(any(unix, windows)))]
         let _ = prefault;
         let checksum_offset = mapping.len() - CHECKSUM_BYTES;
         if sha256(&mapping[..checksum_offset]).as_slice() != &mapping[checksum_offset..] {
@@ -1319,6 +1323,24 @@ fn to_usize(value: u64, name: &str) -> Result<usize> {
 }
 fn artifact_error(message: impl std::fmt::Display) -> Error {
     Error::Artifact(format!("static context: {message}"))
+}
+
+/// Ask Windows to start reading a mapping's pages, like `madvise(WILLNEED)`.
+/// A hint: failure is ignored. `PrefetchVirtualMemory` needs Windows 8 or later.
+#[cfg(windows)]
+#[allow(unsafe_code)] // One Win32 call; memmap2 does not expose it.
+fn prefetch(mapping: &Mmap) {
+    use windows_sys::Win32::System::{
+        Memory::{PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY},
+        Threading::GetCurrentProcess,
+    };
+    let range = WIN32_MEMORY_RANGE_ENTRY {
+        VirtualAddress: mapping.as_ptr().cast_mut().cast(),
+        NumberOfBytes: mapping.len(),
+    };
+    // SAFETY: the range is this process's live mapping, which outlives the
+    // call; the call only schedules reads.
+    let _ = unsafe { PrefetchVirtualMemory(GetCurrentProcess(), 1, &raw const range, 0) };
 }
 
 #[cfg(test)]
