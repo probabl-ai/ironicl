@@ -2,7 +2,7 @@
 
 Prints each stage's current and lifetime-peak physical footprint, which on Apple Silicon
 includes GPU buffers. Runs on macOS (the footprint comes from proc_pid_rusage). Set
-IRONICL_NO_METAL=1 to trace the CPU path.
+IRONICL_NO_METAL=1 to trace the CPU path, and IRONICL_MEMORY_LIMIT (such as 8G) to plan for less memory.
 
     python tools/trace_memory.py --checkpoint PATH --rows 10000 --features 100 --optimize auto
 """
@@ -54,6 +54,8 @@ def main() -> None:
     model = TabICLClassifier(model_path=args.checkpoint, optimize=args.optimize)
     stage("import + estimator")
     stage("fit", lambda: model.fit(x[:n], y[:n]))
+    plan = model.memory_plan_
+    print(f"  plan: {plan.builder} build, {plan.build_group} estimator(s) at a time, peak {plan.peak_bytes / 2**30:.2f} GiB")
     for rows in (1, 64, 1000):
         stage(f"predict {rows} rows", lambda: model.predict_proba(x[n : n + rows]))
 

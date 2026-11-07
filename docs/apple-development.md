@@ -30,10 +30,10 @@ macOS is a performance target, not only a development host. On Apple Silicon:
 - the `metal` cargo feature enables a Metal GPU path that builds static contexts
   and runs the predict graph. `IRONICL_NO_METAL=1` disables it; contexts with
   fewer than 160 training rows build on the CPU because the build graph's setup
-  costs about 250 ms; `IRONICL_GPU_BUILD_BUDGET` sets the per-group working-set
-  budget in bytes (default: Metal's recommended working set, at most about
-  2.2 GB per estimator). Query counts pad to buckets that keep their top four
-  significant bits.
+  costs about 250 ms; the [memory planner](memory-planner.md) sizes the groups
+  of estimators built together, and `IRONICL_MEMORY_LIMIT` lowers the memory it
+  plans for. Query counts pad to buckets that keep their top four significant
+  bits.
 
 The full experiment record and gates are in
 [experiments.md](experiments.md#apple-silicon-experiments). The GPU latencies
