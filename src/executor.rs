@@ -4116,6 +4116,23 @@ fn admit_request(b: usize, t: usize, h: usize, n: usize, width: usize) -> Result
     Ok(())
 }
 
+/// Transient bytes the CPU build estimates for one estimator, for the memory
+/// planner. Like the build itself, this is 2-3x the measured peak.
+pub(crate) fn cpu_build_estimator_bytes(n: usize, h: usize, width: usize) -> Result<usize> {
+    checked_product(
+        &[
+            request_activation_elements(1, n, h, n, width)?,
+            std::mem::size_of::<f32>(),
+        ],
+        "CPU build bytes",
+    )
+}
+
+/// The CPU build's budget for estimators built together: four activation limits.
+pub(crate) const fn cpu_build_budget_bytes() -> u64 {
+    4 * MAX_ACTIVATION_BYTES as u64
+}
+
 /// The FP32 activation elements that [`admit_request`] checks.
 fn request_activation_elements(b: usize, t: usize, h: usize, n: usize, width: usize) -> Result<usize> {
     let streams = h

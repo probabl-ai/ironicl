@@ -48,6 +48,15 @@ rayon = "1.12.0"
 sha2 = "0.11.1"
 zip = { version = "9.3.0", default-features = false }
 
+# The memory planner's Windows probe (memory status, job limits, commit charge).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_System_JobObjects",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
 # The Metal backend: Apple Silicon only, behind the `metal` feature.
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 objc2 = { version = "0.6.5", optional = true }

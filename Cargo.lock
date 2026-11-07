@@ -662,6 +662,7 @@ dependencies = [
  "rayon",
  "sha2",
  "tempfile",
+ "windows-sys",
  "zip",
 ]
 

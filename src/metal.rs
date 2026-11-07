@@ -89,7 +89,7 @@ pub(crate) const GPU_MIN_BUILD_ROWS: usize = 160;
 /// Measured on an M1 Max: the peak grows linearly in N, with no N x N term,
 /// by about 1.7 GB per estimator at 8192 x 54; this estimates 2.2 GB.
 pub(crate) fn gpu_build_estimator_bytes(n: usize, h: usize) -> usize {
-    n.saturating_mul((h + RESERVED) * COLUMN_DIM * 4 * 8 + ICL_DIM * 4 * 16)
+    crate::memory::gpu_build_estimator_bytes(n, h)
 }
 
 /// Group each feature of `[rows, H]` inputs with the features 1, 2, and 4

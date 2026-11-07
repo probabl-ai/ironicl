@@ -3,10 +3,10 @@ use std::{env, process, time::Instant};
 use ironicl::{
     BenchmarkArgs, BenchmarkStats, ClassifierAggregation, Command, CpuCapabilities, Executor, HelpTopic,
     ImportArgs, InputBundle, InspectArgs, ModelSource, PlanArgs, RunArgs, StaticContextArtifact,
-    StaticExecutor, StaticQueryBundle,
+    StaticExecutor, StaticQueryBundle, StorageDType,
     cache::ByteSize,
     error::{Error, Result},
-    estimate_memory, parse_cli, resolve_backend,
+    estimate_memory, memory, parse_cli, resolve_backend,
 };
 
 fn main() {
@@ -62,6 +62,29 @@ fn print_plan(args: PlanArgs) -> Result<()> {
     println!("context cache:    {}", ByteSize(memory.cache.context_bytes));
     println!("cache total:      {}", ByteSize(memory.cache.total_bytes()));
     println!("persistent total: {}", ByteSize(memory.persistent_bytes()));
+
+    // Whether it fits this machine, with the context built on the CPU.
+    let storage = match config.kv_dtype {
+        StorageDType::Fp32 => memory::Storage::FP32,
+        dtype => memory::Storage {
+            name: match dtype {
+                StorageDType::Bf16 => "BF16",
+                StorageDType::F16 => "FP16",
+                _ => "INT8",
+            },
+            key_bytes: dtype.bytes_per_element(),
+            value_bytes: dtype.bytes_per_element(),
+        },
+    };
+    let shape = memory::ContextShape {
+        task: config.model.task,
+        estimators: workload.estimators,
+        rows: workload.training_rows,
+        features: workload.features,
+    };
+    let plan = memory::plan(shape, storage, memory::Builder::Cpu, memory::Pools::detect(), &[])?;
+    println!();
+    println!("{plan}");
 
     if let Some(bandwidth_gbps) = args.bandwidth_gbps {
         let seconds = memory
