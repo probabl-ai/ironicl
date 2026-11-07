@@ -196,12 +196,11 @@ pub fn plan(
             "memory plan needs estimators, rows, and features".into(),
         ));
     }
-    let available = pools.available();
-    let mut plan = sized(shape, storage, builder, available)?;
+    let mut plan = sized(shape, storage, builder, pools)?;
     if plan.fits() == Some(false) {
-        let available = available.unwrap_or(0);
+        let available = pools.available().unwrap_or(0);
         let fits = |shape: ContextShape, storage: Storage| -> Result<Option<u64>> {
-            let peak = sized(shape, storage, builder, Some(available))?.peak_bytes;
+            let peak = sized(shape, storage, builder, pools)?.peak_bytes;
             Ok((peak <= available).then_some(peak))
         };
         let (mut low, mut high) = (0, shape.rows);
@@ -234,8 +233,10 @@ pub fn plan(
     Ok(plan)
 }
 
-/// The plan's sizes, without suggestions.
-fn sized(shape: ContextShape, storage: Storage, builder: Builder, available: Option<u64>) -> Result<Plan> {
+/// The plan's sizes, without suggestions. A GPU build that cannot fit one
+/// estimator on the device falls back to the CPU, as the executor does.
+fn sized(shape: ContextShape, storage: Storage, builder: Builder, pools: Pools) -> Result<Plan> {
+    let available = pools.available();
     let streams = shape.features + RESERVED_STREAMS;
     let column = mul(&[shape.estimators, streams, COLUMN_BYTES_PER_STREAM])?;
     let icl = mul(&[
@@ -247,8 +248,37 @@ fn sized(shape: ContextShape, storage: Storage, builder: Builder, available: Opt
     ])?;
     let context_bytes = add(column, icl)?;
     let weight_bytes = shape.task.parameter_count() * 4;
+    let device_limit = match pools.device {
+        Some(DeviceMemory::Shared { limit }) => Some(limit),
+        Some(DeviceMemory::Separate { available }) => Some(available),
+        None => None,
+    };
+    let gpu_group = (builder == Builder::Gpu)
+        .then(|| {
+            let per_estimator = build_estimator_bytes(shape, Builder::Gpu)?;
+            Ok::<_, Error>(gpu_build_group(
+                shape.estimators,
+                per_estimator,
+                available,
+                device_limit,
+                None,
+            ))
+        })
+        .transpose()?
+        .flatten();
+    let builder = if gpu_group.is_some() {
+        Builder::Gpu
+    } else {
+        Builder::Cpu
+    };
     let build_estimator_bytes = build_estimator_bytes(shape, builder)?;
-    let build_group = build_group(shape.estimators, build_estimator_bytes, builder, available);
+    let build_group = gpu_group.unwrap_or_else(|| {
+        cpu_build_group(
+            shape.estimators,
+            build_estimator_bytes.saturating_mul(CPU_BUILD_ESTIMATE_DIVISOR),
+            available,
+        )
+    });
     let peak_bytes = add(
         add(weight_bytes, context_bytes)?,
         add(mul(&[build_group, build_estimator_bytes])?, HEADROOM)?,
@@ -290,31 +320,54 @@ pub(crate) fn gpu_build_estimator_bytes(n: usize, h: usize) -> usize {
     n.saturating_mul((h + 4) * 128 * 4 * 8 + 512 * 4 * 16)
 }
 
-/// Estimators to build together. The GPU groups up to a size that keeps it
-/// busy and within a share of the available memory, in equal groups that
-/// divide the estimator count (every run has the same graph shape). The CPU
-/// keeps its own rule: as many as fit four activation limits, in equal groups.
-fn build_group(estimators: u64, per_estimator: u64, builder: Builder, available: Option<u64>) -> u64 {
+/// Estimators the GPU builds together, or `None` when the CPU should build.
+///
+/// `budget` is `IRONICL_GPU_BUILD_BUDGET`: an exact cap, with a CPU build when
+/// one estimator exceeds it. Otherwise the group is the largest that divides
+/// the estimator count (every run has the same graph shape) and stays under the
+/// smallest of a size that keeps the GPU busy, half the available memory, and
+/// the device's limit; the CPU builds only when one estimator exceeds the device.
+pub(crate) fn gpu_build_group(
+    estimators: u64,
+    per_estimator: u64,
+    available: Option<u64>,
+    device_limit: Option<u64>,
+    budget: Option<u64>,
+) -> Option<u64> {
     let per_estimator = per_estimator.max(1);
-    match builder {
-        Builder::Gpu => {
-            let target = available.map_or(GPU_BUILD_TARGET, |available| {
-                GPU_BUILD_TARGET.min(available / BUILD_SHARE_DIVISOR)
-            });
-            (1..=estimators)
-                .rev()
-                .find(|&group| {
-                    estimators.is_multiple_of(group) && group.saturating_mul(per_estimator) <= target
-                })
-                .unwrap_or(1)
-        }
-        Builder::Cpu => {
-            let fit =
-                (crate::executor::cpu_build_budget_bytes() / per_estimator / CPU_BUILD_ESTIMATE_DIVISOR)
-                    .clamp(1, estimators);
-            estimators.div_ceil(estimators.div_ceil(fit))
-        }
+    let largest_under = |cap: u64| {
+        (1..=estimators)
+            .rev()
+            .find(|&group| estimators.is_multiple_of(group) && group.saturating_mul(per_estimator) <= cap)
+    };
+    if let Some(budget) = budget {
+        return largest_under(budget);
     }
+    if device_limit.is_some_and(|limit| per_estimator > limit) {
+        return None;
+    }
+    let mut target = GPU_BUILD_TARGET;
+    if let Some(available) = available {
+        target = target.min(available / BUILD_SHARE_DIVISOR);
+    }
+    if let Some(limit) = device_limit {
+        target = target.min(limit);
+    }
+    Some(largest_under(target).unwrap_or(1))
+}
+
+/// Estimators the CPU builds together: as many as fit four activation limits
+/// by the build's own estimate (2-3x its measured peak), and, when known, half
+/// the available memory by the planner's halved estimate; in equal groups.
+pub(crate) fn cpu_build_group(estimators: u64, estimate_bytes: u64, available: Option<u64>) -> u64 {
+    let estimate = estimate_bytes.max(1);
+    let mut fit = crate::executor::cpu_build_budget_bytes() / estimate;
+    if let Some(available) = available {
+        let counted = (estimate / CPU_BUILD_ESTIMATE_DIVISOR).max(1);
+        fit = fit.min(available / BUILD_SHARE_DIVISOR / counted);
+    }
+    let fit = fit.clamp(1, estimators);
+    estimators.div_ceil(estimators.div_ceil(fit))
 }
 
 impl fmt::Display for Plan {
@@ -331,7 +384,11 @@ impl fmt::Display for Plan {
         )?;
         write!(
             f,
-            "Peak while building: {}, including {} for {} estimator(s) at a time",
+            "Peak while building on the {}: {}, including {} for {} estimator(s) at a time",
+            match self.builder {
+                Builder::Cpu => "CPU",
+                Builder::Gpu => "GPU",
+            },
             gib(self.peak_bytes),
             gib(self.build_group * self.build_estimator_bytes),
             self.build_group
@@ -677,6 +734,62 @@ mod tests {
         // Less memory shrinks the group: half of 4 GiB holds one narrow estimator.
         let tight = plan(shape(10_000, 20), Storage::FP16, Builder::Gpu, host(4 * GIB), &[]).expect("plan");
         assert_eq!(tight.build_group, 1);
+    }
+
+    #[test]
+    fn gpu_build_groups_follow_the_budget_override_and_the_device_limit() {
+        use super::gpu_build_group;
+        const MB: u64 = 1 << 20;
+        // IRONICL_GPU_BUILD_BUDGET is an exact cap: one 17 MB estimator in
+        // 20 MB, and a CPU build when none fits.
+        assert_eq!(gpu_build_group(4, 17 * MB, None, None, Some(20 * MB)), Some(1));
+        assert_eq!(gpu_build_group(4, 17 * MB, None, None, Some(10 * MB)), None);
+        // Without it, one estimator larger than the device builds on the CPU,
+        // and one larger than the memory share still builds alone on the GPU.
+        assert_eq!(
+            gpu_build_group(8, 5 * GIB, Some(28 * GIB), Some(4 * GIB), None),
+            None
+        );
+        assert_eq!(
+            gpu_build_group(8, 5 * GIB, Some(4 * GIB), Some(21 * GIB), None),
+            Some(1)
+        );
+        // Groups divide the estimator count: five of 1 GiB under 6 GiB is 5.
+        assert_eq!(
+            gpu_build_group(5, GIB, Some(28 * GIB), Some(21 * GIB), None),
+            Some(5)
+        );
+        assert_eq!(
+            gpu_build_group(6, GIB, Some(28 * GIB), Some(21 * GIB), None),
+            Some(6)
+        );
+        assert_eq!(
+            gpu_build_group(7, GIB, Some(28 * GIB), Some(21 * GIB), None),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn a_plan_falls_back_to_the_cpu_when_one_estimator_exceeds_the_device() {
+        let pools = Pools {
+            host: Some(HostMemory {
+                available: 28 * GIB,
+                hard_limit: None,
+            }),
+            device: Some(DeviceMemory::Shared { limit: 2 * GIB }),
+        };
+        let plan = plan(shape(10_000, 100), Storage::FP16, Builder::Gpu, pools, &[]).expect("plan");
+        assert_eq!(plan.builder, Builder::Cpu);
+        assert!(plan.to_string().contains("on the CPU"), "{plan}");
+    }
+
+    #[test]
+    fn cpu_build_groups_shrink_with_available_memory() {
+        use super::cpu_build_group;
+        // A 1 GiB estimate counts as 0.5 GiB: 4 GiB available allows 4.
+        assert_eq!(cpu_build_group(8, GIB, Some(4 * GIB)), 4);
+        assert_eq!(cpu_build_group(8, GIB, Some(GIB)), 1);
+        assert_eq!(cpu_build_group(8, GIB, Some(0)), 1);
     }
 
     #[test]

@@ -459,21 +459,30 @@ impl Executor {
         let Some((grouped, column_labels, icl_labels)) = self.gpu_build_inputs((b, n, h), x, y_train)? else {
             return Ok(None);
         };
-        // Run as many estimators per graph as fit Metal's working set, or
-        // IRONICL_GPU_BUILD_BUDGET bytes, in equal groups so every run has the
-        // same shape. When one estimator does not fit, the CPU builds the
-        // context.
+        // The memory plan sizes the estimator groups from the memory actually
+        // available, capped by Metal's working set (unified memory is the
+        // host's RAM). IRONICL_GPU_BUILD_BUDGET overrides it with an exact cap.
+        // When one estimator does not fit the device, the CPU builds the context.
         let budget = std::env::var("IRONICL_GPU_BUILD_BUDGET")
             .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or_else(|| gpu_weights.gpu().working_set_bytes());
-        let estimator_bytes = crate::metal::gpu_build_estimator_bytes(n, h);
-        let Some(group) = (1..=b)
-            .rev()
-            .find(|&group| b % group == 0 && group * estimator_bytes <= budget)
-        else {
+            .and_then(|value| value.parse().ok());
+        let working_set = u64::try_from(gpu_weights.gpu().working_set_bytes()).unwrap_or(u64::MAX);
+        let pools = crate::memory::Pools {
+            host: crate::memory::host_memory(),
+            device: Some(crate::memory::DeviceMemory::Shared { limit: working_set }),
+        };
+        let estimator_bytes =
+            u64::try_from(crate::metal::gpu_build_estimator_bytes(n, h)).unwrap_or(u64::MAX);
+        let Some(group) = crate::memory::gpu_build_group(
+            b as u64,
+            estimator_bytes,
+            pools.available(),
+            Some(working_set),
+            budget,
+        ) else {
             return Ok(None);
         };
+        let group = usize::try_from(group).map_err(|_| Error::ArithmeticOverflow("GPU build group"))?;
         let column_scales = (0..3)
             .map(|block| {
                 qass_base_scale(
@@ -694,14 +703,15 @@ impl Executor {
         let mut icl = (0..12)
             .map(|_| reserve(b * n * ICL_DIM))
             .collect::<Result<Vec<_>>>()?;
-        // Build as many estimators at once as fit the budget, and at least
-        // one: a large context runs serially instead of failing. The estimate
-        // is 2-3x the measured peak, so the budget is four activation limits.
-        // Equal groups keep the last one from running alone.
-        let fit = (4 * MAX_ACTIVATION_ELEMENTS
-            / request_activation_elements(1, n, h, n, self.decoder_width()?)?.max(1))
-        .clamp(1, b);
-        let group = b.div_ceil(b.div_ceil(fit));
+        // Build as many estimators at once as the memory plan allows, and at
+        // least one: a large context runs serially instead of failing.
+        let estimate = cpu_build_estimator_bytes(n, h, self.decoder_width()?)?;
+        let group = crate::memory::cpu_build_group(
+            b as u64,
+            u64::try_from(estimate).unwrap_or(u64::MAX),
+            crate::memory::host_memory().map(crate::memory::HostMemory::usable),
+        );
+        let group = usize::try_from(group).map_err(|_| Error::ArithmeticOverflow("CPU build group"))?;
         for members in (0..b).collect::<Vec<_>>().chunks(group) {
             let estimators: Vec<EstimatorCaches> = members
                 .par_iter()

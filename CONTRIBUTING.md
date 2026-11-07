@@ -125,7 +125,7 @@ checkout used for local development. It runs standalone and live parity tests in
 separate Linux/Python 3.12 environments.
 
 Rust CI does not provision official model or oracle fixtures. The tests in
-`tests/checkpoint_fixtures.rs` and `tests/gpu_build_groups.rs` are marked
+`tests/checkpoint_fixtures.rs`, `tests/gpu_build_groups.rs`, and `tests/build_memory.rs` are marked
 `#[ignore]`, so a normal `make test-rust` reports them as *ignored*, not passed.
 To run them, provide the fixtures and pass `--ignored`:
 
