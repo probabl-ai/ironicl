@@ -28,8 +28,9 @@ class TabICLRegressor(RegressorMixin, TabICLBase):
     Parameters keep TabICL's names and defaults, and behave as in
     ``TabICLClassifier``: ``n_jobs`` sets the thread count, ``batch_size`` and
     ``verbose`` have no effect and warn if changed, and parameters that request
-    an unimplemented feature raise ``NotImplementedError``. ``optimize`` and
-    ``cache_dir`` are Ironicl's own trailing parameters; see ``TabICLClassifier``.
+    an unimplemented feature raise ``NotImplementedError``. ``optimize``,
+    ``cache_dir``, ``memory_limit``, ``device_memory_limit``, and ``memory_overflow``
+    are Ironicl's own trailing parameters; see ``TabICLClassifier``.
 
     The model predicts 999 quantiles of the standardized target per row.
     ``predict`` turns them into the requested statistics exactly as TabICL does,
@@ -64,6 +65,9 @@ class TabICLRegressor(RegressorMixin, TabICLBase):
         inference_config: dict | None = None,
         optimize: str | None = None,
         cache_dir: str | Path | bool | None = False,
+        memory_limit: int | str | None = None,
+        device_memory_limit: int | str | None = None,
+        memory_overflow: str | None = None,
     ):
         self.n_estimators = n_estimators
         self.norm_methods = norm_methods
@@ -85,6 +89,9 @@ class TabICLRegressor(RegressorMixin, TabICLBase):
         self.inference_config = inference_config
         self.optimize = optimize
         self.cache_dir = cache_dir
+        self.memory_limit = memory_limit
+        self.device_memory_limit = device_memory_limit
+        self.memory_overflow = memory_overflow
 
     def fit(self, X, y) -> TabICLRegressor:
         """Standardize the target, fit preprocessing, and build the training context in Rust."""
