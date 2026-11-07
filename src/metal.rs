@@ -123,6 +123,12 @@ pub(crate) fn group_features_into(
     true
 }
 
+/// The memory Metal recommends the system GPU use without paging, or `None`
+/// without a GPU. Creates no command queue.
+pub(crate) fn system_working_set() -> Option<u64> {
+    MTLCreateSystemDefaultDevice().map(|device| device.recommendedMaxWorkingSetSize())
+}
+
 /// The shared device and command queue, and how graphs run on them.
 #[derive(Clone)]
 pub(crate) struct Gpu {

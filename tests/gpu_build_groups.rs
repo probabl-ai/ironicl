@@ -1,10 +1,8 @@
 #![cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-// The only test in this binary, so changing the environment races nothing.
-#![allow(unsafe_code)]
 
 use std::path::Path;
 
-use ironicl::{Executor, Optimize, QueryRequest, load_model_artifact};
+use ironicl::{Executor, Optimize, QueryRequest, load_model_artifact, memory::MemoryLimits};
 
 /// A GPU build that runs one estimator per graph must match a build that runs
 /// every estimator at once. The graph shapes differ, so the GPU may pick
@@ -24,7 +22,7 @@ fn grouped_gpu_build_matches_one_graph_run() {
     let train: Vec<f32> = (0..b * n * h).map(value).collect();
     let query: Vec<f32> = (0..b * q * h).map(|index| value(index + 17)).collect();
     let y: Vec<f32> = (0..b * n).map(|row| (row % 3) as f32).collect();
-    let logits = |optimize| {
+    let logits = |optimize, limits| {
         executor
             .build_context(
                 b,
@@ -36,6 +34,7 @@ fn grouped_gpu_build_matches_one_graph_run() {
                 (0..b).flat_map(|_| 0..h as u64).collect(),
                 optimize,
                 None,
+                limits,
             )
             .expect("build context")
             .predict_logits(QueryRequest::new(b, q, h, &query).expect("valid query"))
@@ -44,12 +43,11 @@ fn grouped_gpu_build_matches_one_graph_run() {
             .to_vec()
     };
     for (optimize, tolerance) in [(Optimize::Safe, 1e-4), (Optimize::Fast, 1e-3)] {
-        let together = logits(optimize);
-        // About 17 MB per estimator at 240 x 5: one estimator per run.
-        // SAFETY: no other thread reads the environment.
-        unsafe { std::env::set_var("IRONICL_GPU_BUILD_BUDGET", "20000000") };
-        let grouped = logits(optimize);
-        unsafe { std::env::remove_var("IRONICL_GPU_BUILD_BUDGET") };
+        let together = logits(optimize, MemoryLimits::default());
+        // About 17 MB per estimator at 240 x 5: half of a 40 MiB memory limit
+        // holds one estimator per run.
+        let limit = MemoryLimits::resolve(Some("40M"), None).expect("limit");
+        let grouped = logits(optimize, limit);
         for (index, (together, grouped)) in together.iter().zip(&grouped).enumerate() {
             assert!(
                 (together - grouped).abs() <= tolerance,

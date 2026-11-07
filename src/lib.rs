@@ -38,7 +38,7 @@ pub use config::{CacheMode, ExecutionConfig, StorageDType, TabIclV2Model, TaskKi
 pub use error::{Error, Result};
 pub use executor::{
     ClassifierAggregation, ClassifierProbabilities, DecoderOutputs, Executor, ForwardTrace, Optimize,
-    SparseAttentionStatistics, StaticExecutor, TraceStage,
+    SparseAttentionStatistics, StaticExecutor, TraceStage, plan_context,
 };
 pub use input_bundle::{
     CLASSIFIER_INPUT_BUNDLE_KIND, CLASSIFIER_INPUT_BUNDLE_MAGIC, CLASSIFIER_INPUT_BUNDLE_VERSION,

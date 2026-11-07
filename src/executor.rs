@@ -38,6 +38,7 @@ use crate::{
             source_major_online_attention_with_backend_f32, tiled_online_scaled_dot_product_attention_f32,
         },
     },
+    memory::{Builder, ContextShape, MemoryLimits, Plan, Pools, Storage},
     profile::{self, Category},
     quantiles::summarize,
 };
@@ -442,6 +443,7 @@ impl Executor {
         x: &[f32],
         y_train: &[f32],
         optimize: Optimize,
+        limits: MemoryLimits,
     ) -> Result<Option<crate::static_context::PageAlignedTensors>> {
         use crate::static_context::{PageAlignedTensors, TensorStorage};
         let icl_storage = match optimize {
@@ -459,27 +461,18 @@ impl Executor {
         let Some((grouped, column_labels, icl_labels)) = self.gpu_build_inputs((b, n, h), x, y_train)? else {
             return Ok(None);
         };
-        // The memory plan sizes the estimator groups from the memory actually
-        // available, capped by Metal's working set (unified memory is the
-        // host's RAM). IRONICL_GPU_BUILD_BUDGET overrides it with an exact cap.
-        // When one estimator does not fit the device, the CPU builds the context.
-        let budget = std::env::var("IRONICL_GPU_BUILD_BUDGET")
-            .ok()
-            .and_then(|value| value.parse().ok());
+        // The memory plan sizes the estimator groups: half the host's available
+        // RAM (unified memory is the host's RAM), capped by Metal's working set
+        // and by the memory limit. When one estimator does not fit the device,
+        // the CPU builds the context.
         let working_set = u64::try_from(gpu_weights.gpu().working_set_bytes()).unwrap_or(u64::MAX);
-        let pools = crate::memory::Pools {
-            host: crate::memory::host_memory(),
+        let pools = Pools {
             device: Some(crate::memory::DeviceMemory::Shared { limit: working_set }),
+            ..Pools::detect().with_limits(limits)
         };
         let estimator_bytes =
             u64::try_from(crate::metal::gpu_build_estimator_bytes(n, h)).unwrap_or(u64::MAX);
-        let Some(group) = crate::memory::gpu_build_group(
-            b as u64,
-            estimator_bytes,
-            pools.available(),
-            Some(working_set),
-            budget,
-        ) else {
+        let Some(group) = crate::memory::gpu_build_group(b as u64, estimator_bytes, pools) else {
             return Ok(None);
         };
         let group = usize::try_from(group).map_err(|_| Error::ArithmeticOverflow("GPU build group"))?;
@@ -590,7 +583,9 @@ impl Executor {
     /// metadata; `class_permutations` is used to undo each estimator's class
     /// order when probabilities are aggregated. `optimize` selects the ICL
     /// cache storage: FP16 on the Apple GPU under `Auto`/`Fast`, BF16 values on
-    /// a BF16-capable CPU under `Fast`, FP32 otherwise.
+    /// a BF16-capable CPU under `Fast`, FP32 otherwise. `limits` lower the
+    /// memory the build plans its estimator groups for; pass
+    /// `MemoryLimits::resolve(None, None)?` to read them from the environment.
     ///
     /// # Errors
     ///
@@ -607,11 +602,12 @@ impl Executor {
         feature_permutations: Vec<u64>,
         optimize: Optimize,
         threads: Option<usize>,
+        limits: MemoryLimits,
     ) -> Result<StaticExecutor> {
         let shape = (ensembles, training_rows, features);
         let metadata = self.context_metadata(shape, x, y_train, class_permutations, feature_permutations)?;
         #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-        if let Some(tensors) = self.build_tensors_gpu(shape, x, y_train, optimize)? {
+        if let Some(tensors) = self.build_tensors_gpu(shape, x, y_train, optimize, limits)? {
             // The build graph checked every value on the GPU.
             let context = StaticContextArtifact::from_page_aligned(metadata, tensors)?;
             return StaticExecutor::with_executor(self.clone(), context, threads);
@@ -619,11 +615,12 @@ impl Executor {
         // On a BF16-capable CPU, `fast` stores the ICL values in BF16 (FP32
         // keys, the retained serving layout); every other case is FP32.
         if optimize == Optimize::Fast && crate::kernels::native::bf16_storage_supported() {
-            let tensors = self.build_tensors_cpu(shape, x, y_train)?;
+            let tensors = self.build_tensors_cpu(shape, x, y_train, limits)?;
             let context = StaticContextArtifact::from_page_aligned(metadata, bf16v_page_aligned(&tensors)?)?;
             return StaticExecutor::with_executor(self.clone(), context, threads);
         }
-        let context = StaticContextArtifact::new(metadata, self.build_tensors_cpu(shape, x, y_train)?)?;
+        let context =
+            StaticContextArtifact::new(metadata, self.build_tensors_cpu(shape, x, y_train, limits)?)?;
         StaticExecutor::with_executor(self.clone(), context, threads)
     }
 
@@ -683,6 +680,7 @@ impl Executor {
         (b, n, h): (usize, usize, usize),
         x: &[f32],
         y_train: &[f32],
+        limits: MemoryLimits,
     ) -> Result<Vec<StaticContextTensor>> {
         let streams = h + RESERVED;
         let column_elements = HEADS * INDUCING * 16;
@@ -709,7 +707,7 @@ impl Executor {
         let group = crate::memory::cpu_build_group(
             b as u64,
             u64::try_from(estimate).unwrap_or(u64::MAX),
-            crate::memory::host_memory().map(crate::memory::HostMemory::usable),
+            Pools::detect().with_limits(limits).host_available(),
         );
         let group = usize::try_from(group).map_err(|_| Error::ArithmeticOverflow("CPU build group"))?;
         for members in (0..b).collect::<Vec<_>>().chunks(group) {
@@ -4124,6 +4122,67 @@ fn admit_request(b: usize, t: usize, h: usize, n: usize, width: usize) -> Result
         )));
     }
     Ok(())
+}
+
+/// The memory plan for building a `task` context of `estimators x rows x
+/// features` with `optimize`: the ICL storage, builder, and pools the build
+/// itself would pick, under `limits`. Faster `optimize` levels with smaller
+/// storage are offered as suggestions.
+///
+/// # Errors
+///
+/// Returns an error for an empty shape or a size that overflows.
+pub fn plan_context(
+    task: TaskKind,
+    (estimators, rows, features): (usize, usize, usize),
+    optimize: Optimize,
+    limits: MemoryLimits,
+) -> Result<Plan> {
+    let working_set = gpu_working_set(rows);
+    let bf16 = crate::kernels::native::bf16_storage_supported();
+    // As in `Executor::build_context`.
+    let storage = |optimize| match optimize {
+        Optimize::Safe => Storage::FP32,
+        _ if working_set.is_some() => Storage::FP16,
+        Optimize::Fast if bf16 => Storage::FP32_KEY_BF16_VALUE,
+        Optimize::Auto | Optimize::Fast => Storage::FP32,
+    };
+    let current = storage(optimize);
+    let element_bytes = |storage: Storage| storage.key_bytes + storage.value_bytes;
+    let mut alternatives: Vec<(String, Storage)> = Vec::new();
+    for (level, name) in [(Optimize::Auto, "auto"), (Optimize::Fast, "fast")] {
+        let smaller = storage(level);
+        if element_bytes(smaller) < element_bytes(current) && alternatives.iter().all(|(_, s)| *s != smaller)
+        {
+            alternatives.push((format!("optimize=\"{name}\""), smaller));
+        }
+    }
+    let mut pools = Pools::detect().with_limits(limits);
+    pools.device = working_set.map(|limit| crate::memory::DeviceMemory::Shared { limit });
+    let shape = ContextShape {
+        task,
+        estimators: estimators as u64,
+        rows: rows as u64,
+        features: features as u64,
+    };
+    let builder = if working_set.is_some() {
+        Builder::Gpu
+    } else {
+        Builder::Cpu
+    };
+    crate::memory::plan(shape, current, builder, pools, &alternatives)
+}
+
+/// Metal's recommended working set when the GPU would build `rows` training
+/// rows, or `None` when the CPU builds: no GPU, `IRONICL_NO_METAL` set, or too
+/// few rows.
+#[allow(unused_variables)]
+fn gpu_working_set(rows: usize) -> Option<u64> {
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    if std::env::var_os("IRONICL_NO_METAL").is_none() && rows >= crate::metal::GPU_MIN_BUILD_ROWS {
+        return crate::metal::system_working_set();
+    }
+    None
 }
 
 /// Transient bytes the CPU build estimates for one estimator, for the memory
