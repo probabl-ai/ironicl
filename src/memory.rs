@@ -16,6 +16,8 @@ use crate::{
 /// Memory the operating system can give this process now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostMemory {
+    /// Physical memory installed.
+    pub total: u64,
     /// Physical memory available without paging.
     pub available: u64,
     /// A cap that fails instead of paging: a cgroup or job limit, or the
@@ -42,31 +44,165 @@ pub enum DeviceMemory {
     Separate { available: u64 },
 }
 
-/// The memory pools a plan draws on. Unknown pools make the verdict unknown.
+/// The environment variable that limits the host's RAM, which shared devices use too.
+pub const MEMORY_LIMIT_ENV: &str = "IRONICL_MEMORY_LIMIT";
+/// The environment variable that limits a separate device's own memory.
+pub const DEVICE_MEMORY_LIMIT_ENV: &str = "IRONICL_DEVICE_MEMORY_LIMIT";
+
+/// A user's cap on one memory pool, and where it was set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limit {
+    pub bytes: u64,
+    /// The argument or environment variable that set it.
+    pub source: &'static str,
+}
+
+/// User caps on the host's RAM (which a shared device uses too) and on a
+/// separate device's own memory. Limits only lower what is detected; they are
+/// a planning budget, not enforced by the operating system.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryLimits {
+    pub host: Option<Limit>,
+    pub device: Option<Limit>,
+}
+
+impl MemoryLimits {
+    /// Limits from explicit values, such as the Python `memory_limit` and
+    /// `device_memory_limit` arguments, falling back to `IRONICL_MEMORY_LIMIT`
+    /// and `IRONICL_DEVICE_MEMORY_LIMIT`. Values are parsed by [`parse_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidArgument`] naming the argument or variable when a
+    /// value is not a positive size.
+    pub fn resolve(host: Option<&str>, device: Option<&str>) -> Result<Self> {
+        let limit = |value: Option<&str>, argument: &'static str, variable: &'static str| {
+            let (text, source) = match value {
+                Some(text) => (text.to_owned(), argument),
+                None => match std::env::var(variable) {
+                    Ok(text) if !text.trim().is_empty() => (text, variable),
+                    _ => return Ok(None),
+                },
+            };
+            parse_bytes(&text)
+                .map(|bytes| Some(Limit { bytes, source }))
+                .map_err(|error| Error::InvalidArgument(format!("{source}={text:?}: {error}")))
+        };
+        Ok(Self {
+            host: limit(host, "memory_limit", MEMORY_LIMIT_ENV)?,
+            device: limit(device, "device_memory_limit", DEVICE_MEMORY_LIMIT_ENV)?,
+        })
+    }
+}
+
+/// Parse a byte size: a number of bytes, or a number with a binary suffix `K`,
+/// `M`, `G`, or `T`, optionally followed by `B` or `iB`, in any case: `512M`,
+/// `16G`, `1.5GiB`, `2t`. `16G` and `16GiB` are both 16 x 2^30 bytes.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] for anything else, zero, or a size that
+/// overflows `u64`.
+pub fn parse_bytes(text: &str) -> Result<u64> {
+    let invalid = || {
+        Error::InvalidArgument(
+            "expected a positive size in bytes, or with a K, M, G, or T suffix such as 512M or 16G".into(),
+        )
+    };
+    let lower = text.trim().to_ascii_lowercase();
+    let number = lower
+        .strip_suffix("ib")
+        .or_else(|| lower.strip_suffix('b'))
+        .unwrap_or(&lower);
+    let shift = number
+        .chars()
+        .last()
+        .and_then(|unit| "kmgt".find(unit))
+        .map_or(0, |index| 10 * (index + 1));
+    let digits = if shift == 0 {
+        number
+    } else {
+        &number[..number.len() - 1]
+    };
+    // "16iB" names no unit; digits and one decimal point only, so no signs,
+    // exponents, or "inf".
+    if (shift == 0 && lower.ends_with("ib"))
+        || digits.is_empty()
+        || !digits.bytes().all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        return Err(invalid());
+    }
+    let scale = 1_u64 << shift;
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let bytes = if digits.contains('.') {
+        digits
+            .parse::<f64>()
+            .ok()
+            .map(|value| value * scale as f64)
+            .filter(|value| *value < u64::MAX as f64)
+            .map(|value| value as u64)
+    } else {
+        digits
+            .parse::<u64>()
+            .ok()
+            .and_then(|value| value.checked_mul(scale))
+    };
+    bytes.filter(|bytes| *bytes > 0).ok_or_else(invalid)
+}
+
+/// The memory pools a plan draws on, with the user's limits. Unknown pools
+/// make the verdict unknown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Pools {
     pub host: Option<HostMemory>,
     pub device: Option<DeviceMemory>,
+    pub limits: MemoryLimits,
 }
 
 impl Pools {
-    /// The host's memory from the operating system, with no device.
+    /// The host's memory from the operating system, with no device and no limits.
     #[must_use]
     pub fn detect() -> Self {
         Self {
             host: host_memory(),
-            device: None,
+            ..Self::default()
         }
     }
 
-    /// Bytes available where the context is built, or `None` if unknown.
+    /// These pools with `limits` applied.
+    #[must_use]
+    pub fn with_limits(self, limits: MemoryLimits) -> Self {
+        Self { limits, ..self }
+    }
+
+    /// Bytes of host RAM this process can use, capped by the memory limit, or
+    /// `None` if unknown. A limit alone is enough to know it.
+    #[must_use]
+    pub fn host_available(self) -> Option<u64> {
+        let limit = self.limits.host.map(|limit| limit.bytes);
+        match (self.host.map(HostMemory::usable), limit) {
+            (Some(host), Some(limit)) => Some(host.min(limit)),
+            (host, limit) => host.or(limit),
+        }
+    }
+
+    /// Bytes available where the context is built, or `None` if unknown: the
+    /// host's for a shared device, capped by its limit; a separate device's own,
+    /// capped by the device memory limit.
     #[must_use]
     pub fn available(self) -> Option<u64> {
-        let host = self.host.map(HostMemory::usable);
         match self.device {
-            None => host,
-            Some(DeviceMemory::Shared { limit }) => host.map(|host| host.min(limit)),
-            Some(DeviceMemory::Separate { available }) => Some(available),
+            None => self.host_available(),
+            Some(DeviceMemory::Shared { limit }) => self.host_available().map(|host| host.min(limit)),
+            Some(DeviceMemory::Separate { available }) => Some(
+                self.limits
+                    .device
+                    .map_or(available, |limit| available.min(limit.bytes)),
+            ),
         }
     }
 }
@@ -116,14 +252,14 @@ pub enum Builder {
     Gpu,
 }
 
-/// GPU build groups stop growing past this size: one wide estimator already
-/// keeps an M1 Max busy (100 features at 10,000 rows built as fast in groups
-/// of 1, 2, or 4), while narrow ones need several per run.
-const GPU_BUILD_TARGET: u64 = 6 << 30;
 /// Reserve for Python, the allocator, preprocessing, and query buffers.
 const HEADROOM: u64 = 512 << 20;
-/// A build may use at most this share of the available memory.
+/// A build may use at most this share of memory it shares with everything else
+/// on the machine: the host's RAM, for the CPU and for shared devices.
 const BUILD_SHARE_DIVISOR: u64 = 2;
+/// A separate device's memory is the build's own, less a reserve for the
+/// allocator and fragmentation: 1/20 of it, and at least this much.
+const SEPARATE_DEVICE_RESERVE: u64 = 256 << 20;
 /// The CPU build's own estimate is 2-3x its measured peak (see
 /// `Executor::build_tensors_cpu`), so the planner counts half of it.
 const CPU_BUILD_ESTIMATE_DIVISOR: u64 = 2;
@@ -153,6 +289,8 @@ pub struct Plan {
     pub peak_bytes: u64,
     /// Memory available to the builder, or `None` if unknown.
     pub available_bytes: Option<u64>,
+    /// The pools and limits the plan was made for.
+    pub pools: Pools,
     /// Ways to fit, empty when it already fits or memory is unknown.
     pub suggestions: Vec<Suggestion>,
 }
@@ -168,11 +306,43 @@ pub enum Suggestion {
     Storage { option: String, peak_bytes: u64 },
 }
 
+/// What a plan means for the fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Verdict {
+    Fits,
+    /// The peak exceeds available memory (or the memory limit), so the system
+    /// would page; it can still complete.
+    Overflow,
+    /// The peak exceeds a hard limit (a cgroup or job limit, or the Windows
+    /// commit limit), or the context alone exceeds physical memory: the fit
+    /// would fail or page without end.
+    CannotComplete,
+    /// Available memory is unknown.
+    Unknown,
+}
+
 impl Plan {
     /// Whether the peak fits in the available memory, or `None` if unknown.
     #[must_use]
     pub fn fits(&self) -> Option<bool> {
         self.available_bytes.map(|available| self.peak_bytes <= available)
+    }
+
+    /// Whether the fit fits, overflows, or cannot complete on this machine.
+    #[must_use]
+    pub fn verdict(&self) -> Verdict {
+        let host = self.pools.host;
+        let persistent = self.weight_bytes.saturating_add(self.context_bytes);
+        if host.is_some_and(|host| {
+            host.hard_limit.is_some_and(|limit| self.peak_bytes > limit) || persistent > host.total
+        }) {
+            return Verdict::CannotComplete;
+        }
+        match self.fits() {
+            Some(true) => Verdict::Fits,
+            Some(false) => Verdict::Overflow,
+            None => Verdict::Unknown,
+        }
     }
 }
 
@@ -198,7 +368,7 @@ pub fn plan(
     }
     let mut plan = sized(shape, storage, builder, pools)?;
     if plan.fits() == Some(false) {
-        let available = pools.available().unwrap_or(0);
+        let available = plan.available_bytes.unwrap_or(0);
         let fits = |shape: ContextShape, storage: Storage| -> Result<Option<u64>> {
             let peak = sized(shape, storage, builder, pools)?.peak_bytes;
             Ok((peak <= available).then_some(peak))
@@ -236,7 +406,6 @@ pub fn plan(
 /// The plan's sizes, without suggestions. A GPU build that cannot fit one
 /// estimator on the device falls back to the CPU, as the executor does.
 fn sized(shape: ContextShape, storage: Storage, builder: Builder, pools: Pools) -> Result<Plan> {
-    let available = pools.available();
     let streams = shape.features + RESERVED_STREAMS;
     let column = mul(&[shape.estimators, streams, COLUMN_BYTES_PER_STREAM])?;
     let icl = mul(&[
@@ -248,21 +417,10 @@ fn sized(shape: ContextShape, storage: Storage, builder: Builder, pools: Pools) 
     ])?;
     let context_bytes = add(column, icl)?;
     let weight_bytes = shape.task.parameter_count() * 4;
-    let device_limit = match pools.device {
-        Some(DeviceMemory::Shared { limit }) => Some(limit),
-        Some(DeviceMemory::Separate { available }) => Some(available),
-        None => None,
-    };
     let gpu_group = (builder == Builder::Gpu)
         .then(|| {
             let per_estimator = build_estimator_bytes(shape, Builder::Gpu)?;
-            Ok::<_, Error>(gpu_build_group(
-                shape.estimators,
-                per_estimator,
-                available,
-                device_limit,
-                None,
-            ))
+            Ok::<_, Error>(gpu_build_group(shape.estimators, per_estimator, pools))
         })
         .transpose()?
         .flatten();
@@ -276,9 +434,13 @@ fn sized(shape: ContextShape, storage: Storage, builder: Builder, pools: Pools) 
         cpu_build_group(
             shape.estimators,
             build_estimator_bytes.saturating_mul(CPU_BUILD_ESTIMATE_DIVISOR),
-            available,
+            pools.host_available(),
         )
     });
+    let available = match builder {
+        Builder::Gpu => pools.available(),
+        Builder::Cpu => pools.host_available(),
+    };
     let peak_bytes = add(
         add(weight_bytes, context_bytes)?,
         add(mul(&[build_group, build_estimator_bytes])?, HEADROOM)?,
@@ -293,6 +455,7 @@ fn sized(shape: ContextShape, storage: Storage, builder: Builder, pools: Pools) 
         build_group,
         peak_bytes,
         available_bytes: available,
+        pools,
         suggestions: Vec::new(),
     })
 }
@@ -322,38 +485,37 @@ pub(crate) fn gpu_build_estimator_bytes(n: usize, h: usize) -> usize {
 
 /// Estimators the GPU builds together, or `None` when the CPU should build.
 ///
-/// `budget` is `IRONICL_GPU_BUILD_BUDGET`: an exact cap, with a CPU build when
-/// one estimator exceeds it. Otherwise the group is the largest that divides
-/// the estimator count (every run has the same graph shape) and stays under the
-/// smallest of a size that keeps the GPU busy, half the available memory, and
-/// the device's limit; the CPU builds only when one estimator exceeds the device.
-pub(crate) fn gpu_build_group(
-    estimators: u64,
-    per_estimator: u64,
-    available: Option<u64>,
-    device_limit: Option<u64>,
-    budget: Option<u64>,
-) -> Option<u64> {
+/// The group is the largest that divides the estimator count (every run has the
+/// same graph shape) and stays under the build's share of the device's memory:
+/// on a shared device, half the host's available RAM, capped by the device's
+/// limit; on a separate device, all of its available memory less a reserve. The
+/// CPU builds only when one estimator exceeds the device.
+pub(crate) fn gpu_build_group(estimators: u64, per_estimator: u64, pools: Pools) -> Option<u64> {
     let per_estimator = per_estimator.max(1);
-    let largest_under = |cap: u64| {
+    let host_share = pools.host_available().map(|host| host / BUILD_SHARE_DIVISOR);
+    let cap = match pools.device {
+        Some(DeviceMemory::Shared { limit }) => {
+            if per_estimator > limit {
+                return None;
+            }
+            host_share.map_or(limit / BUILD_SHARE_DIVISOR, |share| share.min(limit))
+        }
+        Some(DeviceMemory::Separate { .. }) => {
+            let available = pools.available().unwrap_or(0);
+            let usable = available.saturating_sub(SEPARATE_DEVICE_RESERVE.max(available / 20));
+            if per_estimator > usable {
+                return None;
+            }
+            usable
+        }
+        None => host_share.unwrap_or(0),
+    };
+    Some(
         (1..=estimators)
             .rev()
             .find(|&group| estimators.is_multiple_of(group) && group.saturating_mul(per_estimator) <= cap)
-    };
-    if let Some(budget) = budget {
-        return largest_under(budget);
-    }
-    if device_limit.is_some_and(|limit| per_estimator > limit) {
-        return None;
-    }
-    let mut target = GPU_BUILD_TARGET;
-    if let Some(available) = available {
-        target = target.min(available / BUILD_SHARE_DIVISOR);
-    }
-    if let Some(limit) = device_limit {
-        target = target.min(limit);
-    }
-    Some(largest_under(target).unwrap_or(1))
+            .unwrap_or(1),
+    )
 }
 
 /// Estimators the CPU builds together: as many as fit four activation limits
@@ -396,6 +558,37 @@ impl fmt::Display for Plan {
         match self.available_bytes {
             None => write!(f, "; available memory is unknown.")?,
             Some(available) => write!(f, "; available: about {}.", gib(available))?,
+        }
+        if let Some(limit) = self.pools.limits.host {
+            write!(
+                f,
+                "\nMemory limit: {} (set by {}).",
+                gib(limit.bytes),
+                limit.source
+            )?;
+        }
+        if let Some(limit) = self.pools.limits.device {
+            if matches!(self.pools.device, Some(DeviceMemory::Separate { .. })) {
+                write!(
+                    f,
+                    "\nDevice memory limit: {} (set by {}).",
+                    gib(limit.bytes),
+                    limit.source
+                )?;
+            } else {
+                write!(
+                    f,
+                    "\nDevice memory limit ({}): not applicable; there is no separate device memory, \
+                     so memory_limit applies.",
+                    limit.source
+                )?;
+            }
+        }
+        if self.fits() == Some(false) && self.suggestions.is_empty() {
+            write!(
+                f,
+                "\nNo fewer rows, fewer estimators, or smaller storage fits this machine."
+            )?;
         }
         if !self.suggestions.is_empty() {
             write!(f, "\nAny one of these fits:")?;
@@ -448,18 +641,19 @@ mod platform {
     use super::HostMemory;
 
     pub(super) fn host_memory() -> Option<HostMemory> {
-        let available = mem_available(&std::fs::read_to_string("/proc/meminfo").ok()?)?;
+        let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
         Some(HostMemory {
-            available,
+            total: meminfo_bytes(&meminfo, "MemTotal:")?,
+            available: meminfo_bytes(&meminfo, "MemAvailable:")?,
             hard_limit: cgroup_headroom(),
         })
     }
 
-    /// `MemAvailable` from `/proc/meminfo`, in bytes.
-    pub(super) fn mem_available(meminfo: &str) -> Option<u64> {
+    /// A `/proc/meminfo` field such as `MemAvailable:`, in bytes.
+    pub(super) fn meminfo_bytes(meminfo: &str, field: &str) -> Option<u64> {
         let kib = meminfo
             .lines()
-            .find_map(|line| line.strip_prefix("MemAvailable:"))?
+            .find_map(|line| line.strip_prefix(field))?
             .trim()
             .strip_suffix("kB")?
             .trim()
@@ -578,6 +772,7 @@ mod platform {
             + u64::from(stats.compressor_page_count);
         let used = used_pages.checked_mul(u64::try_from(page_size).ok()?)?;
         Some(HostMemory {
+            total,
             available: total.saturating_sub(used),
             hard_limit: None,
         })
@@ -615,6 +810,7 @@ mod platform {
             hard_limit = hard_limit.min(job_headroom);
         }
         Some(HostMemory {
+            total: status.ullTotalPhys,
             available: status.ullAvailPhys,
             hard_limit: Some(hard_limit),
         })
@@ -672,7 +868,10 @@ mod platform {
 
 #[cfg(test)]
 mod tests {
-    use super::{Builder, ContextShape, DeviceMemory, HostMemory, Pools, Storage, Suggestion, plan};
+    use super::{
+        Builder, ContextShape, DeviceMemory, HostMemory, Limit, MemoryLimits, Pools, Storage, Suggestion,
+        Verdict, cpu_build_group, gpu_build_group, parse_bytes, plan,
+    };
     use crate::TaskKind;
 
     const GIB: u64 = 1 << 30;
@@ -689,10 +888,40 @@ mod tests {
     fn host(available: u64) -> Pools {
         Pools {
             host: Some(HostMemory {
+                total: 64 * GIB,
                 available,
                 hard_limit: None,
             }),
-            device: None,
+            ..Pools::default()
+        }
+    }
+
+    fn shared(available: u64, limit: u64) -> Pools {
+        Pools {
+            device: Some(DeviceMemory::Shared { limit }),
+            ..host(available)
+        }
+    }
+
+    fn separate(host_available: u64, device_available: u64) -> Pools {
+        Pools {
+            device: Some(DeviceMemory::Separate {
+                available: device_available,
+            }),
+            ..host(host_available)
+        }
+    }
+
+    fn limits(host: Option<u64>, device: Option<u64>) -> MemoryLimits {
+        let limit = |bytes: Option<u64>| {
+            bytes.map(|bytes| Limit {
+                bytes,
+                source: "test",
+            })
+        };
+        MemoryLimits {
+            host: limit(host),
+            device: limit(device),
         }
     }
 
@@ -712,80 +941,75 @@ mod tests {
     }
 
     #[test]
-    fn wide_gpu_builds_run_one_estimator_and_narrow_ones_group() {
-        let wide = plan(
-            shape(10_000, 100),
-            Storage::FP16,
-            Builder::Gpu,
-            host(28 * GIB),
-            &[],
-        )
-        .expect("plan");
-        assert_eq!(wide.build_group, 1);
-        let narrow = plan(
-            shape(10_000, 20),
-            Storage::FP16,
-            Builder::Gpu,
-            host(28 * GIB),
-            &[],
-        )
-        .expect("plan");
-        assert_eq!(narrow.build_group, 4);
-        // Less memory shrinks the group: half of 4 GiB holds one narrow estimator.
-        let tight = plan(shape(10_000, 20), Storage::FP16, Builder::Gpu, host(4 * GIB), &[]).expect("plan");
-        assert_eq!(tight.build_group, 1);
+    fn shared_device_builds_use_half_the_hosts_memory() {
+        let group = |features, pools| {
+            plan(shape(10_000, features), Storage::FP16, Builder::Gpu, pools, &[])
+                .expect("plan")
+                .build_group
+        };
+        // 28 GiB available: a 14 GiB share holds two wide (4.3 GiB) estimators
+        // and all eight narrow (1.2 GiB) ones.
+        assert_eq!(group(100, shared(28 * GIB, 21 * GIB)), 2);
+        assert_eq!(group(20, shared(28 * GIB, 21 * GIB)), 8);
+        // The device's limit caps the share, and less memory shrinks it.
+        assert_eq!(group(20, shared(28 * GIB, 5 * GIB)), 4);
+        assert_eq!(group(20, shared(4 * GIB, 21 * GIB)), 1);
     }
 
     #[test]
-    fn gpu_build_groups_follow_the_budget_override_and_the_device_limit() {
-        use super::gpu_build_group;
-        const MB: u64 = 1 << 20;
-        // IRONICL_GPU_BUILD_BUDGET is an exact cap: one 17 MB estimator in
-        // 20 MB, and a CPU build when none fits.
-        assert_eq!(gpu_build_group(4, 17 * MB, None, None, Some(20 * MB)), Some(1));
-        assert_eq!(gpu_build_group(4, 17 * MB, None, None, Some(10 * MB)), None);
-        // Without it, one estimator larger than the device builds on the CPU,
-        // and one larger than the memory share still builds alone on the GPU.
+    fn gpu_build_groups_divide_the_estimators_and_fall_back_to_the_cpu() {
+        // One estimator larger than a shared device builds on the CPU; one
+        // larger than the memory share still builds alone on the GPU.
+        assert_eq!(gpu_build_group(8, 5 * GIB, shared(28 * GIB, 4 * GIB)), None);
+        assert_eq!(gpu_build_group(8, 5 * GIB, shared(4 * GIB, 21 * GIB)), Some(1));
+        // Groups divide the estimator count: 14 GiB holds five or six of 1 GiB,
+        // but seven only one at a time.
+        assert_eq!(gpu_build_group(5, GIB, shared(28 * GIB, 21 * GIB)), Some(5));
+        assert_eq!(gpu_build_group(6, GIB, shared(28 * GIB, 21 * GIB)), Some(6));
+        assert_eq!(gpu_build_group(7, GIB, shared(12 * GIB, 21 * GIB)), Some(1));
+        // Unknown host memory: half the device's limit.
+        let unknown_host = Pools {
+            host: None,
+            ..shared(0, 8 * GIB)
+        };
+        assert_eq!(gpu_build_group(8, GIB, unknown_host), Some(4));
+        // Nothing known: one at a time.
+        assert_eq!(gpu_build_group(8, GIB, Pools::default()), Some(1));
+    }
+
+    #[test]
+    fn separate_devices_use_their_own_memory_less_a_reserve() {
+        let wide = 4_400 * (1 << 20);
+        // 24 GiB less 1.2 GiB holds four 4.3 GiB estimators, not eight; the
+        // host's memory does not matter.
+        assert_eq!(gpu_build_group(8, wide, separate(2 * GIB, 24 * GIB)), Some(4));
+        // The device memory limit caps it: 10 GiB less 512 MiB holds two.
+        let limited = separate(2 * GIB, 24 * GIB).with_limits(limits(None, Some(10 * GIB)));
+        assert_eq!(gpu_build_group(8, wide, limited), Some(2));
+        // The reserve is at least 256 MiB, and one estimator over what is left
+        // builds on the CPU.
         assert_eq!(
-            gpu_build_group(8, 5 * GIB, Some(28 * GIB), Some(4 * GIB), None),
+            gpu_build_group(8, GIB, separate(64 * GIB, GIB + 128 * (1 << 20))),
             None
-        );
-        assert_eq!(
-            gpu_build_group(8, 5 * GIB, Some(4 * GIB), Some(21 * GIB), None),
-            Some(1)
-        );
-        // Groups divide the estimator count: five of 1 GiB under 6 GiB is 5.
-        assert_eq!(
-            gpu_build_group(5, GIB, Some(28 * GIB), Some(21 * GIB), None),
-            Some(5)
-        );
-        assert_eq!(
-            gpu_build_group(6, GIB, Some(28 * GIB), Some(21 * GIB), None),
-            Some(6)
-        );
-        assert_eq!(
-            gpu_build_group(7, GIB, Some(28 * GIB), Some(21 * GIB), None),
-            Some(1)
         );
     }
 
     #[test]
     fn a_plan_falls_back_to_the_cpu_when_one_estimator_exceeds_the_device() {
-        let pools = Pools {
-            host: Some(HostMemory {
-                available: 28 * GIB,
-                hard_limit: None,
-            }),
-            device: Some(DeviceMemory::Shared { limit: 2 * GIB }),
-        };
-        let plan = plan(shape(10_000, 100), Storage::FP16, Builder::Gpu, pools, &[]).expect("plan");
+        let plan = plan(
+            shape(10_000, 100),
+            Storage::FP16,
+            Builder::Gpu,
+            shared(28 * GIB, 2 * GIB),
+            &[],
+        )
+        .expect("plan");
         assert_eq!(plan.builder, Builder::Cpu);
         assert!(plan.to_string().contains("on the CPU"), "{plan}");
     }
 
     #[test]
     fn cpu_build_groups_shrink_with_available_memory() {
-        use super::cpu_build_group;
         // A 1 GiB estimate counts as 0.5 GiB: 4 GiB available allows 4.
         assert_eq!(cpu_build_group(8, GIB, Some(4 * GIB)), 4);
         assert_eq!(cpu_build_group(8, GIB, Some(GIB)), 1);
@@ -793,24 +1017,152 @@ mod tests {
     }
 
     #[test]
-    fn a_shared_device_is_capped_by_its_limit_and_a_separate_one_is_not() {
-        let mut pools = host(28 * GIB);
-        pools.device = Some(DeviceMemory::Shared { limit: 21 * GIB });
-        assert_eq!(pools.available(), Some(21 * GIB));
-        pools.device = Some(DeviceMemory::Separate { available: 80 * GIB });
-        assert_eq!(pools.available(), Some(80 * GIB));
-        pools.host = None;
-        pools.device = Some(DeviceMemory::Shared { limit: 21 * GIB });
-        assert_eq!(pools.available(), None);
+    fn available_memory_follows_the_pool_and_its_limit() {
+        assert_eq!(shared(28 * GIB, 21 * GIB).available(), Some(21 * GIB));
+        assert_eq!(separate(28 * GIB, 80 * GIB).available(), Some(80 * GIB));
+        let unknown_host = Pools {
+            host: None,
+            ..shared(0, 21 * GIB)
+        };
+        assert_eq!(unknown_host.available(), None);
+        // The memory limit caps the host and shared devices, and only lowers.
+        let capped = shared(28 * GIB, 21 * GIB).with_limits(limits(Some(8 * GIB), None));
+        assert_eq!(
+            (capped.host_available(), capped.available()),
+            (Some(8 * GIB), Some(8 * GIB))
+        );
+        assert_eq!(
+            host(28 * GIB)
+                .with_limits(limits(Some(64 * GIB), None))
+                .host_available(),
+            Some(28 * GIB)
+        );
+        // A limit alone is enough to know the host's memory.
+        let limit_only = Pools::default().with_limits(limits(Some(8 * GIB), None));
+        assert_eq!(limit_only.host_available(), Some(8 * GIB));
+        // The device memory limit applies only to a separate device.
+        let device_limit = limits(None, Some(10 * GIB));
+        assert_eq!(
+            separate(28 * GIB, 80 * GIB).with_limits(device_limit).available(),
+            Some(10 * GIB)
+        );
+        assert_eq!(
+            shared(28 * GIB, 21 * GIB).with_limits(device_limit).available(),
+            Some(21 * GIB)
+        );
+        assert_eq!(
+            host(28 * GIB).with_limits(device_limit).available(),
+            Some(28 * GIB)
+        );
     }
 
     #[test]
     fn hard_limits_cap_available_memory() {
         let host = HostMemory {
+            total: 32 * GIB,
             available: 30 * GIB,
             hard_limit: Some(8 * GIB),
         };
         assert_eq!(host.usable(), 8 * GIB);
+    }
+
+    #[test]
+    fn sizes_parse_with_binary_suffixes() {
+        for (text, bytes) in [
+            ("1048576", 1 << 20),
+            ("512M", 512 << 20),
+            ("16G", 16 * GIB),
+            ("16g", 16 * GIB),
+            ("16GB", 16 * GIB),
+            ("16GiB", 16 * GIB),
+            (" 1.5G ", 3 * GIB / 2),
+            ("2T", 2 << 40),
+            ("64K", 64 << 10),
+            ("100b", 100),
+        ] {
+            assert_eq!(parse_bytes(text).expect(text), bytes, "{text}");
+        }
+        for text in [
+            "",
+            "0",
+            "0G",
+            "-1G",
+            "1e9",
+            "inf",
+            "G",
+            "16iB",
+            "16X",
+            "1.2.3G",
+            "+5G",
+            "99999999999T",
+        ] {
+            assert!(parse_bytes(text).is_err(), "{text:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn explicit_limits_win_and_errors_name_their_source() {
+        let resolved = MemoryLimits::resolve(Some("16G"), Some("8G")).expect("resolve");
+        assert_eq!(
+            resolved.host,
+            Some(Limit {
+                bytes: 16 * GIB,
+                source: "memory_limit"
+            })
+        );
+        assert_eq!(resolved.device.map(|limit| limit.bytes), Some(8 * GIB));
+        let error = MemoryLimits::resolve(Some("lots"), None).expect_err("invalid");
+        assert!(error.to_string().contains("memory_limit=\"lots\""), "{error}");
+    }
+
+    #[test]
+    fn verdicts_separate_overflow_from_cannot_complete() {
+        let wide = shape(10_000, 100);
+        let verdict = |pools| {
+            plan(wide, Storage::FP32, Builder::Cpu, pools, &[])
+                .expect("plan")
+                .verdict()
+        };
+        assert_eq!(verdict(host(28 * GIB)), Verdict::Fits);
+        // The peak exceeds what is available, or the memory limit: overflow.
+        assert_eq!(verdict(host(4 * GIB)), Verdict::Overflow);
+        assert_eq!(
+            verdict(host(28 * GIB).with_limits(limits(Some(2 * GIB), None))),
+            Verdict::Overflow
+        );
+        // A hard limit, or a context larger than physical memory: cannot complete.
+        let mut capped = host(28 * GIB);
+        capped.host.as_mut().expect("host").hard_limit = Some(2 * GIB);
+        assert_eq!(verdict(capped), Verdict::CannotComplete);
+        let mut small = host(2 * GIB);
+        small.host.as_mut().expect("host").total = 3 * GIB;
+        assert_eq!(verdict(small), Verdict::CannotComplete);
+        assert_eq!(verdict(Pools::default()), Verdict::Unknown);
+    }
+
+    #[test]
+    fn reports_name_the_limits_that_applied() {
+        let pools = shared(28 * GIB, 21 * GIB).with_limits(MemoryLimits {
+            host: Some(Limit {
+                bytes: 16 * GIB,
+                source: "IRONICL_MEMORY_LIMIT",
+            }),
+            device: Some(Limit {
+                bytes: 8 * GIB,
+                source: "device_memory_limit",
+            }),
+        });
+        let report = plan(shape(1_000, 10), Storage::FP16, Builder::Gpu, pools, &[])
+            .expect("plan")
+            .to_string();
+        assert!(
+            report.contains("Memory limit: 16.0 GiB (set by IRONICL_MEMORY_LIMIT)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("device_memory_limit): not applicable"),
+            "{report}"
+        );
     }
 
     #[test]
@@ -858,11 +1210,14 @@ mod tests {
 
     #[test]
     fn unknown_memory_has_no_verdict_or_suggestions() {
-        let unknown = Pools {
-            host: None,
-            device: None,
-        };
-        let plan = plan(shape(50_000, 100), Storage::FP32, Builder::Cpu, unknown, &[]).expect("plan");
+        let plan = plan(
+            shape(50_000, 100),
+            Storage::FP32,
+            Builder::Cpu,
+            Pools::default(),
+            &[],
+        )
+        .expect("plan");
         assert_eq!(plan.fits(), None);
         assert!(plan.suggestions.is_empty());
         assert!(plan.to_string().contains("unknown"));
@@ -883,11 +1238,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_parsers_read_meminfo_and_cgroups() {
-        use super::platform::{cgroup_v2_path, limit_bytes, mem_available};
-        assert_eq!(
-            mem_available("MemTotal: 100 kB\nMemAvailable:    2048 kB\n"),
-            Some(2048 * 1024)
-        );
+        use super::platform::{cgroup_v2_path, limit_bytes, meminfo_bytes};
+        let meminfo = "MemTotal: 100 kB\nMemAvailable:    2048 kB\n";
+        assert_eq!(meminfo_bytes(meminfo, "MemAvailable:"), Some(2048 * 1024));
+        assert_eq!(meminfo_bytes(meminfo, "MemTotal:"), Some(100 * 1024));
         assert_eq!(cgroup_v2_path("0::/user.slice/app\n"), Some("/user.slice/app"));
         assert_eq!(limit_bytes("max\n"), None);
         assert_eq!(limit_bytes("8589934592\n"), Some(8 << 30));

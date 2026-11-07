@@ -11,12 +11,14 @@ use pyo3::{
     buffer::PyBuffer,
     exceptions::{PyNotImplementedError, PyRuntimeError, PyValueError},
     prelude::*,
-    types::PyBytes,
+    types::{PyBytes, PyDict},
 };
 
 use crate::{
     CheckpointCacheOptions, ClassifierAggregation, Error, Executor, Optimize, PreparedCheckpoint,
-    QueryRequest, RegressionOutput, StaticExecutor, load_model_artifact, prepare_checkpoint,
+    QueryRequest, RegressionOutput, StaticExecutor, TaskKind, load_model_artifact,
+    memory::{Builder, MemoryLimits, Verdict},
+    plan_context, prepare_checkpoint,
 };
 
 fn py_error(error: Error) -> PyErr {
@@ -52,8 +54,13 @@ impl Model {
     /// keep their attention keys and values. Targets are class labels for the
     /// classifier and standardized values for the regressor. Permutations are
     /// `[B, C]` (empty for the regressor) and `[B, H]`; `optimize` is `"safe"`,
-    /// `"auto"`, or `"fast"`.
+    /// `"auto"`, or `"fast"`. The memory limits are sizes such as `"16G"`;
+    /// `None` reads `IRONICL_MEMORY_LIMIT` and `IRONICL_DEVICE_MEMORY_LIMIT`.
     #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (
+        x, y_train, class_permutations, feature_permutations, optimize, threads,
+        memory_limit=None, device_memory_limit=None,
+    ))]
     fn build_context(
         &self,
         py: Python<'_>,
@@ -63,8 +70,12 @@ impl Model {
         feature_permutations: PyBuffer<u64>,
         optimize: &str,
         threads: Option<usize>,
+        memory_limit: Option<String>,
+        device_memory_limit: Option<String>,
     ) -> PyResult<Context> {
         let optimize = optimize.parse::<Optimize>().map_err(py_error)?;
+        let limits = MemoryLimits::resolve(memory_limit.as_deref(), device_memory_limit.as_deref())
+            .map_err(py_error)?;
         let &[ensembles, rows, features] = x.shape() else {
             return Err(PyValueError::new_err("x must have shape [B, N, H]"));
         };
@@ -82,6 +93,7 @@ impl Model {
                 feature_permutations,
                 optimize,
                 threads,
+                limits,
             )
         })
         .map(Context)
@@ -182,9 +194,63 @@ impl Context {
     }
 }
 
+/// Plan the memory to build a `task` context of `estimators x rows x features`
+/// with `optimize`, as `build_context` would on this machine. The memory limits
+/// are sizes such as `"16G"`; `None` reads `IRONICL_MEMORY_LIMIT` and
+/// `IRONICL_DEVICE_MEMORY_LIMIT`. Returns the plan as a dict.
+#[pyfunction]
+#[pyo3(signature = (task, estimators, rows, features, optimize, memory_limit=None, device_memory_limit=None))]
+#[allow(clippy::too_many_arguments)]
+fn plan_memory<'py>(
+    py: Python<'py>,
+    task: &str,
+    estimators: usize,
+    rows: usize,
+    features: usize,
+    optimize: &str,
+    memory_limit: Option<String>,
+    device_memory_limit: Option<String>,
+) -> PyResult<Bound<'py, PyDict>> {
+    let task = task.parse::<TaskKind>().map_err(py_error)?;
+    let optimize = optimize.parse::<Optimize>().map_err(py_error)?;
+    let limits =
+        MemoryLimits::resolve(memory_limit.as_deref(), device_memory_limit.as_deref()).map_err(py_error)?;
+    let plan = py
+        .detach(|| plan_context(task, (estimators, rows, features), optimize, limits))
+        .map_err(py_error)?;
+    let dict = PyDict::new(py);
+    dict.set_item(
+        "verdict",
+        match plan.verdict() {
+            Verdict::Fits => "fits",
+            Verdict::Overflow => "overflow",
+            Verdict::CannotComplete => "cannot_complete",
+            Verdict::Unknown => "unknown",
+        },
+    )?;
+    dict.set_item("report", plan.to_string())?;
+    dict.set_item("peak_bytes", plan.peak_bytes)?;
+    dict.set_item("available_bytes", plan.available_bytes)?;
+    dict.set_item("context_bytes", plan.context_bytes)?;
+    dict.set_item("weight_bytes", plan.weight_bytes)?;
+    dict.set_item("build_group", plan.build_group)?;
+    dict.set_item(
+        "builder",
+        match plan.builder {
+            Builder::Cpu => "cpu",
+            Builder::Gpu => "gpu",
+        },
+    )?;
+    dict.set_item("storage", plan.storage.name)?;
+    dict.set_item("memory_limit", limits.host.map(|limit| limit.bytes))?;
+    dict.set_item("device_memory_limit", limits.device.map(|limit| limit.bytes))?;
+    Ok(dict)
+}
+
 #[pymodule]
 #[pyo3(name = "_core")]
 fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Model>()?;
-    module.add_class::<Context>()
+    module.add_class::<Context>()?;
+    module.add_function(wrap_pyfunction!(plan_memory, module)?)
 }

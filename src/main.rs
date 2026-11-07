@@ -82,7 +82,8 @@ fn print_plan(args: PlanArgs) -> Result<()> {
         rows: workload.training_rows,
         features: workload.features,
     };
-    let plan = memory::plan(shape, storage, memory::Builder::Cpu, memory::Pools::detect(), &[])?;
+    let pools = memory::Pools::detect().with_limits(memory::MemoryLimits::resolve(None, None)?);
+    let plan = memory::plan(shape, storage, memory::Builder::Cpu, pools, &[])?;
     println!();
     println!("{plan}");
 
