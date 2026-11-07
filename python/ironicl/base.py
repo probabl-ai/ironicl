@@ -1,5 +1,5 @@
 """What ``TabICLClassifier`` and ``TabICLRegressor`` share: the checkpoint, the
-fitted context and its disk cache, threads, and ``optimize``."""
+fitted context and its disk cache, threads, ``optimize``, and memory planning."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ import numpy as np
 from sklearn.base import BaseEstimator
 
 from ironicl._core import Model
+from ironicl.memory import _enforce, _limit_text, _overflow_policy, _plan
 from ironicl.preprocessing import Preprocessor
 
 CHECKPOINT_URL = "https://huggingface.co/jingang/TabICL/resolve/main/{}"
@@ -34,10 +35,16 @@ class TabICLBase(BaseEstimator):
         """Fit preprocessing and build the Rust context from per-estimator ``targets(preprocessor)``.
 
         Fitted attributes are set only once the context exists, so a failed fit
-        never looks fitted.
+        never looks fitted. The memory plan is checked after preprocessing, when
+        the context's shape is known, and before any model or build work.
         """
         self._validate_params()
         optimize = self._optimize()
+        policy = _overflow_policy(self.memory_overflow)
+        limits = (
+            _limit_text("memory_limit", self.memory_limit),
+            _limit_text("device_memory_limit", self.device_memory_limit),
+        )
         methods = self.norm_methods or ["none", "power"]
         preprocessor = Preprocessor(
             n_estimators=self.n_estimators,
@@ -47,6 +54,8 @@ class TabICLBase(BaseEstimator):
             classification=classification,
         )
         train_rows = _ensemble_rows(preprocessor, preprocessor.fit_transform(X, y))
+        plan = _plan(self._task, *train_rows.shape, optimize, *limits)
+        _enforce(plan, policy, stacklevel=3)
         checkpoint = self._checkpoint()
         model = _model(checkpoint)
         if model.task != self._task:
@@ -54,11 +63,13 @@ class TabICLBase(BaseEstimator):
         self.context_ = self._context(
             model,
             optimize,
+            limits,
             train_rows,
             np.ascontiguousarray(targets(preprocessor), dtype=np.float32),
             np.ascontiguousarray(preprocessor.class_permutations_, dtype=np.uint64),
             np.ascontiguousarray(preprocessor.feature_permutations_, dtype=np.uint64),
         )
+        self.memory_plan_ = plan
         self.preprocessor_ = preprocessor
         self.checkpoint_path_ = checkpoint
         self.n_features_in_ = preprocessor.n_features_in_
@@ -110,12 +121,14 @@ class TabICLBase(BaseEstimator):
             return self.n_jobs
         return max(1, (os.cpu_count() or 1) + 1 + self.n_jobs)
 
-    def _context(self, model, optimize, train_rows, targets, class_perms, feature_perms):
+    def _context(self, model, optimize, limits, train_rows, targets, class_perms, feature_perms):
         """Build the Rust context, or load it from ``cache_dir`` when available."""
         threads = self._resolve_threads()
 
         def build():
-            return model.build_context(train_rows, targets, class_perms, feature_perms, optimize, threads)
+            return model.build_context(
+                train_rows, targets, class_perms, feature_perms, optimize, threads, *limits
+            )
 
         cache_dir = self._cache_dir()
         if cache_dir is None:

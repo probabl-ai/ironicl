@@ -48,6 +48,28 @@ class TabICLClassifier(ClassifierMixin, TabICLBase):
     ``<XDG_CACHE_HOME or ~/.cache>/ironicl/contexts``; a path caches there (each
     context is large, so caching is opt-in). Entries are keyed by the model,
     inputs, and ``optimize``, and a corrupt entry is silently rebuilt.
+
+    ``memory_limit``, ``device_memory_limit``, and ``memory_overflow`` are
+    Ironicl's own, after ``cache_dir``. ``fit`` plans the memory it needs after
+    preprocessing and before building:
+
+    - ``memory_limit``: the most host RAM to plan for, as an int number of bytes
+      or a size such as ``"16G"`` or ``"512M"`` (binary units). It also covers a
+      GPU that shares RAM, such as an Apple GPU, and only lowers what is
+      detected. ``None`` (default) reads ``IRONICL_MEMORY_LIMIT``, else uses the
+      memory available.
+    - ``device_memory_limit``: the same for a GPU's own dedicated memory, from
+      ``IRONICL_DEVICE_MEMORY_LIMIT``. It has no effect where memory is shared.
+    - ``memory_overflow``: what to do when the plan exceeds available memory or
+      ``memory_limit``: ``"warn"`` emits ``IroniclMemoryWarning`` and continues,
+      ``"error"`` raises ``IroniclMemoryError`` and leaves the estimator
+      unfitted, ``"ignore"`` continues silently. ``None`` (default) reads
+      ``IRONICL_MEMORY_OVERFLOW``, else ``"warn"``. A fit that cannot complete
+      on this machine at all (past a container's hard limit, or a context larger
+      than physical memory) raises under ``"warn"`` too.
+
+    The plan is kept as ``memory_plan_``; ``ironicl.plan_memory`` plans without
+    data. Limits plan memory; the operating system does not enforce them.
     """
 
     def __init__(
@@ -76,6 +98,9 @@ class TabICLClassifier(ClassifierMixin, TabICLBase):
         inference_config: dict | None = None,
         optimize: str | None = None,
         cache_dir: str | Path | bool | None = False,
+        memory_limit: int | str | None = None,
+        device_memory_limit: int | str | None = None,
+        memory_overflow: str | None = None,
     ):
         self.n_estimators = n_estimators
         self.norm_methods = norm_methods
@@ -101,6 +126,9 @@ class TabICLClassifier(ClassifierMixin, TabICLBase):
         self.inference_config = inference_config
         self.optimize = optimize
         self.cache_dir = cache_dir
+        self.memory_limit = memory_limit
+        self.device_memory_limit = device_memory_limit
+        self.memory_overflow = memory_overflow
 
     _task = "classifier"
     _checkpoint_version = "tabicl-classifier-v2-20260212.ckpt"
