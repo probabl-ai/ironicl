@@ -89,9 +89,8 @@ is most of the machine's RAM: at 10,000 x 100 on an M1 Max (32 GB) the build
 peaked at 21.4 GiB for a 2 GiB context. With 19 GiB free it now builds two
 estimators at a time and peaks at 12.0 GiB; under an 8 GiB limit, one at a time
 at 7.1 GiB. `tests/build_memory.rs` checks the peak against the plan.
-Predict-time GPU query buffers are kept
-between calls for buckets up to 1024 rows, and large cached queries are split into
-chunks so GPU scratch stays bounded.
+Prediction splits GPU queries so the shapes the predict graph keeps fit the
+same share; see [Prediction](memory-planner.md#prediction).
 
 ## Bandwidth Lower Bound
 

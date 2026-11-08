@@ -362,7 +362,8 @@ the missing marker runs on the CPU). The accuracy gate is in
 
 - Query counts are padded to a bucket that keeps their top four significant bits,
   at most 12.5% padding, so new batch sizes rarely trigger a 150-400 ms graph
-  compile. Buckets up to 1024 rows keep their buffers between calls.
+  compile. Buckets keep their buffers between calls; queries split so the
+  kept buckets fit the [memory budget](memory-planner.md#prediction).
 - Large cached queries are split into chunks; each estimator's rows land in place
   when the chunks are joined.
 
