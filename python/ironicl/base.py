@@ -12,12 +12,17 @@ from pathlib import Path
 
 import numpy as np
 from sklearn.base import BaseEstimator
+from sklearn.utils import _safe_indexing
+from sklearn.utils.validation import _num_samples
 
 from ironicl._core import Model
 from ironicl.memory import _enforce, _limit_text, _overflow_policy, _plan
 from ironicl.preprocessing import Preprocessor
 
 CHECKPOINT_URL = "https://huggingface.co/jingang/TabICL/resolve/main/{}"
+# Prediction preprocesses this many rows at a time, which bounds the [B, rows, H]
+# copies it makes. Rust splits each chunk further to fit its own buffers.
+PREDICT_CHUNK_ROWS = 8192
 
 
 @cache  # ponytail: one resident model per checkpoint for the process lifetime.
@@ -77,8 +82,12 @@ class TabICLBase(BaseEstimator):
             self.feature_names_in_ = preprocessor.feature_names_in_
         return preprocessor
 
-    def _query_rows(self, X) -> np.ndarray:
-        return _ensemble_rows(self.preprocessor_, self.preprocessor_.transform(X))
+    def _query_chunks(self, X):
+        """Yield the preprocessed ``[B, rows, H]`` query rows of ``X``, ``PREDICT_CHUNK_ROWS`` at a time."""
+        rows = _num_samples(X)
+        for start in range(0, max(rows, 1), PREDICT_CHUNK_ROWS):
+            chunk = _safe_indexing(X, slice(start, start + PREDICT_CHUNK_ROWS))
+            yield _ensemble_rows(self.preprocessor_, self.preprocessor_.transform(chunk))
 
     def _validate_params(self, unsupported=(), noops=()) -> None:
         # Values that would change results or request an unimplemented feature raise.

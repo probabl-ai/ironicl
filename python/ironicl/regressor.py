@@ -132,11 +132,11 @@ class TabICLRegressor(RegressorMixin, TabICLBase):
             raise ValueError("The provided input X is one-dimensional. Reshape your data.")
         types = [output_type] if isinstance(output_type, str) else list(output_type)
         alphas = DEFAULT_ALPHAS if alphas is None else list(alphas)
-        results = self.context_.predict_regression(self._query_rows(X), types, alphas)
+        chunks = [self.context_.predict_regression(rows, types, alphas) for rows in self._query_chunks(X)]
         mean, scale = self.y_scaler_.mean_[0], self.y_scaler_.scale_[0]
         final = {}
-        for name, (values, shape) in zip(types, results):
-            values = np.frombuffer(values, dtype=np.float32).reshape(shape)
+        for name, *parts in zip(types, *chunks):
+            values = np.concatenate([np.frombuffer(values, dtype=np.float32).reshape(shape) for values, shape in parts])
             # Standardized units back to the target's: locations by σ·v + μ,
             # the variance, a squared spread, by σ².
             values = values * scale**2 if name == "variance" else values * scale + mean
