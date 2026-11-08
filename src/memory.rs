@@ -328,6 +328,22 @@ impl Plan {
         self.available_bytes.map(|available| self.peak_bytes <= available)
     }
 
+    /// This plan for loading the built context instead of building it: no
+    /// build group, so the peak is the weights, the context, and headroom.
+    #[must_use]
+    pub fn for_load(self) -> Self {
+        let peak_bytes = self
+            .weight_bytes
+            .saturating_add(self.context_bytes)
+            .saturating_add(HEADROOM);
+        Self {
+            build_group: 0,
+            peak_bytes,
+            suggestions: Vec::new(),
+            ..self
+        }
+    }
+
     /// Whether the fit fits, overflows, or cannot complete on this machine.
     #[must_use]
     pub fn verdict(&self) -> Verdict {
@@ -548,17 +564,21 @@ impl fmt::Display for Plan {
             shape.features,
             self.storage.name
         )?;
-        write!(
-            f,
-            "Peak while building on the {}: {}, including {} for {} estimator(s) at a time",
-            match self.builder {
-                Builder::Cpu => "CPU",
-                Builder::Gpu => "GPU",
-            },
-            gib(self.peak_bytes),
-            gib(self.build_group * self.build_estimator_bytes),
-            self.build_group
-        )?;
+        if self.build_group == 0 {
+            write!(f, "Peak while loading: {}", gib(self.peak_bytes))?;
+        } else {
+            write!(
+                f,
+                "Peak while building on the {}: {}, including {} for {} estimator(s) at a time",
+                match self.builder {
+                    Builder::Cpu => "CPU",
+                    Builder::Gpu => "GPU",
+                },
+                gib(self.peak_bytes),
+                gib(self.build_group * self.build_estimator_bytes),
+                self.build_group
+            )?;
+        }
         match self.available_bytes {
             None => write!(f, "; available memory is unknown.")?,
             Some(available) => write!(f, "; available: about {}.", gib(available))?,
@@ -588,7 +608,7 @@ impl fmt::Display for Plan {
                 )?;
             }
         }
-        if self.fits() == Some(false) && self.suggestions.is_empty() {
+        if self.fits() == Some(false) && self.suggestions.is_empty() && self.build_group > 0 {
             write!(
                 f,
                 "\nNo fewer rows, fewer estimators, or smaller storage fits this machine."
@@ -1117,6 +1137,26 @@ mod tests {
         assert_eq!(resolved.device.map(|limit| limit.bytes), Some(8 * GIB));
         let error = MemoryLimits::resolve(Some("lots"), None).expect_err("invalid");
         assert!(error.to_string().contains("memory_limit=\"lots\""), "{error}");
+    }
+
+    #[test]
+    fn a_load_plans_the_context_without_a_build() {
+        let build = plan(
+            shape(10_000, 100),
+            Storage::FP32,
+            Builder::Cpu,
+            host(32 * GIB),
+            &[],
+        )
+        .expect("plan");
+        let load = build.clone().for_load();
+        assert_eq!(load.build_group, 0);
+        assert_eq!(
+            load.peak_bytes,
+            build.weight_bytes + build.context_bytes + super::HEADROOM
+        );
+        assert!(load.peak_bytes < build.peak_bytes);
+        assert!(load.to_string().contains("Peak while loading"), "{load}");
     }
 
     #[test]

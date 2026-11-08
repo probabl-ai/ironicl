@@ -66,8 +66,8 @@ class TabICLBase(BaseEstimator):
         plan = _plan(self._task, preprocessor.n_estimators_, rows, features, optimize, *limits)
         _enforce(plan, policy, stacklevel=3)
         checkpoint = self._checkpoint()
-        training = {"groups": groups, "targets": targets(preprocessor), "optimize": optimize}
-        self.context_ = self._build(_model(checkpoint), limits, preprocessor, training)
+        training = {"groups": groups, "targets": targets(preprocessor)}
+        self.context_ = self._build(_model(checkpoint), optimize, limits, preprocessor, training)
         self._training = training
         self.memory_plan_ = plan
         self.preprocessor_ = preprocessor
@@ -77,14 +77,14 @@ class TabICLBase(BaseEstimator):
             self.feature_names_in_ = preprocessor.feature_names_in_
         return preprocessor
 
-    def _build(self, model, limits, preprocessor, training):
-        """Build the context from ``training``: the grouped training rows, the
-        per-row targets, and the ``optimize`` level that ``fit`` resolved."""
+    def _build(self, model, optimize, limits, preprocessor, training):
+        """Build the context from ``training``: the grouped training rows and
+        the per-row targets."""
         if model.task != self._task:
             raise ValueError(f"{self.checkpoint_version} is a {model.task} checkpoint, not a {self._task}")
         return self._context(
             model,
-            training["optimize"],
+            optimize,
             limits,
             _ensemble_rows(preprocessor, training["groups"]),
             np.ascontiguousarray(self._expand_targets(preprocessor, training["targets"]), dtype=np.float32),
@@ -152,7 +152,10 @@ class TabICLBase(BaseEstimator):
         return state
 
     def __setstate__(self, state):
-        """Load the context, or rebuild it, with this machine's threads and memory limits."""
+        """Load the context, or rebuild it, with this machine's threads and memory limits.
+
+        Loading plans its memory as ``fit`` does and follows ``memory_overflow``;
+        ``memory_plan_`` becomes this machine's plan."""
         state = dict(state)
         version = state.pop("_ironicl_version", None)
         if version != _version():
@@ -165,13 +168,18 @@ class TabICLBase(BaseEstimator):
         super().__setstate__(state)
         if "context_" not in state:
             return  # Not fitted.
+        fitted, limits = self.memory_plan_, self._limits()
+        load = self.context_ is not None
+        plan = _plan(self._task, fitted.estimators, fitted.rows, fitted.features, fitted.optimize, *limits, load)
+        _enforce(plan, _overflow_policy(self.memory_overflow), stacklevel=2, action="load")
+        self.memory_plan_ = plan
         if not Path(self.checkpoint_path_).exists():
             self.checkpoint_path_ = self._checkpoint(checkpoint)
         model = _model(self.checkpoint_path_)
-        if self.context_ is not None:
-            self.context_ = model.context_from_bytes(self.context_, self._resolve_threads(), *self._limits())
+        if load:
+            self.context_ = model.context_from_bytes(self.context_, self._resolve_threads(), *limits)
         else:
-            self.context_ = self._build(model, self._limits(), self.preprocessor_, self._training)
+            self.context_ = self._build(model, plan.optimize, limits, self.preprocessor_, self._training)
 
     def _limits(self) -> tuple[str | None, str | None]:
         return (

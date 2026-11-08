@@ -28,11 +28,16 @@ class MemoryPlan:
     exceeds a hard limit such as a container's, or the context exceeds physical
     memory), or ``"unknown"``. ``report`` explains the plan and lists changes
     that would fit. Byte counts are integers; ``available_bytes`` is ``None``
-    when unknown.
+    when unknown. ``estimators``, ``rows``, ``features``, and ``optimize`` are
+    what was planned for.
     """
 
     verdict: str
     report: str
+    estimators: int
+    rows: int
+    features: int
+    optimize: str
     peak_bytes: int
     available_bytes: int | None
     context_bytes: int
@@ -67,7 +72,10 @@ def plan_memory(
     return _plan(task, n_estimators, n_samples, n_features, optimize, memory_limit, device_memory_limit)
 
 
-def _plan(task, estimators, rows, features, optimize, memory_limit, device_memory_limit) -> MemoryPlan:
+def _plan(
+    task, estimators, rows, features, optimize, memory_limit, device_memory_limit, load=False
+) -> MemoryPlan:
+    """Plan building the context, or with ``load``, loading the built context."""
     return MemoryPlan(
         **_core.plan_memory(
             task,
@@ -77,7 +85,9 @@ def _plan(task, estimators, rows, features, optimize, memory_limit, device_memor
             optimize,
             _limit_text("memory_limit", memory_limit),
             _limit_text("device_memory_limit", device_memory_limit),
-        )
+            load,
+        ),
+        optimize=optimize,
     )
 
 
@@ -103,13 +113,14 @@ def _overflow_policy(value: str | None) -> str:
     return value
 
 
-def _enforce(plan: MemoryPlan, policy: str, stacklevel: int) -> None:
-    """Warn or raise for a plan that does not fit, as ``policy`` says."""
+def _enforce(plan: MemoryPlan, policy: str, stacklevel: int, action: str = "fit") -> None:
+    """Warn or raise for a plan that does not fit, as ``policy`` says. ``action``
+    names what the plan is for: ``"fit"`` or ``"load"``."""
     if policy == "ignore" or plan.verdict in ("fits", "unknown"):
         return
     if plan.verdict == "cannot_complete":
         raise IroniclMemoryError(
-            f"This fit cannot complete on this machine.\n{plan.report}\n"
+            f"This {action} cannot complete on this machine.\n{plan.report}\n"
             "Pass memory_overflow='ignore' to try anyway."
         )
     if policy == "error":
@@ -117,7 +128,7 @@ def _enforce(plan: MemoryPlan, policy: str, stacklevel: int) -> None:
             f"{plan.report}\nPass memory_overflow='warn' or 'ignore' to proceed anyway."
         )
     warnings.warn(
-        f"{plan.report}\nThe fit continues, and the system may page, which is much slower. "
+        f"{plan.report}\nThe {action} continues, and the system may page, which is much slower. "
         "Pass memory_overflow='error' to raise instead, or 'ignore' to silence this.",
         IroniclMemoryWarning,
         stacklevel=stacklevel + 1,
