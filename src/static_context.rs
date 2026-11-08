@@ -30,7 +30,6 @@ const STATIC_CONTEXT_FP32_VERSION: u32 = 1;
 const STATIC_CONTEXT_BF16_VERSION: u32 = 2;
 const HEADER_BYTES: usize = 164;
 const MAX_ARTIFACT_BYTES: usize = 48 * 1024 * 1024 * 1024;
-const MAX_OWNED_ARTIFACT_BYTES: usize = 2 * 1024 * 1024 * 1024;
 const MAX_DIRECTORY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TENSOR_COUNT: usize = 4096;
 const MAX_TENSOR_RANK: usize = 16;
@@ -405,211 +404,24 @@ impl StaticContextArtifact {
         }
     }
 
-    /// Decode, verify, and own a complete static-context artifact.
+    /// Decode and verify a complete static-context artifact of any version,
+    /// copied into anonymous memory.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Artifact`] for malformed, corrupt, or invalid input.
-    #[allow(clippy::too_many_lines)]
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if bytes.len() < HEADER_BYTES + CHECKSUM_BYTES || bytes.len() > MAX_OWNED_ARTIFACT_BYTES {
+        if !(HEADER_BYTES + CHECKSUM_BYTES..=MAX_ARTIFACT_BYTES).contains(&bytes.len()) {
             return Err(artifact_error(
                 "static context length is outside the resource limit",
             ));
         }
-        let checksum_offset = bytes.len() - CHECKSUM_BYTES;
-        if sha256(&bytes[..checksum_offset]).as_slice() != &bytes[checksum_offset..] {
-            return Err(artifact_error("static context checksum does not match"));
-        }
-        let mut header = ByteReader::new(&bytes[..HEADER_BYTES]);
-        if header.read_array::<8>()? != STATIC_CONTEXT_MAGIC {
-            return Err(artifact_error("static context magic does not match"));
-        }
-        let version = header.read_u32()?;
-        if version != STATIC_CONTEXT_FP32_VERSION {
-            return Err(artifact_error(format!(
-                "owned static context version {version} is unsupported; expected {STATIC_CONTEXT_FP32_VERSION}"
-            )));
-        }
-        if header.read_u32()? != STATIC_CONTEXT_KIND {
-            return Err(artifact_error("artifact kind is not a static context"));
-        }
-        let model_sha256 = header.read_array()?;
-        let context_sha256 = header.read_array()?;
-        let ensemble_count = to_usize(header.read_u64()?, "ensemble count")?;
-        let training_rows = to_usize(header.read_u64()?, "training rows")?;
-        let feature_count = to_usize(header.read_u64()?, "feature count")?;
-        let class_count = to_usize(header.read_u64()?, "class count")?;
-        let architecture = [
-            header.read_u32()?,
-            header.read_u32()?,
-            header.read_u32()?,
-            header.read_u32()?,
-            header.read_u32()?,
-        ];
-        if architecture != [3, 12, 8, 16, 64] {
-            return Err(artifact_error(
-                "static context architecture metadata is unsupported",
-            ));
-        }
-        let tensor_count = to_usize(u64::from(header.read_u32()?), "tensor count")?;
-        let class_permutation_count = to_usize(u64::from(header.read_u32()?), "class permutation count")?;
-        let feature_permutation_count = to_usize(u64::from(header.read_u32()?), "feature permutation count")?;
-        let directory_length = to_usize(header.read_u64()?, "directory length")?;
-        let payload_length = to_usize(header.read_u64()?, "payload length")?;
-        if header.read_u32()? != 0 || !header.is_empty() {
-            return Err(artifact_error("static context header reserved bytes are invalid"));
-        }
-        if tensor_count == 0
-            || tensor_count > MAX_TENSOR_COUNT
-            || directory_length > MAX_DIRECTORY_BYTES
-            || payload_length > MAX_TOTAL_TENSOR_BYTES
-        {
-            return Err(artifact_error(
-                "static context section exceeds the resource limit",
-            ));
-        }
-        let expected_class_permutations = ensemble_count
-            .checked_mul(class_count)
-            .ok_or_else(|| artifact_error("class permutation count overflows usize"))?;
-        let expected_feature_permutations = ensemble_count
-            .checked_mul(feature_count)
-            .ok_or_else(|| artifact_error("feature permutation count overflows usize"))?;
-        if class_permutation_count != expected_class_permutations
-            || feature_permutation_count != expected_feature_permutations
-        {
-            return Err(artifact_error(
-                "static context permutation lengths do not match metadata",
-            ));
-        }
-        let permutation_bytes = class_permutation_count
-            .checked_add(feature_permutation_count)
-            .and_then(|count| count.checked_mul(8))
-            .ok_or_else(|| artifact_error("permutation length overflows usize"))?;
-        let permutations_end = HEADER_BYTES
-            .checked_add(permutation_bytes)
-            .ok_or_else(|| artifact_error("permutation section end overflows usize"))?;
-        let directory_end = permutations_end
-            .checked_add(directory_length)
-            .ok_or_else(|| artifact_error("directory end overflows usize"))?;
-        let payload_start = align_up(directory_end, TENSOR_ALIGNMENT)?;
-        let payload_end = payload_start
-            .checked_add(payload_length)
-            .ok_or_else(|| artifact_error("payload end overflows usize"))?;
-        if payload_end != checksum_offset || directory_end > payload_start {
-            return Err(artifact_error("static context section offsets are inconsistent"));
-        }
-        if bytes[directory_end..payload_start].iter().any(|byte| *byte != 0) {
-            return Err(artifact_error("static context alignment padding is not zero"));
-        }
-        let mut permutations = ByteReader::new(&bytes[HEADER_BYTES..permutations_end]);
-        let class_permutations = read_permutation(&mut permutations, class_permutation_count)?;
-        let feature_permutations = read_permutation(&mut permutations, feature_permutation_count)?;
-        let metadata = StaticContextMetadata {
-            model_sha256,
-            context_sha256,
-            ensemble_count,
-            training_rows,
-            feature_count,
-            class_count,
-            class_permutations,
-            feature_permutations,
-        };
-        validate_metadata(&metadata)?;
-
-        let mut directory = ByteReader::new(&bytes[permutations_end..directory_end]);
-        let mut previous_name = None;
-        let mut ranges = Vec::with_capacity(tensor_count);
-        let mut tensors = BTreeMap::new();
-        let mut total_bytes = 0_usize;
-        for _ in 0..tensor_count {
-            let name_length = to_usize(u64::from(directory.read_u32()?), "tensor name length")?;
-            let rank = usize::from(directory.read_u16()?);
-            if name_length == 0
-                || name_length > MAX_TENSOR_NAME_BYTES
-                || rank == 0
-                || rank > MAX_TENSOR_RANK
-                || directory.read_u16()? != 0
-            {
-                return Err(artifact_error("static context tensor directory entry is invalid"));
-            }
-            let offset = to_usize(directory.read_u64()?, "tensor payload offset")?;
-            let byte_length = to_usize(directory.read_u64()?, "tensor byte length")?;
-            if offset % TENSOR_ALIGNMENT != 0 || byte_length > MAX_TENSOR_BYTES {
-                return Err(artifact_error(
-                    "static context tensor offset or length is invalid",
-                ));
-            }
-            let mut dimensions = Vec::with_capacity(rank);
-            for _ in 0..rank {
-                dimensions.push(directory.read_u64()?);
-            }
-            let name = std::str::from_utf8(directory.read_bytes(name_length)?)
-                .map_err(|_| artifact_error("static context tensor name is not UTF-8"))?
-                .to_owned();
-            if previous_name
-                .as_ref()
-                .is_some_and(|previous: &String| previous >= &name)
-            {
-                return Err(artifact_error(
-                    "static context tensor names are not unique and sorted",
-                ));
-            }
-            previous_name = Some(name.clone());
-            let elements = checked_elements(&dimensions)?;
-            let expected_bytes = elements
-                .checked_mul(4)
-                .ok_or_else(|| artifact_error("tensor byte length overflows usize"))?;
-            if byte_length != expected_bytes {
-                return Err(artifact_error(format!(
-                    "static context tensor '{name}' byte length does not match its shape"
-                )));
-            }
-            let end = offset
-                .checked_add(byte_length)
-                .ok_or_else(|| artifact_error("tensor payload end overflows usize"))?;
-            if end > payload_length {
-                return Err(artifact_error(format!(
-                    "static context tensor '{name}' exceeds the payload section"
-                )));
-            }
-            total_bytes = total_bytes
-                .checked_add(byte_length)
-                .ok_or_else(|| artifact_error("total tensor byte length overflows usize"))?;
-            ranges.push((offset, end));
-            let absolute_start = payload_start
-                .checked_add(offset)
-                .ok_or_else(|| artifact_error("absolute tensor payload start overflows usize"))?;
-            let absolute_end = payload_start
-                .checked_add(end)
-                .ok_or_else(|| artifact_error("absolute tensor payload end overflows usize"))?;
-            let payload = bytes
-                .get(absolute_start..absolute_end)
-                .ok_or_else(|| artifact_error("static context tensor payload is truncated"))?;
-            let values = decode_f32(payload)?;
-            tensors.insert(
-                name,
-                StaticContextTensorRecord {
-                    dimensions,
-                    values: StaticContextTensorValues::Owned(values),
-                },
-            );
-        }
-        if !directory.is_empty() {
-            return Err(artifact_error(
-                "static context tensor directory has trailing bytes",
-            ));
-        }
-        ranges.sort_unstable();
-        if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) || total_bytes > MAX_TOTAL_TENSOR_BYTES {
-            return Err(artifact_error("static context tensor payload ranges are invalid"));
-        }
-        Ok(Self {
-            version: STATIC_CONTEXT_FP32_VERSION,
-            metadata,
-            tensors,
-            storage: StaticContextStorage::Owned,
-        })
+        let mut mapping = MmapOptions::new()
+            .len(bytes.len())
+            .map_anon()
+            .map_err(artifact_error)?;
+        mapping.copy_from_slice(bytes);
+        Self::from_mapping(mapping.make_read_only().map_err(artifact_error)?)
     }
 
     /// Read, decode, and verify an artifact from a bounded file.
@@ -659,13 +471,8 @@ impl StaticContextArtifact {
         Self::read_mapped_file(&file, length, true)
     }
 
-    #[allow(unsafe_code, clippy::too_many_lines)]
+    #[allow(unsafe_code)]
     fn read_mapped_file(file: &File, length: usize, prefault: bool) -> Result<Self> {
-        if !cfg!(target_endian = "little") {
-            return Err(artifact_error(
-                "mapped FP32 contexts require a little-endian host",
-            ));
-        }
         if !(HEADER_BYTES + CHECKSUM_BYTES..=MAX_ARTIFACT_BYTES).contains(&length) {
             return Err(artifact_error(
                 "static context length is outside the resource limit",
@@ -686,6 +493,17 @@ impl StaticContextArtifact {
         }
         #[cfg(not(any(unix, windows)))]
         let _ = prefault;
+        Self::from_mapping(mapping)
+    }
+
+    /// Verify and decode a mapped artifact, borrowing its tensors from `mapping`.
+    #[allow(clippy::too_many_lines)]
+    fn from_mapping(mapping: Mmap) -> Result<Self> {
+        if !cfg!(target_endian = "little") {
+            return Err(artifact_error(
+                "mapped FP32 contexts require a little-endian host",
+            ));
+        }
         let checksum_offset = mapping.len() - CHECKSUM_BYTES;
         if sha256(&mapping[..checksum_offset]).as_slice() != &mapping[checksum_offset..] {
             return Err(artifact_error("static context checksum does not match"));
@@ -1299,22 +1117,6 @@ fn checked_elements(dimensions: &[u64]) -> Result<usize> {
     })
 }
 
-fn decode_f32(bytes: &[u8]) -> Result<Vec<f32>> {
-    if !bytes.len().is_multiple_of(4) {
-        return Err(artifact_error("static context FP32 payload length is invalid"));
-    }
-    let values = bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("FP32 chunk has four bytes")))
-        .collect::<Vec<_>>();
-    if values.iter().any(|value| !value.is_finite()) {
-        return Err(artifact_error(
-            "static context tensor contains a non-finite value",
-        ));
-    }
-    Ok(values)
-}
-
 fn read_permutation(reader: &mut ByteReader<'_>, count: usize) -> Result<Vec<u64>> {
     (0..count).map(|_| reader.read_u64()).collect()
 }
@@ -1386,7 +1188,7 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_is_deterministic_and_owned() {
+    fn round_trip_is_deterministic() {
         let artifact = fixture();
         let bytes = artifact.to_bytes().expect("encode");
         assert_eq!(bytes, artifact.to_bytes().expect("encode again"));
@@ -1453,7 +1255,7 @@ mod tests {
     }
 
     #[test]
-    fn mapped_round_trip_preserves_bf16_and_f16() {
+    fn round_trip_preserves_bf16_and_f16() {
         let specs = vec![
             ("column.k.0".to_string(), vec![2, 8, 3, 16], TensorStorage::Fp32),
             ("icl.k.0".to_string(), vec![2, 8, 3, 64], TensorStorage::Bf16),
@@ -1495,6 +1297,8 @@ mod tests {
         }
         // Re-encoding the mapped context is byte-stable.
         assert_eq!(decoded.to_bytes().expect("re-encode"), bytes);
+        let from_bytes = StaticContextArtifact::from_bytes(&bytes).expect("decode bytes");
+        assert_eq!(from_bytes.to_bytes().expect("re-encode bytes"), bytes);
     }
 
     #[test]
