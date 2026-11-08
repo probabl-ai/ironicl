@@ -32,11 +32,12 @@ graph runs the column, row, and ICL stages and the decoder for every estimator i
 one run, with only the query count unknown; one batched run beat the CPU on an M1
 Max from a single query row, so prediction always uses it. Query counts are padded
 to a bucket that keeps their top four significant bits, at most 12.5% padding, so
-new batch sizes rarely trigger a 150–400 ms graph compile; buckets up to 1024 rows
-keep their buffers between calls. The build graph runs the training rows through
-every stage once and captures each column and ICL block's keys and values; its
-graph setup costs about 250 ms, so contexts with fewer than 160 training rows
-build on the CPU. The build graph runs as many estimators at once as fit half
+new batch sizes rarely trigger a 150–400 ms graph compile; buckets keep their
+buffers between calls, and queries split so the kept buckets fit a
+[memory budget](memory-planner.md#prediction). The build graph runs the training
+rows through every stage once and captures each column and ICL block's keys and
+values; its graph setup costs about 250 ms, so contexts with fewer than 160
+training rows build on the CPU. The build graph runs as many estimators at once as fit half
 the host's available memory and Metal's recommended working set (about 2.2 GB
 per estimator at 8192 x 54), in equal groups; see the
 [memory planner](memory-planner.md). Grouped contexts take one graph run per

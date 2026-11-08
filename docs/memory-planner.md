@@ -124,13 +124,75 @@ Any one of these fits:
   - at most 8938 training rows (subsample X, y before fit)
 ```
 
+## Prediction
+
+`MPSGraph` keeps the intermediate buffers of every query shape a predict graph
+has run until the graph is freed: about 2.3 MB per padded row at 8 estimators
+and 100 features. A single shape cannot be freed. Every bucket up to 1024 rows
+used to stay, so memory grew with each new predict size: ten predicts of 1 to
+50,000 rows against a 2,000-row context kept 11.6 GiB.
+
+### Budget
+
+The predict graph's budget is the device's share, as for builds: half the
+host's available memory, capped by Metal's working set and `memory_limit`,
+measured when the context is built or loaded. Instead of freeing shapes, the
+graph runs only a fixed set of shapes whose total fits that budget, chosen from
+two powers of two, `chunk` and `small`:
+
+- A query of at most `small` rows runs once, padded to a bucket that keeps its
+  top four significant bits (at most 12.5% padding).
+- A larger query runs in pieces: whole chunks of `chunk` rows, then the largest
+  power of two that fits, until at most `small` rows remain, which run as one
+  bucket. Pieces are not padded; a query takes at most log2(`chunk`/`small`)
+  extra runs, about 10 ms each.
+
+The powers of two up to `chunk` take about `2 x chunk` rows, so `chunk` is the
+largest, up to 1024, that takes at most half the budget. `small` is the largest
+whose buckets fit the rest. A kept row is estimated as building that row for
+every estimator, 3.7 MB at 8 estimators and 100 features, about 1.4 times what
+the graph keeps. At that width:
+
+| Budget | `chunk` | `small` | Kept at most (estimated) |
+|---|---|---|---|
+| No limit, about 19 GiB free (9.5 GiB) | 512 | 128 | 7.9 GiB |
+| 4 GiB | 256 | 64 | 3.8 GiB |
+| 2 GiB | 128 | 32 | 1.8 GiB |
+
+With no limit, 700 rows run as 512 + 128 + 60, and 10,000 rows as
+19 chunks of 512, then 256, then 16.
+
+The same ten predicts, and 40 predicts of mixed sizes from 1 to 2,000 rows run a
+second time, on an M1 Max with about 19 GiB free:
+
+| Limit | Kept after the ten predicts | Mixed sizes, second time |
+|---|---|---|
+| None, before | 11.6 GiB | 0.93 s |
+| None | 2.2 GiB | 0.92 s |
+| 4 GiB | 1.4 GiB | 1.01 s |
+| 2 GiB | 1.0 GiB | 1.12 s |
+
+Without a limit, predicts take as long as before. Under a 4 GiB limit, 10,000
+rows take 3% longer, and 100 rows 76 ms instead of 60 ms (64 + 36 rows);
+predicts of 1 and 10 rows take 11 ms and 15 ms either way.
+`tests/build_memory.rs` checks the kept memory under a limit.
+
+Python's `predict` and `predict_proba` preprocess 8,192 rows at a time, so the
+preprocessing copies and the `[B, rows, H]` query array stay bounded for any
+number of rows. The CPU path keeps its fixed 1.5 GiB activation limit: it
+measured at most 0.35 GiB above the context.
+
+GPU results vary with the batch shape by about 1e-6: a single row differs from
+the same row in a batch of 1,000 by up to 5.6e-6 in probability. A memory limit
+changes which shapes run, so it can change results that much.
+
 ## Phases
 
 | PR | Scope |
 |---|---|
 | A (#27) | Pools, platform probes, demand, plan, and the `ironicl plan` report. No behavior change |
 | B (#28) | The builds use the plan's group sizes by pool; memory limits; the Python API with warnings, errors, and the "cannot complete" verdict; a peak-memory fixture test against the plan |
-| D | Prediction buffers bounded by the plan, and large query buckets released after use |
+| D (#29) | GPU queries split into a fixed set of shapes that fits the device's share; Python predicts in row chunks |
 
 Later, as separate plans:
 
