@@ -113,8 +113,14 @@ Saving encodes the context straight into the pickled bytes, one more copy in
 memory; loading holds those bytes alongside the loaded context until the load
 finishes. Writing a `cache_dir` entry streams to the file without a copy.
 
-The loaded estimator uses the loading machine's threads and memory limits; on
-the same machine it predicts exactly as the saved one did. `device` accepts what
+Loading plans its memory on the loading machine as `fit` does: the weights,
+the context, and headroom, or the whole build when it rebuilds the context. It
+warns or raises as `memory_overflow` says, and `memory_plan_` becomes the
+loading machine's plan. The loaded estimator uses the loading machine's threads
+and memory limits; on the same machine and with the same limits, it predicts
+exactly as the saved one did. A GPU-built context also loads without the GPU:
+on the CPU, `optimize="auto"` predictions moved by at most `6.7e-4` in
+probability. `device` accepts what
 the constructor does. Loading warns when the file was saved with another Ironicl
 version. Load only files you trust: like any pickle, loading can run code.
 
