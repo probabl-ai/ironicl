@@ -21,6 +21,7 @@ use std::{
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use sha2::{Digest, Sha256};
 
+use crate::progress::Stage;
 use crate::{
     Error, ModelArtifact, QueryRequest, RegressionOutput, Request, Result, StaticContextArtifact,
     StaticContextMetadata, StaticContextTensor, StaticContextTensorData, StaticQueryBundle, TaskKind,
@@ -537,6 +538,7 @@ impl Executor {
         };
         let mut context = tensors(b)?;
         let mut scratch = if group == b { None } else { Some(tensors(group)?) };
+        crate::progress::report(Stage::Build, 0, b)?;
         for start in (0..b).step_by(group) {
             let output = scratch.as_mut().unwrap_or(&mut context);
             crate::metal::build_context(
@@ -560,6 +562,7 @@ impl Executor {
             if let Some(scratch) = &scratch {
                 context.copy_group(scratch, start / group);
             }
+            crate::progress::report(Stage::Build, start + group, b)?;
         }
         Ok(Some(context))
     }
@@ -733,6 +736,7 @@ impl Executor {
             Pools::detect().with_limits(limits).host_available(),
         );
         let group = usize::try_from(group).map_err(|_| Error::ArithmeticOverflow("CPU build group"))?;
+        crate::progress::report(Stage::Build, 0, b)?;
         for members in (0..b).collect::<Vec<_>>().chunks(group) {
             let estimators: Vec<EstimatorCaches> = members
                 .par_iter()
@@ -771,6 +775,7 @@ impl Executor {
                     values.extend(value);
                 }
             }
+            crate::progress::report(Stage::Build, members[members.len() - 1] + 1, b)?;
         }
         Ok(column
             .into_iter()
@@ -1808,6 +1813,7 @@ impl StaticExecutor {
                 values[(ensemble * q + start) * classes..][..len * classes].copy_from_slice(part);
             }
             start += len;
+            crate::progress::report(Stage::Predict, start, q)?;
         }
         Ok(DecoderOutputs {
             shape: [b, q, classes],
@@ -3679,7 +3685,7 @@ fn validate_static_cache_contract(context: &StaticContextArtifact) -> Result<()>
     validate_sparse_index_contract(context)
 }
 
-fn executor_threads() -> usize {
+pub(crate) fn executor_threads() -> usize {
     *EXECUTOR_THREADS.get_or_init(|| {
         if let Some(value) = std::env::var_os("IRONICL_THREADS") {
             return value
