@@ -5,15 +5,17 @@ from __future__ import annotations
 
 import hashlib
 import os
+import pickle
 import urllib.request
 import warnings
 from functools import cache
+from importlib.metadata import version
 from pathlib import Path
 
 import numpy as np
 from sklearn.base import BaseEstimator
 from sklearn.utils import _safe_indexing
-from sklearn.utils.validation import _num_samples
+from sklearn.utils.validation import _num_samples, check_is_fitted
 
 from ironicl._core import Model
 from ironicl.memory import _enforce, _limit_text, _overflow_policy, _plan
@@ -23,6 +25,10 @@ CHECKPOINT_URL = "https://huggingface.co/jingang/TabICL/resolve/main/{}"
 # Prediction preprocesses this many rows at a time, which bounds the [B, rows, H]
 # copies it makes. Rust splits each chunk further to fit its own buffers.
 PREDICT_CHUNK_ROWS = 8192
+
+
+def _version() -> str:
+    return version("ironicl")
 
 
 @cache  # ponytail: one resident model per checkpoint for the process lifetime.
@@ -37,7 +43,7 @@ class TabICLBase(BaseEstimator):
     _checkpoint_version: str
 
     def _fit_context(self, X, y, targets, classification: bool) -> Preprocessor:
-        """Fit preprocessing and build the Rust context from per-estimator ``targets(preprocessor)``.
+        """Fit preprocessing and build the Rust context from the per-row ``targets(preprocessor)``.
 
         Fitted attributes are set only once the context exists, so a failed fit
         never looks fitted. The memory plan is checked after preprocessing, when
@@ -55,22 +61,14 @@ class TabICLBase(BaseEstimator):
             outlier_threshold=self.outlier_threshold,
             classification=classification,
         )
-        train_rows = _ensemble_rows(preprocessor, preprocessor.fit_transform(X, y))
-        plan = _plan(self._task, *train_rows.shape, optimize, *limits)
+        groups = tuple(group.astype(np.float32) for group in preprocessor.fit_transform(X, y))
+        rows, features = groups[0].shape
+        plan = _plan(self._task, preprocessor.n_estimators_, rows, features, optimize, *limits)
         _enforce(plan, policy, stacklevel=3)
         checkpoint = self._checkpoint()
-        model = _model(checkpoint)
-        if model.task != self._task:
-            raise ValueError(f"{self.checkpoint_version} is a {model.task} checkpoint, not a {self._task}")
-        self.context_ = self._context(
-            model,
-            optimize,
-            limits,
-            train_rows,
-            np.ascontiguousarray(targets(preprocessor), dtype=np.float32),
-            np.ascontiguousarray(preprocessor.class_permutations_, dtype=np.uint64),
-            np.ascontiguousarray(preprocessor.feature_permutations_, dtype=np.uint64),
-        )
+        training = {"groups": groups, "targets": targets(preprocessor), "optimize": optimize}
+        self.context_ = self._build(_model(checkpoint), limits, preprocessor, training)
+        self._training = training
         self.memory_plan_ = plan
         self.preprocessor_ = preprocessor
         self.checkpoint_path_ = checkpoint
@@ -79,22 +77,101 @@ class TabICLBase(BaseEstimator):
             self.feature_names_in_ = preprocessor.feature_names_in_
         return preprocessor
 
+    def _build(self, model, limits, preprocessor, training):
+        """Build the context from ``training``: the grouped training rows, the
+        per-row targets, and the ``optimize`` level that ``fit`` resolved."""
+        if model.task != self._task:
+            raise ValueError(f"{self.checkpoint_version} is a {model.task} checkpoint, not a {self._task}")
+        return self._context(
+            model,
+            training["optimize"],
+            limits,
+            _ensemble_rows(preprocessor, training["groups"]),
+            np.ascontiguousarray(self._expand_targets(preprocessor, training["targets"]), dtype=np.float32),
+            np.ascontiguousarray(preprocessor.class_permutations_, dtype=np.uint64),
+            np.ascontiguousarray(preprocessor.feature_permutations_, dtype=np.uint64),
+        )
+
+    def _expand_targets(self, preprocessor: Preprocessor, targets: np.ndarray) -> np.ndarray:
+        """Each estimator's ``[B, N]`` targets from the per-row ``targets``."""
+        raise NotImplementedError
+
+    def save(
+        self,
+        path: str | Path,
+        save_model_weights: bool = False,
+        save_training_data: bool = True,
+        save_kv_cache: bool = True,
+    ) -> None:
+        """Save the fitted estimator to ``path``, for ``load``, ``pickle.load``, or ``joblib.load``.
+
+        ``save_model_weights`` includes the checkpoint, so loading needs no
+        file or download. ``save_kv_cache`` includes the fitted context; without
+        it, loading rebuilds the context from the training data, through
+        ``cache_dir`` when set. ``save_training_data`` includes the preprocessed
+        training rows, which only a load without the context needs.
+        """
+        check_is_fitted(self)
+        if not (save_training_data or save_kv_cache):
+            raise ValueError(
+                "Cannot exclude both the training data and the KV cache: loading needs one of them."
+            )
+        self._save_options = (save_model_weights, save_training_data, save_kv_cache)
+        try:
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "wb") as file:
+                pickle.dump(self, file, protocol=5)
+        finally:
+            del self._save_options
+
+    @classmethod
+    def load(cls, path: str | Path, device: str | None = None):
+        """Load an estimator that ``save`` wrote. ``device`` accepts what the constructor does."""
+        with open(path, "rb") as file:
+            estimator = pickle.load(file)
+        if not isinstance(estimator, cls):
+            raise TypeError(f"{path} holds a {type(estimator).__name__}, not a {cls.__name__}")
+        if device is not None:
+            if device != "cpu":
+                raise NotImplementedError(f"device={device!r} is not supported")
+            estimator.device = device
+        return estimator
+
     def __getstate__(self):
-        """Pickle the fitted context as bytes, so the pickle is self-contained."""
+        """The pickled state: by default self-contained, with the context as bytes."""
         state = dict(super().__getstate__())  # May be this estimator's own __dict__.
+        weights, training, context = state.pop("_save_options", (False, True, True))
+        state["_ironicl_version"] = _version()
         if "context_" in state:
-            state["context_"] = state["context_"].to_bytes()
+            state["context_"] = state["context_"].to_bytes() if context else None
+            if not training:
+                del state["_training"]
+            if weights:
+                state["_checkpoint_bytes"] = Path(self.checkpoint_path_).read_bytes()
         return state
 
     def __setstate__(self, state):
-        """Load a pickled context with this machine's checkpoint, threads, and memory limits."""
-        super().__setstate__(state)
-        if isinstance(getattr(self, "context_", None), bytes):
-            checkpoint = self.checkpoint_path_ if Path(self.checkpoint_path_).exists() else self._checkpoint()
-            self.context_ = _model(checkpoint).context_from_bytes(
-                self.context_, self._resolve_threads(), *self._limits()
+        """Load the context, or rebuild it, with this machine's threads and memory limits."""
+        state = dict(state)
+        version = state.pop("_ironicl_version", None)
+        if version != _version():
+            warnings.warn(
+                f"This estimator was saved with Ironicl {version} and is loaded with {_version()}",
+                UserWarning,
+                stacklevel=2,
             )
-            self.checkpoint_path_ = checkpoint
+        checkpoint = state.pop("_checkpoint_bytes", None)
+        super().__setstate__(state)
+        if "context_" not in state:
+            return  # Not fitted.
+        if not Path(self.checkpoint_path_).exists():
+            self.checkpoint_path_ = self._checkpoint(checkpoint)
+        model = _model(self.checkpoint_path_)
+        if self.context_ is not None:
+            self.context_ = model.context_from_bytes(self.context_, self._resolve_threads(), *self._limits())
+        else:
+            self.context_ = self._build(model, self._limits(), self.preprocessor_, self._training)
 
     def _limits(self) -> tuple[str | None, str | None]:
         return (
@@ -211,7 +288,8 @@ class TabICLBase(BaseEstimator):
             raise ValueError(f"optimize must be 'safe', 'auto', or 'fast', not {optimize!r}")
         return optimize
 
-    def _checkpoint(self) -> Path:
+    def _checkpoint(self, data: bytes | None = None) -> Path:
+        """The checkpoint path, downloaded if missing, or written from ``data`` when given."""
         if self.model_path is not None:
             path = Path(self.model_path)
         else:
@@ -219,17 +297,20 @@ class TabICLBase(BaseEstimator):
             path = cache_root / "ironicl" / "checkpoints" / self.checkpoint_version
         if path.exists():
             return path
-        if not self.allow_auto_download:
+        if data is None and not self.allow_auto_download:
             raise FileNotFoundError(f"Checkpoint {path} not found and allow_auto_download=False")
         # The Rust importer verifies the checkpoint's SHA-256 before use.
         path.parent.mkdir(parents=True, exist_ok=True)
         partial = path.with_name(path.name + ".partial")
-        urllib.request.urlretrieve(CHECKPOINT_URL.format(self.checkpoint_version), partial)
+        if data is None:
+            urllib.request.urlretrieve(CHECKPOINT_URL.format(self.checkpoint_version), partial)
+        else:
+            partial.write_bytes(data)
         partial.replace(path)
         return path
 
 
-def _ensemble_rows(preprocessor: Preprocessor, groups: list[np.ndarray]) -> np.ndarray:
+def _ensemble_rows(preprocessor: Preprocessor, groups: tuple[np.ndarray, ...]) -> np.ndarray:
     """Stack each estimator's feature-permuted group into ``[B, rows, H]``."""
     rows = [
         groups[group][:, preprocessor.feature_permutations_[e]]
