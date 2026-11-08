@@ -76,6 +76,18 @@ at RAM speed from the first query. A corrupt or mismatched entry is silently
 rebuilt, and a write failure never fails `fit`. There is no automatic eviction;
 remove files to reclaim space.
 
+### Pickling
+
+A fitted estimator pickles with `pickle` and `joblib`, and copies with
+`copy.deepcopy`. The pickle holds the whole fitted context, so it is as large as
+the context in `memory_plan_` and needs no cache or training data to load.
+Loading needs the checkpoint: the pickled path if it exists, otherwise the
+default checkpoint location, downloaded when `allow_auto_download` allows. The
+loaded estimator uses the loading machine's threads and memory limits; on the
+same machine it predicts exactly as the pickled one did. Pickling briefly holds
+up to two more copies of the context in memory, and loading holds the pickled
+bytes alongside the loaded context until the load finishes.
+
 ## Regressor
 
 ```python
