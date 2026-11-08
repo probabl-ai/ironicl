@@ -291,6 +291,10 @@ pub struct Executor {
 #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
 struct GpuContext {
     predict: crate::metal::PredictGraph,
+    /// How queries split into graph runs, `(chunk, small)` from
+    /// [`crate::metal::PredictGraph::query_split`], which keeps the buckets the
+    /// graph keeps within the device's share of memory.
+    split: (usize, usize),
     /// Keeps page-aligned context memory alive while GPU buffers wrap it.
     _storage: Option<Arc<memmap2::Mmap>>,
 }
@@ -392,15 +396,21 @@ impl Executor {
 
     /// Load a persisted static context and pair it with this model's weights,
     /// prefaulting the mapping so the first prediction runs at RAM speed. The
-    /// model weights are shared, not copied.
+    /// model weights are shared, not copied. `limits` size the prediction
+    /// buffers, as in [`Self::build_context`].
     ///
     /// # Errors
     ///
     /// Returns an error if the file is unreadable or invalid, or if the context
     /// does not match this model's serving contract.
-    pub fn load_context(&self, path: &std::path::Path, threads: Option<usize>) -> Result<StaticExecutor> {
+    pub fn load_context(
+        &self,
+        path: &std::path::Path,
+        threads: Option<usize>,
+        limits: MemoryLimits,
+    ) -> Result<StaticExecutor> {
         let context = StaticContextArtifact::read_mapped_prefault(path)?;
-        StaticExecutor::with_executor(self.clone(), context, threads)
+        StaticExecutor::with_executor(self.clone(), context, threads, limits)
     }
 
     /// Whether the model is the classifier or the regressor.
@@ -465,11 +475,7 @@ impl Executor {
         // RAM (unified memory is the host's RAM), capped by Metal's working set
         // and by the memory limit. When one estimator does not fit the device,
         // the CPU builds the context.
-        let working_set = u64::try_from(gpu_weights.gpu().working_set_bytes()).unwrap_or(u64::MAX);
-        let pools = Pools {
-            device: Some(crate::memory::DeviceMemory::Shared { limit: working_set }),
-            ..Pools::detect().with_limits(limits)
-        };
+        let pools = shared_gpu_pools(gpu_weights.gpu(), limits);
         let estimator_bytes =
             u64::try_from(crate::metal::gpu_build_estimator_bytes(n, h)).unwrap_or(u64::MAX);
         let Some(group) = crate::memory::gpu_build_group(b as u64, estimator_bytes, pools) else {
@@ -610,18 +616,18 @@ impl Executor {
         if let Some(tensors) = self.build_tensors_gpu(shape, x, y_train, optimize, limits)? {
             // The build graph checked every value on the GPU.
             let context = StaticContextArtifact::from_page_aligned(metadata, tensors)?;
-            return StaticExecutor::with_executor(self.clone(), context, threads);
+            return StaticExecutor::with_executor(self.clone(), context, threads, limits);
         }
         // On a BF16-capable CPU, `fast` stores the ICL values in BF16 (FP32
         // keys, the retained serving layout); every other case is FP32.
         if optimize == Optimize::Fast && crate::kernels::native::bf16_storage_supported() {
             let tensors = self.build_tensors_cpu(shape, x, y_train, limits)?;
             let context = StaticContextArtifact::from_page_aligned(metadata, bf16v_page_aligned(&tensors)?)?;
-            return StaticExecutor::with_executor(self.clone(), context, threads);
+            return StaticExecutor::with_executor(self.clone(), context, threads, limits);
         }
         let context =
             StaticContextArtifact::new(metadata, self.build_tensors_cpu(shape, x, y_train, limits)?)?;
-        StaticExecutor::with_executor(self.clone(), context, threads)
+        StaticExecutor::with_executor(self.clone(), context, threads, limits)
     }
 
     /// Validate a context's inputs and describe it: model and content hashes,
@@ -1477,9 +1483,15 @@ impl StaticExecutor {
     /// # Errors
     ///
     /// Returns an artifact error if the model identity, architecture, or required
-    /// cache tensor names and shapes do not match the serving contract.
+    /// cache tensor names and shapes do not match the serving contract, or when
+    /// `IRONICL_MEMORY_LIMIT` or `IRONICL_DEVICE_MEMORY_LIMIT` is invalid.
     pub fn new(model: ModelArtifact, context: StaticContextArtifact) -> Result<Self> {
-        Self::with_executor(Executor::new(model), context, None)
+        Self::with_executor(
+            Executor::new(model),
+            context,
+            None,
+            MemoryLimits::resolve(None, None)?,
+        )
     }
 
     /// Write this context to `path` atomically, for reuse by [`Executor::load_context`].
@@ -1496,6 +1508,7 @@ impl StaticExecutor {
         model: Executor,
         context: StaticContextArtifact,
         threads: Option<usize>,
+        limits: MemoryLimits,
     ) -> Result<Self> {
         let threads = threads.map_or_else(executor_threads, |threads| threads.max(1));
         validate_static_context(&model.model, &context)?;
@@ -1569,13 +1582,15 @@ impl StaticExecutor {
             #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
             gpu: None,
         }
-        .with_gpu()
+        .with_gpu(limits)
     }
 
-    /// Build the context's GPU predict graph when Metal is available. Packed
-    /// contexts and contexts with mixed ICL storage stay on the CPU.
+    /// Build the context's GPU predict graph when Metal is available, with
+    /// queries split to keep its buckets within the device's share of memory
+    /// under `limits`, as for builds. Packed contexts and contexts with mixed
+    /// ICL storage stay on the CPU.
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-    fn with_gpu(mut self) -> Result<Self> {
+    fn with_gpu(mut self, limits: MemoryLimits) -> Result<Self> {
         if self.context.has_packed_icl_keys() {
             return Ok(self);
         }
@@ -1643,7 +1658,9 @@ impl StaticExecutor {
             &self.qass_base_scales,
             self.context.page_aligned_storage().is_some(),
         )?;
+        let (budget, _) = crate::memory::device_share(shared_gpu_pools(gpu_weights.gpu(), limits));
         self.gpu = Some(Arc::new(GpuContext {
+            split: predict.query_split(budget),
             predict,
             _storage: self.context.page_aligned_storage().cloned(),
         }));
@@ -1652,7 +1669,7 @@ impl StaticExecutor {
 
     #[cfg(not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")))]
     #[allow(clippy::unnecessary_wraps)]
-    fn with_gpu(self) -> Result<Self> {
+    fn with_gpu(self, _limits: MemoryLimits) -> Result<Self> {
         Ok(self)
     }
 
@@ -1725,31 +1742,52 @@ impl StaticExecutor {
             metadata.feature_count,
             self.outputs()?,
         );
-        // Rows are independent, so a large query runs in chunks that fit the
-        // activation budget. Only a single row that does not fit is an error.
-        let mut rows = q.min(QUERY_CHUNK_ROWS);
-        while let Err(error) = self.admit_query(rows) {
-            if rows == 1 {
+        // Rows are independent, so a large query runs in pieces that fit the
+        // activation budget and the GPU's. Only a single row that does not fit
+        // is an error.
+        let (mut chunk, small) = self.query_split();
+        while let Err(error) = self.admit_query(chunk.min(q)) {
+            if chunk == 1 {
                 return Err(error);
             }
-            rows /= 2;
+            chunk /= 2;
         }
-        if rows == q {
+        let small = small.min(chunk);
+        // Whole chunks, then powers of two, until at most `small` rows remain.
+        let piece = |left: usize| match left {
+            left if left > chunk => chunk,
+            left if left <= small => left,
+            left => 1 << left.ilog2(),
+        };
+        if piece(q) == q {
             return self.predict_chunk(request);
         }
         let mut values = vec![0.0; checked_product(&[b, q, classes], "static decoder output")?];
-        let mut x = Vec::with_capacity(checked_product(&[b, rows, h], "query chunk")?);
-        for start in (0..q).step_by(rows) {
-            let len = rows.min(q - start);
+        let mut x = Vec::with_capacity(checked_product(&[b, chunk, h], "query chunk")?);
+        let mut start = 0;
+        while start < q {
+            let len = piece(q - start);
             let logits = self.predict_chunk(query_rows(request, start, len, &mut x)?)?;
-            for (ensemble, chunk) in logits.values.chunks_exact(len * classes).enumerate() {
-                values[(ensemble * q + start) * classes..][..len * classes].copy_from_slice(chunk);
+            for (ensemble, part) in logits.values.chunks_exact(len * classes).enumerate() {
+                values[(ensemble * q + start) * classes..][..len * classes].copy_from_slice(part);
             }
+            start += len;
         }
         Ok(DecoderOutputs {
             shape: [b, q, classes],
             values,
         })
+    }
+
+    /// How queries split into runs, `(chunk, small)`: the GPU's split within
+    /// its budget, or chunks of [`QUERY_CHUNK_ROWS`] on the CPU.
+    #[allow(clippy::unused_self)] // Without Metal.
+    fn query_split(&self) -> (usize, usize) {
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        if let Some(gpu) = &self.gpu {
+            return gpu.split;
+        }
+        (QUERY_CHUNK_ROWS, QUERY_CHUNK_ROWS)
     }
 
     /// Decoder outputs kept per query row: the class count, or every quantile
@@ -4171,6 +4209,17 @@ pub fn plan_context(
         Builder::Cpu
     };
     crate::memory::plan(shape, current, builder, pools, &alternatives)
+}
+
+/// This machine's memory pools with `gpu` as a device that shares the host's
+/// RAM, limited by Metal's recommended working set and by `limits`.
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+fn shared_gpu_pools(gpu: &crate::metal::Gpu, limits: MemoryLimits) -> Pools {
+    let working_set = u64::try_from(gpu.working_set_bytes()).unwrap_or(u64::MAX);
+    Pools {
+        device: Some(crate::memory::DeviceMemory::Shared { limit: working_set }),
+        ..Pools::detect().with_limits(limits)
+    }
 }
 
 /// Metal's recommended working set when the GPU would build `rows` training

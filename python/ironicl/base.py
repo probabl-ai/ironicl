@@ -137,7 +137,7 @@ class TabICLBase(BaseEstimator):
         path = cache_dir / f"{key}.irctx"
         if path.exists():
             try:
-                return model.load_context(str(path), threads)
+                return model.load_context(str(path), threads, *limits)
             except (OSError, ValueError, RuntimeError):
                 pass  # Corrupt, truncated, or mismatched cache entry: rebuild it.
         context = build()

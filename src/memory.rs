@@ -486,36 +486,40 @@ pub(crate) fn gpu_build_estimator_bytes(n: usize, h: usize) -> usize {
 /// Estimators the GPU builds together, or `None` when the CPU should build.
 ///
 /// The group is the largest that divides the estimator count (every run has the
-/// same graph shape) and stays under the build's share of the device's memory:
-/// on a shared device, half the host's available RAM, capped by the device's
-/// limit; on a separate device, all of its available memory less a reserve. The
+/// same graph shape) and stays under the device's share, [`device_share`]. The
 /// CPU builds only when one estimator exceeds the device.
 pub(crate) fn gpu_build_group(estimators: u64, per_estimator: u64, pools: Pools) -> Option<u64> {
     let per_estimator = per_estimator.max(1);
-    let host_share = pools.host_available().map(|host| host / BUILD_SHARE_DIVISOR);
-    let cap = match pools.device {
-        Some(DeviceMemory::Shared { limit }) => {
-            if per_estimator > limit {
-                return None;
-            }
-            host_share.map_or(limit / BUILD_SHARE_DIVISOR, |share| share.min(limit))
-        }
-        Some(DeviceMemory::Separate { .. }) => {
-            let available = pools.available().unwrap_or(0);
-            let usable = available.saturating_sub(SEPARATE_DEVICE_RESERVE.max(available / 20));
-            if per_estimator > usable {
-                return None;
-            }
-            usable
-        }
-        None => host_share.unwrap_or(0),
-    };
+    let (share, ceiling) = device_share(pools);
+    if per_estimator > ceiling {
+        return None;
+    }
     Some(
         (1..=estimators)
             .rev()
-            .find(|&group| estimators.is_multiple_of(group) && group.saturating_mul(per_estimator) <= cap)
+            .find(|&group| estimators.is_multiple_of(group) && group.saturating_mul(per_estimator) <= share)
             .unwrap_or(1),
     )
+}
+
+/// The device memory one GPU working set may use, and the most it can hold.
+/// On a shared device, half the host's available RAM, capped by the device's
+/// limit; on a separate device, all of its available memory less a reserve.
+/// Without a device, half the host's available RAM, or 0 when unknown.
+pub(crate) fn device_share(pools: Pools) -> (u64, u64) {
+    let host_share = pools.host_available().map(|host| host / BUILD_SHARE_DIVISOR);
+    match pools.device {
+        Some(DeviceMemory::Shared { limit }) => (
+            host_share.map_or(limit / BUILD_SHARE_DIVISOR, |share| share.min(limit)),
+            limit,
+        ),
+        Some(DeviceMemory::Separate { .. }) => {
+            let available = pools.available().unwrap_or(0);
+            let usable = available.saturating_sub(SEPARATE_DEVICE_RESERVE.max(available / 20));
+            (usable, usable)
+        }
+        None => (host_share.unwrap_or(0), u64::MAX),
+    }
 }
 
 /// Estimators the CPU builds together: as many as fit four activation limits
