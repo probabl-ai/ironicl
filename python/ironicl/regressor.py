@@ -113,11 +113,14 @@ class TabICLRegressor(RegressorMixin, TabICLBase):
         self._fit_context(
             X,
             y,
-            lambda preprocessor: np.tile(scaled, (preprocessor.n_estimators_, 1)),
+            lambda _: scaled,
             classification=False,
         )
         self.y_scaler_ = scaler
         return self
+
+    def _expand_targets(self, preprocessor, targets):
+        return np.tile(targets, (preprocessor.n_estimators_, 1))
 
     def predict(self, X, output_type: str | list[str] = "mean", alphas: list[float] | None = None):
         """Predict target statistics for each sample.

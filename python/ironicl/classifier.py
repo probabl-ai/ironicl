@@ -140,12 +140,15 @@ class TabICLClassifier(ClassifierMixin, TabICLBase):
         self._fit_context(
             X,
             y,
-            lambda preprocessor: preprocessor.class_permutations_[:, preprocessor.encode_labels(y)],
+            lambda preprocessor: preprocessor.encode_labels(y),
             classification=True,
         )
         self.classes_ = self.preprocessor_.classes_
         self.n_classes_ = len(self.classes_)
         return self
+
+    def _expand_targets(self, preprocessor, targets):
+        return preprocessor.class_permutations_[:, targets]
 
     def predict_proba(self, X) -> np.ndarray:
         """Return class probabilities with shape ``(n_samples, n_classes)``."""
