@@ -124,6 +124,11 @@ Any one of these fits:
   - at most 8938 training rows (subsample X, y before fit)
 ```
 
+Loading a saved or pickled estimator plans again on the loading machine and
+follows `memory_overflow` the same way. Its peak is the weights, the context,
+and headroom, without a build, unless the save left out the context and the
+load rebuilds it.
+
 ## Prediction
 
 `MPSGraph` keeps the intermediate buffers of every query shape a predict graph
