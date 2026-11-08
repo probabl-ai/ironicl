@@ -413,6 +413,23 @@ impl Executor {
         StaticExecutor::with_executor(self.clone(), context, threads, limits)
     }
 
+    /// Load a context from the bytes [`StaticExecutor::context_bytes`] returned,
+    /// as [`Self::load_context`] does from a file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bytes are invalid, or if the context does not
+    /// match this model's serving contract.
+    pub fn load_context_bytes(
+        &self,
+        bytes: &[u8],
+        threads: Option<usize>,
+        limits: MemoryLimits,
+    ) -> Result<StaticExecutor> {
+        let context = StaticContextArtifact::from_bytes(bytes)?;
+        StaticExecutor::with_executor(self.clone(), context, threads, limits)
+    }
+
     /// Whether the model is the classifier or the regressor.
     #[must_use]
     pub fn task(&self) -> TaskKind {
@@ -1501,6 +1518,15 @@ impl StaticExecutor {
     /// Returns [`Error::Artifact`] if encoding or the atomic write fails.
     pub fn save_context(&self, path: &std::path::Path) -> Result<()> {
         self.context.write(path)
+    }
+
+    /// This context encoded as [`Self::save_context`] writes it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Artifact`] if encoding fails.
+    pub fn context_bytes(&self) -> Result<Vec<u8>> {
+        self.context.to_bytes()
     }
 
     /// Pair a context with an executor whose model weights it shares.
