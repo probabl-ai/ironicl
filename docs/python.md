@@ -153,8 +153,9 @@ between build groups and between query pieces of up to 1,024 rows, so a build
 that runs as one group shows only its end.
 
 Ctrl-C stops a build or prediction at the next of those steps with
-`KeyboardInterrupt`, instead of when the work ends. Only the main thread
-receives Ctrl-C; work started on another thread runs to its end.
+`KeyboardInterrupt`, instead of when the work ends, so a build that runs as one
+group stops only at its end. Only the main thread receives Ctrl-C; work started
+on another thread runs to its end.
 
 ### Configuration
 

@@ -40,7 +40,7 @@ def _config() -> str:
         "",
         f"GPU: {_gpu(info)}",
         f"CPU: {info['architecture']} {info['operating_system']}, {info['threads']} threads, "
-        f"BF16 cache storage {'supported' if info['bf16_storage'] else 'not supported'}",
+        f"BF16 storage for optimize='fast' on the CPU {'supported' if info['bf16_storage'] else 'not supported'}",
         f"Memory: {_memory(info)}",
         "",
         "ICL cache storage by optimize level, for {} estimators x {} rows x {} features:".format(*EXAMPLE),

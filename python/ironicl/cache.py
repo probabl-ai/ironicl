@@ -36,7 +36,7 @@ def _cache_dir(cache_dir) -> Path | None:
 
 @dataclass(frozen=True)
 class CacheEntry:
-    """One cached context. ``last_used`` is when a fit last built or loaded it."""
+    """One cached context. ``last_used``, in local time, is when a fit last built or loaded it."""
 
     path: Path
     size_bytes: int
@@ -100,6 +100,8 @@ def clear_cache(
         keep = []
     if older_than is not None:
         cutoff = datetime.now() - older_than if isinstance(older_than, timedelta) else older_than
+        if cutoff.tzinfo is not None:
+            cutoff = cutoff.astimezone().replace(tzinfo=None)  # last_used is local time.
         keep = [entry for entry in keep if entry.last_used >= cutoff]
     if max_size is not None:
         limit = _core.parse_size(max_size) if isinstance(max_size, str) else max_size
