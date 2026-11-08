@@ -150,12 +150,11 @@ class TabICLClassifier(ClassifierMixin, TabICLBase):
     def predict_proba(self, X) -> np.ndarray:
         """Return class probabilities with shape ``(n_samples, n_classes)``."""
         check_is_fitted(self)
-        values, shape = self.context_.predict_proba(
-            self._query_rows(X),
-            self.softmax_temperature,
-            self.average_logits,
-        )
-        return np.frombuffer(values, dtype=np.float32).reshape(shape).copy()  # Writable, like TabICL.
+        chunks = []
+        for rows in self._query_chunks(X):
+            values, shape = self.context_.predict_proba(rows, self.softmax_temperature, self.average_logits)
+            chunks.append(np.frombuffer(values, dtype=np.float32).reshape(shape))
+        return np.concatenate(chunks)  # A writable copy, like TabICL's output.
 
     def predict(self, X) -> np.ndarray:
         """Return the most probable class label for each sample."""
