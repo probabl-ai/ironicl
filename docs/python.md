@@ -30,14 +30,16 @@ parameter names and defaults. A live parity test checks this.
   `latin`, a `class_shuffle_method` other than `shift`, a `device` other than
   `cpu`, any `inference_config`, and `random_state=None`.
 - `n_jobs` sets the executor thread count (negative values follow TabICL, so
-  `-1` is all logical cores). `batch_size`, `verbose`, and `support_many_classes`
-  have no effect and warn if changed; `use_amp=True`, `use_fa3=True`, a
+  `-1` is all logical cores). `verbose=True` shows progress (see
+  [Progress and interrupts](#progress-and-interrupts)). `batch_size` and
+  `support_many_classes` have no effect and warn if changed; `use_amp=True`, `use_fa3=True`, a
   non-default `offload_mode`/`disk_offload_dir`, and `kv_cache="repr"` raise
   `NotImplementedError`.
 - `fit` runs the training rows through the model once and keeps their attention
   keys and values in memory, like upstream's `kv_cache=True`. `predict_proba`
   then runs only the query rows. The context takes about 49 KB per training row
-  and estimator. A fitted estimator cannot be pickled yet.
+  and estimator. A fitted estimator can be saved and pickled; see
+  [Saving and pickling](#saving-and-pickling).
 
 ### Optimization levels
 
@@ -73,8 +75,25 @@ once; with a cache it is written to disk and reused when the same data, model, a
 Entries are content-addressed by the model identity, the preprocessed inputs, and
 `optimize`, with a `.irctx` name. A load prefaults the mapping so prediction runs
 at RAM speed from the first query. A corrupt or mismatched entry is silently
-rebuilt, and a write failure never fails `fit`. There is no automatic eviction;
-remove files to reclaim space.
+rebuilt, and a write failure never fails `fit`. Each entry records its last
+use, when `fit` built or loaded it.
+
+Nothing is evicted automatically. `ironicl.cache_info()` lists the entries,
+most recently used first, and `ironicl.clear_cache()` removes them: all by
+default, those last used before `older_than` (a `timedelta` or `datetime`), or
+the least recently used until the rest fit `max_size` (bytes or a size such as
+`"10G"`). Both take a directory, and default to where `cache_dir=None` caches.
+`clear_cache` returns what it removed, and also removes temporary files that
+interrupted writes left behind:
+
+```python
+>>> print(ironicl.cache_info())
+~/.cache/ironicl/contexts: 2 contexts, 1.73 GiB
+       1.04 GiB  last used 2026-11-08 21:40  3f2a....irctx
+       0.69 GiB  last used 2026-11-07 10:12  9c1e....irctx
+>>> ironicl.clear_cache(max_size="1.5G").size_bytes
+740800512
+```
 
 ### Saving and pickling
 
@@ -120,9 +139,30 @@ loading machine's plan. The loaded estimator uses the loading machine's threads
 and memory limits; on the same machine and with the same limits, it predicts
 exactly as the saved one did. A GPU-built context also loads without the GPU:
 on the CPU, `optimize="auto"` predictions moved by at most `6.7e-4` in
-probability. `device` accepts what
-the constructor does. Loading warns when the file was saved with another Ironicl
-version. Load only files you trust: like any pickle, loading can run code.
+probability. `device` accepts what the constructor does. Loading warns when
+the file was saved with another Ironicl version. Load only files you trust:
+like any pickle, loading can run code.
+
+### Progress and interrupts
+
+With `verbose=True`, `fit` shows the estimators built, `predict` and
+`predict_proba` the rows predicted, and a load that rebuilds the context the
+build: as a tqdm bar when tqdm is installed (`pip install ironicl[progress]`),
+and otherwise as a line on stderr for each tenth of the way. Updates come
+between build groups and between query pieces of up to 1,024 rows, so a build
+that runs as one group shows only its end.
+
+Ctrl-C stops a build or prediction at the next of those steps with
+`KeyboardInterrupt`, instead of when the work ends. Only the main thread
+receives Ctrl-C; work started on another thread runs to its end.
+
+### Configuration
+
+`ironicl.show_config()` prints what Ironicl detects and how it would run: its
+version and dependencies, the GPU and its Metal working set, CPU threads and BF16
+support, memory, the ICL cache storage each `optimize` level gives, the
+downloaded checkpoints, the context cache, and the `IRONICL_*` environment
+variables that are set. Include it in bug reports.
 
 ## Regressor
 
