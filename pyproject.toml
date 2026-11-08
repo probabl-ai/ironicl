@@ -18,6 +18,10 @@ dependencies = [
 license = "BSD-3-Clause"
 license-files = ["LICENSE", "LICENSES/TabICL-BSD-3-Clause.txt"]
 
+[project.optional-dependencies]
+# verbose=True shows a progress bar with tqdm, and plain lines without it.
+progress = ["tqdm>=4.66"]
+
 [tool.maturin]
 python-source = "python"
 module-name = "ironicl._core"

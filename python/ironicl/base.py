@@ -3,6 +3,7 @@ fitted context and its disk cache, threads, ``optimize``, and memory planning.""
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import pickle
@@ -18,8 +19,10 @@ from sklearn.utils import _safe_indexing
 from sklearn.utils.validation import _num_samples, check_is_fitted
 
 from ironicl._core import Model
+from ironicl.cache import _cache_dir
 from ironicl.memory import _enforce, _limit_text, _overflow_policy, _plan
 from ironicl.preprocessing import Preprocessor
+from ironicl.progress import Progress
 
 CHECKPOINT_URL = "https://huggingface.co/jingang/TabICL/resolve/main/{}"
 # Prediction preprocesses this many rows at a time, which bounds the [B, rows, H]
@@ -188,11 +191,20 @@ class TabICLBase(BaseEstimator):
         )
 
     def _query_chunks(self, X):
-        """Yield the preprocessed ``[B, rows, H]`` query rows of ``X``, ``PREDICT_CHUNK_ROWS`` at a time."""
+        """Yield the preprocessed ``[B, rows, H]`` query rows of ``X``, ``PREDICT_CHUNK_ROWS`` at a
+        time, each with the progress callback for its prediction (``None`` unless ``verbose``)."""
         rows = _num_samples(X)
-        for start in range(0, max(rows, 1), PREDICT_CHUNK_ROWS):
-            chunk = _safe_indexing(X, slice(start, start + PREDICT_CHUNK_ROWS))
-            yield _ensemble_rows(self.preprocessor_, self.preprocessor_.transform(chunk))
+        with self._progress("Predicting", "row", rows) as progress:
+            for start in range(0, max(rows, 1), PREDICT_CHUNK_ROWS):
+                chunk = _safe_indexing(X, slice(start, start + PREDICT_CHUNK_ROWS))
+                report = progress and (lambda _stage, done, _total, start=start: progress.update(start + done))
+                yield _ensemble_rows(self.preprocessor_, self.preprocessor_.transform(chunk)), report
+                if progress:
+                    progress.update(min(start + PREDICT_CHUNK_ROWS, rows))
+
+    def _progress(self, description: str, unit: str, total: int | None = None):
+        """A ``Progress`` for ``verbose=True``, else a context that yields ``None``."""
+        return Progress(description, unit, total) if self.verbose else contextlib.nullcontext()
 
     def _validate_params(self, unsupported=(), noops=()) -> None:
         # Values that would change results or request an unimplemented feature raise.
@@ -221,7 +233,7 @@ class TabICLBase(BaseEstimator):
                     f"norm_methods {unsupported} are not supported; only 'none' and 'power'"
                 )
         # Genuine no-ops: warn when changed so the caller knows they are ignored.
-        for name, default in (("batch_size", 8), ("verbose", False), *noops):
+        for name, default in (("batch_size", 8), *noops):
             if getattr(self, name) != default:
                 warnings.warn(
                     f"{name}={getattr(self, name)!r} has no effect in Ironicl",
@@ -240,20 +252,32 @@ class TabICLBase(BaseEstimator):
         threads = self._resolve_threads()
 
         def build():
-            return model.build_context(
-                train_rows, targets, class_perms, feature_perms, optimize, threads, *limits
-            )
+            with self._progress("Building context", "estimator") as progress:
+                return model.build_context(
+                    train_rows,
+                    targets,
+                    class_perms,
+                    feature_perms,
+                    optimize,
+                    threads,
+                    *limits,
+                    progress=progress and (lambda _stage, done, total: progress.update(done, total)),
+                )
 
-        cache_dir = self._cache_dir()
+        cache_dir = _cache_dir(self.cache_dir)
         if cache_dir is None:
             return build()
         key = self._cache_key(model, optimize, train_rows, targets, class_perms, feature_perms)
         path = cache_dir / f"{key}.irctx"
         if path.exists():
             try:
-                return model.load_context(str(path), threads, *limits)
+                context = model.load_context(str(path), threads, *limits)
             except (OSError, ValueError, RuntimeError):
                 pass  # Corrupt, truncated, or mismatched cache entry: rebuild it.
+            else:
+                with contextlib.suppress(OSError):
+                    os.utime(path)  # The entry's last use, for clear_cache.
+                return context
         context = build()
         try:
             cache_dir.mkdir(parents=True, exist_ok=True)
@@ -261,23 +285,6 @@ class TabICLBase(BaseEstimator):
         except OSError:
             pass  # Caching is best-effort; a write failure must not fail fit.
         return context
-
-    def _cache_dir(self) -> Path | None:
-        """Resolve ``cache_dir`` HuggingFace-style.
-
-        ``None``/``True`` use ``IRONICL_CACHE_DIR`` or ``<cache root>/ironicl/contexts``;
-        ``False`` disables caching; a string or path is used directly.
-        """
-        cache_dir = self.cache_dir
-        if cache_dir is False:
-            return None
-        if cache_dir is None or cache_dir is True:
-            override = os.environ.get("IRONICL_CACHE_DIR")
-            if override:
-                return Path(override)
-            root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
-            return root / "ironicl" / "contexts"
-        return Path(cache_dir)
 
     def _cache_key(self, model, optimize, train_rows, targets, class_perms, feature_perms) -> str:
         """Content hash of everything the built context depends on."""
