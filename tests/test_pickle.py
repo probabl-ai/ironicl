@@ -12,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ironicl import TabICLClassifier, TabICLRegressor
+from ironicl import IroniclMemoryError, IroniclMemoryWarning, TabICLClassifier, TabICLRegressor
 
 CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "ironicl" / "checkpoints"
 
@@ -96,6 +96,22 @@ class PickleTest(unittest.TestCase):
         state["_ironicl_version"] = "0.0.1"
         with self.assertWarnsRegex(UserWarning, "saved with Ironicl 0.0.1"):
             TabICLClassifier().__setstate__(state)
+
+    def test_load_plans_its_memory(self):
+        model = fitted(TabICLClassifier)
+        self.assertIn("Peak while loading", str(pickle.loads(pickle.dumps(model)).memory_plan_))
+        rebuilt = self.directory / "small.pkl"
+        model.save(rebuilt, save_kv_cache=False)
+        self.assertIn("Peak while building", str(TabICLClassifier.load(rebuilt).memory_plan_))
+        model.memory_limit = "1M"
+        with self.assertWarns(IroniclMemoryWarning):
+            loaded = pickle.loads(pickle.dumps(model))
+        self.assertEqual(loaded.memory_plan_.memory_limit, 1 << 20)
+        # The limit shrinks the GPU's query pieces, and batch shape moves results by about 1e-6.
+        np.testing.assert_allclose(predict(loaded), predict(model), atol=1e-5)
+        model.memory_overflow = "error"
+        with self.assertRaisesRegex(IroniclMemoryError, "load"):
+            pickle.loads(pickle.dumps(model))
 
     def test_unfitted_estimator_pickles(self):
         model = pickle.loads(pickle.dumps(TabICLClassifier(n_estimators=4)))

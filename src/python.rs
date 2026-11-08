@@ -242,9 +242,12 @@ impl Context {
 /// Plan the memory to build a `task` context of `estimators x rows x features`
 /// with `optimize`, as `build_context` would on this machine. The memory limits
 /// are sizes such as `"16G"`; `None` reads `IRONICL_MEMORY_LIMIT` and
-/// `IRONICL_DEVICE_MEMORY_LIMIT`. Returns the plan as a dict.
+/// `IRONICL_DEVICE_MEMORY_LIMIT`. With `load`, plans loading the built context
+/// instead of building it. Returns the plan as a dict.
 #[pyfunction]
-#[pyo3(signature = (task, estimators, rows, features, optimize, memory_limit=None, device_memory_limit=None))]
+#[pyo3(signature = (
+    task, estimators, rows, features, optimize, memory_limit=None, device_memory_limit=None, load=false,
+))]
 #[allow(clippy::too_many_arguments)]
 fn plan_memory<'py>(
     py: Python<'py>,
@@ -255,6 +258,7 @@ fn plan_memory<'py>(
     optimize: &str,
     memory_limit: Option<String>,
     device_memory_limit: Option<String>,
+    load: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
     let task = task.parse::<TaskKind>().map_err(py_error)?;
     let optimize = optimize.parse::<Optimize>().map_err(py_error)?;
@@ -263,6 +267,7 @@ fn plan_memory<'py>(
     let plan = py
         .detach(|| plan_context(task, (estimators, rows, features), optimize, limits))
         .map_err(py_error)?;
+    let plan = if load { plan.for_load() } else { plan };
     let dict = PyDict::new(py);
     dict.set_item(
         "verdict",
@@ -274,6 +279,9 @@ fn plan_memory<'py>(
         },
     )?;
     dict.set_item("report", plan.to_string())?;
+    dict.set_item("estimators", estimators)?;
+    dict.set_item("rows", rows)?;
+    dict.set_item("features", features)?;
     dict.set_item("peak_bytes", plan.peak_bytes)?;
     dict.set_item("available_bytes", plan.available_bytes)?;
     dict.set_item("context_bytes", plan.context_bytes)?;
