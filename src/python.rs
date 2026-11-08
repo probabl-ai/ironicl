@@ -221,10 +221,21 @@ impl Context {
         py.detach(|| self.0.save_context(&path)).map_err(py_error)
     }
 
-    /// This context encoded as `save` writes it, for pickling.
+    /// This context encoded as `save` writes it, for pickling. Encodes straight
+    /// into the returned bytes, without another copy.
     fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = py.detach(|| self.0.context_bytes()).map_err(py_error)?;
-        Ok(PyBytes::new(py, &bytes))
+        let length = self.0.context_encoded_len().map_err(py_error)?;
+        PyBytes::new_with(py, length, |mut buffer: &mut [u8]| {
+            py.detach(|| self.0.encode_context(&mut buffer))
+                .map_err(py_error)?;
+            if buffer.is_empty() {
+                Ok(())
+            } else {
+                Err(PyRuntimeError::new_err(
+                    "the encoded context is shorter than its length",
+                ))
+            }
+        })
     }
 }
 
