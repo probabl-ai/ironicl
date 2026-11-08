@@ -5,7 +5,11 @@
 
 #![allow(clippy::needless_pass_by_value)] // PyO3 and `map_err` pass arguments by value.
 
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    rc::Rc,
+    sync::{Arc, Mutex, PoisonError},
+};
 
 use pyo3::{
     buffer::PyBuffer,
@@ -19,6 +23,7 @@ use crate::{
     QueryRequest, RegressionOutput, StaticExecutor, TaskKind, load_model_artifact,
     memory::{Builder, MemoryLimits, Verdict},
     plan_context, prepare_checkpoint,
+    progress::{self, Hook, Stage},
 };
 
 fn py_error(error: Error) -> PyErr {
@@ -28,6 +33,52 @@ fn py_error(error: Error) -> PyErr {
         Error::NotImplemented(_) => PyNotImplementedError::new_err(message),
         _ => PyRuntimeError::new_err(message),
     }
+}
+
+/// Run `work` without the GIL. Between steps of a build or prediction it
+/// reports `(stage, done, total)` to `progress`, and on the main thread checks
+/// for Ctrl-C, so the work stops with `KeyboardInterrupt` instead of running
+/// to the end. An exception from `progress` stops it too.
+fn run<T: Send>(
+    py: Python<'_>,
+    progress: Option<Py<PyAny>>,
+    work: impl FnOnce() -> crate::Result<T> + Send,
+) -> PyResult<T> {
+    let threading = py.import("threading")?;
+    let main = threading
+        .call_method0("current_thread")?
+        .is(&threading.call_method0("main_thread")?);
+    if progress.is_none() && !main {
+        return py.detach(work).map_err(py_error);
+    }
+    let raised = Arc::new(Mutex::new(None::<PyErr>));
+    let sink = Arc::clone(&raised);
+    let result = py.detach(move || {
+        let hook: Hook = Rc::new(move |stage: Stage, done, total| {
+            Python::attach(|py| {
+                if main {
+                    py.check_signals()?;
+                }
+                if let Some(progress) = &progress {
+                    progress.call1(py, (stage.name(), done, total))?;
+                }
+                Ok(())
+            })
+            .map_err(|error: PyErr| {
+                *sink.lock().unwrap_or_else(PoisonError::into_inner) = Some(error);
+                Error::Interrupted
+            })
+        });
+        progress::with_hook(hook, work)
+    });
+    result.map_err(|error| match error {
+        Error::Interrupted => raised
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+            .unwrap_or_else(|| py_error(Error::Interrupted)),
+        error => py_error(error),
+    })
 }
 
 /// A loaded `TabICLv2` classifier or regressor.
@@ -56,10 +107,11 @@ impl Model {
     /// `[B, C]` (empty for the regressor) and `[B, H]`; `optimize` is `"safe"`,
     /// `"auto"`, or `"fast"`. The memory limits are sizes such as `"16G"`;
     /// `None` reads `IRONICL_MEMORY_LIMIT` and `IRONICL_DEVICE_MEMORY_LIMIT`.
+    /// `progress` receives `("build", estimators built, estimators)`.
     #[allow(clippy::too_many_arguments)]
     #[pyo3(signature = (
         x, y_train, class_permutations, feature_permutations, optimize, threads,
-        memory_limit=None, device_memory_limit=None,
+        memory_limit=None, device_memory_limit=None, progress=None,
     ))]
     fn build_context(
         &self,
@@ -72,6 +124,7 @@ impl Model {
         threads: Option<usize>,
         memory_limit: Option<String>,
         device_memory_limit: Option<String>,
+        progress: Option<Py<PyAny>>,
     ) -> PyResult<Context> {
         let optimize = optimize.parse::<Optimize>().map_err(py_error)?;
         let limits = MemoryLimits::resolve(memory_limit.as_deref(), device_memory_limit.as_deref())
@@ -82,7 +135,7 @@ impl Model {
         let (x, y_train) = (x.to_vec(py)?, y_train.to_vec(py)?);
         let (class_permutations, feature_permutations) =
             (class_permutations.to_vec(py)?, feature_permutations.to_vec(py)?);
-        py.detach(|| {
+        run(py, progress, || {
             self.0.build_context(
                 ensembles,
                 rows,
@@ -97,7 +150,6 @@ impl Model {
             )
         })
         .map(Context)
-        .map_err(py_error)
     }
 
     /// `"classifier"` or `"regressor"`.
@@ -156,13 +208,16 @@ struct Context(StaticExecutor);
 #[pymethods]
 impl Context {
     /// Predict FP32 query rows `x[B, Q, H]`. Returns probabilities as FP32
-    /// bytes and their `[Q, C]` shape.
+    /// bytes and their `[Q, C]` shape. `progress` receives `("predict", rows
+    /// done, rows)` when the query runs in pieces.
+    #[pyo3(signature = (x, softmax_temperature, average_logits, progress=None))]
     fn predict_proba<'py>(
         &self,
         py: Python<'py>,
         x: PyBuffer<f32>,
         softmax_temperature: f32,
         average_logits: bool,
+        progress: Option<Py<PyAny>>,
     ) -> PyResult<(Bound<'py, PyBytes>, [usize; 2])> {
         let &[ensembles, rows, features] = x.shape() else {
             return Err(PyValueError::new_err("x must have shape [B, Q, H]"));
@@ -172,12 +227,10 @@ impl Context {
             softmax_temperature,
             average_logits,
         };
-        let probabilities = py
-            .detach(|| {
-                let request = QueryRequest::new(ensembles, rows, features, &x)?;
-                self.0.predict_probabilities(request, aggregation)
-            })
-            .map_err(py_error)?;
+        let probabilities = run(py, progress, || {
+            let request = QueryRequest::new(ensembles, rows, features, &x)?;
+            self.0.predict_probabilities(request, aggregation)
+        })?;
         Ok((
             PyBytes::new(py, bytemuck::cast_slice(probabilities.values())),
             probabilities.shape(),
@@ -187,12 +240,15 @@ impl Context {
     /// Predict FP32 query rows `x[B, Q, H]` against a regression context. Returns
     /// each `output_types` entry as FP32 bytes and its `[Q, columns]` shape, in
     /// standardized target units. `alphas` are the levels for `"quantiles"`.
+    /// `progress` is as for `predict_proba`.
+    #[pyo3(signature = (x, output_types, alphas, progress=None))]
     fn predict_regression<'py>(
         &self,
         py: Python<'py>,
         x: PyBuffer<f32>,
         output_types: Vec<String>,
         alphas: Vec<f32>,
+        progress: Option<Py<PyAny>>,
     ) -> PyResult<Vec<(Bound<'py, PyBytes>, [usize; 2])>> {
         let &[ensembles, rows, features] = x.shape() else {
             return Err(PyValueError::new_err("x must have shape [B, Q, H]"));
@@ -203,12 +259,10 @@ impl Context {
             .collect::<Result<Vec<_>, _>>()
             .map_err(py_error)?;
         let x = x.to_vec(py)?;
-        let results = py
-            .detach(|| {
-                let request = QueryRequest::new(ensembles, rows, features, &x)?;
-                self.0.predict_regression(request, &outputs)
-            })
-            .map_err(py_error)?;
+        let results = run(py, progress, || {
+            let request = QueryRequest::new(ensembles, rows, features, &x)?;
+            self.0.predict_regression(request, &outputs)
+        })?;
         Ok(results
             .into_iter()
             .map(|(values, columns)| (PyBytes::new(py, bytemuck::cast_slice(&values)), [rows, columns]))
@@ -300,10 +354,52 @@ fn plan_memory<'py>(
     Ok(dict)
 }
 
+/// A size such as `"16G"` in bytes, as the memory limits read it.
+#[pyfunction]
+fn parse_size(text: &str) -> PyResult<u64> {
+    crate::memory::parse_bytes(text).map_err(py_error)
+}
+
+/// What Ironicl detects on this machine, for `ironicl.show_config`.
+#[pyfunction]
+fn system_info(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
+    let dict = PyDict::new(py);
+    dict.set_item("version", env!("CARGO_PKG_VERSION"))?;
+    let metal = cfg!(all(
+        feature = "metal",
+        target_os = "macos",
+        target_arch = "aarch64"
+    ));
+    dict.set_item("metal", metal)?;
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    {
+        let gpu = crate::metal::system_gpu();
+        dict.set_item("gpu", gpu.as_ref().map(|(name, _)| name.clone()))?;
+        dict.set_item("gpu_working_set", gpu.map(|(_, bytes)| bytes))?;
+        dict.set_item("gpu_min_build_rows", crate::metal::GPU_MIN_BUILD_ROWS)?;
+    }
+    #[cfg(not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")))]
+    for key in ["gpu", "gpu_working_set", "gpu_min_build_rows"] {
+        dict.set_item(key, py.None())?;
+    }
+    let cpu = crate::platform::CpuCapabilities::detect();
+    dict.set_item("architecture", cpu.architecture)?;
+    dict.set_item("operating_system", cpu.operating_system)?;
+    dict.set_item("bf16_storage", crate::kernels::native::bf16_storage_supported())?;
+    dict.set_item("threads", crate::executor::executor_threads())?;
+    let host = crate::memory::host_memory();
+    dict.set_item("memory_total", host.map(|host| host.total))?;
+    dict.set_item("memory_available", host.map(|host| host.available))?;
+    dict.set_item("memory_hard_limit", host.and_then(|host| host.hard_limit))?;
+    Ok(dict)
+}
+
 #[pymodule]
 #[pyo3(name = "_core")]
 fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Model>()?;
     module.add_class::<Context>()?;
+    module.add_function(wrap_pyfunction!(parse_size, module)?)?;
+    module.add_function(wrap_pyfunction!(system_info, module)?)?;
     module.add_function(wrap_pyfunction!(plan_memory, module)?)
 }

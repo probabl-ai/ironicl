@@ -19,6 +19,7 @@ mod metal;
 pub mod model_artifact;
 pub mod platform;
 pub mod profile;
+pub mod progress;
 #[cfg(feature = "python")]
 mod python;
 pub mod quantiles;

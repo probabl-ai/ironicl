@@ -12,6 +12,8 @@ pub enum Error {
     NotImplemented(String),
     UnsupportedBackend(String),
     ArithmeticOverflow(&'static str),
+    /// A progress hook stopped the work, as on Ctrl-C.
+    Interrupted,
 }
 
 impl fmt::Display for Error {
@@ -26,6 +28,7 @@ impl fmt::Display for Error {
             Self::NotImplemented(message) => write!(f, "not implemented: {message}"),
             Self::UnsupportedBackend(message) => write!(f, "unsupported backend: {message}"),
             Self::ArithmeticOverflow(name) => write!(f, "arithmetic overflow while calculating {name}"),
+            Self::Interrupted => write!(f, "interrupted"),
         }
     }
 }

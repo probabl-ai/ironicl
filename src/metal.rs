@@ -129,6 +129,13 @@ pub(crate) fn system_working_set() -> Option<u64> {
     MTLCreateSystemDefaultDevice().map(|device| device.recommendedMaxWorkingSetSize())
 }
 
+/// The system GPU's name and the memory Metal recommends it use, or `None`
+/// without a GPU.
+pub(crate) fn system_gpu() -> Option<(String, u64)> {
+    MTLCreateSystemDefaultDevice()
+        .map(|device| (device.name().to_string(), device.recommendedMaxWorkingSetSize()))
+}
+
 /// The shared device and command queue, and how graphs run on them.
 #[derive(Clone)]
 pub(crate) struct Gpu {
