@@ -23,10 +23,16 @@ def data():
     return x, x[:, 0] + 0.5 * x[:, 1]
 
 
+def checkpoint(estimator) -> Path:
+    path = CACHE / estimator().checkpoint_version
+    if not path.exists():
+        raise unittest.SkipTest(f"{path.name} is not in {CACHE}")
+    return path
+
+
 def fitted(estimator, **params):
     model = estimator(allow_auto_download=False, cache_dir=False, **params)
-    if not (CACHE / model.checkpoint_version).exists():
-        raise unittest.SkipTest(f"{model.checkpoint_version} is not in {CACHE}")
+    checkpoint(estimator)
     x, y = data()
     return model.fit(x, (y > 0).astype(int) if estimator is TabICLClassifier else y)
 
@@ -73,14 +79,14 @@ class PickleTest(unittest.TestCase):
             model.save(path, save_training_data=False, save_kv_cache=False)
 
     def test_saved_model_weights_restore_a_missing_checkpoint(self):
-        checkpoint = self.directory / "checkpoint.ckpt"
-        shutil.copyfile(CACHE / TabICLClassifier().checkpoint_version, checkpoint)
-        model = fitted(TabICLClassifier, model_path=str(checkpoint))
+        copy = self.directory / "checkpoint.ckpt"
+        shutil.copyfile(checkpoint(TabICLClassifier), copy)
+        model = fitted(TabICLClassifier, model_path=str(copy))
         path = self.directory / "model.pkl"
         model.save(path, save_model_weights=True)
-        checkpoint.unlink()
+        copy.unlink()
         loaded = TabICLClassifier.load(path)
-        self.assertTrue(checkpoint.exists())
+        self.assertTrue(copy.exists())
         np.testing.assert_array_equal(predict(loaded), predict(model))
 
     def test_load_checks_the_class_device_and_version(self):
