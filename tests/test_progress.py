@@ -55,6 +55,7 @@ class ProgressTest(unittest.TestCase):
         model = TabICLClassifier(cache_dir=False).fit(x, (y > 0).astype(int))
         # One Python chunk, so only Rust's pieces can notice the interrupt.
         query = np.tile(x, (27, 1))[:8000]
+        model.predict_proba(query)  # Compile the graphs, so the timed run is steady.
         start = time.perf_counter()
         model.predict_proba(query)
         full = time.perf_counter() - start
