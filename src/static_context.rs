@@ -761,8 +761,63 @@ impl StaticContextArtifact {
     /// # Errors
     ///
     /// Returns [`Error::Artifact`] if a validated size cannot be encoded.
-    #[allow(clippy::too_many_lines)]
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(self.encoded_len()?);
+        self.encode(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// The length of [`Self::encode`]'s output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Artifact`] if a validated size cannot be encoded.
+    pub fn encoded_len(&self) -> Result<usize> {
+        Ok(self.head()?.1)
+    }
+
+    /// Encode the artifact into `sink` in one pass, hashing as it writes, so
+    /// encoding needs no copy of the payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Artifact`] if a validated size cannot be encoded, on a
+    /// big-endian host, or if writing fails.
+    pub fn encode(&self, sink: &mut impl std::io::Write) -> Result<()> {
+        use sha2::{Digest as _, Sha256};
+        // The payload is the in-memory values verbatim, which must be little-endian.
+        if !cfg!(target_endian = "little") {
+            return Err(artifact_error(
+                "encoding a static context requires a little-endian host",
+            ));
+        }
+        let (head, _) = self.head()?;
+        let mut hasher = Sha256::new();
+        let mut write = |bytes: &[u8]| {
+            hasher.update(bytes);
+            sink.write_all(bytes).map_err(artifact_error)
+        };
+        write(&head)?;
+        let mut written = 0;
+        for tensor in self.tensors.values() {
+            let padding = align_up(written, TENSOR_ALIGNMENT)? - written;
+            write(&[0; TENSOR_ALIGNMENT][..padding])?;
+            let bytes: &[u8] = match self.tensor_data(tensor) {
+                StaticContextTensorData::Fp32(values) => bytemuck::cast_slice(values),
+                StaticContextTensorData::Bf16(values) | StaticContextTensorData::F16(values) => {
+                    bytemuck::cast_slice(values)
+                }
+            };
+            write(bytes)?;
+            written += padding + bytes.len();
+        }
+        sink.write_all(&hasher.finalize()).map_err(artifact_error)
+    }
+
+    /// The header, permutations, tensor directory, and padding that precede
+    /// the payload, and the whole encoded length.
+    #[allow(clippy::too_many_lines)]
+    fn head(&self) -> Result<(Vec<u8>, usize)> {
         // Version 1 when every tensor is FP32; version 2 tags each tensor's dtype.
         let version = if self
             .tensors
@@ -774,32 +829,17 @@ impl StaticContextArtifact {
             STATIC_CONTEXT_BF16_VERSION
         };
         let mut directory = Vec::new();
-        let mut payload = Vec::new();
+        let mut payload_length = 0_usize;
         for (name, tensor) in &self.tensors {
-            pad_to_alignment(&mut payload, TENSOR_ALIGNMENT)?;
-            let offset = payload.len();
-            // The stored bytes are the in-memory values verbatim (little-endian).
-            let dtype = match self.tensor_data(tensor) {
-                StaticContextTensorData::Fp32(values) => {
-                    for value in values {
-                        payload.extend_from_slice(&value.to_le_bytes());
-                    }
-                    StorageDType::Fp32
-                }
-                StaticContextTensorData::Bf16(values) => {
-                    for value in values {
-                        payload.extend_from_slice(&value.to_le_bytes());
-                    }
-                    StorageDType::Bf16
-                }
-                StaticContextTensorData::F16(values) => {
-                    for value in values {
-                        payload.extend_from_slice(&value.to_le_bytes());
-                    }
-                    StorageDType::F16
-                }
+            let offset = align_up(payload_length, TENSOR_ALIGNMENT)?;
+            let (dtype, byte_length) = match self.tensor_data(tensor) {
+                StaticContextTensorData::Fp32(values) => (StorageDType::Fp32, size_of_val(values)),
+                StaticContextTensorData::Bf16(values) => (StorageDType::Bf16, size_of_val(values)),
+                StaticContextTensorData::F16(values) => (StorageDType::F16, size_of_val(values)),
             };
-            let byte_length = payload.len() - offset;
+            payload_length = offset
+                .checked_add(byte_length)
+                .ok_or_else(|| artifact_error("static context payload length overflows usize"))?;
             let dtype_tag = if version == STATIC_CONTEXT_FP32_VERSION {
                 0
             } else {
@@ -828,28 +868,17 @@ impl StaticContextArtifact {
             }
             directory.extend_from_slice(name.as_bytes());
         }
-        if directory.len() > MAX_DIRECTORY_BYTES || payload.len() > MAX_TOTAL_TENSOR_BYTES {
+        if directory.len() > MAX_DIRECTORY_BYTES || payload_length > MAX_TOTAL_TENSOR_BYTES {
             return Err(artifact_error(
                 "static context section exceeds the resource limit",
             ));
         }
-        let capacity = HEADER_BYTES
-            .checked_add(
-                (self.metadata.class_permutations.len() + self.metadata.feature_permutations.len())
-                    .checked_mul(8)
-                    .ok_or_else(|| artifact_error("permutation length overflows usize"))?,
-            )
-            .and_then(|size| size.checked_add(directory.len()))
-            .and_then(|size| size.checked_add(TENSOR_ALIGNMENT))
-            .and_then(|size| size.checked_add(payload.len()))
-            .and_then(|size| size.checked_add(CHECKSUM_BYTES))
-            .ok_or_else(|| artifact_error("static context length overflows usize"))?;
-        let mut bytes = Vec::with_capacity(capacity);
-        bytes.extend_from_slice(&STATIC_CONTEXT_MAGIC);
-        write_u32(&mut bytes, version);
-        write_u32(&mut bytes, STATIC_CONTEXT_KIND);
-        bytes.extend_from_slice(&self.metadata.model_sha256);
-        bytes.extend_from_slice(&self.metadata.context_sha256);
+        let mut head = Vec::new();
+        head.extend_from_slice(&STATIC_CONTEXT_MAGIC);
+        write_u32(&mut head, version);
+        write_u32(&mut head, STATIC_CONTEXT_KIND);
+        head.extend_from_slice(&self.metadata.model_sha256);
+        head.extend_from_slice(&self.metadata.context_sha256);
         for value in [
             self.metadata.ensemble_count,
             self.metadata.training_rows,
@@ -857,66 +886,66 @@ impl StaticContextArtifact {
             self.metadata.class_count,
         ] {
             write_u64(
-                &mut bytes,
+                &mut head,
                 u64::try_from(value).map_err(|_| artifact_error("metadata value exceeds u64"))?,
             );
         }
         for value in [3_u32, 12, 8, 16, 64] {
-            write_u32(&mut bytes, value);
+            write_u32(&mut head, value);
         }
         write_u32(
-            &mut bytes,
+            &mut head,
             u32::try_from(self.tensors.len()).map_err(|_| artifact_error("tensor count exceeds u32"))?,
         );
         write_u32(
-            &mut bytes,
+            &mut head,
             u32::try_from(self.metadata.class_permutations.len())
                 .map_err(|_| artifact_error("class permutation count exceeds u32"))?,
         );
         write_u32(
-            &mut bytes,
+            &mut head,
             u32::try_from(self.metadata.feature_permutations.len())
                 .map_err(|_| artifact_error("feature permutation count exceeds u32"))?,
         );
         write_u64(
-            &mut bytes,
+            &mut head,
             u64::try_from(directory.len()).map_err(|_| artifact_error("directory length exceeds u64"))?,
         );
         write_u64(
-            &mut bytes,
-            u64::try_from(payload.len()).map_err(|_| artifact_error("payload length exceeds u64"))?,
+            &mut head,
+            u64::try_from(payload_length).map_err(|_| artifact_error("payload length exceeds u64"))?,
         );
-        write_u32(&mut bytes, 0);
-        debug_assert_eq!(bytes.len(), HEADER_BYTES);
+        write_u32(&mut head, 0);
+        debug_assert_eq!(head.len(), HEADER_BYTES);
         for value in self
             .metadata
             .class_permutations
             .iter()
             .chain(&self.metadata.feature_permutations)
         {
-            write_u64(&mut bytes, *value);
+            write_u64(&mut head, *value);
         }
-        bytes.extend_from_slice(&directory);
-        pad_to_alignment(&mut bytes, TENSOR_ALIGNMENT)?;
-        bytes.extend_from_slice(&payload);
-        bytes.extend_from_slice(&sha256(&bytes));
-        if bytes.len() > MAX_ARTIFACT_BYTES {
-            return Err(artifact_error("static context exceeds the resource limit"));
-        }
-        Ok(bytes)
+        head.extend_from_slice(&directory);
+        pad_to_alignment(&mut head, TENSOR_ALIGNMENT)?;
+        let length = head
+            .len()
+            .checked_add(payload_length)
+            .and_then(|length| length.checked_add(CHECKSUM_BYTES))
+            .filter(|length| *length <= MAX_ARTIFACT_BYTES)
+            .ok_or_else(|| artifact_error("static context exceeds the resource limit"))?;
+        Ok((head, length))
     }
 
     /// Encode and write this context to `path` atomically: write a uniquely-named
     /// temp file in the same directory, flush it, then rename it into place, so a
     /// reader never observes a partial file and concurrent writers of the same
-    /// content do not clobber each other.
+    /// content do not clobber each other. The payload streams to the file
+    /// without a copy in memory.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Artifact`] if encoding or any filesystem step fails.
     pub fn write(&self, path: &Path) -> Result<()> {
-        use std::io::Write as _;
-        let bytes = self.to_bytes()?;
         let directory = path
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
@@ -925,16 +954,17 @@ impl StaticContextArtifact {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
         let temp = directory.join(format!(".ironicl-{}-{nanos}.tmp", std::process::id()));
-        let result = (|| -> std::io::Result<()> {
-            let mut file = File::create(&temp)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            std::fs::rename(&temp, path)
+        let result = (|| -> Result<()> {
+            let mut file = std::io::BufWriter::new(File::create(&temp).map_err(artifact_error)?);
+            self.encode(&mut file)?;
+            let file = file.into_inner().map_err(artifact_error)?;
+            file.sync_all().map_err(artifact_error)?;
+            std::fs::rename(&temp, path).map_err(artifact_error)
         })();
         if result.is_err() {
             let _ = std::fs::remove_file(&temp);
         }
-        result.map_err(artifact_error)
+        result
     }
 
     /// Verified context metadata.

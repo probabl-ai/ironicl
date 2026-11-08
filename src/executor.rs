@@ -413,7 +413,7 @@ impl Executor {
         StaticExecutor::with_executor(self.clone(), context, threads, limits)
     }
 
-    /// Load a context from the bytes [`StaticExecutor::context_bytes`] returned,
+    /// Load a context from the bytes [`StaticExecutor::encode_context`] wrote,
     /// as [`Self::load_context`] does from a file.
     ///
     /// # Errors
@@ -1520,13 +1520,23 @@ impl StaticExecutor {
         self.context.write(path)
     }
 
-    /// This context encoded as [`Self::save_context`] writes it.
+    /// The length of [`Self::encode_context`]'s output.
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Artifact`] if encoding fails.
-    pub fn context_bytes(&self) -> Result<Vec<u8>> {
-        self.context.to_bytes()
+    /// Returns [`Error::Artifact`] if a validated size cannot be encoded.
+    pub fn context_encoded_len(&self) -> Result<usize> {
+        self.context.encoded_len()
+    }
+
+    /// Encode this context into `sink` as [`Self::save_context`] writes it,
+    /// for [`Executor::load_context_bytes`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Artifact`] if encoding or writing fails.
+    pub fn encode_context(&self, sink: &mut impl std::io::Write) -> Result<()> {
+        self.context.encode(sink)
     }
 
     /// Pair a context with an executor whose model weights it shares.
