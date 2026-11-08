@@ -26,8 +26,8 @@ class TabICLRegressor(RegressorMixin, TabICLBase):
     """TabICLv2 regressor with Ironicl's Rust inference engine.
 
     Parameters keep TabICL's names and defaults, and behave as in
-    ``TabICLClassifier``: ``n_jobs`` sets the thread count, ``batch_size`` and
-    ``verbose`` have no effect and warn if changed, and parameters that request
+    ``TabICLClassifier``: ``n_jobs`` sets the thread count, ``verbose`` shows
+    progress, ``batch_size`` has no effect and warns if changed, and parameters that request
     an unimplemented feature raise ``NotImplementedError``. ``optimize``,
     ``cache_dir``, ``memory_limit``, ``device_memory_limit``, and ``memory_overflow``
     are Ironicl's own trailing parameters; see ``TabICLClassifier``.
@@ -135,7 +135,10 @@ class TabICLRegressor(RegressorMixin, TabICLBase):
             raise ValueError("The provided input X is one-dimensional. Reshape your data.")
         types = [output_type] if isinstance(output_type, str) else list(output_type)
         alphas = DEFAULT_ALPHAS if alphas is None else list(alphas)
-        chunks = [self.context_.predict_regression(rows, types, alphas) for rows in self._query_chunks(X)]
+        chunks = [
+            self.context_.predict_regression(rows, types, alphas, progress)
+            for rows, progress in self._query_chunks(X)
+        ]
         mean, scale = self.y_scaler_.mean_[0], self.y_scaler_.scale_[0]
         final = {}
         for name, *parts in zip(types, *chunks):

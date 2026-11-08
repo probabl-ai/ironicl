@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from ironicl import TabICLClassifier
+from ironicl.cache import _cache_dir
 
 
 class ValidateParamsTest(unittest.TestCase):
@@ -38,7 +39,7 @@ class ValidateParamsTest(unittest.TestCase):
         TabICLClassifier(use_amp=False, use_fa3=False, kv_cache="kv", norm_methods="power")._validate_params()
 
     def test_noop_values_warn(self):
-        for param, value in (("batch_size", 16), ("verbose", True), ("support_many_classes", False)):
+        for param, value in (("batch_size", 16), ("support_many_classes", False)):
             with self.subTest(param=param), self.assertWarns(UserWarning):
                 TabICLClassifier(**{param: value})._validate_params()
 
@@ -64,22 +65,22 @@ class ResolveThreadsTest(unittest.TestCase):
 class CacheDirTest(unittest.TestCase):
     def test_default_is_off(self):
         with mock.patch.dict(os.environ, {"IRONICL_CACHE_DIR": "/data/ctx"}):
-            self.assertIsNone(TabICLClassifier()._cache_dir())  # default False ignores the env
+            self.assertIsNone(_cache_dir(TabICLClassifier().cache_dir))  # default False ignores the env
 
     def test_false_disables(self):
-        self.assertIsNone(TabICLClassifier(cache_dir=False)._cache_dir())
+        self.assertIsNone(_cache_dir(TabICLClassifier(cache_dir=False).cache_dir))
 
     def test_explicit_path(self):
-        self.assertEqual(TabICLClassifier(cache_dir="/tmp/ctx")._cache_dir(), Path("/tmp/ctx"))
+        self.assertEqual(_cache_dir(TabICLClassifier(cache_dir="/tmp/ctx").cache_dir), Path("/tmp/ctx"))
 
     def test_none_uses_ironicl_cache_dir(self):
         with mock.patch.dict(os.environ, {"IRONICL_CACHE_DIR": "/data/ctx"}):
-            self.assertEqual(TabICLClassifier(cache_dir=None)._cache_dir(), Path("/data/ctx"))
+            self.assertEqual(_cache_dir(TabICLClassifier(cache_dir=None).cache_dir), Path("/data/ctx"))
 
     def test_none_falls_back_to_xdg(self):
         with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": "/xdg"}):
             os.environ.pop("IRONICL_CACHE_DIR", None)
-            self.assertEqual(TabICLClassifier(cache_dir=None)._cache_dir(), Path("/xdg/ironicl/contexts"))
+            self.assertEqual(_cache_dir(TabICLClassifier(cache_dir=None).cache_dir), Path("/xdg/ironicl/contexts"))
 
 
 if __name__ == "__main__":

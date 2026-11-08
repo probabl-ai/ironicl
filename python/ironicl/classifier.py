@@ -21,7 +21,9 @@ class TabICLClassifier(ClassifierMixin, TabICLBase):
 
     Parameters keep TabICL's names and defaults. ``n_jobs`` sets the executor
     thread count (``None`` leaves Ironicl's default; negative values follow
-    TabICL, so ``-1`` is all logical cores). ``batch_size``, ``verbose``, and
+    TabICL, so ``-1`` is all logical cores). ``verbose=True`` shows the progress
+    of building the context and of predicting, as a tqdm bar when tqdm is
+    installed and as lines on stderr otherwise. ``batch_size`` and
     ``support_many_classes`` have no effect and warn if changed (the last because
     more than 10 classes are not supported yet). Parameters that request an
     unimplemented feature raise ``NotImplementedError``: ``use_amp=True``,
@@ -154,8 +156,10 @@ class TabICLClassifier(ClassifierMixin, TabICLBase):
         """Return class probabilities with shape ``(n_samples, n_classes)``."""
         check_is_fitted(self)
         chunks = []
-        for rows in self._query_chunks(X):
-            values, shape = self.context_.predict_proba(rows, self.softmax_temperature, self.average_logits)
+        for rows, progress in self._query_chunks(X):
+            values, shape = self.context_.predict_proba(
+                rows, self.softmax_temperature, self.average_logits, progress
+            )
             chunks.append(np.frombuffer(values, dtype=np.float32).reshape(shape))
         return np.concatenate(chunks)  # A writable copy, like TabICL's output.
 

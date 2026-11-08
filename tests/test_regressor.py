@@ -29,7 +29,7 @@ class ValidateParamsTest(unittest.TestCase):
             TabICLRegressor()._validate_params()
 
     def test_noop_values_warn(self):
-        for param, value in (("batch_size", 16), ("verbose", True)):
+        for param, value in (("batch_size", 16),):
             with self.subTest(param=param), self.assertWarns(UserWarning):
                 TabICLRegressor(**{param: value})._validate_params()
 
