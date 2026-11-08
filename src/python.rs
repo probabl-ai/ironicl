@@ -129,6 +129,24 @@ impl Model {
             .map(Context)
             .map_err(py_error)
     }
+
+    /// Load a context from the bytes `Context.to_bytes` returned, as
+    /// `load_context` does from a file.
+    #[pyo3(signature = (data, threads, memory_limit=None, device_memory_limit=None))]
+    fn context_from_bytes(
+        &self,
+        py: Python<'_>,
+        data: &[u8],
+        threads: Option<usize>,
+        memory_limit: Option<String>,
+        device_memory_limit: Option<String>,
+    ) -> PyResult<Context> {
+        let limits = MemoryLimits::resolve(memory_limit.as_deref(), device_memory_limit.as_deref())
+            .map_err(py_error)?;
+        py.detach(|| self.0.load_context_bytes(data, threads, limits))
+            .map(Context)
+            .map_err(py_error)
+    }
 }
 
 /// A fitted training context. Prediction runs only the query rows.
@@ -201,6 +219,12 @@ impl Context {
     /// `Model.load_context`.
     fn save(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
         py.detach(|| self.0.save_context(&path)).map_err(py_error)
+    }
+
+    /// This context encoded as `save` writes it, for pickling.
+    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = py.detach(|| self.0.context_bytes()).map_err(py_error)?;
+        Ok(PyBytes::new(py, &bytes))
     }
 }
 

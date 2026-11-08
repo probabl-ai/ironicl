@@ -46,10 +46,7 @@ class TabICLBase(BaseEstimator):
         self._validate_params()
         optimize = self._optimize()
         policy = _overflow_policy(self.memory_overflow)
-        limits = (
-            _limit_text("memory_limit", self.memory_limit),
-            _limit_text("device_memory_limit", self.device_memory_limit),
-        )
+        limits = self._limits()
         methods = self.norm_methods or ["none", "power"]
         preprocessor = Preprocessor(
             n_estimators=self.n_estimators,
@@ -81,6 +78,29 @@ class TabICLBase(BaseEstimator):
         if hasattr(preprocessor, "feature_names_in_"):
             self.feature_names_in_ = preprocessor.feature_names_in_
         return preprocessor
+
+    def __getstate__(self):
+        """Pickle the fitted context as bytes, so the pickle is self-contained."""
+        state = dict(super().__getstate__())  # May be this estimator's own __dict__.
+        if "context_" in state:
+            state["context_"] = state["context_"].to_bytes()
+        return state
+
+    def __setstate__(self, state):
+        """Load a pickled context with this machine's checkpoint, threads, and memory limits."""
+        super().__setstate__(state)
+        if isinstance(getattr(self, "context_", None), bytes):
+            checkpoint = self.checkpoint_path_ if Path(self.checkpoint_path_).exists() else self._checkpoint()
+            self.context_ = _model(checkpoint).context_from_bytes(
+                self.context_, self._resolve_threads(), *self._limits()
+            )
+            self.checkpoint_path_ = checkpoint
+
+    def _limits(self) -> tuple[str | None, str | None]:
+        return (
+            _limit_text("memory_limit", self.memory_limit),
+            _limit_text("device_memory_limit", self.device_memory_limit),
+        )
 
     def _query_chunks(self, X):
         """Yield the preprocessed ``[B, rows, H]`` query rows of ``X``, ``PREDICT_CHUNK_ROWS`` at a time."""
