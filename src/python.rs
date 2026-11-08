@@ -112,10 +112,20 @@ impl Model {
         self.0.source_sha256().to_owned()
     }
 
-    /// Load a persisted static context for this model from `path`. `threads` maps
-    /// `n_jobs` to the executor thread count, like `build_context`.
-    fn load_context(&self, py: Python<'_>, path: PathBuf, threads: Option<usize>) -> PyResult<Context> {
-        py.detach(|| self.0.load_context(&path, threads))
+    /// Load a persisted static context for this model from `path`. `threads` and
+    /// the memory limits mean what they mean for `build_context`.
+    #[pyo3(signature = (path, threads, memory_limit=None, device_memory_limit=None))]
+    fn load_context(
+        &self,
+        py: Python<'_>,
+        path: PathBuf,
+        threads: Option<usize>,
+        memory_limit: Option<String>,
+        device_memory_limit: Option<String>,
+    ) -> PyResult<Context> {
+        let limits = MemoryLimits::resolve(memory_limit.as_deref(), device_memory_limit.as_deref())
+            .map_err(py_error)?;
+        py.detach(|| self.0.load_context(&path, threads, limits))
             .map(Context)
             .map_err(py_error)
     }

@@ -233,18 +233,14 @@ impl Gpu {
 
     /// Run `graph` synchronously, feeding `inputs` and writing `outputs`.
     fn run(&self, graph: &MPSGraph, inputs: &[&Binding], outputs: &[&Binding]) {
-        self.run_prepared(graph, &dictionary(inputs), &dictionary(outputs));
-    }
-
-    fn run_prepared(&self, graph: &MPSGraph, feeds: &Dictionary, results: &Dictionary) {
         // SAFETY: the descriptor waits until the run completes, and the
         // dictionaries keep their buffers alive.
         unsafe {
             graph.runAsyncWithMTLCommandQueue_feeds_targetOperations_resultsDictionary_executionDescriptor(
                 &self.queue,
-                feeds,
+                &dictionary(inputs),
                 None,
-                results,
+                &dictionary(outputs),
                 Some(&self.execution),
             );
         }
@@ -764,8 +760,8 @@ pub(crate) struct PredictGraph {
     logits: Tensor,
     /// Decoder outputs per row.
     outputs: usize,
-    /// Buffers and dictionaries per cached query bucket. The lock also
-    /// serializes graph runs.
+    /// Each query bucket's buffers and executable. The lock also serializes
+    /// graph runs.
     prepared: Mutex<HashMap<usize, Prepared>>,
 }
 
@@ -778,24 +774,53 @@ fn bucket(rows: usize) -> usize {
     rows.next_multiple_of(1 << shift)
 }
 
-/// One query bucket's input and output buffers and how to run the graph on
-/// them.
+/// How to split queries so the buckets a predict graph keeps stay within
+/// `budget` bytes, at `row_bytes` per bucket row: `(chunk, small)`, powers of
+/// two with `small <= chunk <= QUERY_CHUNK_ROWS`. A query of at most `small`
+/// rows runs as one bucket; a larger one runs in power-of-two pieces of at most
+/// `chunk` rows until at most `small` remain, so the graph keeps only the
+/// buckets up to `small` and the powers of two up to `chunk`.
+///
+/// `MPSGraph` keeps each input shape's intermediate buffers until the graph is
+/// freed, so the graph keeps every bucket it has run. The powers of two take
+/// at most half the budget, as large a `chunk` as fits, and the small buckets
+/// the rest. A row is estimated as building it for every estimator; the graph
+/// measured 0.7x this.
+fn query_split(row_bytes: usize, budget: u64) -> (usize, usize) {
+    let bytes = |rows: usize| u64::try_from(rows.saturating_mul(row_bytes)).unwrap_or(u64::MAX);
+    let mut chunk = QUERY_CHUNK_ROWS;
+    while chunk > 1 && bytes(2 * chunk) > budget / 2 {
+        chunk /= 2;
+    }
+    let mut small = chunk;
+    while small > 1 && bytes(kept_rows(chunk, small)) > budget {
+        small /= 2;
+    }
+    (chunk, small)
+}
+
+/// The bucket rows a predict graph keeps once it has run every split of
+/// [`query_split`]: each bucket up to `small`, then the powers of two up to
+/// `chunk`.
+fn kept_rows(chunk: usize, small: usize) -> usize {
+    let (mut rows, mut kept) = (1, 0);
+    while rows <= small {
+        let bucket = bucket(rows);
+        kept += bucket;
+        rows = bucket + 1;
+    }
+    kept + 2 * (chunk - small)
+}
+
+/// One query bucket's input and output buffers and its compiled executable,
+/// with its inputs in feed order. Skipping the per-call executable lookup saved
+/// 0.5-1.4 ms per single-row predict.
 struct Prepared {
     input: Buffer,
     output: Buffer,
-    run: PreparedRun,
-}
-
-enum PreparedRun {
-    /// A graph run that `MPSGraph` matches to a compiled executable per call.
-    Graph { feeds: Dictionary, results: Dictionary },
-    /// An executable compiled once, with its inputs in feed order. Skipping
-    /// the per-call lookup saved 0.5-1.4 ms per single-row predict.
-    Executable {
-        executable: Retained<MPSGraphExecutable>,
-        inputs: Retained<NSArray<MPSGraphTensorData>>,
-        results: Retained<NSArray<MPSGraphTensorData>>,
-    },
+    executable: Retained<MPSGraphExecutable>,
+    inputs: Retained<NSArray<MPSGraphTensorData>>,
+    results: Retained<NSArray<MPSGraphTensorData>>,
 }
 
 // SAFETY: the Objective-C objects are immutable after construction, and every
@@ -903,9 +928,8 @@ impl PredictGraph {
         })
     }
 
-    /// Allocate a bucket's buffers. A `cached` bucket also compiles its
-    /// executable once; an uncached one would compile on every call.
-    fn prepare(&self, rows: usize, cached: bool) -> Result<Prepared> {
+    /// Allocate a bucket's buffers and compile its executable.
+    fn prepare(&self, rows: usize) -> Result<Prepared> {
         let (b, h) = (self.shape.ensembles, self.shape.features);
         let input = self.gpu.empty(b * h * rows * 3)?;
         // Padding rows must be finite; they never mix with real rows.
@@ -927,82 +951,82 @@ impl PredictGraph {
         let mut inputs = self.bindings.iter().collect::<Vec<_>>();
         inputs.push(&input);
         let (feeds, results) = (dictionary(&inputs), dictionary(&[&output]));
-        let run = if cached {
-            // SAFETY: compiling the graph for these inputs' shapes; every feed
-            // tensor has a value in `feeds`.
-            unsafe {
-                let tensors: Vec<&MPSGraphTensor> = inputs.iter().map(|item| &*item.0).collect();
-                let types: Vec<_> = inputs
-                    .iter()
-                    .map(|item| {
-                        MPSGraphShapedType::initWithShape_dataType(
-                            MPSGraphShapedType::alloc(),
-                            Some(&shape(&item.2)),
-                            item.3,
-                        )
-                    })
-                    .collect();
-                let executable = self
-                    .graph
-                    .compileWithDevice_feeds_targetTensors_targetOperations_compilationDescriptor(
-                        Some(&MPSGraphDevice::deviceWithMTLDevice(&self.gpu.device)),
-                        &NSDictionary::from_retained_objects(&tensors, &types),
-                        &NSArray::from_slice(&[&*self.logits]),
-                        None,
-                        Some(&self.gpu.compilation),
-                    );
-                let order = executable
-                    .feedTensors()
-                    .ok_or_else(|| metal_error("compiled graph has no feeds"))?;
-                let inputs = order
-                    .iter()
-                    .map(|tensor| {
-                        feeds
-                            .objectForKey(&tensor)
-                            .ok_or_else(|| metal_error("compiled graph feed is unbound"))
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                let output = results
-                    .objectForKey(&self.logits)
-                    .ok_or_else(|| metal_error("graph output is unbound"))?;
-                PreparedRun::Executable {
-                    executable,
-                    inputs: NSArray::from_retained_slice(&inputs),
-                    results: NSArray::from_retained_slice(&[output]),
-                }
-            }
-        } else {
-            PreparedRun::Graph { feeds, results }
+        // SAFETY: compiling the graph for these inputs' shapes; every feed
+        // tensor has a value in `feeds`.
+        let executable = unsafe {
+            let tensors: Vec<&MPSGraphTensor> = inputs.iter().map(|item| &*item.0).collect();
+            let types: Vec<_> = inputs
+                .iter()
+                .map(|item| {
+                    MPSGraphShapedType::initWithShape_dataType(
+                        MPSGraphShapedType::alloc(),
+                        Some(&shape(&item.2)),
+                        item.3,
+                    )
+                })
+                .collect();
+            self.graph
+                .compileWithDevice_feeds_targetTensors_targetOperations_compilationDescriptor(
+                    Some(&MPSGraphDevice::deviceWithMTLDevice(&self.gpu.device)),
+                    &NSDictionary::from_retained_objects(&tensors, &types),
+                    &NSArray::from_slice(&[&*self.logits]),
+                    None,
+                    Some(&self.gpu.compilation),
+                )
         };
+        // SAFETY: reading the compiled executable's feed order.
+        let order =
+            unsafe { executable.feedTensors() }.ok_or_else(|| metal_error("compiled graph has no feeds"))?;
+        let ordered = order
+            .iter()
+            .map(|tensor| {
+                feeds
+                    .objectForKey(&tensor)
+                    .ok_or_else(|| metal_error("compiled graph feed is unbound"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let result = results
+            .objectForKey(&self.logits)
+            .ok_or_else(|| metal_error("graph output is unbound"))?;
         Ok(Prepared {
             input: input.1,
             output: output.1,
-            run,
+            executable,
+            inputs: NSArray::from_retained_slice(&ordered),
+            results: NSArray::from_retained_slice(&[result]),
         })
     }
 
-    /// Predict `query_rows` rows. `fill` writes the `[B * H, rows, 3]` grouped
-    /// inputs, given the bucket's row count as the stride, and returns false
-    /// to cancel. Returns `[B, query_rows, outputs]` decoder outputs.
+    /// How to split queries so the buckets the graph keeps stay within
+    /// `budget` bytes of device memory; see [`query_split`].
+    pub(crate) fn query_split(&self, budget: u64) -> (usize, usize) {
+        query_split(
+            gpu_build_estimator_bytes(1, self.shape.features).saturating_mul(self.shape.ensembles),
+            budget,
+        )
+    }
+
+    /// Predict `query_rows` rows, at most [`QUERY_CHUNK_ROWS`]; split queries
+    /// as [`Self::query_split`] says to stay within the budget. `fill` writes
+    /// the `[B * H, rows, 3]` grouped inputs, given the bucket's row count as
+    /// the stride, and returns false to cancel. Returns `[B, query_rows,
+    /// outputs]` decoder outputs.
     pub(crate) fn run(
         &self,
         query_rows: usize,
         fill: impl FnOnce(&mut [f32], usize) -> bool,
     ) -> Result<Option<Vec<f32>>> {
         let (b, h, rows) = (self.shape.ensembles, self.shape.features, bucket(query_rows));
+        if rows > QUERY_CHUNK_ROWS {
+            return Err(metal_error("query chunk exceeds the largest bucket"));
+        }
         let mut cache = self
             .prepared
             .lock()
             .map_err(|_| metal_error("graph lock poisoned"))?;
-        let uncached;
-        let prepared = if rows <= QUERY_CHUNK_ROWS {
-            match cache.entry(rows) {
-                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::hash_map::Entry::Vacant(entry) => entry.insert(self.prepare(rows, true)?),
-            }
-        } else {
-            uncached = self.prepare(rows, false)?;
-            &uncached
+        let prepared = match cache.entry(rows) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(self.prepare(rows)?),
         };
         // SAFETY: the lock gives this call sole use of the buffer, which holds
         // `b * h * rows * 3` floats.
@@ -1012,21 +1036,16 @@ impl PredictGraph {
         if !fill(input, rows) {
             return Ok(None);
         }
-        match &prepared.run {
-            PreparedRun::Graph { feeds, results } => self.gpu.run_prepared(&self.graph, feeds, results),
-            // SAFETY: synchronous run; the arrays keep their buffers alive.
-            PreparedRun::Executable {
-                executable,
-                inputs,
-                results,
-            } => unsafe {
-                executable.runWithMTLCommandQueue_inputsArray_resultsArray_executionDescriptor(
+        // SAFETY: synchronous run; the arrays keep their buffers alive.
+        unsafe {
+            prepared
+                .executable
+                .runWithMTLCommandQueue_inputsArray_resultsArray_executionDescriptor(
                     &self.gpu.queue,
-                    inputs,
-                    Some(results),
+                    &prepared.inputs,
+                    Some(&prepared.results),
                     Some(&self.gpu.executable_execution),
                 );
-            },
         }
         // SAFETY: the run is complete and wrote `[b, rows, outputs]` floats.
         let output = unsafe {
@@ -1210,4 +1229,31 @@ pub(crate) fn build_context(
         return Err(metal_error("the built context contains a non-finite value"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_split_keeps_every_bucket_within_the_budget() {
+        // 8 estimators of 100 features: 3.7 MB a row.
+        let row_bytes = gpu_build_estimator_bytes(1, 100) * 8;
+        for (budget, split) in [
+            (u64::MAX, (QUERY_CHUNK_ROWS, QUERY_CHUNK_ROWS)),
+            (10 << 30, (512, 128)),
+            (4 << 30, (256, 64)),
+            (2 << 30, (128, 32)),
+            (0, (1, 1)),
+        ] {
+            assert_eq!(query_split(row_bytes, budget), split, "budget {budget}");
+            let (chunk, small) = split;
+            assert!(budget == 0 || (kept_rows(chunk, small) * row_bytes) as u64 <= budget);
+        }
+        // Every bucket up to 16 rows, 8 per doubling to 32, then 64.
+        assert_eq!(
+            kept_rows(64, 32),
+            (1..=16).sum::<usize>() + (18..=32).step_by(2).sum::<usize>() + 64
+        );
+    }
 }
