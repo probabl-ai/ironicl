@@ -108,9 +108,10 @@ A 2,000-row, 100-feature classifier with 8 estimators, on an M1 Max:
 | `save_model_weights=True` | 1,169 MiB | 794 MiB |
 
 The context compresses to only 94% of its size, so compressing the file is not
-worth it. Decoding and encoding a 1 GiB context takes about 0.7 s each. Saving
-briefly holds up to two more copies of the context in memory, and loading holds
-the saved bytes alongside the loaded context until the load finishes.
+worth it. Decoding a 1 GiB context takes about 0.7 s and encoding it 0.5 s.
+Saving encodes the context straight into the pickled bytes, one more copy in
+memory; loading holds those bytes alongside the loaded context until the load
+finishes. Writing a `cache_dir` entry streams to the file without a copy.
 
 The loaded estimator uses the loading machine's threads and memory limits; on
 the same machine it predicts exactly as the saved one did. `device` accepts what
