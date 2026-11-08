@@ -76,17 +76,46 @@ at RAM speed from the first query. A corrupt or mismatched entry is silently
 rebuilt, and a write failure never fails `fit`. There is no automatic eviction;
 remove files to reclaim space.
 
-### Pickling
+### Saving and pickling
 
-A fitted estimator pickles with `pickle` and `joblib`, and copies with
-`copy.deepcopy`. The pickle holds the whole fitted context, so it is as large as
-the context in `memory_plan_` and needs no cache or training data to load.
-Loading needs the checkpoint: the pickled path if it exists, otherwise the
-default checkpoint location, downloaded when `allow_auto_download` allows. The
-loaded estimator uses the loading machine's threads and memory limits; on the
-same machine it predicts exactly as the pickled one did. Pickling briefly holds
-up to two more copies of the context in memory, and loading holds the pickled
-bytes alongside the loaded context until the load finishes.
+As in TabICL, `save` and `load` write and read a fitted estimator, and `pickle`,
+`joblib`, and `copy.deepcopy` work as `save` does with its defaults:
+
+```python
+clf.save("model.pkl", save_model_weights=False, save_training_data=True, save_kv_cache=True)
+clf = TabICLClassifier.load("model.pkl", device=None)
+```
+
+- `save_kv_cache` keeps the fitted context. Without it, `load` rebuilds the
+  context from the training data, which takes as long as the build in `fit`;
+  with `cache_dir` set, a context cached on this machine loads from the cache
+  instead.
+- `save_training_data` keeps the preprocessed training rows, one copy per
+  normalization group (`fit` keeps them for this). Leaving out both the rows
+  and the context raises `ValueError`.
+- `save_model_weights` includes the checkpoint, so loading needs no checkpoint
+  file or download. Without it, loading uses the saved checkpoint path if it
+  exists, otherwise `model_path` or the default location, downloaded when
+  `allow_auto_download` allows. An included checkpoint is written there when it
+  is missing.
+
+A 2,000-row, 100-feature classifier with 8 estimators, on an M1 Max:
+
+| `save` options | `optimize="safe"` | `optimize="auto"` |
+|---|---|---|
+| Defaults | 1,064 MiB | 689 MiB |
+| `save_kv_cache=False` | 1.6 MiB | 1.6 MiB |
+| `save_model_weights=True` | 1,169 MiB | 794 MiB |
+
+The context compresses to only 94% of its size, so compressing the file is not
+worth it. Decoding and encoding a 1 GiB context takes about 0.7 s each. Saving
+briefly holds up to two more copies of the context in memory, and loading holds
+the saved bytes alongside the loaded context until the load finishes.
+
+The loaded estimator uses the loading machine's threads and memory limits; on
+the same machine it predicts exactly as the saved one did. `device` accepts what
+the constructor does. Loading warns when the file was saved with another Ironicl
+version. Load only files you trust: like any pickle, loading can run code.
 
 ## Regressor
 
@@ -141,7 +170,9 @@ permutations. It removes constant features and rejects all-constant training
 data. Categorical inputs, missing values, and sparse matrices are not supported.
 Numeric DataFrames must have unique string column names in the same order at
 prediction time. Preprocessing is fitted on training data only, retains no
-training rows, and does not require `PYTHONHASHSEED` configuration. It preserves
+training rows (the estimator keeps the preprocessed rows for
+[`save`](#saving-and-pickling)), and does not require `PYTHONHASHSEED`
+configuration. It preserves
 upstream's power-transform fallback, including its batch-wide clipping when a
 transform raises a domain error.
 
