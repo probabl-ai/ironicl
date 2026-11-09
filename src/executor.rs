@@ -673,7 +673,7 @@ impl Executor {
         let class_count = self.validate_targets(y_train, b, n)?;
         let mut model_sha256 = [0; 32];
         let source = self.model.summary().source_sha256.as_bytes();
-        for (byte, pair) in model_sha256.iter_mut().zip(source.chunks_exact(2)) {
+        for (byte, pair) in model_sha256.iter_mut().zip(source.as_chunks::<2>().0) {
             *byte = std::str::from_utf8(pair)
                 .ok()
                 .and_then(|pair| u8::from_str_radix(pair, 16).ok())

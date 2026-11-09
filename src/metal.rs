@@ -777,7 +777,7 @@ pub(crate) struct PredictGraph {
 /// pads at most 12.5%. Power-of-two buckets padded up to 2x, which cost more
 /// than the compiles they saved on large batches.
 fn bucket(rows: usize) -> usize {
-    let shift = (usize::BITS - rows.leading_zeros()).saturating_sub(4);
+    let shift = rows.bit_width().saturating_sub(4);
     rows.next_multiple_of(1 << shift)
 }
 

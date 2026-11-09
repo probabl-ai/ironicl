@@ -89,8 +89,8 @@ impl StaticQueryBundle {
             return Err(query_error("query bundle dimensions and length do not match"));
         }
         let mut x = Vec::with_capacity(elements);
-        for chunk in bytes[HEADER_BYTES..checksum_offset].chunks_exact(4) {
-            let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        for &chunk in bytes[HEADER_BYTES..checksum_offset].as_chunks().0 {
+            let value = f32::from_le_bytes(chunk);
             if !value.is_finite() {
                 return Err(query_error("query bundle contains a non-finite value"));
             }

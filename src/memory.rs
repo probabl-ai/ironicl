@@ -1263,7 +1263,7 @@ mod tests {
         )
         .expect("plan");
         assert_eq!(plan.fits(), None);
-        assert!(plan.suggestions.is_empty());
+        assert_eq!(plan.suggestions, []);
         assert!(plan.to_string().contains("unknown"));
     }
 
