@@ -1,0 +1,51 @@
+cff-version: 1.2.0
+message: >-
+  If you use Ironicl, please cite this software and the TabICLv2 paper that
+  defines the model it runs.
+title: Ironicl
+type: software
+authors:
+  - name: Probabl
+abstract: >-
+  A cache-aware CPU inference engine for the TabICLv2 tabular foundation model.
+keywords:
+  - tabular data
+  - in-context learning
+  - inference
+  - rust
+license: BSD-3-Clause
+version: 0.1.0
+references:
+  - type: article
+    title: "TabICLv2: A better, faster, scalable, and open tabular foundation model"
+    authors:
+      - family-names: Qu
+        given-names: Jingang
+      - family-names: Holzmüller
+        given-names: David
+      - family-names: Varoquaux
+        given-names: Gaël
+      - family-names: Le Morvan
+        given-names: Marine
+    year: 2026
+    identifiers:
+      - type: other
+        value: "arXiv:2602.11139"
+    url: https://arxiv.org/abs/2602.11139
+  - type: conference-paper
+    title: "TabICL: A Tabular Foundation Model for In-Context Learning on Large Data"
+    authors:
+      - family-names: Qu
+        given-names: Jingang
+      - family-names: Holzmüller
+        given-names: David
+      - family-names: Varoquaux
+        given-names: Gaël
+      - family-names: Le Morvan
+        given-names: Marine
+    collection-title: Proceedings of the 42nd International Conference on Machine Learning
+    year: 2025
+    identifiers:
+      - type: other
+        value: "arXiv:2502.05564"
+    url: https://arxiv.org/abs/2502.05564
