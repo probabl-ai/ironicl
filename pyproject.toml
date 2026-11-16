@@ -30,7 +30,7 @@ features = ["python", "metal"]
 # `pyodide build`: Pyodide's default flags need its pinned nightly. Stable Rust
 # already unwinds with WebAssembly exceptions on this target, as Pyodide does.
 [tool.pyodide.build]
-rustflags = "-C link-arg=-sSIDE_MODULE=2"
+rustflags = "-C link-arg=-sSIDE_MODULE=2 -C target-feature=+simd128"
 
 [tool.ruff.lint]
 # Pyflakes only: catch real errors (unused imports, undefined names, bad
