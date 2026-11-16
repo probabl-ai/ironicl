@@ -27,6 +27,11 @@ python-source = "python"
 module-name = "ironicl._core"
 features = ["python", "metal"]
 
+# `pyodide build`: Pyodide's default flags need its pinned nightly. Stable Rust
+# already unwinds with WebAssembly exceptions on this target, as Pyodide does.
+[tool.pyodide.build]
+rustflags = "-C link-arg=-sSIDE_MODULE=2"
+
 [tool.ruff.lint]
 # Pyflakes only: catch real errors (unused imports, undefined names, bad
 # f-strings) without imposing a formatting or import-order policy on existing
