@@ -120,9 +120,13 @@ matches the intended dot-product path.
 The `optimize` level selects the reduced-precision ICL cache storage on each
 backend:
 
-- `safe` keeps FP32 everywhere.
+- `safe` keeps FP32 everywhere: on the CPU, on the Apple GPU, and on NVIDIA
+  GPUs, where every product runs on the CUDA cores, without tensor cores or
+  TF32, and the ICL keys and values stay FP32.
 - `auto` stores ICL keys and values in FP16 on the Apple GPU and runs ICL
   attention in FP16 there, converting only the queries; the CPU stays FP32.
+  On NVIDIA GPUs it also stores them in FP16, and products run on tensor cores
+  in split FP16 parts, close to FP32.
 - `fast` does everything `auto` does, and on a BF16-capable CPU (`AVX512_BF16`)
   also stores the ICL values in BF16 with FP32 keys — the retained serving
   layout. Without `AVX512_BF16`, the CPU stays FP32.

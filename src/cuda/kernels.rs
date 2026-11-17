@@ -6,6 +6,9 @@
 //! cached training rows, in Ironicl's `[estimators x heads, N, 64]` cache
 //! layout. The attention kernels write a normalized partial output and its
 //! log-sum-exp per chunk of N; `icl_attention_merge` combines the chunks.
+//!
+//! Each tensor-core family (`_half`, `_split`) has an `_f32` counterpart on
+//! the CUDA cores for `optimize="safe"`, which never touches FP16.
 
 use cuda_host::cuda_module;
 
@@ -19,7 +22,8 @@ use cuda_host::cuda_module;
     clippy::similar_names, // Paired high and low parts: `w_hi`, `w_lo`.
     clippy::needless_range_loop, // `#[unroll]` loops over register-array indices.
     clippy::inline_always, // Device helpers inline into their kernels.
-    clippy::cast_ptr_alignment // Vector loads at offsets aligned by construction.
+    clippy::cast_ptr_alignment, // Vector loads at offsets aligned by construction.
+    clippy::items_after_statements // `#[launch_bounds]` expands ahead of a kernel's shared statics.
 )]
 pub(super) mod device {
     use cuda_device::async_copy::{cp_async_cg_16, cp_async_commit_group, cp_async_wait_group};
@@ -914,19 +918,22 @@ pub(super) mod device {
     }
 
     /// `QASSMax` and packing for ICL attention: for token `t = b * Q + q` and head
-    /// `j`, `q * base[j] * (1 + tanh(modulation)) * key_scale[b * 8 + j]` in FP16
-    /// at `[(b * 8 + j) * qp + q, 64]`; `key_scale` is the FP8 keys' scale per
-    /// dim, or ones.
+    /// `j`, `q * base[j] * (1 + tanh(modulation)) * key_scale[b * 8 + j]` at
+    /// `[(b * 8 + j) * qp + q, 64]`, in FP32 into `packed` (`format` 0) or in
+    /// FP16 into `packed_hi` (1); `key_scale` is the FP8 keys' scale per dim, or
+    /// ones.
     #[kernel]
     pub fn qass_pack(
         query: &[f32],
         modulation: &[f32],
         base: &[f32],
         key_scale: &[f32],
-        mut packed: DisjointSlice<u16>,
+        mut packed: DisjointSlice<f32>,
+        mut packed_hi: DisjointSlice<u16>,
         ensembles: u32,
         queries: u32,
         qp: u32,
+        format: u32,
     ) {
         let i = thread::index_1d().get();
         let q = queries as usize;
@@ -937,9 +944,13 @@ pub(super) mod device {
         let (b, row) = (token / q, token % q);
         let gate = 1.0 + modulation[(token * 8 + head) * 64 + d].tanh();
         let value = query[i] * base[head * 64 + d] * gate * key_scale[(b * 8 + head) * 64 + d];
+        let at = ((b * 8 + head) * qp as usize + row) * 64 + d;
         unsafe {
-            *packed.get_unchecked_mut(((b * 8 + head) * qp as usize + row) * 64 + d) =
-                (value as f16).to_bits();
+            if format == 0 {
+                *packed.get_unchecked_mut(at) = value;
+            } else {
+                *packed_hi.get_unchecked_mut(at) = (value as f16).to_bits();
+            }
         }
     }
 
@@ -1093,6 +1104,31 @@ pub(super) mod device {
         unsafe {
             *keys.get_unchecked_mut(to) = (kv[token * 1024 + head * 64 + d] as f16).to_bits();
             *values.get_unchecked_mut(to) = (kv[token * 1024 + 512 + head * 64 + d] as f16).to_bits();
+        }
+    }
+
+    /// [`icl_kv`] into FP32 caches, for `optimize="safe"`.
+    #[kernel]
+    pub fn icl_kv_f32(
+        kv: &[f32],
+        mut keys: DisjointSlice<f32>,
+        mut values: DisjointSlice<f32>,
+        ensembles: u32,
+        queries: u32,
+        start: u32,
+        np: u32,
+    ) {
+        let i = thread::index_1d().get();
+        let q = queries as usize;
+        if i >= ensembles as usize * q * 512 {
+            return;
+        }
+        let (d, head, token) = (i % 64, (i / 64) % 8, i / 512);
+        let (b, row) = (token / q, token % q);
+        let to = ((b * 8 + head) * np as usize + start as usize + row) * 64 + d;
+        unsafe {
+            *keys.get_unchecked_mut(to) = kv[token * 1024 + head * 64 + d];
+            *values.get_unchecked_mut(to) = kv[token * 1024 + 512 + head * 64 + d];
         }
     }
 
@@ -2716,5 +2752,658 @@ pub(super) mod device {
             (m, n, k),
             (ldx, ldy, ldr, mode),
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // FP32 on the CUDA cores, for `optimize="safe"`: the counterparts of the
+    // tensor-core block, attention, and ICL kernels, every product, sum, and
+    // softmax in FP32. Weights are FP32 `[n, k]` in row order.
+    // ---------------------------------------------------------------------------
+
+    /// `acc[i][j] += Σ_t a[(r0 + i) * lda + t] w[(c0 + j) * ldw + t]` over
+    /// `t < k` (a multiple of 4): four rows of a shared tile by four weight
+    /// rows, in 16-byte loads. Row starts are 16-byte aligned.
+    #[device]
+    fn product4x4(
+        (a, lda, r0): (*const f32, usize, usize),
+        (w, ldw, c0): (*const f32, usize, usize),
+        k: usize,
+        acc: &mut [[f32; 4]; 4],
+    ) {
+        let mut t = 0;
+        while t < k {
+            let mut av = [[0.0f32; 4]; 4];
+            let mut wv = [[0.0f32; 4]; 4];
+            #[unroll]
+            for i in 0..4 {
+                av[i] = unsafe { *a.add((r0 + i) * lda + t).cast::<F32x4>() }.0;
+                wv[i] = unsafe { *w.add((c0 + i) * ldw + t).cast::<F32x4>() }.0;
+            }
+            #[unroll]
+            for i in 0..4 {
+                #[unroll]
+                for j in 0..4 {
+                    #[unroll]
+                    for e in 0..4 {
+                        acc[i][j] += av[i][e] * wv[j][e];
+                    }
+                }
+            }
+            t += 4;
+        }
+    }
+
+    /// Rows `[row0, row0 + 32)` of `x[.., 128]` through `LayerNorm` (epsilon
+    /// 1e-5) into the FP32 tile `a` `[32, 128]`; rows from `m` on read as zeros.
+    /// Each of 8 warps normalizes four rows, four values per lane.
+    #[device]
+    fn load_normed_f32(xp: *const f32, gamma: &[f32], beta: &[f32], a: *mut f32, row0: usize, m: usize) {
+        let tid = thread::threadIdx_x() as usize;
+        let (warp_id, lane) = (tid / 32, tid % 32);
+        #[unroll]
+        for i in 0..4 {
+            let row = warp_id * 4 + i;
+            let col = lane * 4;
+            let v = if row0 + row < m {
+                unsafe { *xp.add((row0 + row) * 128 + col).cast::<F32x4>() }.0
+            } else {
+                [0.0; 4]
+            };
+            let y = normed4(v, gamma, beta, col);
+            unsafe { *a.add(row * 128 + col).cast::<F32x4>() = F32x4(y) };
+        }
+    }
+
+    /// One lane's four values `v` of a 128-wide row (columns `col..col + 4`;
+    /// the warp holds the row) through `LayerNorm`, epsilon 1e-5.
+    #[inline(always)]
+    fn normed4(v: [f32; 4], gamma: &[f32], beta: &[f32], col: usize) -> [f32; 4] {
+        let mean = warp::reduce_sum_f32(v[0] + v[1] + v[2] + v[3]) * (1.0 / 128.0);
+        let d = [v[0] - mean, v[1] - mean, v[2] - mean, v[3] - mean];
+        let variance =
+            warp::reduce_sum_f32(d[0] * d[0] + d[1] * d[1] + d[2] * d[2] + d[3] * d[3]) * (1.0 / 128.0);
+        let inverse = 1.0 / libm::sqrtf(variance + 1e-5);
+        [
+            d[0] * inverse * gamma[col] + beta[col],
+            d[1] * inverse * gamma[col + 1] + beta[col + 1],
+            d[2] * inverse * gamma[col + 2] + beta[col + 2],
+            d[3] * inverse * gamma[col + 3] + beta[col + 3],
+        ]
+    }
+
+    /// [`block_head_body`] in FP32: `out = norm1(x) Wᵀ + b` for `n` (128 or
+    /// 384) outputs, then `RoPE` on the first 256 by each row's position
+    /// `row % len` when `len` is not zero. Thread `(warp, lane)` computes rows
+    /// `4 warp..` by columns `4 lane..` of each 128-column pass; a head's dims
+    /// `d` and `d + 8` sit two lanes apart.
+    /// Grid: ceil(m / 32); block: 256 threads.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    pub fn block_head_f32(
+        x: &[f32],
+        gamma: &[f32],
+        beta: &[f32],
+        w: &[f32],
+        bias: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        mut out: DisjointSlice<f32>,
+        m: u32,
+        n: u32,
+        len: u32,
+    ) {
+        static mut AS: SharedArray<f32, { 32 * 128 }, 16> = SharedArray::UNINIT;
+        let a = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(AS)) };
+        let tid = thread::threadIdx_x() as usize;
+        let (r0, lane) = ((tid / 32) * 4, tid % 32);
+        let (m, n, len) = (m as usize, n as usize, len as usize);
+        let row0 = thread::blockIdx_x() as usize * 32;
+        load_normed_f32(x.as_ptr(), gamma, beta, a, row0, m);
+        thread::sync_threads();
+        let mut pass = 0;
+        while pass < n / 128 {
+            let c0 = pass * 128 + lane * 4;
+            let mut acc = [[0.0f32; 4]; 4];
+            product4x4((a.cast_const(), 128, r0), (w.as_ptr(), 128, c0), 128, &mut acc);
+            #[unroll]
+            for i in 0..4 {
+                #[unroll]
+                for j in 0..4 {
+                    acc[i][j] += bias[c0 + j];
+                }
+            }
+            if len != 0 && pass < 2 {
+                // With the tables holding [-sin, sin], both halves of a head
+                // take `x cos + partner sin`.
+                #[unroll]
+                for i in 0..4 {
+                    let t = (row0 + r0 + i) % len;
+                    #[unroll]
+                    for j in 0..4 {
+                        let partner = warp::shuffle_xor_f32(acc[i][j], 2);
+                        let d = (c0 + j) % 16;
+                        acc[i][j] = acc[i][j] * cos[t * 16 + d] + partner * sin[t * 16 + d];
+                    }
+                }
+            }
+            #[unroll]
+            for i in 0..4 {
+                let row = row0 + r0 + i;
+                if row < m {
+                    #[unroll]
+                    for j in 0..4 {
+                        unsafe { *out.get_unchecked_mut(row * n + c0 + j) = acc[i][j] };
+                    }
+                }
+            }
+            pass += 1;
+        }
+    }
+
+    /// [`block_tail_core`] in FP32, once the attention output of rows `[row0,
+    /// row0 + 32)` is in `a` `[32, 128]`; rows from `m` on are not written.
+    /// `h` `[32, 256]` is scratch. Warp `w` owns rows `4w..4w + 4` throughout,
+    /// lane `l` columns `4l..4l + 4` of each 128-column pass, so `mid` stays
+    /// in registers and `norm2` reduces within the warp.
+    #[device]
+    fn block_tail_core_f32(
+        a: *mut f32,
+        h: *mut f32,
+        state: &mut DisjointSlice<f32>,
+        (row0, m): (usize, usize),
+        (wo, bo): (&[f32], &[f32]),
+        (gamma, beta): (&[f32], &[f32]),
+        (w1, b1): (&[f32], &[f32]),
+        (w2, b2): (&[f32], &[f32]),
+    ) {
+        let tid = thread::threadIdx_x() as usize;
+        let (r0, c0) = ((tid / 32) * 4, (tid % 32) * 4);
+        // mid = state + attended Woᵀ + bo.
+        let mut mid = [[0.0f32; 4]; 4];
+        product4x4((a.cast_const(), 128, r0), (wo.as_ptr(), 128, c0), 128, &mut mid);
+        #[unroll]
+        for i in 0..4 {
+            let row = row0 + r0 + i;
+            #[unroll]
+            for j in 0..4 {
+                let residual = if row < m {
+                    unsafe { *state.get_unchecked_mut(row * 128 + c0 + j) }
+                } else {
+                    0.0
+                };
+                mid[i][j] += bo[c0 + j] + residual;
+            }
+        }
+        // norm2(mid) replaces the attention output in A.
+        thread::sync_threads();
+        #[unroll]
+        for i in 0..4 {
+            let y = normed4(mid[i], gamma, beta, c0);
+            unsafe { *a.add((r0 + i) * 128 + c0).cast::<F32x4>() = F32x4(y) };
+        }
+        thread::sync_threads();
+        // gelu(norm2(mid) W1ᵀ + b1) into H, two 128-column passes.
+        #[unroll]
+        for pass in 0..2 {
+            let c = pass * 128 + c0;
+            let mut acc = [[0.0f32; 4]; 4];
+            product4x4((a.cast_const(), 128, r0), (w1.as_ptr(), 128, c), 128, &mut acc);
+            #[unroll]
+            for i in 0..4 {
+                let y = [
+                    gelu(acc[i][0] + b1[c]),
+                    gelu(acc[i][1] + b1[c + 1]),
+                    gelu(acc[i][2] + b1[c + 2]),
+                    gelu(acc[i][3] + b1[c + 3]),
+                ];
+                unsafe { *h.add((r0 + i) * 256 + c).cast::<F32x4>() = F32x4(y) };
+            }
+        }
+        thread::sync_threads();
+        // state = mid + H W2ᵀ + b2.
+        let mut out = [[0.0f32; 4]; 4];
+        product4x4((h.cast_const(), 256, r0), (w2.as_ptr(), 256, c0), 256, &mut out);
+        #[unroll]
+        for i in 0..4 {
+            let row = row0 + r0 + i;
+            if row < m {
+                #[unroll]
+                for j in 0..4 {
+                    unsafe {
+                        *state.get_unchecked_mut(row * 128 + c0 + j) = mid[i][j] + out[i][j] + b2[c0 + j];
+                    }
+                }
+            }
+        }
+    }
+
+    /// [`block_tail_body`] in FP32 (see [`block_tail_core_f32`]).
+    /// Grid: ceil(m / 32); block: 256 threads.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    pub fn block_tail_f32(
+        attended: &[f32],
+        mut state: DisjointSlice<f32>,
+        wo: &[f32],
+        bo: &[f32],
+        gamma: &[f32],
+        beta: &[f32],
+        w1: &[f32],
+        b1: &[f32],
+        w2: &[f32],
+        b2: &[f32],
+        m: u32,
+    ) {
+        static mut AS: SharedArray<f32, { 32 * 128 }, 16> = SharedArray::UNINIT;
+        static mut HS: SharedArray<f32, { 32 * 256 }, 16> = SharedArray::UNINIT;
+        let a = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(AS)) };
+        let h = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(HS)) };
+        let tid = thread::threadIdx_x() as usize;
+        let m = m as usize;
+        let row0 = thread::blockIdx_x() as usize * 32;
+        let ap = attended.as_ptr();
+        #[unroll]
+        for i in 0..4 {
+            let index = tid + i * 256;
+            let (row, col) = (index / 32, (index % 32) * 4);
+            let v = if row0 + row < m {
+                unsafe { *ap.add((row0 + row) * 128 + col).cast::<F32x4>() }
+            } else {
+                F32x4::splat(0.0)
+            };
+            unsafe { *a.add(row * 128 + col).cast::<F32x4>() = v };
+        }
+        thread::sync_threads();
+        block_tail_core_f32(
+            a,
+            h,
+            &mut state,
+            (row0, m),
+            (wo, bo),
+            (gamma, beta),
+            (w1, b1),
+            (w2, b2),
+        );
+    }
+
+    /// [`column_block_body`] in FP32: `norm1`, the query projection (the first
+    /// 128 rows of the in-projection), attention of each 16-wide head to the
+    /// column's 128 cached inducing points, then [`block_tail_core_f32`], in
+    /// place on `state` `[B * H, q, 128]`. Thread `t` attends for row `t / 8`
+    /// and head `t % 8`.
+    /// Grid: (ceil(q / 32), B * H); block: 256 threads.
+    #[kernel]
+    #[launch_bounds(256, 2)]
+    pub fn column_block_f32(
+        mut state: DisjointSlice<f32>,
+        gamma1: &[f32],
+        beta1: &[f32],
+        wq: &[f32],
+        bq: &[f32],
+        keys: &[f32],
+        values: &[f32],
+        wo: &[f32],
+        bo: &[f32],
+        gamma2: &[f32],
+        beta2: &[f32],
+        w1: &[f32],
+        b1: &[f32],
+        w2: &[f32],
+        b2: &[f32],
+        features: u32,
+        queries: u32,
+        reserved: u32,
+    ) {
+        static mut AS: SharedArray<f32, { 32 * 128 }, 16> = SharedArray::UNINIT;
+        static mut HS: SharedArray<f32, { 32 * 256 }, 16> = SharedArray::UNINIT;
+        let a = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(AS)) };
+        let h = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(HS)) };
+        let tid = thread::threadIdx_x() as usize;
+        let (r0, c0) = ((tid / 32) * 4, (tid % 32) * 4);
+        let (features, q) = (features as usize, queries as usize);
+        let column = thread::blockIdx_y() as usize;
+        let tile = thread::blockIdx_x() as usize * 32;
+        let row0 = column * q + tile;
+        let m = row0 + if q - tile < 32 { q - tile } else { 32 };
+
+        // norm1 into A, then Q = A Wqᵀ + bq into the first 128 columns of H.
+        load_normed_f32(state.as_mut_ptr(), gamma1, beta1, a, row0, m);
+        thread::sync_threads();
+        let mut acc = [[0.0f32; 4]; 4];
+        product4x4((a.cast_const(), 128, r0), (wq.as_ptr(), 128, c0), 128, &mut acc);
+        #[unroll]
+        for i in 0..4 {
+            let y = [
+                acc[i][0] + bq[c0],
+                acc[i][1] + bq[c0 + 1],
+                acc[i][2] + bq[c0 + 2],
+                acc[i][3] + bq[c0 + 3],
+            ];
+            unsafe { *h.add((r0 + i) * 256 + c0).cast::<F32x4>() = F32x4(y) };
+        }
+        thread::sync_threads();
+
+        // Attention to the column's cache stream `f + reserved` of estimator `e`.
+        let (row, head) = (tid / 8, tid % 8);
+        let (e, f) = (column / features, column % features);
+        let kv0 =
+            (e * (features + reserved as usize) + f + reserved as usize) * (8 * 128 * 16) + head * 128 * 16;
+        let mut query = [0.0f32; 16];
+        #[unroll]
+        for c in 0..4 {
+            let v = unsafe { *h.add(row * 256 + head * 16 + c * 4).cast::<F32x4>() }.0;
+            #[unroll]
+            for t in 0..4 {
+                query[c * 4 + t] = v[t];
+            }
+        }
+        let mut out = [0.0f32; 16];
+        attend16_f32(
+            &query,
+            (
+                keys.as_ptr().wrapping_add(kv0),
+                values.as_ptr().wrapping_add(kv0),
+                16,
+            ),
+            (0, 128),
+            &mut out,
+        );
+        // The attention output replaces the normalized rows in A.
+        #[unroll]
+        for c in 0..4 {
+            let y = [out[c * 4], out[c * 4 + 1], out[c * 4 + 2], out[c * 4 + 3]];
+            unsafe { *a.add(row * 128 + head * 16 + c * 4).cast::<F32x4>() = F32x4(y) };
+        }
+        thread::sync_threads();
+        block_tail_core_f32(
+            a,
+            h,
+            &mut state,
+            (row0, m),
+            (wo, bo),
+            (gamma2, beta2),
+            (w1, b1),
+            (w2, b2),
+        );
+    }
+
+    /// Softmax attention of one 16-wide `query` to keys `[from, to)` at `kp`
+    /// and `vp` (`stride` values apart, 16-byte aligned), with scale 1 / 4 in
+    /// the exp2 domain and an online softmax key by key: the normalized output
+    /// into `acc`, which starts at zero.
+    #[device]
+    fn attend16_f32(
+        query: &[f32; 16],
+        (kp, vp, stride): (*const f32, *const f32, usize),
+        (from, to): (usize, usize),
+        acc: &mut [f32; 16],
+    ) {
+        let scale_log2 = 0.25 * core::f32::consts::LOG2_E; // 1 / sqrt(16)
+        let (mut max, mut total) = (f32::NEG_INFINITY, 0.0f32);
+        let mut key = from;
+        while key < to {
+            let mut dot = 0.0f32;
+            #[unroll]
+            for c in 0..4 {
+                let k = unsafe { *kp.add(key * stride + c * 4).cast::<F32x4>() }.0;
+                #[unroll]
+                for e in 0..4 {
+                    dot += query[c * 4 + e] * k[e];
+                }
+            }
+            let score = dot * scale_log2;
+            if score > max {
+                let alpha = (max - score).exp2();
+                total *= alpha;
+                #[unroll]
+                for d in 0..16 {
+                    acc[d] *= alpha;
+                }
+                max = score;
+            }
+            let p = (score - max).exp2();
+            total += p;
+            #[unroll]
+            for c in 0..4 {
+                let v = unsafe { *vp.add(key * stride + c * 4).cast::<F32x4>() }.0;
+                #[unroll]
+                for e in 0..4 {
+                    acc[c * 4 + e] += p * v[e];
+                }
+            }
+            key += 1;
+        }
+        #[unroll]
+        for d in 0..16 {
+            acc[d] /= total;
+        }
+    }
+
+    /// The largest of `x` over the 16 lanes of a half warp.
+    #[inline(always)]
+    fn max16(x: f32) -> f32 {
+        let x = x.max(warp::shuffle_xor_f32(x, 1));
+        let x = x.max(warp::shuffle_xor_f32(x, 2));
+        let x = x.max(warp::shuffle_xor_f32(x, 4));
+        x.max(warp::shuffle_xor_f32(x, 8))
+    }
+
+    /// The sum of `x` over the 16 lanes of a half warp.
+    #[inline(always)]
+    fn sum16(x: f32) -> f32 {
+        let x = x + warp::shuffle_xor_f32(x, 1);
+        let x = x + warp::shuffle_xor_f32(x, 2);
+        let x = x + warp::shuffle_xor_f32(x, 4);
+        x + warp::shuffle_xor_f32(x, 8)
+    }
+
+    /// [`attention16_tc_body`] in FP32, with its layout: one thread per query
+    /// of a (sequence, head), each query against every key in turn.
+    /// Grid: (ceil(lq / 64), 8, sequences); block: 64 threads.
+    #[kernel]
+    pub fn attention16_f32(
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        mut out: DisjointSlice<f32>,
+        lq: u32,
+        lk: u32,
+        inner: u32,
+        q_seq: u32,
+        q_tok: u32,
+        k_base: u32,
+        v_base: u32,
+        kv_outer: u32,
+        kv_inner: u32,
+        kv_tok: u32,
+        kv_head: u32,
+        o_seq: u32,
+        o_tok: u32,
+    ) {
+        let query_row = thread::blockIdx_x() as usize * 64 + thread::threadIdx_x() as usize;
+        let head = thread::blockIdx_y() as usize;
+        let seq = thread::blockIdx_z() as usize;
+        let inner = inner as usize;
+        if query_row >= lq as usize {
+            return;
+        }
+        let kv0 =
+            (seq / inner) * kv_outer as usize + (seq % inner) * kv_inner as usize + head * kv_head as usize;
+        let mut query = [0.0f32; 16];
+        let at = seq * q_seq as usize + query_row * q_tok as usize + head * 16;
+        #[unroll]
+        for d in 0..16 {
+            query[d] = q[at + d];
+        }
+        let (kp, vp) = (
+            k.as_ptr().wrapping_add(k_base as usize + kv0),
+            v.as_ptr().wrapping_add(v_base as usize + kv0),
+        );
+        let mut result = [0.0f32; 16];
+        attend16_f32(&query, (kp, vp, kv_tok as usize), (0, lk as usize), &mut result);
+        let at = seq * o_seq as usize + query_row * o_tok as usize + head * 16;
+        #[unroll]
+        for d in 0..16 {
+            unsafe { *out.get_unchecked_mut(at + d) = result[d] };
+        }
+    }
+
+    /// Partial ICL attention in FP32 on the CUDA cores over FP32 keys and
+    /// values (bytes of `[pairs, np, 64]`), with [`fast_body`]'s split of the
+    /// keys into chunks and its outputs: 32 queries per block, keys in 32-key
+    /// steps through shared memory. Thread `(y, x)` = `(t / 16, t % 16)`
+    /// scores rows `y + 8i` against keys `x + 16j` and accumulates dims
+    /// `4x..4x + 4` of the same rows.
+    /// Grid: (ceil(qp / 32), pairs * splits); block: 128 threads.
+    #[kernel]
+    #[launch_bounds(128)]
+    pub fn icl_attention_f32(
+        q: &[f32],
+        k: &[u8],
+        v: &[u8],
+        mut part: DisjointSlice<f32>,
+        mut lse: DisjointSlice<f32>,
+        qp: u32,
+        np: u32,
+        n_valid: u32,
+        chunk_tiles: u32,
+        splits: u32,
+        scale_log2: f32,
+    ) {
+        // Q and K rows padded to 68 values, so that rows four apart and keys
+        // one apart start in different banks.
+        static mut QS: SharedArray<f32, { 32 * 68 }, 16> = SharedArray::UNINIT;
+        static mut KS: SharedArray<f32, { 32 * 68 }, 16> = SharedArray::UNINIT;
+        static mut VS: SharedArray<f32, { 32 * 64 }, 16> = SharedArray::UNINIT;
+        static mut PS: SharedArray<f32, { 32 * 33 }, 16> = SharedArray::UNINIT;
+        let qs = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(QS)) };
+        let ks = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(KS)) };
+        let vs = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(VS)) };
+        let ps = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(PS)) };
+        let tid = thread::threadIdx_x() as usize;
+        let (ty, tx) = (tid / 16, tid % 16);
+        let block = thread::blockIdx_y() as usize;
+        let (bh, chunk) = (block / splits as usize, block % splits as usize);
+        let q0 = thread::blockIdx_x() as usize * 32;
+        let (qp, np) = (qp as usize, np as usize);
+        let first_tile = chunk * chunk_tiles as usize;
+        let (kp, vp) = (k.as_ptr().cast::<f32>(), v.as_ptr().cast::<f32>());
+
+        // The block's 32 query rows; rows from qp on are zeros.
+        #[unroll]
+        for i in 0..4 {
+            let index = tid + i * 128;
+            let (row, c) = (index / 16, (index % 16) * 4);
+            let value = if q0 + row < qp {
+                unsafe { *q.as_ptr().add((bh * qp + q0 + row) * 64 + c).cast::<F32x4>() }
+            } else {
+                F32x4::splat(0.0)
+            };
+            unsafe { *qs.add(row * 68 + c).cast::<F32x4>() = value };
+        }
+
+        let mut acc = [[0.0f32; 4]; 4];
+        let mut max = [f32::NEG_INFINITY; 4];
+        let mut total = [0.0f32; 4];
+        // The cache holds np / 64 tiles, so the last chunk can be shorter.
+        let tiles = (chunk_tiles as usize).min(np / 64 - first_tile);
+        for step in 0..2 * tiles {
+            let key0 = first_tile * 64 + step * 32;
+            // The previous step is done reading K, V, and P.
+            thread::sync_threads();
+            #[unroll]
+            for i in 0..4 {
+                let index = tid + i * 128;
+                let (key, c) = (index / 16, (index % 16) * 4);
+                let at = (bh * np + key0 + key) * 64 + c;
+                unsafe {
+                    *ks.add(key * 68 + c).cast::<F32x4>() = *kp.add(at).cast::<F32x4>();
+                    *vs.add(key * 64 + c).cast::<F32x4>() = *vp.add(at).cast::<F32x4>();
+                }
+            }
+            thread::sync_threads();
+
+            // Scores, masked past N, in the exp2 domain.
+            let mut s = [[0.0f32; 2]; 4];
+            let mut c = 0;
+            while c < 64 {
+                let mut qv = [[0.0f32; 4]; 4];
+                #[unroll]
+                for i in 0..4 {
+                    qv[i] = unsafe { *qs.add((ty + 8 * i) * 68 + c).cast::<F32x4>() }.0;
+                }
+                #[unroll]
+                for j in 0..2 {
+                    let kv = unsafe { *ks.add((tx + 16 * j) * 68 + c).cast::<F32x4>() }.0;
+                    #[unroll]
+                    for i in 0..4 {
+                        #[unroll]
+                        for e in 0..4 {
+                            s[i][j] += qv[i][e] * kv[e];
+                        }
+                    }
+                }
+                c += 4;
+            }
+            #[unroll]
+            for i in 0..4 {
+                #[unroll]
+                for j in 0..2 {
+                    let valid = key0 + tx + 16 * j < n_valid as usize;
+                    s[i][j] = if valid {
+                        s[i][j] * scale_log2
+                    } else {
+                        f32::NEG_INFINITY
+                    };
+                }
+                // Online softmax over the 16 lanes sharing the row.
+                let new = max[i].max(max16(s[i][0].max(s[i][1])));
+                // A row with no valid key yet keeps zero weight instead of NaN.
+                let base = if new == f32::NEG_INFINITY { 0.0 } else { new };
+                let alpha = (max[i] - base).exp2();
+                let (p0, p1) = ((s[i][0] - base).exp2(), (s[i][1] - base).exp2());
+                total[i] = total[i] * alpha + sum16(p0 + p1);
+                max[i] = new;
+                #[unroll]
+                for e in 0..4 {
+                    acc[i][e] *= alpha;
+                }
+                unsafe {
+                    *ps.add((ty + 8 * i) * 33 + tx) = p0;
+                    *ps.add((ty + 8 * i) * 33 + tx + 16) = p1;
+                }
+            }
+            thread::sync_threads();
+
+            // O += P V.
+            for key in 0..32 {
+                let value = unsafe { *vs.add(key * 64 + tx * 4).cast::<F32x4>() }.0;
+                #[unroll]
+                for i in 0..4 {
+                    let p = unsafe { *ps.add((ty + 8 * i) * 33 + key) };
+                    #[unroll]
+                    for e in 0..4 {
+                        acc[i][e] += p * value[e];
+                    }
+                }
+            }
+        }
+
+        let out_row = (bh * splits as usize + chunk) * qp + q0;
+        #[unroll]
+        for i in 0..4 {
+            let row = ty + 8 * i;
+            if q0 + row < qp {
+                #[unroll]
+                for e in 0..4 {
+                    unsafe {
+                        *part.get_unchecked_mut((out_row + row) * 64 + tx * 4 + e) = acc[i][e] / total[i];
+                    }
+                }
+                if tx == 0 {
+                    unsafe { *lse.get_unchecked_mut(out_row + row) = max[i] + total[i].log2() };
+                }
+            }
+        }
     }
 }

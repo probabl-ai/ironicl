@@ -45,7 +45,7 @@ parameter names and defaults. A live parity test checks this.
 
 `TabICLClassifier` takes one parameter TabICL does not have, after all of
 TabICL's: `optimize`. It sets how far Ironicl may trade exactness for speed on
-Apple Silicon GPUs:
+Apple Silicon and NVIDIA GPUs:
 
 | `optimize` | Precision | Accuracy against `"safe"` |
 |---|---|---|
@@ -55,7 +55,9 @@ Apple Silicon GPUs:
 
 `None`, the default, reads the `IRONICL_OPTIMIZE` environment variable and
 falls back to `"safe"`. An explicit argument wins over the variable. Without a
-Metal GPU, every level behaves like `"safe"`. On an M1 Max, `"auto"` made
+Metal or CUDA GPU, every level behaves like `"safe"`. Every level runs on the
+GPU when there is one; on an NVIDIA GPU, `"safe"` runs in FP32 on the CUDA
+cores, without tensor cores or TF32. On an M1 Max, `"auto"` made
 7071x22 fitting 16% faster, batch prediction 14% faster, and single-row
 prediction 25% faster, with a maximum probability error of `4.9e-4` across 12
 datasets.

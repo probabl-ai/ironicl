@@ -54,8 +54,19 @@ impl Device {
                     half::f16::from_f32(half::f16::from_bits(query).to_f32() * scale).to_bits();
             }
         }
-        let queries = self.upload(&packed)?;
-        let (_, splits) = self.icl_split(pairs, padded, rows);
+        // FP32 queries hold the FP16 ones exactly; the scales are ones.
+        let queries16 = self.upload(&packed)?;
+        let widened: Vec<f32> = packed
+            .iter()
+            .map(|&bits| half::f16::from_bits(bits).to_f32())
+            .collect();
+        let queries32 = self.upload(&widened)?;
+        let queries = if precision == Precision::Fp32 {
+            Activation::F32(&queries32)
+        } else {
+            Activation::Half(&queries16)
+        };
+        let (_, splits) = self.icl_split(precision, pairs, padded, rows);
         let zeroed = |len: usize| self.zeroed::<f32>(len).map_err(gpu_error);
         let (mut part, mut lse, mut out) = (
             zeroed(pairs * splits * padded * HEAD_DIM)?,
@@ -64,7 +75,7 @@ impl Device {
         );
         self.attend_icl(
             precision,
-            &queries,
+            queries,
             (&block.cache.keys, &block.cache.values),
             (&mut part, &mut lse, &mut out),
             (pairs, padded, rows),
@@ -82,8 +93,8 @@ impl Device {
         Ok(result)
     }
 
-    /// Two products chained on tensor cores at `precision`, as a predictor
-    /// runs them: `first = gelu(input w1ᵀ + b1)`, written in FP32 and as the
+    /// Two products chained at `precision`, as a predictor runs them: `first
+    /// = gelu(input w1ᵀ + b1)`, written in FP32 and, on tensor cores, as the
     /// next product's operand, then `second = first w2ᵀ + b2`, plus `first`
     /// when `w2` is square. `input` is `[rows, depth]`, encoded on the host as a
     /// producer would, `w1` `[width, depth]`, `w2` `[width2, width]`. Returns
@@ -114,6 +125,33 @@ impl Device {
             ));
         }
         let (layer1, layer2) = (Dense::upload(self, w1, b1)?, Dense::upload(self, w2, b2)?);
+        if precision == Precision::Fp32 {
+            let input = self.upload(input)?;
+            let zeroed = |len: usize| self.zeroed::<f32>(len).map_err(gpu_error);
+            let (mut first, mut second) = (zeroed(rows * width)?, zeroed(rows * width2)?);
+            // Room for the split-K partial sums, as a workspace reserves it.
+            let mut partial = zeroed(4 * self.multiprocessors() * 64 * 64)?;
+            self.product(
+                Activation::F32(&input),
+                &layer1,
+                None,
+                (Some(&mut first), None),
+                &mut partial,
+                (rows, width, depth),
+                true,
+            )?;
+            let residual = (width2 == width).then_some(&first);
+            self.product(
+                Activation::F32(&first),
+                &layer2,
+                residual,
+                (Some(&mut second), None),
+                &mut partial,
+                (rows, width2, width),
+                false,
+            )?;
+            return Ok((self.download(&first)?, self.download(&second)?));
+        }
         let high: Vec<u16> = input.iter().map(|&v| half::f16::from_f32(v).to_bits()).collect();
         let low: Vec<u16> = input
             .iter()
@@ -128,7 +166,7 @@ impl Device {
         let mut partial = zeroed32(0)?;
         let (input, next) = match precision {
             Precision::Half => (Activation::Half(&input_hi), Output::Half(&mut next_hi)),
-            Precision::Split => (
+            Precision::Split | Precision::Fp32 => (
                 Activation::Split {
                     hi: &input_hi,
                     lo: &input_lo,
@@ -150,7 +188,7 @@ impl Device {
         )?;
         let next = match precision {
             Precision::Half => Activation::Half(&next_hi),
-            Precision::Split => Activation::Split {
+            Precision::Split | Precision::Fp32 => Activation::Split {
                 hi: &next_hi,
                 lo: &next_lo,
             },

@@ -1,9 +1,15 @@
 """CUDA builds and predictions: the context built on the GPU, the ICL cache
 streamed from host memory, and rows only the CPU path predicts. Skipped
-without a CUDA GPU."""
+without a CUDA GPU. Every level runs on the GPU, ``safe`` in FP32, so the
+CPU's results come from a process with ``IRONICL_NO_CUDA`` set."""
 
+import os
 import pickle
+import subprocess
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -18,6 +24,27 @@ def classification(rows):
     return x, (x[:, 0] + 0.5 * x[:, 1] > 0).astype(int)
 
 
+CPU_PROBA = """
+import sys
+import numpy as np
+from ironicl import TabICLClassifier
+data = np.load(sys.argv[1])
+model = TabICLClassifier(optimize="safe", cache_dir=False).fit(data["x_train"], data["y_train"])
+assert model.context_.device == "cpu", model.context_.device
+np.save(sys.argv[2], model.predict_proba(data["x_test"]))
+"""
+
+
+def cpu_proba(x_train, y_train, x_test):
+    """``optimize="safe"`` probabilities from the CPU, in a process without CUDA."""
+    with tempfile.TemporaryDirectory() as directory:
+        data, out = Path(directory) / "data.npz", Path(directory) / "proba.npy"
+        np.savez(data, x_train=x_train, y_train=y_train, x_test=x_test)
+        env = {**os.environ, "IRONICL_NO_CUDA": "1"}
+        subprocess.run([sys.executable, "-c", CPU_PROBA, data, out], env=env, check=True)
+        return np.load(out)
+
+
 class CudaTest(unittest.TestCase):
     def setUp(self):
         checkpoint(TabICLClassifier)
@@ -30,9 +57,14 @@ class CudaTest(unittest.TestCase):
             self.skipTest("no CUDA GPU")
         return model
 
-    def test_a_gpu_built_context_predicts_like_a_cpu_built_one(self):
-        expected = TabICLClassifier(optimize="safe", cache_dir=False).fit(self.x[:2000], self.y[:2000])
-        expected = expected.predict_proba(self.x[2000:])
+    def test_safe_runs_on_the_gpu_like_the_cpu(self):
+        model = self.fit(optimize="safe")
+        self.assertEqual(model.context_.device, "cuda")
+        expected = cpu_proba(self.x[:2000], self.y[:2000], self.x[2000:])
+        np.testing.assert_allclose(model.predict_proba(self.x[2000:]), expected, atol=1e-4)
+
+    def test_auto_predicts_like_safe(self):
+        expected = self.fit(optimize="safe").predict_proba(self.x[2000:])
         actual = self.fit().predict_proba(self.x[2000:])
         np.testing.assert_allclose(actual, expected, atol=1e-3)
 
@@ -64,7 +96,7 @@ class CudaTest(unittest.TestCase):
 
         np.testing.assert_allclose(proba(gpu), proba(cpu), atol=1e-3)
 
-    def test_a_gpu_built_regressor_predicts_like_a_cpu_built_one(self):
+    def test_an_auto_regressor_predicts_like_a_safe_one(self):
         checkpoint(TabICLRegressor)
         target = self.x[:, 0] + 0.5 * self.x[:, 1]
         cpu, gpu = (
@@ -78,7 +110,7 @@ class CudaTest(unittest.TestCase):
     def test_a_kept_cache_predicts_like_an_uploaded_one(self):
         # The build leaves the cache on the device, encoded there; a pickled
         # copy uploads the cache the build wrote to the host, encoded there.
-        for optimize in ("auto", "fast"):
+        for optimize in ("safe", "auto", "fast"):
             with self.subTest(optimize=optimize):
                 model = self.fit(optimize=optimize)
                 copy = pickle.loads(pickle.dumps(model))
@@ -89,11 +121,15 @@ class CudaTest(unittest.TestCase):
 
     def test_a_streamed_cache_predicts_like_a_resident_one(self):
         # The 2,000-row cache takes about 400 MB on the device in FP16, one
-        # block of it 34 MB, and half that in FP8: these limits leave room to
-        # stream it but not to keep it. The same context loads under each.
-        # Shorter runs change which products run in which precision, which
-        # moves `fast` by up to its own error.
-        cases = (("auto", ("350M", "450M", "550M"), 1e-3), ("fast", ("300M", "350M", "400M"), 3e-2))
+        # block of it 34 MB, twice that in FP32 and half in FP8: these limits
+        # leave room to stream it but not to keep it. The same context loads
+        # under each. Shorter runs change which products run in which
+        # precision, which moves `fast` by up to its own error.
+        cases = (
+            ("safe", ("700M", "850M", "1000M"), 1e-5),
+            ("auto", ("350M", "450M", "550M"), 1e-3),
+            ("fast", ("300M", "350M", "400M"), 3e-2),
+        )
         for optimize, limits, tolerance in cases:
             with self.subTest(optimize=optimize):
                 resident = self.fit(optimize=optimize)
