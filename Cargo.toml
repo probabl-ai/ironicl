@@ -120,3 +120,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ["cfg(ironicl_sm89)"] }
 [lints.clippy]
 all = "warn"
 pedantic = "warn"
+
+# One codegen unit and fat LTO let the kernels inline into their callers: about
+# 7% faster CPU fit and predict (M1 Max), for a slower release build.
+[profile.release]
+lto = "fat"
+codegen-units = 1
