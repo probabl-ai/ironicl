@@ -600,7 +600,7 @@ fn decode_sha256(value: &str) -> Result<[u8; 32]> {
         return Err(Error::Checkpoint("source SHA-256 has an invalid length".into()));
     }
     let mut digest = [0_u8; 32];
-    for (output, pair) in digest.iter_mut().zip(value.as_bytes().chunks_exact(2)) {
+    for (output, pair) in digest.iter_mut().zip(value.as_bytes().as_chunks::<2>().0) {
         let high = decode_hex(pair[0])?;
         let low = decode_hex(pair[1])?;
         *output = (high << 4) | low;

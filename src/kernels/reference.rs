@@ -145,7 +145,12 @@ pub(crate) fn affine_input3_transposed_f32(
     if super::native::affine_input3_transposed_f32(input, rows, weight, bias, output_dim, output) {
         return Ok(());
     }
-    for (input, output) in input.chunks_exact(3).zip(output.chunks_exact_mut(output_dim)) {
+    for (input, output) in input
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(output.chunks_exact_mut(output_dim))
+    {
         for channel in 0..output_dim {
             let value = weight[channel].mul_add(input[0], bias[channel]);
             let value = weight[output_dim + channel].mul_add(input[1], value);

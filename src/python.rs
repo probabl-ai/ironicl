@@ -164,38 +164,43 @@ impl Model {
         self.0.source_sha256().to_owned()
     }
 
-    /// Load a persisted static context for this model from `path`. `threads` and
-    /// the memory limits mean what they mean for `build_context`.
-    #[pyo3(signature = (path, threads, memory_limit=None, device_memory_limit=None))]
+    /// Load a persisted static context for this model from `path`. `optimize`,
+    /// `threads`, and the memory limits mean what they mean for
+    /// `build_context`; `optimize` should be the level the context was built at.
+    #[pyo3(signature = (path, optimize, threads, memory_limit=None, device_memory_limit=None))]
     fn load_context(
         &self,
         py: Python<'_>,
         path: PathBuf,
+        optimize: &str,
         threads: Option<usize>,
         memory_limit: Option<String>,
         device_memory_limit: Option<String>,
     ) -> PyResult<Context> {
         let limits = MemoryLimits::resolve(memory_limit.as_deref(), device_memory_limit.as_deref())
             .map_err(py_error)?;
-        py.detach(|| self.0.load_context(&path, threads, limits))
+        let optimize = optimize.parse::<Optimize>().map_err(py_error)?;
+        py.detach(|| self.0.load_context(&path, optimize, threads, limits))
             .map(Context)
             .map_err(py_error)
     }
 
     /// Load a context from the bytes `Context.to_bytes` returned, as
     /// `load_context` does from a file.
-    #[pyo3(signature = (data, threads, memory_limit=None, device_memory_limit=None))]
+    #[pyo3(signature = (data, optimize, threads, memory_limit=None, device_memory_limit=None))]
     fn context_from_bytes(
         &self,
         py: Python<'_>,
         data: &[u8],
+        optimize: &str,
         threads: Option<usize>,
         memory_limit: Option<String>,
         device_memory_limit: Option<String>,
     ) -> PyResult<Context> {
         let limits = MemoryLimits::resolve(memory_limit.as_deref(), device_memory_limit.as_deref())
             .map_err(py_error)?;
-        py.detach(|| self.0.load_context_bytes(data, threads, limits))
+        let optimize = optimize.parse::<Optimize>().map_err(py_error)?;
+        py.detach(|| self.0.load_context_bytes(data, optimize, threads, limits))
             .map(Context)
             .map_err(py_error)
     }
@@ -267,6 +272,22 @@ impl Context {
             .into_iter()
             .map(|(values, columns)| (PyBytes::new(py, bytemuck::cast_slice(&values)), [rows, columns]))
             .collect())
+    }
+
+    /// Where predictions run: `"cuda"` with the ICL cache on the GPU,
+    /// `"cuda-streamed"` with it streamed from host memory on every pass, or
+    /// `"cpu"` (Metal included).
+    #[getter]
+    fn device(&self) -> &'static str {
+        self.0.device()
+    }
+
+    /// Query rows a prediction call should bring at once: one pass's when the
+    /// ICL cache streams, so each copy of it serves as many rows as fit,
+    /// else `None`.
+    #[getter]
+    fn batch_rows(&self) -> Option<usize> {
+        self.0.batch_rows()
     }
 
     /// Write this fitted context to `path` atomically, for reuse through

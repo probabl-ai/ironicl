@@ -261,6 +261,22 @@ impl PageAlignedTensors {
             .collect()
     }
 
+    /// Each tensor's bytes, in the order given to [`Self::new`], for writing
+    /// in its storage type.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))] // CUDA only.
+    pub(crate) fn tensors_mut(&mut self) -> Vec<&mut [u8]> {
+        let mut rest = &mut self.mapping[..];
+        let mut at = 0;
+        self.layout
+            .iter()
+            .map(|(.., offset, bytes)| {
+                let (_padding, tensor) = (rest.split_off_mut(..offset - at), rest.split_off_mut(..*bytes));
+                at = offset + bytes;
+                tensor.expect("tensors lie within the mapping")
+            })
+            .collect()
+    }
+
     /// Write a tensor's already-encoded storage bytes into its region. The
     /// caller converts to the tensor's [`TensorStorage`] and must pass exactly
     /// the region's byte length.

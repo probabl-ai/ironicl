@@ -1,4 +1,6 @@
 //! Ironicl reference types, model artifacts, and scalar `TabICLv2` execution.
+// The CUDA kernels convert to FP16; CUDA builds run with `RUSTC_BOOTSTRAP`.
+#![cfg_attr(feature = "cuda", feature(f16))]
 
 pub mod artifact;
 pub mod backend;
@@ -8,6 +10,8 @@ pub mod checkpoint;
 pub mod checkpoint_cache;
 pub mod cli;
 pub mod config;
+#[cfg(feature = "cuda")]
+pub mod cuda;
 pub mod error;
 mod execution_plan;
 pub mod executor;

@@ -1,6 +1,6 @@
 PYTHON ?= python3
 
-.PHONY: test-rust lint-rust audit lint-python test-python test-parity
+.PHONY: test-rust lint-rust audit lint-python test-python test-parity cuda-sm89 test-cuda lint-cuda develop-cuda
 
 test-rust:
 	cargo test --locked
@@ -22,3 +22,24 @@ test-python:
 
 test-parity:
 	$(PYTHON) -m unittest discover -s tests/parity -p 'test_*.py' -v
+
+# CUDA (Linux): builds through cuda-oxide's codegen backend; see tools/cuda-env.sh.
+# The sm_89 kernels build first, on their own, and the main build embeds them.
+# Cargo builds a library and its unit tests at once, and the backend names its
+# files after the crate, so the library builds before the tests.
+CUDA_ENV = . tools/cuda-env.sh && export IRONICL_CUDA_SM89_PTX=$(CURDIR)/target/cuda-oxide/sm_89/ironicl.ptx
+
+cuda-sm89:
+	IRONICL_CUDA_ARCH=sm_89 . tools/cuda-env.sh && cargo build --release --locked --lib --features cuda \
+		--target-dir target/cuda-sm89
+
+test-cuda: cuda-sm89
+	$(CUDA_ENV) && cargo build --release --locked --lib --features cuda \
+		&& cargo test --release --locked --features cuda \
+		&& IRONICL_CUDA_MODULE=sm80 cargo test --release --locked --features cuda --test 'cuda_*'
+
+lint-cuda: cuda-sm89
+	$(CUDA_ENV) && cargo clippy --release --locked --all-targets --features cuda,python -- -D warnings
+
+develop-cuda: cuda-sm89
+	$(CUDA_ENV) && maturin develop --release --uv --features python,cuda

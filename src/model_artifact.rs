@@ -257,14 +257,11 @@ impl ModelArtifact {
                 .get(tensor.payload_range)
                 .ok_or_else(|| Error::Artifact(format!("tensor '{}' payload is missing", tensor.name)))?;
             let values = payload
-                .chunks_exact(4)
-                .map(|chunk| {
-                    let bytes = chunk.try_into().map_err(|_| {
-                        Error::Artifact(format!("tensor '{}' has an invalid FP32 payload", tensor.name))
-                    })?;
-                    Ok(f32::from_le_bytes(bytes))
-                })
-                .collect::<Result<Vec<_>>>()?;
+                .as_chunks()
+                .0
+                .iter()
+                .map(|&chunk| f32::from_le_bytes(chunk))
+                .collect();
             tensors.insert(
                 tensor.name,
                 ModelTensorF32 {

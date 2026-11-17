@@ -42,9 +42,10 @@ tests on other hosts through portable Rust code.
 2. Build a deterministic static-context artifact from fitted preprocessing,
    training features, training targets, and ensemble configuration.
 3. Produce predictions that pass the validation policy in `validation.md`.
-4. Dispatch optimized kernels only after runtime CPU capability checks, and the
+4. Dispatch optimized kernels only after runtime CPU capability checks, the
    Metal GPU path only when the `metal` feature is built and `IRONICL_NO_METAL`
-   is unset.
+   is unset, and the NVIDIA GPU path only when the `cuda` feature is built and
+   `IRONICL_NO_CUDA` is unset.
 5. Fall back to a portable FP32 implementation on unsupported hosts.
 6. Report memory, bandwidth, and precision choices before allocating a context.
 7. Avoid hidden allocations in the steady-state request path.
@@ -52,7 +53,7 @@ tests on other hosts through portable Rust code.
 ## Initial Non-Goals
 
 - Pretraining or fine-tuning TabICLv2.
-- Discrete-GPU runtimes such as CUDA and ROCm.
+- Discrete-GPU runtimes other than CUDA, such as ROCm.
 - More than 10 classifier classes in the cached path.
 - Exact online insertion or deletion of training rows.
 - Bitwise parity across PyTorch, operating systems, or CPU architectures.

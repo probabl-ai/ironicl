@@ -42,12 +42,15 @@ use crate::{
     memory::{Builder, ContextShape, MemoryLimits, Plan, Pools, Storage},
     profile::{self, Category},
     quantiles::summarize,
+    static_context::{PageAlignedTensors, TensorStorage},
 };
 
 pub(crate) const COLUMN_DIM: usize = 128;
 pub(crate) const ICL_DIM: usize = 512;
 pub(crate) const HEADS: usize = 8;
 pub(crate) const INDUCING: usize = 128;
+pub(crate) const COLUMN_BLOCKS: usize = 3;
+pub(crate) const ICL_BLOCKS: usize = 12;
 /// CLS streams ahead of the features in the row stage.
 pub(crate) const RESERVED: usize = 4;
 const ATTENTION_QUERY_BLOCK_ROWS: usize = 16;
@@ -286,6 +289,8 @@ pub struct Executor {
     model: Arc<ModelArtifact>,
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
     gpu_weights: Arc<OnceLock<Option<Arc<crate::metal::ModelWeights>>>>,
+    #[cfg(feature = "cuda")]
+    cuda_weights: Arc<OnceLock<Result<Option<Arc<crate::cuda::ModelWeights>>>>>,
 }
 
 /// One context's Metal buffers and the graph that reads them.
@@ -336,6 +341,8 @@ pub struct StaticExecutor {
     sparse_attention_stats: Arc<SparseAttentionStats>,
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
     gpu: Option<Arc<GpuContext>>,
+    #[cfg(feature = "cuda")]
+    cuda: Option<Arc<crate::cuda::Predictor>>,
 }
 
 /// Sparse ICL attention decisions since the last reset.
@@ -393,6 +400,8 @@ impl Executor {
             model: Arc::new(model),
             #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
             gpu_weights: Arc::default(),
+            #[cfg(feature = "cuda")]
+            cuda_weights: Arc::default(),
         }
     }
 
@@ -408,11 +417,12 @@ impl Executor {
     pub fn load_context(
         &self,
         path: &std::path::Path,
+        optimize: Optimize,
         threads: Option<usize>,
         limits: MemoryLimits,
     ) -> Result<StaticExecutor> {
         let context = StaticContextArtifact::read_mapped_prefault(path)?;
-        StaticExecutor::with_executor(self.clone(), context, threads, limits)
+        StaticExecutor::with_executor(self.clone(), context, optimize, threads, limits)
     }
 
     /// Load a context from the bytes [`StaticExecutor::encode_context`] wrote,
@@ -425,11 +435,12 @@ impl Executor {
     pub fn load_context_bytes(
         &self,
         bytes: &[u8],
+        optimize: Optimize,
         threads: Option<usize>,
         limits: MemoryLimits,
     ) -> Result<StaticExecutor> {
         let context = StaticContextArtifact::from_bytes(bytes)?;
-        StaticExecutor::with_executor(self.clone(), context, threads, limits)
+        StaticExecutor::with_executor(self.clone(), context, optimize, threads, limits)
     }
 
     /// Whether the model is the classifier or the regressor.
@@ -442,6 +453,27 @@ impl Executor {
     #[must_use]
     pub fn source_sha256(&self) -> &str {
         &self.model.summary().source_sha256
+    }
+
+    /// The CUDA device and the model's weights on it, created on first use
+    /// and shared by every context of the model. `None` without a CUDA device
+    /// or with `IRONICL_NO_CUDA` set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a CUDA device exists but the kernels or weights
+    /// fail to load; set `IRONICL_NO_CUDA` to use the CPU instead.
+    #[cfg(feature = "cuda")]
+    fn cuda_weights(&self) -> Result<Option<Arc<crate::cuda::ModelWeights>>> {
+        self.cuda_weights
+            .get_or_init(|| {
+                crate::cuda::Device::new()?
+                    .map(|device| {
+                        crate::cuda::ModelWeights::new(device, |name| self.tensor(name)).map(Arc::new)
+                    })
+                    .transpose()
+            })
+            .clone()
     }
 
     /// The GPU and the model's weights in shared GPU buffers, created on first
@@ -473,8 +505,7 @@ impl Executor {
         y_train: &[f32],
         optimize: Optimize,
         limits: MemoryLimits,
-    ) -> Result<Option<crate::static_context::PageAlignedTensors>> {
-        use crate::static_context::{PageAlignedTensors, TensorStorage};
+    ) -> Result<Option<PageAlignedTensors>> {
         let icl_storage = match optimize {
             Optimize::Safe => TensorStorage::Fp32,
             // BF16 had no native GPU arithmetic on an M1 Max: slower and less
@@ -487,9 +518,16 @@ impl Executor {
         let Some(gpu_weights) = self.gpu_weights() else {
             return Ok(None);
         };
-        let Some((grouped, column_labels, icl_labels)) = self.gpu_build_inputs((b, n, h), x, y_train)? else {
+        // Each feature grouped with its neighbors, `[B * H, N, 3]`.
+        let Some(grouped) = x
+            .chunks_exact(n * h)
+            .map(|x| crate::metal::group_features(x, n, h))
+            .collect::<Option<Vec<_>>>()
+        else {
             return Ok(None);
         };
+        let grouped = grouped.concat();
+        let (column_labels, icl_labels) = self.label_embeddings(n, y_train)?;
         // The memory plan sizes the estimator groups: half the host's available
         // RAM (unified memory is the host's RAM), capped by Metal's working set
         // and by the memory limit. When one estimator does not fit the device,
@@ -501,7 +539,7 @@ impl Executor {
             return Ok(None);
         };
         let group = usize::try_from(group).map_err(|_| Error::ArithmeticOverflow("GPU build group"))?;
-        let column_scales = (0..3)
+        let column_scales = (0..COLUMN_BLOCKS)
             .map(|block| {
                 qass_base_scale(
                     self,
@@ -511,32 +549,9 @@ impl Executor {
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        let icl_scales = (0..12)
-            .map(|block| {
-                qass_base_scale(
-                    self,
-                    &format!("icl_predictor.tf_icl.blocks.{block}.attn"),
-                    n,
-                    ICL_DIM,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let icl_scales = self.icl_base_scales(n)?;
         // Only the ICL caches, almost all of a context, take the reduced type.
-        let tensors = |ensembles: usize| {
-            PageAlignedTensors::new(
-                context_tensors(ensembles, n, h)
-                    .into_iter()
-                    .map(|(name, dimensions)| {
-                        let storage = if name.starts_with("icl.") {
-                            icl_storage
-                        } else {
-                            TensorStorage::Fp32
-                        };
-                        (name, dimensions, storage)
-                    })
-                    .collect(),
-            )
-        };
+        let tensors = |ensembles: usize| context_page(ensembles, n, h, icl_storage);
         let mut context = tensors(b)?;
         let mut scratch = if group == b { None } else { Some(tensors(group)?) };
         crate::progress::report(Stage::Build, 0, b)?;
@@ -568,38 +583,38 @@ impl Executor {
         Ok(Some(context))
     }
 
-    /// The GPU build's inputs: each feature grouped with its neighbors as
-    /// `[B * H, N, 3]`, and the column and ICL label embeddings as
-    /// `[B, N, 128]` and `[B, N, 512]`. `None` on the all-missing marker.
-    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-    #[allow(clippy::type_complexity)]
-    fn gpu_build_inputs(
-        &self,
-        (b, n, h): (usize, usize, usize),
-        x: &[f32],
-        y_train: &[f32],
-    ) -> Result<Option<(Vec<f32>, Vec<f32>, Vec<f32>)>> {
-        let mut grouped = Vec::with_capacity(b * h * n * 3);
-        let mut column_labels = vec![0.0; b * n * COLUMN_DIM];
-        let mut icl_labels = vec![0.0; b * n * ICL_DIM];
-        for ensemble in 0..b {
-            let Some(group) = crate::metal::group_features(&x[ensemble * n * h..][..n * h], n, h) else {
-                return Ok(None);
-            };
-            grouped.extend(group);
-            for (prefix, width, output) in [
-                ("col_embedder", COLUMN_DIM, &mut column_labels),
-                ("icl_predictor", ICL_DIM, &mut icl_labels),
-            ] {
-                self.target_embeddings(
-                    prefix,
-                    &y_train[ensemble * n..][..n],
-                    width,
-                    &mut output[ensemble * n * width..][..n * width],
-                )?;
-            }
-        }
-        Ok(Some((grouped, column_labels, icl_labels)))
+    /// Each estimator's training labels `y_train` `[B, N]` embedded for the
+    /// column stage, `[B, N, 128]`, and for the ICL stage, `[B, N, 512]`.
+    #[cfg(any(
+        feature = "cuda",
+        all(feature = "metal", target_os = "macos", target_arch = "aarch64")
+    ))]
+    fn label_embeddings(&self, n: usize, y_train: &[f32]) -> Result<(Vec<f32>, Vec<f32>)> {
+        let mut column = vec![0.0; y_train.len() * COLUMN_DIM];
+        let mut icl = vec![0.0; y_train.len() * ICL_DIM];
+        column
+            .par_chunks_mut(n * COLUMN_DIM)
+            .zip(icl.par_chunks_mut(n * ICL_DIM))
+            .zip(y_train.par_chunks(n))
+            .try_for_each(|((column, icl), labels)| {
+                self.target_embeddings("col_embedder", labels, COLUMN_DIM, column)?;
+                self.target_embeddings("icl_predictor", labels, ICL_DIM, icl)
+            })?;
+        Ok((column, icl))
+    }
+
+    /// Each ICL block's `QASSMax` base scale for `n` training rows, `[8, 64]`.
+    fn icl_base_scales(&self, n: usize) -> Result<Vec<Vec<f32>>> {
+        (0..ICL_BLOCKS)
+            .map(|block| {
+                qass_base_scale(
+                    self,
+                    &format!("icl_predictor.tf_icl.blocks.{block}.attn"),
+                    n,
+                    ICL_DIM,
+                )
+            })
+            .collect()
     }
 
     /// Run the training rows once and keep their attention keys and values as
@@ -637,18 +652,113 @@ impl Executor {
         if let Some(tensors) = self.build_tensors_gpu(shape, x, y_train, optimize, limits)? {
             // The build graph checked every value on the GPU.
             let context = StaticContextArtifact::from_page_aligned(metadata, tensors)?;
-            return StaticExecutor::with_executor(self.clone(), context, threads, limits);
+            return StaticExecutor::with_executor(self.clone(), context, optimize, threads, limits);
+        }
+        // With a CUDA GPU, `auto` and `fast` build on it and store the ICL keys
+        // and values in FP16, which the GPU predicts from, as on Apple GPUs.
+        #[cfg(feature = "cuda")]
+        if let Some(precision) = crate::cuda::Precision::for_optimize(optimize)
+            && let Some(weights) = self.cuda_weights()?
+        {
+            let built = self.build_tensors_cuda(&weights, shape, x, y_train, precision, limits)?;
+            let (tensors, built) = if let Some(built) = built {
+                built
+            } else {
+                let tensors = self.build_tensors_cpu(shape, x, y_train, limits)?;
+                let icl = |name: &str| name.starts_with("icl.");
+                (page_aligned(&tensors, icl, TensorStorage::F16)?, None)
+            };
+            let context = StaticContextArtifact::from_page_aligned(metadata, tensors)?;
+            return StaticExecutor::prepared(self.clone(), context, threads, limits)?
+                .with_cuda(optimize, limits, built);
         }
         // On a BF16-capable CPU, `fast` stores the ICL values in BF16 (FP32
         // keys, the retained serving layout); every other case is FP32.
         if optimize == Optimize::Fast && crate::kernels::native::bf16_storage_supported() {
             let tensors = self.build_tensors_cpu(shape, x, y_train, limits)?;
-            let context = StaticContextArtifact::from_page_aligned(metadata, bf16v_page_aligned(&tensors)?)?;
-            return StaticExecutor::with_executor(self.clone(), context, threads, limits);
+            let values = |name: &str| name.starts_with("icl.") && name.rsplit('.').next() == Some("value");
+            let context = StaticContextArtifact::from_page_aligned(
+                metadata,
+                page_aligned(&tensors, values, TensorStorage::Bf16)?,
+            )?;
+            return StaticExecutor::with_executor(self.clone(), context, optimize, threads, limits);
         }
         let context =
             StaticContextArtifact::new(metadata, self.build_tensors_cpu(shape, x, y_train, limits)?)?;
-        StaticExecutor::with_executor(self.clone(), context, threads, limits)
+        StaticExecutor::with_executor(self.clone(), context, optimize, threads, limits)
+    }
+
+    /// Build every estimator's keys and values on the CUDA device, with
+    /// products at `precision`, into page-aligned context tensors, the ICL ones
+    /// in FP16, and return them with the ICL ones the build left on the device
+    /// for prediction. Returns `None` when a grouped triple is the all-missing
+    /// marker that only the CPU path handles, or when the context does not
+    /// [`crate::cuda::fits`] the device.
+    #[cfg(feature = "cuda")]
+    fn build_tensors_cuda(
+        &self,
+        weights: &crate::cuda::ModelWeights,
+        (b, n, h): (usize, usize, usize),
+        x: &[f32],
+        y_train: &[f32],
+        precision: crate::cuda::Precision,
+        limits: MemoryLimits,
+    ) -> Result<Option<(PageAlignedTensors, Option<crate::cuda::BuiltCache>)>> {
+        use crate::cuda::{BuildInputs, BuildOutputs, Shape};
+        let shape = Shape {
+            ensembles: b,
+            features: h,
+            rows: n,
+            outputs: self.decoder_width()?,
+        };
+        let budget = weights.budget(limits.device.map(|limit| limit.bytes))?;
+        if !crate::cuda::fits(budget, shape) || has_missing_marker(x, h) {
+            return Ok(None);
+        }
+        let (column_labels, icl_labels) = self.label_embeddings(n, y_train)?;
+        let inducing_queries = (0..COLUMN_BLOCKS)
+            .map(|block| {
+                let prefix = format!("col_embedder.tf_col.blocks.{block}");
+                let inducing = self.tensor(&format!("{prefix}.ind_vectors"))?;
+                let prefix = format!("{prefix}.multihead_attn1");
+                let heads = self.query_heads(inducing, INDUCING, n, COLUMN_DIM, &prefix, true)?;
+                Ok(heads_to_tokens(&heads, INDUCING, COLUMN_DIM, HEADS))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let base_scales = self.icl_base_scales(n)?;
+        let mut page = context_page(b, n, h, TensorStorage::F16)?;
+        // `context_tensors` order: the column blocks, then the ICL blocks, each
+        // its key then its value.
+        let mut tensors = page.tensors_mut().into_iter();
+        let mut pairs = std::iter::from_fn(|| Some((tensors.next()?, tensors.next()?)));
+        let mut outputs = BuildOutputs {
+            column: pairs
+                .by_ref()
+                .take(COLUMN_BLOCKS)
+                .map(|(key, value)| (bytemuck::cast_slice_mut(key), bytemuck::cast_slice_mut(value)))
+                .collect(),
+            icl: pairs
+                .map(|(key, value)| (bytemuck::cast_slice_mut(key), bytemuck::cast_slice_mut(value)))
+                .collect(),
+        };
+        let built = crate::cuda::build(
+            weights,
+            precision,
+            &BuildInputs {
+                shape,
+                x,
+                column_labels: &column_labels,
+                icl_labels: &icl_labels,
+                inducing_queries: &inducing_queries,
+                base_scales: &base_scales,
+                rope_frequencies: self.tensor("row_interactor.tf_row.rope.freqs")?,
+                cls_tokens: self.tensor("row_interactor.cls_tokens")?,
+                budget,
+            },
+            &mut outputs,
+        )?;
+        drop(outputs);
+        Ok(Some((page, built)))
     }
 
     /// Validate a context's inputs and describe it: model and content hashes,
@@ -674,7 +784,7 @@ impl Executor {
         let class_count = self.validate_targets(y_train, b, n)?;
         let mut model_sha256 = [0; 32];
         let source = self.model.summary().source_sha256.as_bytes();
-        for (byte, pair) in model_sha256.iter_mut().zip(source.chunks_exact(2)) {
+        for (byte, pair) in model_sha256.iter_mut().zip(source.as_chunks::<2>().0) {
             *byte = std::str::from_utf8(pair)
                 .ok()
                 .and_then(|pair| u8::from_str_radix(pair, 16).ok())
@@ -722,10 +832,10 @@ impl Executor {
             }
             Ok((keys, values))
         };
-        let mut column = (0..3)
+        let mut column = (0..COLUMN_BLOCKS)
             .map(|_| reserve(b * streams * column_elements))
             .collect::<Result<Vec<_>>>()?;
-        let mut icl = (0..12)
+        let mut icl = (0..ICL_BLOCKS)
             .map(|_| reserve(b * n * ICL_DIM))
             .collect::<Result<Vec<_>>>()?;
         // Build as many estimators at once as the memory plan allows, and at
@@ -749,7 +859,7 @@ impl Executor {
                     let mut caches = Vec::with_capacity(12);
                     self.icl_rows(rows, labels, n, n, Some(&mut caches))?;
                     // Per block, every feature's keys and values in feature order.
-                    let column = (0..3)
+                    let column = (0..COLUMN_BLOCKS)
                         .map(|block| {
                             let keys = feature_caches
                                 .iter()
@@ -977,7 +1087,7 @@ impl Executor {
             }
         }
         let mut caches = Vec::with_capacity(if capture { 3 } else { 0 });
-        for block in 0..3 {
+        for block in 0..COLUMN_BLOCKS {
             let cache;
             (embedded, cache) = self.isab(embedded, t, n, block)?;
             if capture {
@@ -1097,7 +1207,7 @@ impl Executor {
                 rows[row * ICL_DIM + dim] += targets[row * ICL_DIM + dim];
             }
         }
-        for block in 0..12 {
+        for block in 0..ICL_BLOCKS {
             let prefix = format!("icl_predictor.tf_icl.blocks.{block}");
             let source = &rows[..n * ICL_DIM];
             let cache = self.source_heads(source, source, n, ICL_DIM, &prefix, None)?;
@@ -1227,19 +1337,18 @@ impl Executor {
         Ok((k_heads, v_heads))
     }
 
-    /// Attend from `q` to projected sources, then apply the residual feed-forward block.
-    fn attend(
+    /// Block `prefix`'s head-major queries for `q` `[q_rows, dim]`: `norm1`
+    /// and the query projection, then, with `qass`, `QASSMax` for
+    /// `source_rows` keys.
+    fn query_heads(
         &self,
         q: &[f32],
         q_rows: usize,
-        (k_heads, v_heads): &KeyValue,
         source_rows: usize,
         dim: usize,
         prefix: &str,
         qass: bool,
-        rope: Option<usize>,
     ) -> Result<Vec<f32>> {
-        let _profile = profile::scope(Category::Block);
         let mut q_norm = vec![0.0; q.len()];
         layer_norm_f32(
             q,
@@ -1262,21 +1371,40 @@ impl Executor {
             dim,
             &mut q_proj,
         )?;
+        let q_heads = tokens_to_heads(&q_proj, q_rows, dim, HEADS);
+        if !qass {
+            return Ok(q_heads);
+        }
+        let mut gated = vec![0.0; q_heads.len()];
+        self.qass(
+            &attn_prefix,
+            &q_heads,
+            q_rows,
+            source_rows,
+            HEADS,
+            dim / HEADS,
+            &mut gated,
+        )?;
+        Ok(gated)
+    }
+
+    /// Attend from `q` to projected sources, then apply the residual feed-forward block.
+    fn attend(
+        &self,
+        q: &[f32],
+        q_rows: usize,
+        (k_heads, v_heads): &KeyValue,
+        source_rows: usize,
+        dim: usize,
+        prefix: &str,
+        qass: bool,
+        rope: Option<usize>,
+    ) -> Result<Vec<f32>> {
+        let _profile = profile::scope(Category::Block);
+        let attn_prefix = format!("{prefix}.attn");
         let heads = HEADS;
         let head_dim = dim / heads;
-        let mut q_heads = tokens_to_heads(&q_proj, q_rows, dim, heads);
-        if qass {
-            let original = q_heads.clone();
-            self.qass(
-                &attn_prefix,
-                &original,
-                q_rows,
-                source_rows,
-                heads,
-                head_dim,
-                &mut q_heads,
-            )?;
-        }
+        let mut q_heads = self.query_heads(q, q_rows, source_rows, dim, prefix, qass)?;
         if rope.is_some() {
             let mut rotated = vec![0.0; q_heads.len()];
             rope_non_interleaved_f32(
@@ -1488,6 +1616,7 @@ impl StaticExecutor {
         Self::with_executor(
             Executor::new(model),
             context,
+            Optimize::Safe,
             None,
             MemoryLimits::resolve(None, None)?,
         )
@@ -1525,6 +1654,22 @@ impl StaticExecutor {
     fn with_executor(
         model: Executor,
         context: StaticContextArtifact,
+        optimize: Optimize,
+        threads: Option<usize>,
+        limits: MemoryLimits,
+    ) -> Result<Self> {
+        let executor = Self::prepared(model, context, threads, limits)?;
+        #[cfg(feature = "cuda")]
+        let executor = executor.with_cuda(optimize, limits, None)?;
+        #[cfg(not(feature = "cuda"))]
+        let _ = optimize;
+        Ok(executor)
+    }
+
+    /// [`Self::with_executor`] up to the CUDA predictor.
+    fn prepared(
+        model: Executor,
+        context: StaticContextArtifact,
         threads: Option<usize>,
         limits: MemoryLimits,
     ) -> Result<Self> {
@@ -1537,16 +1682,7 @@ impl StaticExecutor {
                 column_input_weight[input * COLUMN_DIM + output] = input_weight[output * 3 + input];
             }
         }
-        let qass_base_scales = (0..12)
-            .map(|block| {
-                qass_base_scale(
-                    &model,
-                    &format!("icl_predictor.tf_icl.blocks.{block}.attn"),
-                    context.metadata().training_rows,
-                    ICL_DIM,
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let qass_base_scales = model.icl_base_scales(context.metadata().training_rows)?;
         // The BF16/packed dense experiment is off unless built with the
         // `bf16-dense` feature; it is never activated by a runtime flag.
         let bf16_dense = cfg!(feature = "bf16-dense");
@@ -1595,8 +1731,103 @@ impl StaticExecutor {
             sparse_attention_stats: Arc::new(SparseAttentionStats::default()),
             #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
             gpu: None,
+            #[cfg(feature = "cuda")]
+            cuda: None,
         }
         .with_gpu(limits)
+    }
+
+    /// Where predictions run: `"cuda"` with the ICL cache on the GPU,
+    /// `"cuda-streamed"` with it streamed from host memory on every pass, or
+    /// `"cpu"` (Metal included).
+    #[must_use]
+    #[cfg_attr(not(feature = "cuda"), allow(clippy::unused_self))]
+    pub fn device(&self) -> &'static str {
+        #[cfg(feature = "cuda")]
+        if let Some(predictor) = &self.cuda {
+            return if predictor.streamed() {
+                "cuda-streamed"
+            } else {
+                "cuda"
+            };
+        }
+        "cpu"
+    }
+
+    /// Query rows a prediction should bring at once: a streamed pass's, so
+    /// each copy of the ICL cache serves as many rows as fit, else `None`.
+    #[must_use]
+    #[cfg_attr(not(feature = "cuda"), allow(clippy::unused_self))]
+    pub fn batch_rows(&self) -> Option<usize> {
+        #[cfg(feature = "cuda")]
+        if let Some(predictor) = &self.cuda
+            && predictor.streamed()
+        {
+            return Some(predictor.pass_rows());
+        }
+        None
+    }
+
+    /// Upload the context for CUDA prediction when a CUDA device is available
+    /// and the context stores its ICL caches in FP16; `built`, the ICL keys
+    /// and values the context's build left on the device, replaces their
+    /// upload. Other contexts stay on the CPU.
+    #[cfg(feature = "cuda")]
+    fn with_cuda(
+        mut self,
+        optimize: Optimize,
+        limits: MemoryLimits,
+        built: Option<crate::cuda::BuiltCache>,
+    ) -> Result<Self> {
+        let Some(precision) = crate::cuda::Precision::for_optimize(optimize) else {
+            return Ok(self);
+        };
+        if self.context.has_packed_icl_keys() {
+            return Ok(self);
+        }
+        let Some(weights) = self.model.cuda_weights()? else {
+            return Ok(self);
+        };
+        let Some(icl) = ContextIcl::new(&self.context) else {
+            return Ok(self);
+        };
+        let column = (0..COLUMN_BLOCKS)
+            .map(|block| {
+                let tensor = |kind: &str| {
+                    self.context
+                        .tensor(&format!("column.{block}.{kind}"))?
+                        .fp32_values()
+                };
+                Some((tensor("key")?, tensor("value")?))
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(column) = column else {
+            return Ok(self);
+        };
+        let metadata = self.context.metadata();
+        let budget = weights.budget(limits.device.map(|limit| limit.bytes))?;
+        let predictor = crate::cuda::Predictor::new(
+            weights,
+            precision,
+            &crate::cuda::ContextTensors {
+                shape: crate::cuda::Shape {
+                    ensembles: metadata.ensemble_count,
+                    features: metadata.feature_count,
+                    rows: metadata.training_rows,
+                    outputs: self.model.decoder_width()?,
+                },
+                column,
+                icl: Arc::new(icl),
+                base_scales: &self.qass_base_scales,
+                rope_frequencies: self.model.tensor("row_interactor.tf_row.rope.freqs")?,
+                cls_tokens: self.model.tensor("row_interactor.cls_tokens")?,
+                budget,
+            },
+            built,
+        )?;
+        // Without room even to stream the ICL cache, the CPU predicts.
+        self.cuda = predictor.map(Arc::new);
+        Ok(self)
     }
 
     /// Build the context's GPU predict graph when Metal is available, with
@@ -1614,7 +1845,7 @@ impl StaticExecutor {
             return Ok(self);
         };
         let column = |kind: &str| -> Option<Vec<&[f32]>> {
-            (0..3)
+            (0..COLUMN_BLOCKS)
                 .map(|block| {
                     self.context
                         .tensor(&format!("column.{block}.{kind}"))?
@@ -1626,7 +1857,7 @@ impl StaticExecutor {
         let icl = |kind: &str| -> Option<(Vec<&[u8]>, crate::static_context::TensorStorage)> {
             use crate::static_context::TensorStorage;
             let mut storage = None;
-            let blocks = (0..12)
+            let blocks = (0..ICL_BLOCKS)
                 .map(|block| {
                     let (bytes, block_storage) =
                         match self.context.tensor(&format!("icl.{block}.{kind}"))?.data {
@@ -1750,11 +1981,51 @@ impl StaticExecutor {
                 metadata.feature_count
             )));
         }
-        let (b, q, h, classes) = (
-            metadata.ensemble_count,
+        let classes = self.outputs()?;
+        #[cfg(feature = "cuda")]
+        if let Some(cuda) = &self.cuda {
+            let (b, q, h) = (
+                metadata.ensemble_count,
+                request.query_rows(),
+                metadata.feature_count,
+            );
+            let prediction = cuda.predict(request.x(), q)?;
+            let width = self.model.decoder_width()?;
+            let mut values: Vec<f32> = prediction
+                .logits
+                .chunks_exact(width)
+                .flat_map(|row| row[..classes].iter().copied())
+                .collect();
+            // Rows with the all-missing marker run on the CPU path.
+            if !prediction.cpu_rows.is_empty() {
+                let rows = &prediction.cpu_rows;
+                let mut x = Vec::with_capacity(b * rows.len() * h);
+                for ensemble in 0..b {
+                    for &row in rows {
+                        x.extend_from_slice(&request.x()[(ensemble * q + row) * h..][..h]);
+                    }
+                }
+                let cpu = self.predict_cpu(QueryRequest::new(b, rows.len(), h, &x)?, classes)?;
+                for (ensemble, part) in cpu.values.chunks_exact(rows.len() * classes).enumerate() {
+                    for (&row, value) in rows.iter().zip(part.chunks_exact(classes)) {
+                        values[(ensemble * q + row) * classes..][..classes].copy_from_slice(value);
+                    }
+                }
+            }
+            return Ok(DecoderOutputs {
+                shape: [b, q, classes],
+                values,
+            });
+        }
+        self.predict_cpu(request, classes)
+    }
+
+    /// [`Self::predict_logits`] on the CPU, or on Metal where available.
+    fn predict_cpu(&self, request: QueryRequest<'_>, classes: usize) -> Result<DecoderOutputs> {
+        let (b, q, h) = (
+            request.ensemble_count(),
             request.query_rows(),
-            metadata.feature_count,
-            self.outputs()?,
+            request.feature_count(),
         );
         // Rows are independent, so a large query runs in pieces that fit the
         // activation budget and the GPU's. Only a single row that does not fit
@@ -2106,7 +2377,7 @@ impl StaticExecutor {
                 embedded[row * COLUMN_DIM..][..COLUMN_DIM].fill(-100.0);
             }
         }
-        for block in 0..3 {
+        for block in 0..COLUMN_BLOCKS {
             let prefix = format!("col_embedder.tf_col.blocks.{block}.multihead_attn2");
             embedded = self.cached_block(
                 &embedded,
@@ -2144,7 +2415,7 @@ impl StaticExecutor {
         workers: usize,
     ) -> Result<Vec<f32>> {
         let _profile = profile::scope(Category::Icl);
-        for block in 0..12 {
+        for block in 0..ICL_BLOCKS {
             rows = self.cached_icl_block(&rows, ensemble, q, block, workers)?;
         }
         self.cached_icl_decoder(&rows, q, workers)
@@ -3042,7 +3313,7 @@ impl StaticExecutor {
 
     fn build_packed_f32_row_affines(model: &Executor) -> Result<BTreeMap<String, PackedF32Affine>> {
         let mut packed = BTreeMap::new();
-        for block in 0..3 {
+        for block in 0..COLUMN_BLOCKS {
             let prefix = format!("row_interactor.tf_row.blocks.{block}");
             let attention = format!("{prefix}.attn");
             let projection_name = format!("{attention}.in_proj_weight");
@@ -3094,7 +3365,7 @@ impl StaticExecutor {
     ) -> Result<BTreeMap<String, PackedF32Affine>> {
         let mut packed = BTreeMap::new();
         if policy.column_q || policy.column_out || policy.column_ffn1 || policy.column_ffn2 {
-            for block in 0..3 {
+            for block in 0..COLUMN_BLOCKS {
                 let prefix = format!("col_embedder.tf_col.blocks.{block}.multihead_attn2");
                 Self::pack_f32_cached_block(
                     &mut packed,
@@ -3109,7 +3380,7 @@ impl StaticExecutor {
                 )?;
             }
         }
-        for block in 0..12 {
+        for block in 0..ICL_BLOCKS {
             let prefix = format!("icl_predictor.tf_icl.blocks.{block}");
             let attention = format!("{prefix}.attn");
             Self::pack_f32_cached_block(
@@ -3575,50 +3846,117 @@ fn model_hash_matches(model_hash: &[u8], context_hash: &[u8; 32]) -> bool {
     model_hash == crate::artifact::encode_sha256(context_hash).as_bytes()
 }
 
-/// A context's cache tensors in order: each column block's key and value as
-/// `[B, H + 4, 8, 128, 16]`, then each ICL block's as `[B, 8, N, 64]`.
-/// Pack FP32 context tensors into a page-aligned context whose ICL values are
-/// stored in BF16 (FP32 keys), the retained CPU serving layout for `fast`.
-fn bf16v_page_aligned(tensors: &[StaticContextTensor]) -> Result<crate::static_context::PageAlignedTensors> {
-    use crate::static_context::{PageAlignedTensors, TensorStorage};
-    let is_bf16 = |name: &str| name.starts_with("icl.") && name.rsplit('.').next() == Some("value");
+/// Pack FP32 context tensors into page-aligned memory: the tensors `reduced`
+/// names in `storage`, FP16 or BF16, the rest in FP32.
+fn page_aligned(
+    tensors: &[StaticContextTensor],
+    reduced: impl Fn(&str) -> bool,
+    storage: TensorStorage,
+) -> Result<PageAlignedTensors> {
+    let storage_of = |name: &str| {
+        if reduced(name) {
+            storage
+        } else {
+            TensorStorage::Fp32
+        }
+    };
     let mut page = PageAlignedTensors::new(
         tensors
             .iter()
             .map(|tensor| {
-                let storage = if is_bf16(&tensor.name) {
-                    TensorStorage::Bf16
-                } else {
-                    TensorStorage::Fp32
-                };
-                (tensor.name.clone(), tensor.dimensions.clone(), storage)
+                (
+                    tensor.name.clone(),
+                    tensor.dimensions.clone(),
+                    storage_of(&tensor.name),
+                )
             })
             .collect(),
     )?;
     for (index, tensor) in tensors.iter().enumerate() {
-        if tensor.values.iter().any(|value| !value.is_finite()) {
-            return Err(Error::InvalidArgument(
-                "static context tensor has a non-finite value".into(),
-            ));
+        let storage = storage_of(&tensor.name);
+        let holds =
+            |value: &f32| value.is_finite() && (storage != TensorStorage::F16 || value.abs() <= 65504.0);
+        if !tensor.values.iter().all(holds) {
+            return Err(Error::InvalidArgument(format!(
+                "static context tensor '{}' has a value {storage:?} cannot hold",
+                tensor.name
+            )));
         }
-        let bytes: Vec<u8> = if is_bf16(&tensor.name) {
-            tensor
-                .values
-                .iter()
-                .flat_map(|value| crate::kernels::native::f32_to_bf16_rne(*value).to_le_bytes())
-                .collect()
-        } else {
-            tensor
-                .values
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect()
+        let values = tensor.values.iter().copied();
+        let bytes: Vec<u8> = match storage {
+            TensorStorage::Fp32 => values.flat_map(f32::to_le_bytes).collect(),
+            TensorStorage::Bf16 => values
+                .flat_map(|value| crate::kernels::native::f32_to_bf16_rne(value).to_le_bytes())
+                .collect(),
+            TensorStorage::F16 => values
+                .flat_map(|value| half::f16::from_f32(value).to_bits().to_le_bytes())
+                .collect(),
         };
         page.fill(index, &bytes);
     }
     Ok(page)
 }
 
+/// A context's page-aligned tensors, as [`context_tensors`] lists them, with
+/// the ICL keys and values in `icl`.
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal", target_os = "macos", target_arch = "aarch64")
+))]
+fn context_page(b: usize, n: usize, h: usize, icl: TensorStorage) -> Result<PageAlignedTensors> {
+    PageAlignedTensors::new(
+        context_tensors(b, n, h)
+            .into_iter()
+            .map(|(name, dimensions)| {
+                let storage = if name.starts_with("icl.") {
+                    icl
+                } else {
+                    TensorStorage::Fp32
+                };
+                (name, dimensions, storage)
+            })
+            .collect(),
+    )
+}
+
+/// Whether a row of `x` `[_, H]` groups a feature's neighbors into the
+/// all-missing marker, which only the CPU column stage handles.
+#[cfg(feature = "cuda")]
+#[allow(clippy::float_cmp)] // The all-missing marker is exactly -100.
+fn has_missing_marker(x: &[f32], h: usize) -> bool {
+    x.par_chunks(h).any(|row| {
+        (0..h).any(|feature| {
+            [1, 2, 4]
+                .iter()
+                .all(|offset| row[(feature + offset) % h] == -100.0)
+        })
+    })
+}
+
+/// `RoPE` tables of the row stage for `len` sequence positions: cos twice,
+/// and `[-sin, sin]`, per 16-dimensional head, as the GPU paths read them.
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal", target_os = "macos", target_arch = "aarch64")
+))]
+#[allow(clippy::cast_precision_loss)] // Positions are small.
+pub(crate) fn rope_tables(len: usize, frequencies: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    let head_dim = COLUMN_DIM / HEADS;
+    let half = head_dim / 2;
+    let (mut cos, mut sin) = (vec![0.0; len * head_dim], vec![0.0; len * head_dim]);
+    for row in 0..len {
+        for (index, frequency) in frequencies[..half].iter().enumerate() {
+            let (s, c) = (row as f32 * frequency).sin_cos();
+            let at = row * head_dim + index;
+            (cos[at], cos[at + half]) = (c, c);
+            (sin[at], sin[at + half]) = (-s, s);
+        }
+    }
+    (cos, sin)
+}
+
+/// A context's cache tensors in order: each column block's key and value as
+/// `[B, H + 4, 8, 128, 16]`, then each ICL block's as `[B, 8, N, 64]`.
 fn context_tensors(b: usize, n: usize, h: usize) -> Vec<(String, Vec<u64>)> {
     let dimensions = |values: &[usize]| values.iter().map(|&value| value as u64).collect::<Vec<_>>();
     [
@@ -4610,6 +4948,37 @@ fn heads_to_tokens_into(input: &[f32], rows: usize, dim: usize, heads: usize, ou
         for h in 0..heads {
             output[row * dim + h * head..][..head].copy_from_slice(&input[(h * rows + row) * head..][..head]);
         }
+    }
+}
+
+/// A context's FP16 ICL keys and values, which the CUDA predictor uploads or
+/// streams. Holds the context, so its storage outlives the predictor.
+#[cfg(feature = "cuda")]
+struct ContextIcl(StaticContextArtifact);
+
+#[cfg(feature = "cuda")]
+impl ContextIcl {
+    /// `None` unless every ICL block's keys and values are FP16.
+    fn new(context: &StaticContextArtifact) -> Option<Self> {
+        let context = Self(context.clone());
+        (0..ICL_BLOCKS)
+            .all(|block| context.tensors(block).is_some())
+            .then_some(context)
+    }
+
+    fn tensors(&self, block: usize) -> Option<(&[u16], &[u16])> {
+        let tensor = |kind: &str| match self.0.tensor(&format!("icl.{block}.{kind}"))?.data {
+            StaticContextTensorData::F16(values) => Some(values),
+            _ => None,
+        };
+        Some((tensor("key")?, tensor("value")?))
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl crate::cuda::IclSource for ContextIcl {
+    fn block(&self, block: usize) -> (&[u16], &[u16]) {
+        self.tensors(block).expect("ContextIcl::new checked every block")
     }
 }
 

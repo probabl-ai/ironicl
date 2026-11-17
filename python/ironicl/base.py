@@ -180,7 +180,7 @@ class TabICLBase(BaseEstimator):
             self.checkpoint_path_ = self._checkpoint(checkpoint)
         model = _model(self.checkpoint_path_)
         if load:
-            self.context_ = model.context_from_bytes(self.context_, self._resolve_threads(), *limits)
+            self.context_ = model.context_from_bytes(self.context_, plan.optimize, self._resolve_threads(), *limits)
         else:
             self.context_ = self._build(model, plan.optimize, limits, self.preprocessor_, self._training)
 
@@ -191,16 +191,18 @@ class TabICLBase(BaseEstimator):
         )
 
     def _query_chunks(self, X):
-        """Yield the preprocessed ``[B, rows, H]`` query rows of ``X``, ``PREDICT_CHUNK_ROWS`` at a
-        time, each with the progress callback for its prediction (``None`` unless ``verbose``)."""
+        """Yield the preprocessed ``[B, rows, H]`` query rows of ``X`` a chunk at a time, each with
+        the progress callback for its prediction (``None`` unless ``verbose``). Chunks hold
+        ``PREDICT_CHUNK_ROWS``, or a whole pass when the context streams its cache to the GPU."""
         rows = _num_samples(X)
+        step = self.context_.batch_rows or PREDICT_CHUNK_ROWS
         with self._progress("Predicting", "row", rows) as progress:
-            for start in range(0, max(rows, 1), PREDICT_CHUNK_ROWS):
-                chunk = _safe_indexing(X, slice(start, start + PREDICT_CHUNK_ROWS))
+            for start in range(0, max(rows, 1), step):
+                chunk = _safe_indexing(X, slice(start, start + step))
                 report = progress and (lambda _stage, done, _total, start=start: progress.update(start + done))
                 yield _ensemble_rows(self.preprocessor_, self.preprocessor_.transform(chunk)), report
                 if progress:
-                    progress.update(min(start + PREDICT_CHUNK_ROWS, rows))
+                    progress.update(min(start + step, rows))
 
     def _progress(self, description: str, unit: str, total: int | None = None):
         """A ``Progress`` for ``verbose=True``, else a context that yields ``None``."""
@@ -271,7 +273,7 @@ class TabICLBase(BaseEstimator):
         path = cache_dir / f"{key}.irctx"
         if path.exists():
             try:
-                context = model.load_context(str(path), threads, *limits)
+                context = model.load_context(str(path), optimize, threads, *limits)
             except (OSError, ValueError, RuntimeError):
                 pass  # Corrupt, truncated, or mismatched cache entry: rebuild it.
             else:

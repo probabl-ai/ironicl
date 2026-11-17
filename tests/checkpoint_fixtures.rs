@@ -499,8 +499,10 @@ fn read_irlogits(bytes: &[u8]) -> std::result::Result<OracleLogits, String> {
         return Err("IRLOGITS lengths do not match whole-file length".into());
     }
     let values = bytes[HEADER_BYTES..checksum_offset]
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("FP32 chunks have four bytes")))
+        .as_chunks()
+        .0
+        .iter()
+        .map(|&chunk| f32::from_le_bytes(chunk))
         .collect::<Vec<_>>();
     if values.iter().any(|value| !value.is_finite()) {
         return Err("IRLOGITS contains a non-finite value".into());
