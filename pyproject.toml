@@ -12,8 +12,6 @@ requires-python = ">=3.12"
 dependencies = [
     "numpy>=2",
     "scikit-learn>=1.7",
-    # PowerTransformer fits with SciPy, and older solvers drift from the oracle.
-    "scipy>=1.17",
 ]
 license = "BSD-3-Clause"
 license-files = ["LICENSE", "LICENSES/TabICL-BSD-3-Clause.txt"]
@@ -26,6 +24,11 @@ progress = ["tqdm>=4.66"]
 python-source = "python"
 module-name = "ironicl._core"
 features = ["python", "metal"]
+
+# `pyodide build` for Pyodide 314 (Python 3.14 build host): its default flags
+# plus WebAssembly SIMD for the kernels.
+[tool.pyodide.build]
+rustflags = "-C link-arg=-sSIDE_MODULE=2 -C target-feature=+simd128"
 
 [tool.ruff.lint]
 # Pyflakes only: catch real errors (unused imports, undefined names, bad

@@ -29,17 +29,29 @@ const STATIC_CONTEXT_KIND: u32 = 1;
 const STATIC_CONTEXT_FP32_VERSION: u32 = 1;
 const STATIC_CONTEXT_BF16_VERSION: u32 = 2;
 const HEADER_BYTES: usize = 164;
-const MAX_ARTIFACT_BYTES: usize = 48 * 1024 * 1024 * 1024;
+const MAX_ARTIFACT_BYTES: usize = byte_limit(48 << 30);
 const MAX_DIRECTORY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TENSOR_COUNT: usize = 4096;
 const MAX_TENSOR_RANK: usize = 16;
 const MAX_TENSOR_NAME_BYTES: usize = 4096;
-const MAX_TENSOR_BYTES: usize = 4 * 1024 * 1024 * 1024;
-const MAX_TOTAL_TENSOR_BYTES: usize = 48 * 1024 * 1024 * 1024;
+const MAX_TENSOR_BYTES: usize = byte_limit(4 << 30);
+const MAX_TOTAL_TENSOR_BYTES: usize = byte_limit(48 << 30);
 const MAX_ENSEMBLE_COUNT: usize = 4096;
 const MAX_TRAINING_ROWS: usize = 1_000_000;
 const MAX_FEATURE_COUNT: usize = 65_536;
 const MAX_CLASS_COUNT: usize = 4096;
+
+/// `bytes`, or the largest possible allocation (`isize::MAX`) where that is
+/// smaller, as on 32-bit WebAssembly.
+#[allow(clippy::cast_possible_truncation)] // Only after checking that it fits.
+const fn byte_limit(bytes: u64) -> usize {
+    const LARGEST: usize = usize::MAX >> 1;
+    if bytes > LARGEST as u64 {
+        LARGEST
+    } else {
+        bytes as usize
+    }
+}
 
 /// Metadata that identifies and describes one static training context.
 #[derive(Debug, Clone, PartialEq, Eq)]
