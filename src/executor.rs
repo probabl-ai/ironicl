@@ -325,7 +325,7 @@ type ColumnStream = (usize, Vec<f32>, Vec<KeyValue>);
 pub struct StaticExecutor {
     model: Executor,
     context: StaticContextArtifact,
-    affine_pool: Arc<ThreadPool>,
+    affine_pool: Arc<WorkerPool>,
     column_input_weight: Arc<Vec<f32>>,
     qass_base_scales: Arc<Vec<Vec<f32>>>,
     packed_f32_affines: Option<Arc<BTreeMap<String, PackedF32Affine>>>,
@@ -388,6 +388,7 @@ impl Executor {
     /// Take ownership of an exact-manifest validated classifier model.
     #[must_use]
     pub fn new(model: ModelArtifact) -> Self {
+        WorkerPool::init_global();
         Self {
             model: Arc::new(model),
             #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
@@ -920,27 +921,15 @@ impl Executor {
         self.target_embeddings("col_embedder", labels, COLUMN_DIM, &mut y)?;
         // RowInteraction replaces the reserved streams with CLS tokens before
         // its first block, so running the column transformer for them is dead work.
-        let workers = executor_threads().min(h);
-        let chunk = h.div_ceil(workers);
         let y = y.as_slice();
-        let results = std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(workers);
-            for start in (0..h).step_by(chunk) {
-                let end = (start + chunk).min(h);
-                handles.push(scope.spawn(move || -> Result<Vec<ColumnStream>> {
-                    let mut results = Vec::with_capacity(end - start);
-                    for feature in start..end {
-                        let (embedded, caches) =
-                            self.column_stream(x, y, t, h, n, feature, in_weight, in_bias, capture)?;
-                        results.push((feature + RESERVED, embedded, caches));
-                    }
-                    Ok(results)
-                }));
+        let results = scoped_chunks(h, executor_threads(), |features| -> Result<Vec<ColumnStream>> {
+            let mut results = Vec::with_capacity(features.len());
+            for feature in features {
+                let (embedded, caches) =
+                    self.column_stream(x, y, t, h, n, feature, in_weight, in_bias, capture)?;
+                results.push((feature + RESERVED, embedded, caches));
             }
-            handles
-                .into_iter()
-                .map(|handle| handle.join().expect("column worker must not panic"))
-                .collect::<Result<Vec<_>>>()
+            Ok(results)
         })?;
         let mut feature_caches = Vec::with_capacity(if capture { h } else { 0 });
         for (stream, embedded, caches) in results.into_iter().flatten() {
@@ -1035,24 +1024,12 @@ impl Executor {
     fn row_embeddings(&self, columns: &[f32], t: usize, streams: usize) -> Result<Vec<f32>> {
         let _profile = profile::scope(Category::Row);
         let cls = self.tensor("row_interactor.cls_tokens")?;
-        let workers = executor_threads().min(t);
-        let chunk = t.div_ceil(workers);
-        let chunks = std::thread::scope(|scope| {
-            let mut handles = Vec::with_capacity(workers);
-            for start in (0..t).step_by(chunk) {
-                let end = (start + chunk).min(t);
-                handles.push(scope.spawn(move || -> Result<Vec<f32>> {
-                    let mut rows = Vec::with_capacity((end - start) * ICL_DIM);
-                    for row in start..end {
-                        rows.extend_from_slice(&self.row_embedding(columns, cls, row, streams)?);
-                    }
-                    Ok(rows)
-                }));
+        let chunks = scoped_chunks(t, executor_threads(), |rows| -> Result<Vec<f32>> {
+            let mut output = Vec::with_capacity(rows.len() * ICL_DIM);
+            for row in rows {
+                output.extend_from_slice(&self.row_embedding(columns, cls, row, streams)?);
             }
-            handles
-                .into_iter()
-                .map(|handle| handle.join().expect("row worker must not panic"))
-                .collect::<Result<Vec<_>>>()
+            Ok(output)
         })?;
         let mut rows = Vec::with_capacity(t * ICL_DIM);
         for chunk in chunks {
@@ -1603,11 +1580,7 @@ impl StaticExecutor {
         } else {
             None
         };
-        let affine_pool = ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .thread_name(|index| format!("ironicl-affine-{index}"))
-            .build()
-            .map_err(|error| Error::InvalidArgument(format!("cannot create affine worker pool: {error}")))?;
+        let affine_pool = WorkerPool::new(threads)?;
         Self {
             model,
             context,
@@ -3685,8 +3658,82 @@ fn validate_static_cache_contract(context: &StaticContextArtifact) -> Result<()>
     validate_sparse_index_contract(context)
 }
 
+/// The executor's own worker pool, or none where the target cannot start
+/// threads (WebAssembly without atomics, as in Pyodide). Work then runs on the
+/// calling thread, which [`WorkerPool::init_global`] makes rayon's only worker.
+#[derive(Debug)]
+struct WorkerPool(Option<ThreadPool>);
+
+impl WorkerPool {
+    const THREADS: bool = !cfg!(all(target_family = "wasm", not(target_feature = "atomics")));
+
+    fn new(threads: usize) -> Result<Self> {
+        if !Self::THREADS {
+            return Ok(Self(None));
+        }
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .thread_name(|index| format!("ironicl-affine-{index}"))
+            .build()
+            .map_err(|error| Error::InvalidArgument(format!("cannot create affine worker pool: {error}")))?;
+        Ok(Self(Some(pool)))
+    }
+
+    /// Without threads, run rayon's global pool on the calling thread. Rayon
+    /// falls back to this only when spawning reports `Unsupported`, and
+    /// Emscripten reports `WouldBlock`.
+    fn init_global() {
+        if !Self::THREADS {
+            // An error means the global pool already exists.
+            let _ = ThreadPoolBuilder::new()
+                .num_threads(1)
+                .use_current_thread()
+                .build_global();
+        }
+    }
+
+    fn current_num_threads(&self) -> usize {
+        self.0.as_ref().map_or(1, ThreadPool::current_num_threads)
+    }
+
+    fn install<R: Send>(&self, work: impl FnOnce() -> R + Send) -> R {
+        match &self.0 {
+            Some(pool) => pool.install(work),
+            None => work(),
+        }
+    }
+}
+
+/// Split `0..items` into at most `workers` contiguous ranges and run `work` on
+/// each, one scoped thread per range, or on the calling thread when there is
+/// only one.
+fn scoped_chunks<T: Send>(
+    items: usize,
+    workers: usize,
+    work: impl Fn(std::ops::Range<usize>) -> Result<T> + Sync,
+) -> Result<Vec<T>> {
+    let chunk = items.div_ceil(workers.clamp(1, items.max(1)));
+    if chunk >= items {
+        return Ok(vec![work(0..items)?]);
+    }
+    let work = &work;
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..items)
+            .step_by(chunk)
+            .map(|start| scope.spawn(move || work(start..(start + chunk).min(items))))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("worker must not panic"))
+            .collect()
+    })
+}
+
 pub(crate) fn executor_threads() -> usize {
     *EXECUTOR_THREADS.get_or_init(|| {
+        if !WorkerPool::THREADS {
+            return 1;
+        }
         if let Some(value) = std::env::var_os("IRONICL_THREADS") {
             return value
                 .to_string_lossy()
