@@ -12,8 +12,6 @@ requires-python = ">=3.12"
 dependencies = [
     "numpy>=2",
     "scikit-learn>=1.7",
-    # PowerTransformer fits with SciPy, and older solvers drift from the oracle.
-    "scipy>=1.17",
 ]
 license = "BSD-3-Clause"
 license-files = ["LICENSE", "LICENSES/TabICL-BSD-3-Clause.txt"]

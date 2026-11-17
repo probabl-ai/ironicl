@@ -19,11 +19,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
+import scipy
 from numpy.testing import assert_allclose, assert_array_equal
 from sklearn.base import clone
 from sklearn.exceptions import NotFittedError
 
 from ironicl.preprocessing import Preprocessor, _feature_shuffles
+
+SCIPY = tuple(int(part) for part in scipy.__version__.split(".")[:2])
 
 FIXTURE = Path(__file__).parent / "fixtures" / "preprocessing.json"
 
@@ -54,6 +57,10 @@ class PreprocessingTest(unittest.TestCase):
         self.assertEqual(fixture["upstream_commit"], "bd030d47ff7d9f987f0f33431d743a3003bfe0d3")
         for case in fixture["cases"]:
             with self.subTest(dtype=case["dtype"]):
+                if case["dtype"] == "float32" and SCIPY < (1, 17):
+                    # The fixture was made with SciPy 1.17+, whose float32 power-transform fit
+                    # differs; TabICL on older SciPy matches Ironicl (see tests/parity).
+                    self.skipTest("float32 fixture needs SciPy 1.17+")
                 x = np.asarray(fixture["training"], dtype=case["dtype"])
                 q = np.asarray(fixture["query"], dtype=case["dtype"])
                 preprocessor = Preprocessor(random_state=42).fit(x, fixture["labels"])
