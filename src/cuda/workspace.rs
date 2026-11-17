@@ -11,11 +11,13 @@
 //! | `w` | the 16-bit operands of up to `[B q, 1024]`: the gate's input, linear1's output, the decoder's hidden layer |
 //!
 //! A 16-bit operand is its values in FP16, and for split precision their low
-//! parts in a buffer of their own.
+//! parts in a buffer of their own. FP32 products reserve no 16-bit buffers.
 
 use cuda_core::{DeviceBuffer, DeviceCopy, DriverError};
 
-use super::{COLUMN_DIM, HEAD_DIM, HEADS, ICL_DIM, RESERVED, device::Device, launch::padded_query_rows};
+use super::{
+    COLUMN_DIM, HEAD_DIM, HEADS, ICL_DIM, Precision, RESERVED, device::Device, launch::padded_query_rows,
+};
 
 /// A context's shape: `B` estimators, `H` features, `N` training rows, and
 /// the decoder's outputs per row.
@@ -57,8 +59,10 @@ pub(super) struct Workspace {
     pub(super) cls: Buffer<f32>,
     pub(super) a: Halves,
     pub(super) w: Halves,
-    /// FP16 queries packed for ICL attention, `[B * 8, qp, 64]`.
+    /// Queries packed for ICL attention, `[B * 8, qp, 64]`: FP16 on tensor
+    /// cores, FP32 at [`Precision::Fp32`].
     pub(super) packed: Buffer<u16>,
+    pub(super) packed32: Buffer<f32>,
     /// ICL attention's chunk outputs and log-sum-exps, and their merge.
     pub(super) part: Buffer<f32>,
     pub(super) lse: Buffer<f32>,
@@ -112,6 +116,7 @@ impl Buffers {
     pub(super) fn reserve(
         &mut self,
         device: &Device,
+        precision: Precision,
         shape: Shape,
         (run, pass): (usize, usize),
     ) -> Result<(), DriverError> {
@@ -120,13 +125,20 @@ impl Buffers {
         for buffer in &mut self.hidden {
             buffer.reserve(device, seqs * ICL_DIM)?;
         }
-        self.work.reserve(device, shape, run)
+        self.work.reserve(device, precision, shape, run)
     }
 }
 
 impl Workspace {
-    /// Reserve every buffer for runs of `run` rows.
-    pub(super) fn reserve(&mut self, device: &Device, shape: Shape, run: usize) -> Result<(), DriverError> {
+    /// Reserve every buffer products at `precision` use for runs of `run`
+    /// rows.
+    pub(super) fn reserve(
+        &mut self,
+        device: &Device,
+        precision: Precision,
+        shape: Shape,
+        run: usize,
+    ) -> Result<(), DriverError> {
         let (b, h) = (shape.ensembles, shape.features);
         let seqs = b * run;
         let columns = b * h * run;
@@ -137,7 +149,7 @@ impl Workspace {
         // most query rows times chunks of any run up to `run` rows.
         let chunks = std::iter::once(16)
             .chain((64..=padded).step_by(64))
-            .map(|queries| queries * device.icl_split(pairs, queries, shape.rows).1)
+            .map(|queries| queries * device.icl_split(precision, pairs, queries, shape.rows).1)
             .max()
             .unwrap_or(padded);
         let state = (columns * COLUMN_DIM)
@@ -153,11 +165,15 @@ impl Workspace {
         for buffer in [&mut self.gate_hidden, &mut self.gate, &mut self.cls] {
             buffer.reserve(device, seqs * ICL_DIM)?;
         }
-        for (halves, len) in [(&mut self.a, seqs * ICL_DIM), (&mut self.w, 2 * seqs * ICL_DIM)] {
-            halves.hi.reserve(device, len)?;
-            halves.lo.reserve(device, len)?;
+        if precision == Precision::Fp32 {
+            self.packed32.reserve(device, pairs * padded * HEAD_DIM)?;
+        } else {
+            for (halves, len) in [(&mut self.a, seqs * ICL_DIM), (&mut self.w, 2 * seqs * ICL_DIM)] {
+                halves.hi.reserve(device, len)?;
+                halves.lo.reserve(device, len)?;
+            }
+            self.packed.reserve(device, pairs * padded * HEAD_DIM)?;
         }
-        self.packed.reserve(device, pairs * padded * HEAD_DIM)?;
         self.part.reserve(device, pairs * chunks * HEAD_DIM)?;
         self.lse.reserve(device, pairs * chunks)?;
         self.attention.reserve(device, pairs * padded * HEAD_DIM)?;

@@ -65,10 +65,13 @@ fn icl_attention_matches_an_fp64_reference() {
         let k = rounded(&values(pairs * rows * D, 2));
         let v = rounded(&values(pairs * rows * D, 3));
         let (k_bits, v_bits) = (bits(&k), bits(&v));
-        for (query_rows, precision) in [1usize, 5, 16, 17, 64, 100]
-            .into_iter()
-            .flat_map(|rows| [(rows, Precision::Split), (rows, Precision::Half)])
-        {
+        for (query_rows, precision) in [1usize, 5, 16, 17, 64, 100].into_iter().flat_map(|rows| {
+            [
+                (rows, Precision::Fp32),
+                (rows, Precision::Split),
+                (rows, Precision::Half),
+            ]
+        }) {
             let q = rounded(&values(pairs * query_rows * D, 1));
             let out = device
                 .icl_attention(
@@ -94,10 +97,15 @@ fn icl_attention_matches_an_fp64_reference() {
                     }
                 }
             }
-            // The softmax weights are rounded to FP16 before P V. Under Half,
-            // keys and values are FP8 (3 mantissa bits), and wide batches
-            // accumulate each 64-key stage in FP16.
-            let tolerance = if precision == Precision::Half { 3e-2 } else { 1e-4 };
+            // FP32 keeps every value and weight in FP32. Split rounds the
+            // softmax weights to FP16 before P V. Under Half, keys and values
+            // are FP8 (3 mantissa bits), and wide batches accumulate each
+            // 64-key stage in FP16.
+            let tolerance = match precision {
+                Precision::Fp32 => 1e-5,
+                Precision::Split => 1e-4,
+                Precision::Half => 3e-2,
+            };
             assert!(
                 max_error < tolerance,
                 "rows {rows}, queries {query_rows}, {precision:?}: max error {max_error:.2e}"

@@ -1,6 +1,6 @@
-//! A context's ICL keys and values on the device: FP16 for `auto`, or FP8
-//! E4M3 with a scale per (estimator, head, dim) for `fast`, kept on the device
-//! or streamed from the host one block at a time on every pass.
+//! A context's ICL keys and values on the device: FP32 for `safe`, FP16 for
+//! `auto`, or FP8 E4M3 with a scale per (estimator, head, dim) for `fast`, kept
+//! on the device or streamed from the host one block at a time on every pass.
 //!
 //! Streaming goes through two device slots, each with a pinned staging
 //! buffer: [`IclCache::begin`] stages the first two blocks, [`IclCache::acquire`]
@@ -21,46 +21,90 @@ use super::{
 };
 use crate::error::{Error, Result};
 
-/// A context's ICL keys and values on the host, which the cache uploads once
-/// or streams on every pass.
-pub trait IclSource: Send + Sync {
-    /// ICL block `block`'s keys and values as FP16 bits, `[B, 8, N, 64]`.
-    fn block(&self, block: usize) -> (&[u16], &[u16]);
+/// One ICL block's keys or values on the host, `[B, 8, N, 64]`.
+#[derive(Clone, Copy)]
+pub enum IclValues<'a> {
+    /// FP32, for [`Precision::Fp32`].
+    F32(&'a [f32]),
+    /// FP16 bits, for the tensor-core precisions.
+    F16(&'a [u16]),
 }
 
-/// 16-bit units of one block's keys (or values) for `pairs` pairs and `rows`
-/// rows at `precision`: FP16, or FP8 bytes two to a unit.
-pub(super) const fn units(precision: Precision, pairs: usize, rows: usize) -> usize {
-    let padded = pairs * padded_rows(rows) * HEAD_DIM;
-    match precision {
-        Precision::Split => padded,
-        Precision::Half => padded / 2,
+impl<'a> IclValues<'a> {
+    fn len(self) -> usize {
+        match self {
+            Self::F32(values) => values.len(),
+            Self::F16(values) => values.len(),
+        }
+    }
+
+    fn bytes(self) -> &'a [u8] {
+        match self {
+            Self::F32(values) => bytemuck::cast_slice(values),
+            Self::F16(values) => bytemuck::cast_slice(values),
+        }
+    }
+
+    /// Whether a cache at `precision` stores these values: FP32 at
+    /// [`Precision::Fp32`], FP16 otherwise.
+    #[must_use]
+    pub const fn stored_at(self, precision: Precision) -> bool {
+        matches!(
+            (self, precision),
+            (Self::F32(_), Precision::Fp32) | (Self::F16(_), Precision::Split | Precision::Half)
+        )
     }
 }
 
-/// Keys or values `[pairs, rows, 64]` into `[pairs, padded_rows(rows), 64]`,
-/// pair by pair in parallel, leaving the padding as it is.
-fn pad<T: Copy + Send + Sync>(padded: &mut [T], values: &[T], rows: usize) {
+/// A context's ICL keys and values on the host, which the cache uploads once
+/// or streams on every pass.
+pub trait IclSource: Send + Sync {
+    /// ICL block `block`'s keys and values.
+    fn block(&self, block: usize) -> (IclValues<'_>, IclValues<'_>);
+}
+
+/// Bytes per cached key or value at `precision`: FP32, FP16, or FP8.
+pub(super) const fn value_bytes(precision: Precision) -> usize {
+    match precision {
+        Precision::Fp32 => 4,
+        Precision::Split => 2,
+        Precision::Half => 1,
+    }
+}
+
+/// 16-bit units of one block's keys (or values) for `pairs` pairs and `rows`
+/// rows at `precision`.
+pub(super) const fn units(precision: Precision, pairs: usize, rows: usize) -> usize {
+    pairs * padded_rows(rows) * HEAD_DIM * value_bytes(precision) / 2
+}
+
+/// Keys or values `[pairs, rows, 64]` of `size` bytes each, as bytes, into
+/// `[pairs, padded_rows(rows), 64]`, pair by pair in parallel, leaving the
+/// padding as it is.
+fn pad(padded: &mut [u8], values: &[u8], rows: usize, size: usize) {
     padded
-        .par_chunks_mut(padded_rows(rows) * HEAD_DIM)
-        .zip(values.par_chunks(rows * HEAD_DIM))
+        .par_chunks_mut(padded_rows(rows) * HEAD_DIM * size)
+        .zip(values.par_chunks(rows * HEAD_DIM * size))
         .for_each(|(to, from)| to[..from.len()].copy_from_slice(from));
 }
 
 /// One block's keys and values on the device as the attention kernels read
-/// them: bytes of FP16 or FP8 values, rows padded to whole key tiles.
+/// them: bytes of FP32, FP16, or FP8 values, rows padded to whole key tiles.
 pub(super) struct KeyValues {
     pub(super) keys: DeviceBuffer<u8>,
     pub(super) values: DeviceBuffer<u8>,
 }
 
 impl KeyValues {
-    /// FP16 keys and values as the bytes the attention kernels read.
-    pub(super) fn from_halves(keys: DeviceBuffer<u16>, values: DeviceBuffer<u16>) -> Result<Self> {
-        let bytes = |buffer: DeviceBuffer<u16>| {
+    /// Keys and values of any type as the bytes the attention kernels read.
+    pub(super) fn from_typed<T: cuda_core::DeviceCopy + bytemuck::NoUninit>(
+        keys: DeviceBuffer<T>,
+        values: DeviceBuffer<T>,
+    ) -> Result<Self> {
+        let bytes = |buffer: DeviceBuffer<T>| {
             buffer
                 .cast_chunks::<u8>()
-                .map_err(|_| gpu_error("FP16 cache as bytes"))
+                .map_err(|_| gpu_error("ICL cache as bytes"))
         };
         Ok(Self {
             keys: bytes(keys)?,
@@ -79,7 +123,8 @@ pub(super) struct Scales {
 /// One block of a cache as its kernels read it.
 #[derive(Clone, Copy)]
 pub(super) struct BlockCache<'a> {
-    /// FP16 at [`Precision::Split`], FP8 at [`Precision::Half`].
+    /// FP32 at [`Precision::Fp32`], FP16 at [`Precision::Split`], FP8 at
+    /// [`Precision::Half`].
     pub(super) precision: Precision,
     pub(super) keys: &'a DeviceBuffer<u8>,
     pub(super) values: &'a DeviceBuffer<u8>,
@@ -187,17 +232,21 @@ impl IclCache {
         let (mut blocks, mut encoded, mut scales) = (Vec::new(), Vec::new(), Vec::new());
         for block in 0..ICL_BLOCKS {
             let (keys, values) = source.block(block);
-            if keys.len() != pairs * rows * HEAD_DIM || values.len() != keys.len() {
+            if keys.len() != pairs * rows * HEAD_DIM
+                || values.len() != keys.len()
+                || !keys.stored_at(precision)
+                || !values.stored_at(precision)
+            {
                 return Err(Error::InvalidArgument("ICL cache shape does not match".into()));
             }
-            match (precision, streamed) {
-                // A streamed FP16 cache copies straight from the context.
-                (Precision::Split, true) => {}
-                (Precision::Split, false) => blocks.push(KeyValues {
-                    keys: upload_padded(device, keys, (pairs, rows))?,
-                    values: upload_padded(device, values, (pairs, rows))?,
+            match (precision, keys, values) {
+                // A streamed FP32 or FP16 cache copies straight from the context.
+                (Precision::Fp32 | Precision::Split, ..) if streamed => {}
+                (Precision::Fp32 | Precision::Split, ..) => blocks.push(KeyValues {
+                    keys: upload_padded(device, precision, keys, (pairs, rows))?,
+                    values: upload_padded(device, precision, values, (pairs, rows))?,
                 }),
-                (Precision::Half, _) => {
+                (Precision::Half, IclValues::F16(keys), IclValues::F16(values)) => {
                     let ((keys, key_scales), (values, value_scales)) = (
                         encode_fp8(device, keys, (pairs, rows))?,
                         encode_fp8(device, values, (pairs, rows))?,
@@ -212,11 +261,14 @@ impl IclCache {
                         blocks.push(KeyValues { keys, values });
                     }
                 }
+                (Precision::Half, ..) => unreachable!("checked: FP8 caches encode FP16 values"),
             }
         }
         let storage = match (precision, streamed) {
             (_, false) => Storage::Resident(blocks),
-            (Precision::Split, true) => Storage::Streamed(Host::Context(Arc::clone(source))),
+            (Precision::Fp32 | Precision::Split, true) => {
+                Storage::Streamed(Host::Context(Arc::clone(source)))
+            }
             (Precision::Half, true) => Storage::Streamed(Host::Encoded(encoded)),
         };
         Ok(Self {
@@ -342,17 +394,21 @@ impl IclCache {
         if let Some(copied) = slot.copied.take() {
             copied.synchronize().map_err(gpu_error)?;
         }
-        // FP16 units of the staging buffers, which hold whole pages.
-        let staged_keys = bytemuck::cast_slice_mut::<u8, u16>(slot.staged_keys.as_mut_slice());
-        let staged_values = bytemuck::cast_slice_mut::<u8, u16>(slot.staged_values.as_mut_slice());
+        let staged_keys = slot.staged_keys.as_mut_slice();
+        let staged_values = slot.staged_values.as_mut_slice();
         match host {
             Host::Context(source) => {
                 let (keys, values) = source.block(block);
-                pad(staged_keys, keys, self.rows);
-                pad(staged_values, values, self.rows);
+                let size = value_bytes(self.precision);
+                pad(staged_keys, keys.bytes(), self.rows, size);
+                pad(staged_values, values.bytes(), self.rows, size);
             }
             Host::Encoded(blocks) => {
                 let (keys, values) = &blocks[block];
+                let (keys, values) = (
+                    bytemuck::cast_slice::<u16, u8>(keys),
+                    bytemuck::cast_slice::<u16, u8>(values),
+                );
                 for (to, from) in [(staged_keys, keys), (staged_values, values)] {
                     to.par_chunks_mut(1 << 20)
                         .zip(from.par_chunks(1 << 20))
@@ -383,11 +439,17 @@ fn ones(device: &Device, pairs: usize) -> Result<DeviceBuffer<f32>> {
     device.upload(&vec![1.0; pairs * HEAD_DIM])
 }
 
-/// FP16 keys or values `[pairs, rows, 64]` uploaded with their rows padded.
-fn upload_padded(device: &Device, values: &[u16], (pairs, rows): (usize, usize)) -> Result<DeviceBuffer<u8>> {
-    let mut padded = vec![0u16; units(Precision::Split, pairs, rows)];
-    pad(&mut padded, values, rows);
-    device.upload(bytemuck::cast_slice(&padded))
+/// FP32 or FP16 keys or values `[pairs, rows, 64]`, as a cache at `precision`
+/// stores them, uploaded with their rows padded.
+fn upload_padded(
+    device: &Device,
+    precision: Precision,
+    values: IclValues<'_>,
+    (pairs, rows): (usize, usize),
+) -> Result<DeviceBuffer<u8>> {
+    let mut padded = vec![0u8; 2 * units(precision, pairs, rows)];
+    pad(&mut padded, values.bytes(), rows, value_bytes(precision));
+    device.upload(&padded)
 }
 
 /// FP16 keys or values `[pairs, rows, 64]` encoded as FP8 on the device, with
@@ -419,32 +481,47 @@ pub(super) struct UploadedBlock {
 
 impl UploadedBlock {
     /// FP16 keys and values `[pairs, rows, 64]` stored as a predictor at
-    /// `precision` stores them.
+    /// `precision` stores them: in FP32 at [`Precision::Fp32`], which holds
+    /// them exactly.
     pub(super) fn new(
         device: &Device,
         precision: Precision,
         (keys, values): (&[u16], &[u16]),
         (pairs, rows): (usize, usize),
     ) -> Result<Self> {
-        if precision == Precision::Split {
-            let ones = vec![1.0; pairs * HEAD_DIM];
-            return Ok(Self {
-                cache: KeyValues {
-                    keys: upload_padded(device, keys, (pairs, rows))?,
-                    values: upload_padded(device, values, (pairs, rows))?,
-                },
-                key_scales: ones.clone(),
-                value_scales: ones,
-            });
-        }
-        let ((keys, key_scales), (values, value_scales)) = (
-            encode_fp8(device, keys, (pairs, rows))?,
-            encode_fp8(device, values, (pairs, rows))?,
-        );
+        let widened = |values: &[u16]| -> Vec<f32> {
+            values
+                .iter()
+                .map(|&bits| half::f16::from_bits(bits).to_f32())
+                .collect()
+        };
+        let upload = |values: IclValues<'_>| upload_padded(device, precision, values, (pairs, rows));
+        let ones = vec![1.0; pairs * HEAD_DIM];
+        let cache = match precision {
+            Precision::Fp32 => KeyValues {
+                keys: upload(IclValues::F32(&widened(keys)))?,
+                values: upload(IclValues::F32(&widened(values)))?,
+            },
+            Precision::Split => KeyValues {
+                keys: upload(IclValues::F16(keys))?,
+                values: upload(IclValues::F16(values))?,
+            },
+            Precision::Half => {
+                let ((keys, key_scales), (values, value_scales)) = (
+                    encode_fp8(device, keys, (pairs, rows))?,
+                    encode_fp8(device, values, (pairs, rows))?,
+                );
+                return Ok(Self {
+                    cache: KeyValues { keys, values },
+                    key_scales: device.download(&key_scales)?,
+                    value_scales: device.download(&value_scales)?,
+                });
+            }
+        };
         Ok(Self {
-            cache: KeyValues { keys, values },
-            key_scales: device.download(&key_scales)?,
-            value_scales: device.download(&value_scales)?,
+            cache,
+            key_scales: ones.clone(),
+            value_scales: ones,
         })
     }
 }

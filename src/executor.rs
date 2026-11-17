@@ -654,19 +654,19 @@ impl Executor {
             let context = StaticContextArtifact::from_page_aligned(metadata, tensors)?;
             return StaticExecutor::with_executor(self.clone(), context, optimize, threads, limits);
         }
-        // With a CUDA GPU, `auto` and `fast` build on it and store the ICL keys
-        // and values in FP16, which the GPU predicts from, as on Apple GPUs.
+        // With a CUDA GPU, every level builds on it and stores the ICL keys and
+        // values as the GPU predicts from them: FP32 for `safe`, FP16 for
+        // `auto` and `fast`, as on Apple GPUs.
         #[cfg(feature = "cuda")]
-        if let Some(precision) = crate::cuda::Precision::for_optimize(optimize)
-            && let Some(weights) = self.cuda_weights()?
-        {
+        if let Some(weights) = self.cuda_weights()? {
+            let precision = crate::cuda::Precision::for_optimize(optimize);
             let built = self.build_tensors_cuda(&weights, shape, x, y_train, precision, limits)?;
             let (tensors, built) = if let Some(built) = built {
                 built
             } else {
                 let tensors = self.build_tensors_cpu(shape, x, y_train, limits)?;
                 let icl = |name: &str| name.starts_with("icl.");
-                (page_aligned(&tensors, icl, TensorStorage::F16)?, None)
+                (page_aligned(&tensors, icl, cuda_icl_storage(precision))?, None)
             };
             let context = StaticContextArtifact::from_page_aligned(metadata, tensors)?;
             return StaticExecutor::prepared(self.clone(), context, threads, limits)?
@@ -690,7 +690,7 @@ impl Executor {
 
     /// Build every estimator's keys and values on the CUDA device, with
     /// products at `precision`, into page-aligned context tensors, the ICL ones
-    /// in FP16, and return them with the ICL ones the build left on the device
+    /// as [`cuda_icl_storage`] says, and return them with the ICL ones the build left on the device
     /// for prediction. Returns `None` when a grouped triple is the all-missing
     /// marker that only the CPU path handles, or when the context does not
     /// [`crate::cuda::fits`] the device.
@@ -712,7 +712,7 @@ impl Executor {
             outputs: self.decoder_width()?,
         };
         let budget = weights.budget(limits.device.map(|limit| limit.bytes))?;
-        if !crate::cuda::fits(budget, shape) || has_missing_marker(x, h) {
+        if !crate::cuda::fits(budget, precision, shape) || has_missing_marker(x, h) {
             return Ok(None);
         }
         let (column_labels, icl_labels) = self.label_embeddings(n, y_train)?;
@@ -726,7 +726,7 @@ impl Executor {
             })
             .collect::<Result<Vec<_>>>()?;
         let base_scales = self.icl_base_scales(n)?;
-        let mut page = context_page(b, n, h, TensorStorage::F16)?;
+        let mut page = context_page(b, n, h, cuda_icl_storage(precision))?;
         // `context_tensors` order: the column blocks, then the ICL blocks, each
         // its key then its value.
         let mut tensors = page.tensors_mut().into_iter();
@@ -737,9 +737,7 @@ impl Executor {
                 .take(COLUMN_BLOCKS)
                 .map(|(key, value)| (bytemuck::cast_slice_mut(key), bytemuck::cast_slice_mut(value)))
                 .collect(),
-            icl: pairs
-                .map(|(key, value)| (bytemuck::cast_slice_mut(key), bytemuck::cast_slice_mut(value)))
-                .collect(),
+            icl: pairs.collect(),
         };
         let built = crate::cuda::build(
             weights,
@@ -1768,10 +1766,11 @@ impl StaticExecutor {
         None
     }
 
-    /// Upload the context for CUDA prediction when a CUDA device is available
-    /// and the context stores its ICL caches in FP16; `built`, the ICL keys
-    /// and values the context's build left on the device, replaces their
-    /// upload. Other contexts stay on the CPU.
+    /// Upload the context for CUDA prediction at `optimize` when a CUDA
+    /// device is available and the context stores its ICL caches as that
+    /// level's GPU reads them: FP32 for `safe`, FP16 otherwise. `built`, the
+    /// ICL keys and values the context's build left on the device, replaces
+    /// their upload. Other contexts stay on the CPU.
     #[cfg(feature = "cuda")]
     fn with_cuda(
         mut self,
@@ -1779,16 +1778,14 @@ impl StaticExecutor {
         limits: MemoryLimits,
         built: Option<crate::cuda::BuiltCache>,
     ) -> Result<Self> {
-        let Some(precision) = crate::cuda::Precision::for_optimize(optimize) else {
-            return Ok(self);
-        };
+        let precision = crate::cuda::Precision::for_optimize(optimize);
         if self.context.has_packed_icl_keys() {
             return Ok(self);
         }
         let Some(weights) = self.model.cuda_weights()? else {
             return Ok(self);
         };
-        let Some(icl) = ContextIcl::new(&self.context) else {
+        let Some(icl) = ContextIcl::new(&self.context, precision) else {
             return Ok(self);
         };
         let column = (0..COLUMN_BLOCKS)
@@ -3897,6 +3894,16 @@ fn page_aligned(
     Ok(page)
 }
 
+/// How a context for the CUDA GPU at `precision` stores its ICL keys and
+/// values: as the GPU caches them, FP32 for `safe` and FP16 otherwise.
+#[cfg(feature = "cuda")]
+const fn cuda_icl_storage(precision: crate::cuda::Precision) -> TensorStorage {
+    match precision {
+        crate::cuda::Precision::Fp32 => TensorStorage::Fp32,
+        crate::cuda::Precision::Split | crate::cuda::Precision::Half => TensorStorage::F16,
+    }
+}
+
 /// A context's page-aligned tensors, as [`context_tensors`] lists them, with
 /// the ICL keys and values in `icl`.
 #[cfg(any(
@@ -4958,18 +4965,24 @@ struct ContextIcl(StaticContextArtifact);
 
 #[cfg(feature = "cuda")]
 impl ContextIcl {
-    /// `None` unless every ICL block's keys and values are FP16.
-    fn new(context: &StaticContextArtifact) -> Option<Self> {
+    /// `None` unless every ICL block's keys and values are stored as a cache
+    /// at `precision` holds them.
+    fn new(context: &StaticContextArtifact, precision: crate::cuda::Precision) -> Option<Self> {
         let context = Self(context.clone());
         (0..ICL_BLOCKS)
-            .all(|block| context.tensors(block).is_some())
+            .all(|block| {
+                context
+                    .tensors(block)
+                    .is_some_and(|(keys, values)| keys.stored_at(precision) && values.stored_at(precision))
+            })
             .then_some(context)
     }
 
-    fn tensors(&self, block: usize) -> Option<(&[u16], &[u16])> {
+    fn tensors(&self, block: usize) -> Option<(crate::cuda::IclValues<'_>, crate::cuda::IclValues<'_>)> {
         let tensor = |kind: &str| match self.0.tensor(&format!("icl.{block}.{kind}"))?.data {
-            StaticContextTensorData::F16(values) => Some(values),
-            _ => None,
+            StaticContextTensorData::Fp32(values) => Some(crate::cuda::IclValues::F32(values)),
+            StaticContextTensorData::F16(values) => Some(crate::cuda::IclValues::F16(values)),
+            StaticContextTensorData::Bf16(_) => None,
         };
         Some((tensor("key")?, tensor("value")?))
     }
@@ -4977,7 +4990,7 @@ impl ContextIcl {
 
 #[cfg(feature = "cuda")]
 impl crate::cuda::IclSource for ContextIcl {
-    fn block(&self, block: usize) -> (&[u16], &[u16]) {
+    fn block(&self, block: usize) -> (crate::cuda::IclValues<'_>, crate::cuda::IclValues<'_>) {
         self.tensors(block).expect("ContextIcl::new checked every block")
     }
 }

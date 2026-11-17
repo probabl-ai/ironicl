@@ -47,11 +47,13 @@ pub(super) struct Norm {
     pub(super) beta: DeviceBuffer<f32>,
 }
 
-/// A 128-wide block's dense layer in the B-fragment order of
-/// `mma.m16n8k16` (see [`fragment_order`]), high and low parts, and its bias.
+/// A 128-wide block's dense layer: in the B-fragment order of
+/// `mma.m16n8k16` (see [`fragment_order`]), high and low parts, for the
+/// tensor cores; in row order, FP32, for the CUDA cores; and its bias.
 pub(super) struct Fragments {
     pub(super) hi: DeviceBuffer<u32>,
     pub(super) lo: DeviceBuffer<u32>,
+    pub(super) w: DeviceBuffer<f32>,
     pub(super) b: DeviceBuffer<f32>,
 }
 
@@ -213,6 +215,7 @@ impl<'a, F: Fn(&str) -> Result<&'a [f32]>> Loader<'_, F> {
         Ok(Fragments {
             hi: self.upload(&hi)?,
             lo: self.upload(&lo)?,
+            w: self.tensor(weight)?,
             b: self.tensor(bias)?,
         })
     }

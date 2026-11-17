@@ -6,7 +6,8 @@
 //! points attend to the column's training rows, then the rows attend back to
 //! them through the cached keys and values. The row stage and the ICL blocks
 //! run in runs of rows; each ICL block stores every training row's keys and
-//! values in FP16 before any row attends to them. The caches go to the host
+//! values, in FP32 for `safe` and FP16 otherwise, before any row attends to
+//! them. The caches go to the host
 //! as each block finishes, and when the whole context builds at once and
 //! they fit, they also stay on the device, encoded as predictions read them,
 //! for the context's predictor.
@@ -19,7 +20,7 @@ use super::{
     RESERVED,
     cache::{BlockCache, BuiltCache, KeyValues, Scales, units},
     device::{Device, gpu_error},
-    launch::{SmallAttention, padded_rows},
+    launch::{CacheOutput, SmallAttention, padded_rows},
     plan::{MIN_RUN as PREDICT_MIN_RUN, row_bytes},
     predictor::{RowTokens, Stages, upload_all},
     weights::ModelWeights,
@@ -66,8 +67,10 @@ pub struct BuildOutputs<'a> {
     /// Each column block's keys and values, `[B, H + 4, 8, 128, 16]`; the
     /// build leaves the reserved streams as they are.
     pub column: Vec<(&'a mut [f32], &'a mut [f32])>,
-    /// Each ICL block's keys and values as FP16 bits, `[B, 8, N, 64]`.
-    pub icl: Vec<(&'a mut [u16], &'a mut [u16])>,
+    /// Each ICL block's keys and values, `[B, 8, N, 64]`, as bytes of FP32
+    /// values at [`Precision::Fp32`] and of FP16 ones otherwise (see
+    /// [`context_bytes`]).
+    pub icl: Vec<(&'a mut [u8], &'a mut [u8])>,
 }
 
 /// How a build uses device memory.
@@ -83,11 +86,22 @@ struct Plan {
     keep: bool,
 }
 
+/// Bytes per ICL key or value in a context built at `precision`: FP32 at
+/// [`Precision::Fp32`], FP16 otherwise.
+#[must_use]
+pub const fn context_bytes(precision: Precision) -> usize {
+    match precision {
+        Precision::Fp32 => 4,
+        Precision::Split | Precision::Half => 2,
+    }
+}
+
 /// Device bytes one estimator of a group keeps through its build with `H`
-/// features and `N` rows: its column embeddings, row states, label
-/// embeddings, and training rows, and an ICL block's FP16 keys and values.
-const fn estimator_bytes(h: usize, n: usize) -> usize {
-    4 * n * (h * COLUMN_DIM + 2 * ICL_DIM + COLUMN_DIM + h) + 2 * 2 * HEADS * padded_rows(n) * HEAD_DIM
+/// features and `N` rows at `precision`: its column embeddings, row states,
+/// label embeddings, and training rows, and an ICL block's keys and values.
+const fn estimator_bytes(precision: Precision, h: usize, n: usize) -> usize {
+    4 * n * (h * COLUMN_DIM + 2 * ICL_DIM + COLUMN_DIM + h)
+        + 2 * context_bytes(precision) * HEADS * padded_rows(n) * HEAD_DIM
 }
 
 /// Device bytes one column of a chunk of the column stage takes: its state
@@ -112,12 +126,13 @@ fn plan(budget: usize, precision: Precision, shape: Shape) -> Option<Plan> {
     } = shape;
     let budget = budget / 10 * 9;
     let limit = u32::MAX as usize;
-    let build =
-        |group: usize| group * estimator_bytes(h, n) + column_bytes(n).max(MIN_RUN * row_bytes((group, h)));
+    let build = |group: usize| {
+        group * estimator_bytes(precision, h, n) + column_bytes(n).max(MIN_RUN * row_bytes((group, h)))
+    };
     let group = (1..=b)
         .rev()
         .find(|&group| build(group) <= budget && group * h * n * COLUMN_DIM <= limit)?;
-    let free = budget - group * estimator_bytes(h, n);
+    let free = budget - group * estimator_bytes(precision, h, n);
     let columns = (free / column_bytes(n))
         .min(limit / (n * 3 * COLUMN_DIM))
         .clamp(1, group * h);
@@ -137,10 +152,11 @@ fn plan(budget: usize, precision: Precision, shape: Shape) -> Option<Plan> {
     })
 }
 
-/// Whether a context of `shape` builds on the device within `budget` bytes.
+/// Whether a context of `shape` builds on the device at `precision` within
+/// `budget` bytes.
 #[must_use]
-pub fn fits(budget: usize, shape: Shape) -> bool {
-    shape.rows >= MIN_ROWS && plan(budget, Precision::Split, shape).is_some()
+pub fn fits(budget: usize, precision: Precision, shape: Shape) -> bool {
+    shape.rows >= MIN_ROWS && plan(budget, precision, shape).is_some()
 }
 
 /// Build a context's caches into `outputs`, with products at `precision`.
@@ -158,7 +174,7 @@ pub fn build(
     inputs: &BuildInputs<'_>,
     outputs: &mut BuildOutputs<'_>,
 ) -> Result<Option<BuiltCache>> {
-    check(inputs, outputs)?;
+    check(precision, inputs, outputs)?;
     let Some(plan) = plan(inputs.budget, precision, inputs.shape) else {
         return Err(Error::InvalidArgument(
             "the context does not fit the CUDA device".into(),
@@ -196,7 +212,7 @@ pub fn build(
 }
 
 /// Check that the inputs and outputs hold the shapes they claim.
-fn check(inputs: &BuildInputs<'_>, outputs: &BuildOutputs<'_>) -> Result<()> {
+fn check(precision: Precision, inputs: &BuildInputs<'_>, outputs: &BuildOutputs<'_>) -> Result<()> {
     let Shape {
         ensembles: b,
         features: h,
@@ -218,10 +234,9 @@ fn check(inputs: &BuildInputs<'_>, outputs: &BuildOutputs<'_>) -> Result<()> {
             keys.len() == b * (h + RESERVED) * COLUMN_CACHE && values.len() == keys.len()
         })
         && outputs.icl.len() == ICL_BLOCKS
-        && outputs
-            .icl
-            .iter()
-            .all(|(keys, values)| keys.len() == b * n * ICL_DIM && values.len() == keys.len());
+        && outputs.icl.iter().all(|(keys, values)| {
+            keys.len() == b * n * ICL_DIM * context_bytes(precision) && values.len() == keys.len()
+        });
     if consistent {
         Ok(())
     } else {
@@ -266,7 +281,7 @@ impl Builder<'_> {
         let mut work = Workspace::default();
         let mut runs = {
             let embeddings = self.columns(inputs, outputs, (first, group))?;
-            work.reserve(self.device(), shape, self.plan.run)
+            work.reserve(self.device(), self.stages.precision, shape, self.plan.run)
                 .map_err(gpu_error)?;
             self.row_runs(&mut work, inputs, &embeddings, (first, group))?
         };
@@ -443,9 +458,10 @@ impl Builder<'_> {
     }
 
     /// The twelve ICL blocks on the runs' row states `[group, len, 512]`:
-    /// each block's FP16 keys and values for every training row, then each
-    /// run's attention to them; the keys and values then go to the host, and
-    /// stay on the device when the plan keeps them.
+    /// each block's keys and values for every training row, FP32 at
+    /// [`Precision::Fp32`] and FP16 otherwise, then each run's attention to
+    /// them; the keys and values then go to the host, and stay on the device
+    /// when the plan keeps them.
     fn icl(
         &self,
         work: &mut Workspace,
@@ -456,33 +472,33 @@ impl Builder<'_> {
         let device = self.device();
         let precision = self.stages.precision;
         let (rows, padded, pairs) = (self.rows, padded_rows(self.rows), group * HEADS);
+        let len = pairs * padded * HEAD_DIM;
         let ones = device.upload(&vec![1.0f32; pairs * HEAD_DIM])?;
         let mut built = self.plan.keep.then(|| BuiltCache::new(precision));
         for block in 0..ICL_BLOCKS {
-            let zeroed = || device.zeroed::<u16>(pairs * padded * HEAD_DIM).map_err(gpu_error);
-            let (mut keys, mut values) = (zeroed()?, zeroed()?);
-            for run in runs.iter() {
-                self.stages
-                    .icl_keys_values(work, &run.hidden, block, group * run.len)?;
-                device.icl_kv(
-                    work.wide.get(),
-                    (&mut keys, &mut values),
-                    (group, run.len, run.start, padded),
-                )?;
-            }
             // A kept `fast` cache is FP8, encoded from the FP16 one.
-            let fp8 = if built.is_some() && precision == Precision::Half {
-                let encode =
-                    |values: &DeviceBuffer<u16>| device.encode_fp8(values, (pairs, rows), (padded, padded));
-                Some((encode(&keys)?, encode(&values)?))
+            let mut fp8 = None;
+            let (stored, read_at) = if precision == Precision::Fp32 {
+                let zeroed = || device.zeroed::<f32>(len).map_err(gpu_error);
+                let (mut keys, mut values) = (zeroed()?, zeroed()?);
+                self.keys_values(work, runs, block, group, CacheOutput::F32(&mut keys, &mut values))?;
+                (KeyValues::from_typed(keys, values)?, Precision::Fp32)
             } else {
-                None
+                let zeroed = || device.zeroed::<u16>(len).map_err(gpu_error);
+                let (mut keys, mut values) = (zeroed()?, zeroed()?);
+                self.keys_values(work, runs, block, group, CacheOutput::F16(&mut keys, &mut values))?;
+                if built.is_some() && precision == Precision::Half {
+                    let encode = |values: &DeviceBuffer<u16>| {
+                        device.encode_fp8(values, (pairs, rows), (padded, padded))
+                    };
+                    fp8 = Some((encode(&keys)?, encode(&values)?));
+                }
+                (KeyValues::from_typed(keys, values)?, Precision::Split)
             };
-            let fp16 = KeyValues::from_halves(keys, values)?;
             let cache = BlockCache {
-                precision: Precision::Split,
-                keys: &fp16.keys,
-                values: &fp16.values,
+                precision: read_at,
+                keys: &stored.keys,
+                values: &stored.values,
                 key_scales: &ones,
                 value_scales: &ones,
             };
@@ -491,9 +507,13 @@ impl Builder<'_> {
                     .icl_block(work, &mut run.hidden, block, cache, (group, run.len, rows))?;
             }
             let (keys_out, values_out) = &mut outputs.icl[block];
-            for (out, cache) in [(&mut **keys_out, &fp16.keys), (&mut **values_out, &fp16.values)] {
-                let out = &mut out[first * rows * ICL_DIM..][..group * rows * ICL_DIM];
-                unpad(&device.download(cache)?, out, rows)?;
+            let size = context_bytes(precision);
+            for (out, cache) in [
+                (&mut **keys_out, &stored.keys),
+                (&mut **values_out, &stored.values),
+            ] {
+                let out = &mut out[first * rows * ICL_DIM * size..][..group * rows * ICL_DIM * size];
+                unpad(&device.download(cache)?, out, rows, size)?;
             }
             if let Some(built) = &mut built {
                 match fp8 {
@@ -504,11 +524,34 @@ impl Builder<'_> {
                             values: value_scales,
                         }),
                     ),
-                    None => built.push(fp16, None),
+                    None => built.push(stored, None),
                 }
             }
         }
         Ok(built)
+    }
+
+    /// ICL block `block`'s keys and values for every training row of the
+    /// runs, into `cache`.
+    fn keys_values(
+        &self,
+        work: &mut Workspace,
+        runs: &[Run<DeviceBuffer<f32>>],
+        block: usize,
+        group: usize,
+        mut cache: CacheOutput<'_>,
+    ) -> Result<()> {
+        let padded = padded_rows(self.rows);
+        for run in runs {
+            self.stages
+                .icl_keys_values(work, &run.hidden, block, group * run.len)?;
+            self.device().icl_kv(
+                work.wide.get(),
+                cache.reborrow(),
+                (group, run.len, run.start, padded),
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -546,23 +589,34 @@ impl ColumnChunk {
     }
 }
 
-/// FP16 keys or values `[pairs, padded_rows(rows), 64]`, as bytes, into
-/// `[pairs, rows, 64]`, checking that every value is finite.
-fn unpad(padded: &[u8], out: &mut [u16], rows: usize) -> Result<()> {
+/// Keys or values `[pairs, padded_rows(rows), 64]` of `size` bytes each (FP32
+/// or FP16), as bytes, into `[pairs, rows, 64]`, checking that every value is
+/// finite.
+fn unpad(padded: &[u8], out: &mut [u8], rows: usize, size: usize) -> Result<()> {
     let finite = out
-        .par_chunks_mut(rows * HEAD_DIM)
-        .zip(padded.par_chunks(2 * padded_rows(rows) * HEAD_DIM))
+        .par_chunks_mut(rows * HEAD_DIM * size)
+        .zip(padded.par_chunks(size * padded_rows(rows) * HEAD_DIM))
         .map(|(to, from)| {
-            bytemuck::cast_slice_mut::<u16, u8>(to).copy_from_slice(&from[..2 * rows * HEAD_DIM]);
-            // FP16 infinities and NaNs have every exponent bit set.
-            to.iter().all(|&bits| bits & 0x7c00 != 0x7c00)
+            to.copy_from_slice(&from[..to.len()]);
+            // Infinities and NaNs have every exponent bit set.
+            if size == 4 {
+                to.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|&bytes| f32::from_le_bytes(bytes).is_finite())
+            } else {
+                to.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .all(|&bytes| u16::from_le_bytes(bytes) & 0x7c00 != 0x7c00)
+            }
         })
         .reduce(|| true, |a, b| a && b);
     if finite {
         Ok(())
     } else {
         Err(Error::InvalidArgument(
-            "static context tensor has a value FP16 cannot hold".into(),
+            "static context tensor has a value its storage cannot hold".into(),
         ))
     }
 }
@@ -600,7 +654,16 @@ mod tests {
 
     #[test]
     fn without_room_for_one_estimator_the_cpu_builds() {
-        assert!(!fits(1 << 30, shape(8, 100, 50_000)));
-        assert!(!fits(14 << 30, shape(8, 20, MIN_ROWS - 1)));
+        assert!(!fits(1 << 30, Precision::Split, shape(8, 100, 50_000)));
+        assert!(!fits(14 << 30, Precision::Split, shape(8, 20, MIN_ROWS - 1)));
+    }
+
+    #[test]
+    fn an_fp32_cache_takes_twice_the_room() {
+        let (fp16, fp32) = (
+            plan(14 << 30, Precision::Split, shape(8, 20, 30_000)).expect("fits"),
+            plan(14 << 30, Precision::Fp32, shape(8, 20, 30_000)).expect("fits"),
+        );
+        assert!(fp16.keep && !fp32.keep);
     }
 }

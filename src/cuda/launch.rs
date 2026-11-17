@@ -30,6 +30,22 @@ pub(super) enum Activation<'a> {
     },
 }
 
+/// Where [`Device::icl_kv`] writes an ICL block's keys and values.
+pub(super) enum CacheOutput<'a> {
+    F32(&'a mut DeviceBuffer<f32>, &'a mut DeviceBuffer<f32>),
+    F16(&'a mut DeviceBuffer<u16>, &'a mut DeviceBuffer<u16>),
+}
+
+impl CacheOutput<'_> {
+    /// The same buffers for one more write.
+    pub(super) fn reborrow(&mut self) -> CacheOutput<'_> {
+        match self {
+            Self::F32(keys, values) => CacheOutput::F32(keys, values),
+            Self::F16(keys, values) => CacheOutput::F16(keys, values),
+        }
+    }
+}
+
 /// Where a kernel writes an activation, in one of the forms of [`Activation`].
 pub(super) enum Output<'a> {
     F32(&'a mut DeviceBuffer<f32>),
@@ -133,15 +149,32 @@ pub(super) const fn padded_query_rows(rows: usize) -> usize {
     if rows <= 16 { 16 } else { rows.div_ceil(64) * 64 }
 }
 
+/// Query rows per block of the ICL attention kernel at `precision` for
+/// `padded_queries` rows: 32 in FP32; on tensor cores, 16 for the decode
+/// kernels, else 64.
+const fn icl_block_rows(precision: Precision, padded_queries: usize) -> usize {
+    match precision {
+        Precision::Fp32 => 32,
+        Precision::Split | Precision::Half if padded_queries <= 16 => 16,
+        Precision::Split | Precision::Half => 64,
+    }
+}
+
 impl Device {
-    /// How [`Self::attend_icl`] splits `rows` keys: `(tiles per chunk,
-    /// chunks)`, enough chunks for about three blocks per multiprocessor.
-    pub(super) fn icl_split(&self, pairs: usize, padded_queries: usize, rows: usize) -> (usize, usize) {
-        let block_rows = if padded_queries <= 16 { 16 } else { 64 };
+    /// How [`Self::attend_icl`] at `precision` splits `rows` keys: `(tiles
+    /// per chunk, chunks)`, enough chunks for about three blocks per
+    /// multiprocessor. FP32's 32-row blocks never take more chunks than the
+    /// tensor cores' 64-row ones.
+    pub(super) fn icl_split(
+        &self,
+        precision: Precision,
+        pairs: usize,
+        padded_queries: usize,
+        rows: usize,
+    ) -> (usize, usize) {
+        let blocks = padded_queries.div_ceil(icl_block_rows(precision, padded_queries));
         let tiles = rows.div_ceil(KEY_TILE);
-        let target = (3 * self.multiprocessors())
-            .div_ceil(pairs * (padded_queries / block_rows))
-            .max(1);
+        let target = (3 * self.multiprocessors()).div_ceil(pairs * blocks).max(1);
         let chunk_tiles = tiles.div_ceil(target).max(2.min(tiles));
         (chunk_tiles, tiles.div_ceil(chunk_tiles))
     }
@@ -336,30 +369,32 @@ impl Device {
     }
 
     /// An ICL block's keys and values for training rows `start..start + q`
-    /// from the in-projection `kv[B * q, 1024]` into the FP16 caches `[B * 8,
-    /// np, 64]`.
+    /// from the in-projection `kv[B * q, 1024]` into the caches `[B * 8, np,
+    /// 64]`, FP32 or FP16.
     pub(super) fn icl_kv(
         &self,
         kv: &DeviceBuffer<f32>,
-        (keys, values): (&mut DeviceBuffer<u16>, &mut DeviceBuffer<u16>),
+        cache: CacheOutput<'_>,
         (ensembles, q, start, np): (usize, usize, usize, usize),
     ) -> Result<()> {
-        assert!(
-            start + q <= np && keys.len() >= ensembles * HEADS * np * HEAD_DIM && values.len() == keys.len()
-        );
+        let (len, other) = match &cache {
+            CacheOutput::F32(keys, values) => (keys.len(), values.len()),
+            CacheOutput::F16(keys, values) => (keys.len(), values.len()),
+        };
+        assert!(start + q <= np && len >= ensembles * HEADS * np * HEAD_DIM && other == len);
+        let config = config(threads(ensembles * q * 512), 256);
+        let (ensembles, q, start, np) = (n(ensembles), n(q), n(start), n(np));
+        let stream = self.stream();
         // SAFETY: one thread per key value, within the caches.
         let launch = unsafe {
-            self.kernels.icl_kv(
-                self.stream(),
-                config(threads(ensembles * q * 512), 256),
-                kv,
-                keys,
-                values,
-                n(ensembles),
-                n(q),
-                n(start),
-                n(np),
-            )
+            match cache {
+                CacheOutput::F32(keys, values) => self
+                    .kernels
+                    .icl_kv_f32(stream, config, kv, keys, values, ensembles, q, start, np),
+                CacheOutput::F16(keys, values) => self
+                    .kernels
+                    .icl_kv(stream, config, kv, keys, values, ensembles, q, start, np),
+            }
         };
         launch.map_err(gpu_error)
     }
@@ -494,6 +529,27 @@ impl Device {
         let (norm, w) = (&block.norm1, &block.in_proj);
         let config = config((rows.div_ceil(32), 1, 1), 256);
         let kernel = match precision {
+            Precision::Fp32 => {
+                // SAFETY: one block per 32 rows.
+                let launch = unsafe {
+                    self.kernels.block_head_f32(
+                        self.stream(),
+                        config,
+                        x,
+                        &norm.gamma,
+                        &norm.beta,
+                        &w.w,
+                        &w.b,
+                        cos,
+                        sin,
+                        out,
+                        n(rows),
+                        n(width),
+                        n(rope_len),
+                    )
+                };
+                return launch.map_err(gpu_error);
+            }
             Precision::Half => LoadedModule::block_head_half,
             Precision::Split => LoadedModule::block_head_split,
         };
@@ -539,6 +595,27 @@ impl Device {
         } = block;
         let config = config((rows.div_ceil(32), 1, 1), 256);
         let kernel = match precision {
+            Precision::Fp32 => {
+                // SAFETY: one block per 32 rows.
+                let launch = unsafe {
+                    self.kernels.block_tail_f32(
+                        self.stream(),
+                        config,
+                        attended,
+                        state,
+                        &o.w,
+                        &o.b,
+                        &norm2.gamma,
+                        &norm2.beta,
+                        &l1.w,
+                        &l1.b,
+                        &l2.w,
+                        &l2.b,
+                        n(rows),
+                    )
+                };
+                return launch.map_err(gpu_error);
+            }
             Precision::Half => LoadedModule::block_tail_half,
             Precision::Split => LoadedModule::block_tail_split,
         };
@@ -589,6 +666,34 @@ impl Device {
         } = block;
         let config = config((q.div_ceil(32), ensembles * features, 1), 256);
         let kernel = match precision {
+            Precision::Fp32 => {
+                // SAFETY: one block per 32 rows of each column.
+                let launch = unsafe {
+                    self.kernels.column_block_f32(
+                        self.stream(),
+                        config,
+                        state,
+                        &norm1.gamma,
+                        &norm1.beta,
+                        &w.w,
+                        &w.b,
+                        keys,
+                        values,
+                        &o.w,
+                        &o.b,
+                        &norm2.gamma,
+                        &norm2.beta,
+                        &l1.w,
+                        &l1.b,
+                        &l2.w,
+                        &l2.b,
+                        n(features),
+                        n(q),
+                        n(reserved),
+                    )
+                };
+                return launch.map_err(gpu_error);
+            }
             Precision::Half => LoadedModule::column_block_half,
             Precision::Split => LoadedModule::column_block_split,
         };
@@ -634,11 +739,38 @@ impl Device {
         layout: &SmallAttention,
     ) -> Result<()> {
         let l = layout;
-        let config = config((l.lq.div_ceil(64), HEADS, l.seqs), 128);
         let kernel = match precision {
+            Precision::Fp32 => {
+                // SAFETY: one thread per query of each (sequence, head).
+                let launch = unsafe {
+                    self.kernels.attention16_f32(
+                        self.stream(),
+                        config((l.lq.div_ceil(64), HEADS, l.seqs), 64),
+                        q,
+                        k,
+                        v,
+                        out,
+                        n(l.lq),
+                        n(l.lk),
+                        n(l.inner),
+                        n(l.q_seq),
+                        n(l.q_tok),
+                        n(l.k_base),
+                        n(l.v_base),
+                        n(l.kv_outer),
+                        n(l.kv_inner),
+                        n(l.kv_tok),
+                        n(l.kv_head),
+                        n(l.o_seq),
+                        n(l.o_tok),
+                    )
+                };
+                return launch.map_err(gpu_error);
+            }
             Precision::Half => LoadedModule::attention16_half,
             Precision::Split => LoadedModule::attention16_split,
         };
+        let config = config((l.lq.div_ceil(64), HEADS, l.seqs), 128);
         let scale = 0.25; // 1 / sqrt(16)
         // SAFETY: one block per 64 queries of each (sequence, head).
         let launch = unsafe {
@@ -810,14 +942,17 @@ impl Device {
 
     /// `QASSMax` and packing for ICL attention: each head of `query`
     /// `[B * q, 512]`, scaled by its base scale, gate, and the keys' scales,
-    /// in FP16 at `packed` `[B * 8, qp, 64]`.
+    /// at `packed` `[B * 8, qp, 64]`, FP32 or FP16.
     pub(super) fn qass_pack(
         &self,
         (query, gate): (&DeviceBuffer<f32>, &DeviceBuffer<f32>),
         (base, key_scale): (&DeviceBuffer<f32>, &DeviceBuffer<f32>),
-        packed: &mut DeviceBuffer<u16>,
+        packed: Output<'_>,
         (ensembles, q, qp): (usize, usize, usize),
     ) -> Result<()> {
+        debug_assert!(!matches!(packed, Output::Split { .. }));
+        let mut unused = Unused::new(self)?;
+        let (y, hi, _, format) = unused.outputs(Some(packed));
         let config = config(threads(ensembles * q * 512), 256);
         // SAFETY: one thread per query value.
         let launch = unsafe {
@@ -828,23 +963,26 @@ impl Device {
                 gate,
                 base,
                 key_scale,
-                packed,
+                y,
+                hi,
                 n(ensembles),
                 n(q),
                 n(qp),
+                format,
             )
         };
         launch.map_err(gpu_error)
     }
 
-    /// Softmax attention of FP16 `queries` `[pairs, padded_queries, 64]`
-    /// against the cache's `keys` and `values` `[pairs, padded_rows, 64]`
-    /// (FP16 for `auto`, FP8 for `fast`), into `out` in FP32, through the
-    /// chunks' partial outputs `part` and log-sum-exps `lse`.
+    /// Softmax attention of `queries` `[pairs, padded_queries, 64]`, FP32 at
+    /// [`Precision::Fp32`] and FP16 otherwise, against the cache's `keys` and
+    /// `values` `[pairs, padded_rows, 64]` (FP32 for `safe`, FP16 for `auto`,
+    /// FP8 for `fast`), into `out` in FP32, through the chunks' partial
+    /// outputs `part` and log-sum-exps `lse`.
     pub(super) fn attend_icl(
         &self,
         precision: Precision,
-        queries: &DeviceBuffer<u16>,
+        queries: Activation<'_>,
         (keys, values): (&DeviceBuffer<u8>, &DeviceBuffer<u8>),
         (part, lse, out): (
             &mut DeviceBuffer<f32>,
@@ -853,37 +991,61 @@ impl Device {
         ),
         (pairs, padded_queries, rows): (usize, usize, usize),
     ) -> Result<()> {
-        let decode = padded_queries <= 16;
-        let block_rows = if decode { 16 } else { 64 };
-        let (chunk_tiles, splits) = self.icl_split(pairs, padded_queries, rows);
-        let grid = config((padded_queries / block_rows, pairs * splits, 1), 128);
-        let kernel = match (precision, decode) {
-            (Precision::Split, true) => LoadedModule::icl_attention_decode,
-            (Precision::Split, false) => LoadedModule::icl_attention_wide,
-            (Precision::Half, true) => LoadedModule::icl_attention_decode_fp8,
-            (Precision::Half, false) => LoadedModule::icl_attention_wide_fp8,
-        };
-        let (qp, splits32) = (n(padded_queries), n(splits));
+        let block_rows = icl_block_rows(precision, padded_queries);
+        let (chunk_tiles, splits) = self.icl_split(precision, pairs, padded_queries, rows);
+        let grid = config((padded_queries.div_ceil(block_rows), pairs * splits, 1), 128);
+        let (qp, np, splits32) = (n(padded_queries), n(padded_rows(rows)), n(splits));
         let scale = 0.125 / std::f32::consts::LN_2; // 1 / sqrt(64), in the exp2 domain
-        // SAFETY: one block per 16 (decode) or 64 query rows of each pair and
-        // chunk of `chunk_tiles` key tiles; the cache holds padded rows.
+        let stream = self.stream();
+        // SAFETY: one block per `block_rows` query rows of each pair and chunk
+        // of `chunk_tiles` key tiles; the cache holds padded rows.
         let launch = unsafe {
-            kernel(
-                &self.kernels,
-                self.stream(),
-                grid,
-                queries,
-                keys,
-                values,
-                part,
-                lse,
-                qp,
-                n(padded_rows(rows)),
-                n(rows),
-                n(chunk_tiles),
-                splits32,
-                scale,
-            )
+            match (precision, queries) {
+                (Precision::Fp32, Activation::F32(queries)) => self.kernels.icl_attention_f32(
+                    stream,
+                    grid,
+                    queries,
+                    keys,
+                    values,
+                    part,
+                    lse,
+                    qp,
+                    np,
+                    n(rows),
+                    n(chunk_tiles),
+                    splits32,
+                    scale,
+                ),
+                (Precision::Split | Precision::Half, Activation::Half(queries)) => {
+                    let kernel = match (precision, block_rows == 16) {
+                        (Precision::Split, true) => LoadedModule::icl_attention_decode,
+                        (Precision::Split, false) => LoadedModule::icl_attention_wide,
+                        (_, true) => LoadedModule::icl_attention_decode_fp8,
+                        (_, false) => LoadedModule::icl_attention_wide_fp8,
+                    };
+                    kernel(
+                        &self.kernels,
+                        stream,
+                        grid,
+                        queries,
+                        keys,
+                        values,
+                        part,
+                        lse,
+                        qp,
+                        np,
+                        n(rows),
+                        n(chunk_tiles),
+                        splits32,
+                        scale,
+                    )
+                }
+                _ => {
+                    return Err(gpu_error(
+                        "ICL queries in a form the cache's precision does not read",
+                    ));
+                }
+            }
         };
         launch.map_err(gpu_error)?;
         let config = config(threads(pairs * padded_queries * HEAD_DIM), 256);

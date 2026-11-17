@@ -212,7 +212,10 @@ impl Predictor {
             let rows = pass.min(q - start);
             // Out of device memory before the pass launches anything: free
             // the buffers and retry with runs half as long.
-            match state.buffers.reserve(device, self.shape, (run, rows)) {
+            match state
+                .buffers
+                .reserve(device, self.precision, self.shape, (run, rows))
+            {
                 Err(error) if out_of_memory(error) && run > MIN_RUN => {
                     state.buffers = Buffers::default();
                     state.run_rows = run / 2;
@@ -489,15 +492,24 @@ impl Stages<'_> {
             gate_shape,
             false,
         )?;
+        let fp32 = cache.precision == Precision::Fp32;
         device.qass_pack(
             (work.x1.get(), work.gate.get()),
             (&self.base_scales[block], cache.key_scales),
-            work.packed.get_mut(),
+            if fp32 {
+                Output::F32(work.packed32.get_mut())
+            } else {
+                Output::Half(work.packed.get_mut())
+            },
             (b, q, padded),
         )?;
         device.attend_icl(
             cache.precision,
-            work.packed.get(),
+            if fp32 {
+                Activation::F32(work.packed32.get())
+            } else {
+                Activation::Half(work.packed.get())
+            },
             (cache.keys, cache.values),
             (work.part.get_mut(), work.lse.get_mut(), work.attention.get_mut()),
             (pairs, padded, rows),
@@ -623,10 +635,9 @@ impl Stages<'_> {
     /// A product's operand as it reads it: on tensor cores, the FP16 values
     /// in `halves`, with their low parts at split precision; else FP32 in `f32`.
     fn input<'a>(&self, tensor: bool, halves: &'a Halves, f32: &'a Buffer<f32>) -> Activation<'a> {
-        if !tensor {
-            return Activation::F32(f32.get());
-        }
         match self.precision {
+            _ if !tensor => Activation::F32(f32.get()),
+            Precision::Fp32 => unreachable!("FP32 runs no tensor-core products"),
             Precision::Half => Activation::Half(halves.hi.get()),
             Precision::Split => Activation::Split {
                 hi: halves.hi.get(),
@@ -647,6 +658,7 @@ impl Stages<'_> {
     /// `halves` as a tensor-core operand at this precision.
     fn halves<'a>(&self, halves: &'a mut Halves) -> Output<'a> {
         match self.precision {
+            Precision::Fp32 => unreachable!("FP32 runs no tensor-core products"),
             Precision::Half => Output::Half(halves.hi.get_mut()),
             Precision::Split => Output::Split {
                 hi: halves.hi.get_mut(),

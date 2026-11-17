@@ -1,6 +1,6 @@
-//! The tensor-core products of CUDA prediction, both precisions, against an
-//! FP64 reference: two chained products, the second reading the first's
-//! output in the operand form the first wrote. Skips without a CUDA device.
+//! The products of CUDA prediction, every precision, against an FP64
+//! reference: two chained products, the second reading the first's output in
+//! the operand form the first wrote. Skips without a CUDA device.
 #![cfg(feature = "cuda")]
 
 use half::f16;
@@ -61,7 +61,7 @@ fn tensor_products_match_an_fp64_reference() {
         let x = values(m * k, 1);
         let (w1, b1) = (values(n * k, 2), values(n, 3));
         let (w2, b2) = (values(n2 * n, 4), values(n2, 5));
-        for precision in [Precision::Split, Precision::Half] {
+        for precision in [Precision::Fp32, Precision::Split, Precision::Half] {
             let half = precision == Precision::Half;
             let (y, z) = device
                 .tensor_products(precision, &x, (&w1, &b1), (&w2, &b2), (m, n, k, n2))
@@ -83,8 +83,9 @@ fn tensor_products_match_an_fp64_reference() {
                     .fold(0.0, f64::max)
                     / peak
             };
-            // Split parts are close to FP32; FP16 rounds the second product's
-            // operand, which the reference rounds from the exact first output.
+            // FP32 and split parts are close to FP32; FP16 rounds the second
+            // product's operand, which the reference rounds from the exact
+            // first output.
             let tolerance = if half { 2e-3 } else { 1e-5 };
             let (ey, ez) = (error(&y, &y_ref), error(&z, &z_ref));
             assert!(
