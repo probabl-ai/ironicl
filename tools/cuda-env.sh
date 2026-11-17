@@ -43,6 +43,9 @@ export CARGO_ENCODED_RUSTFLAGS="$flags" RUSTC_BOOTSTRAP=1 CUDA_OXIDE_TARGET=$arc
     CUDA_OXIDE_PTX_DIR="$PWD/target/cuda-oxide/$arch"
 mkdir -p "$CUDA_OXIDE_PTX_DIR"
 unset RUSTFLAGS
+# Cargo.toml's release LTO is untested with the cuda-oxide backend: keep the
+# defaults until it is.
+export CARGO_PROFILE_RELEASE_LTO=false CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
 for profile in DEV RELEASE; do
     export "CARGO_PROFILE_${profile}_OPT_LEVEL=3" "CARGO_PROFILE_${profile}_DEBUG_ASSERTIONS=false" \
         "CARGO_PROFILE_${profile}_OVERFLOW_CHECKS=false"
