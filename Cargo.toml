@@ -36,8 +36,16 @@ attention-stats = []
 experimental = ["bf16-dense", "bf16-value-dot", "sparse-attention", "attention-stats"]
 profile = []
 python = ["dep:pyo3"]
+# NVIDIA GPUs through the kernels in src/cuda/kernels.rs (Linux). Builds only
+# through cuda-oxide's codegen backend: see tools/cuda-env.sh.
+cuda = ["dep:cuda-core", "dep:cuda-device", "dep:cuda-host"]
 
 [dependencies]
+# cuda-oxide: one revision for all three and for the codegen backend.
+cuda-core = { git = "https://github.com/NVIDIA/cuda-rust", rev = "a0a4dc78a20e06ec90827f597e950bdc49f723e2", optional = true }
+cuda-device = { git = "https://github.com/NVIDIA/cuda-rust", rev = "a0a4dc78a20e06ec90827f597e950bdc49f723e2", optional = true }
+cuda-host = { git = "https://github.com/NVIDIA/cuda-rust", rev = "a0a4dc78a20e06ec90827f597e950bdc49f723e2", optional = true }
+half = "2.7"
 bytemuck = "1.25.2"
 # Exact pin: Candle's pickle reader is on the checkpoint trust boundary.
 candle-core = "=0.11.1"
@@ -106,6 +114,8 @@ tempfile = "3.27.0"
 
 [lints.rust]
 unsafe_code = "warn"
+# Set by the CUDA build for Ada and later GPUs.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(ironicl_sm89)"] }
 
 [lints.clippy]
 all = "warn"

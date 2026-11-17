@@ -26,7 +26,10 @@ use objc2_metal_performance_shaders_graph::{
 
 use crate::{
     Error, Result,
-    executor::{COLUMN_DIM, HEADS, ICL_DIM, INDUCING, QUERY_CHUNK_ROWS, RESERVED},
+    executor::{
+        COLUMN_BLOCKS, COLUMN_DIM, HEADS, ICL_BLOCKS, ICL_DIM, INDUCING, QUERY_CHUNK_ROWS, RESERVED,
+        rope_tables,
+    },
     static_context::TensorStorage,
 };
 
@@ -41,8 +44,6 @@ fn kind(storage: TensorStorage) -> MPSDataType {
 
 const ICL_HEAD_DIM: usize = ICL_DIM / HEADS;
 const COLUMN_HEAD_DIM: usize = COLUMN_DIM / HEADS;
-const ICL_BLOCKS: usize = 12;
-const COLUMN_BLOCKS: usize = 3;
 const FLOAT: MPSDataType = MPSDataType::Float32;
 
 type Tensor = Retained<MPSGraphTensor>;
@@ -693,21 +694,7 @@ impl<'w, 'a> Builder<'w, 'a> {
         let mut sequence = self.concat(&cls, &columns, 1);
         let frequencies = self.weight("row_interactor.tf_row.rope.freqs")?;
         let table = |rows: usize| {
-            let (mut cos, mut sin) = (
-                vec![0.0; rows * COLUMN_HEAD_DIM],
-                vec![0.0; rows * COLUMN_HEAD_DIM],
-            );
-            let half = COLUMN_HEAD_DIM / 2;
-            for row in 0..rows {
-                for (index, frequency) in frequencies[..half].iter().enumerate() {
-                    let (s, c) = (row as f32 * frequency).sin_cos();
-                    for offset in [index, index + half] {
-                        cos[row * COLUMN_HEAD_DIM + offset] = c;
-                    }
-                    sin[row * COLUMN_HEAD_DIM + index] = -s;
-                    sin[row * COLUMN_HEAD_DIM + index + half] = s;
-                }
-            }
+            let (cos, sin) = rope_tables(rows, frequencies);
             let dims = [rows as isize, COLUMN_HEAD_DIM as isize];
             (self.constant(&cos, &dims), self.constant(&sin, &dims))
         };

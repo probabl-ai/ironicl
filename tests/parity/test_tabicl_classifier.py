@@ -31,7 +31,15 @@ class TabICLClassifierParityTest(unittest.TestCase):
 
     def test_public_signatures_match(self):
         # TabICL's parameters in order, then Ironicl's own trailing keywords.
-        extras = {"__init__": [("optimize", None), ("cache_dir", False)]}
+        extras = {
+            "__init__": [
+                ("optimize", None),
+                ("cache_dir", False),
+                ("memory_limit", None),
+                ("device_memory_limit", None),
+                ("memory_overflow", None),
+            ]
+        }
         for name in ("__init__", "fit", "predict_proba", "predict"):
             ours = inspect.signature(getattr(TabICLClassifier, name)).parameters.values()
             theirs = inspect.signature(getattr(self.tabicl, name)).parameters.values()
