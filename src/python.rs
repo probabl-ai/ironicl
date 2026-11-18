@@ -406,7 +406,7 @@ fn system_info(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     for key in ["gpu", "gpu_working_set", "gpu_min_build_rows"] {
         dict.set_item(key, py.None())?;
     }
-    let cpu = crate::platform::CpuCapabilities::detect();
+    let cpu = crate::kernels::cpu::CpuCapabilities::detect();
     dict.set_item("architecture", cpu.architecture)?;
     dict.set_item("operating_system", cpu.operating_system)?;
     dict.set_item("bf16_storage", crate::kernels::cpu::bf16_storage_supported())?;

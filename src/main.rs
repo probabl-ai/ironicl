@@ -2,12 +2,12 @@ use std::{env, process, time::Instant};
 
 use ironicl::{
     BenchmarkArgs, BenchmarkStats, ClassifierAggregation, Command, CpuCapabilities, Executor, HelpTopic,
-    ImportArgs, InputBundle, InspectArgs, ModelSource, PlanArgs, RunArgs, StaticContextArtifact,
+    ImportArgs, InputBundle, InspectArgs, Isa, ModelSource, PlanArgs, RunArgs, StaticContextArtifact,
     StaticExecutor, StaticQueryBundle, StorageDType,
     error::{Error, Result},
     estimate_memory, memory,
     memory::ByteSize,
-    parse_cli, resolve_backend,
+    parse_cli,
 };
 
 fn main() {
@@ -34,17 +34,14 @@ fn run() -> Result<()> {
 fn print_platform() {
     let host = CpuCapabilities::detect();
     println!("Ironicl host capabilities\n{host}");
-    println!(
-        "zen5 base:       {}",
-        if host.supports_zen5_base() { "yes" } else { "no" }
-    );
+    println!("isa:             {}", Isa::for_host(&host));
 }
 
 fn print_plan(args: PlanArgs) -> Result<()> {
     let config = args.config;
     let workload = config.workload;
     let host = CpuCapabilities::detect();
-    let selected_backend = resolve_backend(config, &host)?;
+    let isa = Isa::resolve(config, &host)?;
     let memory = estimate_memory(config)?;
 
     println!("Ironicl execution plan");
@@ -56,7 +53,7 @@ fn print_plan(args: PlanArgs) -> Result<()> {
     println!("cache mode:       {}", config.cache_mode);
     println!("weight storage:   {}", config.weight_dtype);
     println!("cache storage:    {}", config.kv_dtype);
-    println!("backend:          {selected_backend}");
+    println!("isa:              {isa}");
     println!();
     println!("weights:          {}", ByteSize(memory.weight_bytes));
     println!("column cache:     {}", ByteSize(memory.cache.column_bytes));
