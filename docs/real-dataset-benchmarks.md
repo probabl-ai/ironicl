@@ -32,9 +32,10 @@ uses AMP. Large points use one timed iteration for CPU and Ironicl.
 Ironicl admits an uncached request only when its estimated FP32 activation set
 fits a fixed software limit, and rejects it before allocation otherwise. The
 limit is now `MAX_ACTIVATION_BYTES` (1.5 GiB), checked by `admit_request` in
-`src/executor.rs` against a per-ensemble activation estimate. The 60 GiB host
-cannot raise this software limit. The `rejected` row above was measured under an
-earlier, tighter limit and has not been re-measured against the current one; the
+`src/models/tabicl_v2/cpu.rs` against a per-ensemble activation estimate. The
+60 GiB host cannot raise this software limit. The `rejected` row above was
+measured under an earlier, tighter limit and has not been re-measured against
+the current one; the
 cached static-context build path handles large training sets separately (it now
 schedules estimators into memory-bounded groups rather than rejecting them).
 
