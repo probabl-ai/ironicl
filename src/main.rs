@@ -4,9 +4,10 @@ use ironicl::{
     BenchmarkArgs, BenchmarkStats, ClassifierAggregation, Command, CpuCapabilities, Executor, HelpTopic,
     ImportArgs, InputBundle, InspectArgs, ModelSource, PlanArgs, RunArgs, StaticContextArtifact,
     StaticExecutor, StaticQueryBundle, StorageDType,
-    cache::ByteSize,
     error::{Error, Result},
-    estimate_memory, memory, parse_cli, resolve_backend,
+    estimate_memory, memory,
+    memory::ByteSize,
+    parse_cli, resolve_backend,
 };
 
 fn main() {
