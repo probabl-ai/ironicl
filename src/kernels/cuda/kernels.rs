@@ -272,7 +272,9 @@ pub(crate) mod device {
             let i = lane + 32 * j;
             if i < width {
                 let value = (values[j] - mean) * inverse * gamma[i] + beta[i];
-                store_activation((&mut y, &mut y_hi, &mut y_lo), format, row * ldy + i, value);
+                // SAFETY: `row < rows` and `i < width = ldy`; the launcher sizes the buffers
+                // `format` names to `[rows, width]`, and each (row, i) is one lane's.
+                unsafe { store_activation((&mut y, &mut y_hi, &mut y_lo), format, row * ldy + i, value) };
             }
         }
     }
@@ -621,7 +623,9 @@ pub(crate) mod device {
         let (b, row) = (token / q, token % q);
         let pair = b * 8 + head;
         let value = attended[(pair * qp as usize + row) * 64 + d] * value_scale[pair * 64 + d];
-        store_activation((&mut tokens, &mut tokens_hi, &mut tokens_lo), format, i, value);
+        // SAFETY: `i < B * q * 512` (returned above), within the buffers `format` names, which the
+        // launcher sizes to at least `[B q, 512]`; one thread per `i`.
+        unsafe { store_activation((&mut tokens, &mut tokens_hi, &mut tokens_lo), format, i, value) };
     }
 
     // ---------------------------------------------------------------------------
@@ -1118,14 +1122,19 @@ pub(crate) mod device {
         let a = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(AS)) };
         // SAFETY: as above, for `BS`.
         let bt = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(BS)) };
-        linear16_body::<false>(
-            (a, a, bt, bt),
-            (x, x_lo, w, w_lo),
-            (b, r),
-            (&mut y, &mut y_hi, &mut y_lo),
-            (m, n, k),
-            (ldx, ldy, ldr, mode),
-        );
+        // SAFETY: `AS`, `BS` are distinct `3 * 64 * 16` u32 tiles, 128-byte aligned (the low-part
+        // slots alias them, untouched without `SPLIT`). The launcher's grid, block, and buffers
+        // match the contract (`ldx = k`, `ldy = ldr = n`, `k` a multiple of 32).
+        unsafe {
+            linear16_body::<false>(
+                (a, a, bt, bt),
+                (x, x_lo, w, w_lo),
+                (b, r),
+                (&mut y, &mut y_hi, &mut y_lo),
+                (m, n, k),
+                (ldx, ldy, ldr, mode),
+            );
+        }
     }
 
     /// [`linear16_body`] with split, near-FP32 operands, for `optimize="auto"`.
@@ -1162,14 +1171,19 @@ pub(crate) mod device {
                 SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(BL)),
             )
         };
-        linear16_body::<true>(
-            tiles,
-            (x, x_lo, w, w_lo),
-            (b, r),
-            (&mut y, &mut y_hi, &mut y_lo),
-            (m, n, k),
-            (ldx, ldy, ldr, mode),
-        );
+        // SAFETY: four distinct `3 * 64 * 16` u32 tiles, 128-byte aligned. The launcher's grid,
+        // block, and buffers match the contract (`ldx = k`, `ldy = ldr = n`, `k` a multiple of 32,
+        // split `next` only with a split input).
+        unsafe {
+            linear16_body::<true>(
+                tiles,
+                (x, x_lo, w, w_lo),
+                (b, r),
+                (&mut y, &mut y_hi, &mut y_lo),
+                (m, n, k),
+                (ldx, ldy, ldr, mode),
+            );
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -1208,13 +1222,17 @@ pub(crate) mod device {
         let (r0, lane) = ((tid / 32) * 4, tid % 32);
         let (m, n, len) = (m as usize, n as usize, len as usize);
         let row0 = thread::blockIdx_x() as usize * 32;
-        load_normed_f32(x.as_ptr(), gamma, beta, a, row0, m);
+        // SAFETY: the launcher runs 256 threads and passes `x` `[m, 128]` (16-byte aligned rows);
+        // `AS` is `[32, 128]`, 16-byte aligned, and the barrier below ends the stores.
+        unsafe { load_normed_f32(x.as_ptr(), gamma, beta, a, row0, m) };
         thread::sync_threads();
         let mut pass = 0;
         while pass < n / 128 {
             let c0 = pass * 128 + lane * 4;
             let mut acc = [[0.0f32; 4]; 4];
-            product4x4((a.cast_const(), 128, r0), (w.as_ptr(), 128, c0), 128, &mut acc);
+            // SAFETY: `AS` `[32, 128]`, published by the barrier above and not written after, at
+            // rows `r0 + 4 <= 32`; `w` the in-projection `[n, 128]` at rows `c0 + 4 <= n`.
+            unsafe { product4x4((a.cast_const(), 128, r0), (w.as_ptr(), 128, c0), 128, &mut acc) };
             #[unroll]
             for i in 0..4 {
                 #[unroll]
@@ -1296,16 +1314,21 @@ pub(crate) mod device {
             unsafe { *a.add(row * 128 + col).cast::<F32x4>() = v };
         }
         thread::sync_threads();
-        block_tail_core_f32(
-            a,
-            h,
-            &mut state,
-            (row0, m),
-            (wo, bo),
-            (gamma, beta),
-            (w1, b1),
-            (w2, b2),
-        );
+        // SAFETY: all 256 threads of block `row0 / 32` call it; `AS` holds the tile, published by
+        // the barrier above, and `HS` is untouched. The launcher passes `state` `[m, 128]` and the
+        // 128- and 256-wide FP32 layers.
+        unsafe {
+            block_tail_core_f32(
+                a,
+                h,
+                &mut state,
+                (row0, m),
+                (wo, bo),
+                (gamma, beta),
+                (w1, b1),
+                (w2, b2),
+            );
+        }
     }
 
     /// [`column_block_body`] in FP32: `norm1`, the query projection (the first
@@ -1352,10 +1375,15 @@ pub(crate) mod device {
         let m = row0 + if q - tile < 32 { q - tile } else { 32 };
 
         // norm1 into A, then Q = A Wqᵀ + bq into the first 128 columns of H.
-        load_normed_f32(state.as_mut_ptr(), gamma1, beta1, a, row0, m);
+        // SAFETY: 256 threads call it; rows `[row0, m)` with `m <= (column + 1) * q` lie in the
+        // launcher's `state` `[B * H * q, 128]`, which this block writes only later, after
+        // barriers. `AS` is `[32, 128]`, 16-byte aligned, and the barrier below ends the stores.
+        unsafe { load_normed_f32(state.as_mut_ptr(), gamma1, beta1, a, row0, m) };
         thread::sync_threads();
         let mut acc = [[0.0f32; 4]; 4];
-        product4x4((a.cast_const(), 128, r0), (wq.as_ptr(), 128, c0), 128, &mut acc);
+        // SAFETY: `AS` `[32, 128]`, published by the barrier above, at rows `r0 + 4 <= 32`; `wq`
+        // the in-projection (128 or more rows of 128) at rows `c0 + 4 <= 128`.
+        unsafe { product4x4((a.cast_const(), 128, r0), (wq.as_ptr(), 128, c0), 128, &mut acc) };
         #[unroll]
         for i in 0..4 {
             let y = [
@@ -1387,16 +1415,21 @@ pub(crate) mod device {
             }
         }
         let mut out = [0.0f32; 16];
-        attend16_f32(
-            &query,
-            (
-                keys.as_ptr().wrapping_add(kv0),
-                values.as_ptr().wrapping_add(kv0),
-                16,
-            ),
-            (0, 128),
-            &mut out,
-        );
+        // SAFETY: `kv0`, a multiple of 2048, starts head `head` of stream `e * (H + reserved) + f +
+        // reserved` of `B * (H + reserved)`; its 128 keys of stride 16 lie in the caches, which
+        // the launcher asserts hold `B * (H + reserved) * 16384` (`values`: callers check equal).
+        unsafe {
+            attend16_f32(
+                &query,
+                (
+                    keys.as_ptr().wrapping_add(kv0),
+                    values.as_ptr().wrapping_add(kv0),
+                    16,
+                ),
+                (0, 128),
+                &mut out,
+            );
+        }
         // The attention output replaces the normalized rows in A.
         #[unroll]
         for c in 0..4 {
@@ -1406,16 +1439,21 @@ pub(crate) mod device {
             unsafe { *a.add(row * 128 + head * 16 + c * 4).cast::<F32x4>() = F32x4(y) };
         }
         thread::sync_threads();
-        block_tail_core_f32(
-            a,
-            h,
-            &mut state,
-            (row0, m),
-            (wo, bo),
-            (gamma2, beta2),
-            (w1, b1),
-            (w2, b2),
-        );
+        // SAFETY: all 256 threads call it with `AS` published by the barrier above and `HS` last
+        // read before it. Block (tile, column) alone owns rows `[row0, m)` of `state` `[B * H * q,
+        // 128]`; the launcher passes the 128- and 256-wide FP32 layers.
+        unsafe {
+            block_tail_core_f32(
+                a,
+                h,
+                &mut state,
+                (row0, m),
+                (wo, bo),
+                (gamma2, beta2),
+                (w1, b1),
+                (w2, b2),
+            );
+        }
     }
 
     /// [`attention16_tc_body`] in FP32, with its layout: one thread per query
@@ -1461,7 +1499,9 @@ pub(crate) mod device {
             v.as_ptr().wrapping_add(v_base as usize + kv0),
         );
         let mut result = [0.0f32; 16];
-        attend16_f32(&query, (kp, vp, kv_tok as usize), (0, lk as usize), &mut result);
+        // SAFETY: the launcher's layouts keep `k_base + kv0 + key * kv_tok + 16 <= k.len()` for
+        // `key < lk` (likewise `v`), with offsets and strides multiples of 4 for 16-byte alignment.
+        unsafe { attend16_f32(&query, (kp, vp, kv_tok as usize), (0, lk as usize), &mut result) };
         let at = seq * o_seq as usize + query_row * o_tok as usize + head * 16;
         #[unroll]
         for d in 0..16 {

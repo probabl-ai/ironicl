@@ -33,8 +33,13 @@ use cuda_device::{DisjointSlice, device, thread, warp};
 /// Store an activation `value` at `at` as the product reading it next takes
 /// it: FP32 in `y` (`format` 0), FP16 in `hi` (1), or FP16 high and scaled low
 /// parts in `hi` and `lo` (2).
+///
+/// # Safety
+///
+/// `at` must be in bounds of each buffer `format` selects (`y` for 0, `hi` for 1, `hi` and `lo`
+/// for 2), and no other thread may access element `at` of those buffers during the launch.
 #[inline(always)]
-pub(crate) fn store_activation(
+pub(crate) unsafe fn store_activation(
     (y, hi, lo): (
         &mut DisjointSlice<f32>,
         &mut DisjointSlice<u16>,
@@ -44,9 +49,8 @@ pub(crate) fn store_activation(
     at: usize,
     value: f32,
 ) {
-    // SAFETY: callers pass `at` inside the buffer `format` selects (`y` for 0, `hi` for 1, `hi` and
-    // `lo` for 2), which their launcher sizes, and own `at` alone: `layer_norm`, `heads_to_tokens`,
-    // and `linear16_body` store one element per (row, column) per thread.
+    // SAFETY: by this function's contract, `at` is in bounds of the buffers `format` selects and
+    // this thread's alone.
     unsafe {
         if format == 0 {
             *y.get_unchecked_mut(at) = value;
@@ -115,10 +119,15 @@ pub(crate) fn tile_at(stride: usize, row: usize, col: usize) -> usize {
 }
 
 /// Store an (even, odd) column pair as FP16, and its low parts with `SPLIT`.
+///
+/// # Safety
+///
+/// `hi` (and `lo` with `SPLIT`) must be valid for writing the aligned `u32` at offset `at`, and no
+/// other thread may access that word between the barriers around this store.
 #[inline(always)]
-pub(crate) fn store_pair<const SPLIT: bool>(hi: *mut u32, lo: *mut u32, at: usize, a: f32, b: f32) {
-    // SAFETY: callers pass `at` inside their shared tiles `hi` and, with `SPLIT`, `lo` (`tile_at`
-    // of a row below 32), and own that word until the next barrier.
+pub(crate) unsafe fn store_pair<const SPLIT: bool>(hi: *mut u32, lo: *mut u32, at: usize, a: f32, b: f32) {
+    // SAFETY: by this function's contract, word `at` of `hi` (and `lo` with `SPLIT`) is writable
+    // and this thread's until the next barrier.
     unsafe {
         *hi.add(at) = pack_f16(a, b);
         if SPLIT {
@@ -130,8 +139,15 @@ pub(crate) fn store_pair<const SPLIT: bool>(hi: *mut u32, lo: *mut u32, at: usiz
 /// One warp's `[16, NT * 8]` product of a shared FP16 tile (rows from `row0`,
 /// `stride` u32 per row, `ks` 16-wide K steps) with a weight in fragment order
 /// (`[n / 8, k / 16, 32 lanes, 2]` u32), n-tiles from `nt0`.
+///
+/// # Safety
+///
+/// The whole warp must call it under warp-uniform control flow, with `lane` its lane index. `ks` is
+/// 8 or 16, `stride = 8 * ks`, and `a_hi` (and `a_lo` with `SPLIT`) point to 16-byte aligned shared
+/// tiles holding rows `row0..row0 + 16`, written before a barrier and not written until the next.
+/// `w_hi` (and `w_lo` with `SPLIT`) hold at least `(nt0 + NT) * ks * 64` u32.
 #[device]
-pub(crate) fn warp_product<const SPLIT: bool, const NT: usize>(
+pub(crate) unsafe fn warp_product<const SPLIT: bool, const NT: usize>(
     a_hi: *mut u32,
     a_lo: *mut u32,
     stride: usize,
@@ -148,9 +164,9 @@ pub(crate) fn warp_product<const SPLIT: bool, const NT: usize>(
     let mut step = 0;
     while step < ks {
         let at = row * stride + (((step * 2 + lane / 16) ^ (row & 7)) * 4);
-        // SAFETY: row `row0 + lane % 16 < 32` and chunk `(step * 2 + lane / 16) ^ (row & 7) < 2 *
-        // ks` address an aligned 16-byte run inside the caller's tile, `stride = 8 * ks` u32 per
-        // row (64 with 8 steps, 128 with 16), written before a barrier; the whole warp executes it.
+        // SAFETY: by this function's contract, row `row0 + lane % 16` and chunk `(step * 2 + lane /
+        // 16) ^ (row & 7) < 2 * ks` address an aligned 16-byte run of the published tile
+        // (`stride = 8 * ks` u32 per row); the whole warp executes it.
         let fa = unsafe { ldmatrix_x4(a_hi.add(at)) };
         let fal = if SPLIT {
             // SAFETY: as above, in `a_lo`.
@@ -161,11 +177,11 @@ pub(crate) fn warp_product<const SPLIT: bool, const NT: usize>(
         #[unroll]
         for nt in 0..NT {
             let index = (((nt0 + nt) * ks + step) * 32 + lane) * 2;
-            // SAFETY: `index + 1 < (n / 8) * ks * 64`, the length of the fragment-order weight:
-            // callers keep `nt0 + nt < n / 8` (Wo, W2, Wq: 16 n-tiles; W1: 32; the in-projection:
-            // `n / 8`).
+            // SAFETY: `index + 1 < (nt0 + NT) * ks * 64`, which by this function's contract `w_hi`
+            // holds.
             let fb = unsafe { [*w_hi.get_unchecked(index), *w_hi.get_unchecked(index + 1)] };
-            // SAFETY: a full-warp product on the fragments above; the loop bounds are warp-uniform.
+            // SAFETY: a full-warp product on the fragments above; by this function's contract the
+            // whole warp runs it, and the loop bounds are warp-uniform.
             acc[nt] = unsafe { mma_m16n8k16_f32_f16(acc[nt], fa, fb) };
             if SPLIT {
                 // SAFETY: as for `fb`, in `w_lo`, which `SPLIT` callers pass in the same shape.
@@ -185,8 +201,14 @@ pub(crate) fn gelu(value: f32) -> f32 {
 /// Rows `[row0, row0 + 32)` of `x[.., 128]` through `LayerNorm` (epsilon 1e-5)
 /// into A as FP16 parts (64 u32 per row); rows from `m` on become zeros. Each
 /// of 8 warps normalizes four rows, four values per lane.
+///
+/// # Safety
+///
+/// All 256 threads of the block must call it. `xp` must be 16-byte aligned and valid for reading
+/// rows `[row0, m)` of `[.., 128]`. `ah` (and `al` with `SPLIT`) must point to shared tiles of
+/// `32 * 64` u32 that no other thread accesses until the barrier after this call.
 #[device]
-pub(crate) fn load_normed<const SPLIT: bool>(
+pub(crate) unsafe fn load_normed<const SPLIT: bool>(
     xp: *const f32,
     gamma: &[f32],
     beta: &[f32],
@@ -202,8 +224,8 @@ pub(crate) fn load_normed<const SPLIT: bool>(
         let row = warp_id * 4 + i;
         let col = lane * 4;
         let v = if row0 + row < m {
-            // SAFETY: `row0 + row < m` and `col + 4 <= 128`: 16 aligned bytes inside the caller's
-            // `x` `[m, 128]`.
+            // SAFETY: `row0 + row < m` and `col + 4 <= 128`: by this function's contract, 16
+            // aligned readable bytes of `x`.
             unsafe { *xp.add((row0 + row) * 128 + col).cast::<F32x4>() }.0
         } else {
             [0.0; 4]
@@ -219,8 +241,13 @@ pub(crate) fn load_normed<const SPLIT: bool>(
             d[2] * inverse * gamma[col + 2] + beta[col + 2],
             d[3] * inverse * gamma[col + 3] + beta[col + 3],
         ];
-        store_pair::<SPLIT>(ah, al, tile_at(64, row, col), y[0], y[1]);
-        store_pair::<SPLIT>(ah, al, tile_at(64, row, col + 2), y[2], y[3]);
+        // SAFETY: `row = warp_id * 4 + i < 32` (256 threads) and `col + 3 < 128`, so both
+        // `tile_at(64, ..)` words lie in the `32 * 64` tiles of this function's contract, which
+        // no other thread touches before the caller's barrier; each lane writes its own pairs.
+        unsafe {
+            store_pair::<SPLIT>(ah, al, tile_at(64, row, col), y[0], y[1]);
+            store_pair::<SPLIT>(ah, al, tile_at(64, row, col + 2), y[2], y[3]);
+        }
     }
 }
 
@@ -241,8 +268,17 @@ pub(crate) fn load_normed<const SPLIT: bool>(
 /// `b_hi`, `b_lo` hold three stages of 64 x 16 `u32` each.
 /// Needs `k` a multiple of 32 and 16-byte aligned rows.
 /// Grid: (ceil(n / 64), ceil(m / 64)); block: 128 threads.
+///
+/// # Safety
+///
+/// Every thread of a launch with that grid and block must call it, with `m, n >= 1`. `a_hi` and
+/// `b_hi` (and `a_lo`, `b_lo` with `SPLIT`) point to distinct 16-byte aligned shared tiles of
+/// `3 * 64 * 16` u32 that nothing else touches. `x` (`x_lo`) holds `[m, ldx = k]` and `w` (`w_lo`)
+/// `[n, k]`, 16-byte aligned with `k` a multiple of 32; `b` holds `n`. With `mode & 2` `r` holds
+/// `[m, ldr]`, with `mode & 4` `y`, and with `mode & 8` `y_hi` (`y_lo` with `SPLIT`), `[m, ldy]`,
+/// with `n <= ldr, ldy`.
 #[device]
-pub(crate) fn linear16_body<const SPLIT: bool>(
+pub(crate) unsafe fn linear16_body<const SPLIT: bool>(
     (a_hi, a_lo, b_hi, b_lo): (*mut u32, *mut u32, *mut u32, *mut u32),
     (x, x_lo, w, w_lo): (&[u16], &[u16], &[u16], &[u16]),
     (b, r): (&[f32], &[f32]),
@@ -281,11 +317,11 @@ pub(crate) fn linear16_body<const SPLIT: bool>(
         a_src[j] = (a_row * ldx + chunk * 8, swizzled32(row, chunk));
         b_src[j] = b_row * k + chunk * 8;
     }
-    // SAFETY: rows are clamped below `m` and `n` (at least 1: the grid has a block) and `step < k /
-    // 32`, so each 16 bytes lie in `x` `[m, ldx = k]`, `w` `[n, k]`, and with `SPLIT` their low
-    // parts; `k` a multiple of 32 keeps them 16-byte aligned. `stage * STAGE + swizzled32(row < 64,
-    // chunk < 4) + 4 <= 3 * STAGE`. A stage is overwritten only after the barrier that follows its
-    // last `ldmatrix`.
+    // SAFETY: by this function's contract, rows are clamped below `m` and `n` (both at least 1)
+    // and `step < k / 32`, so each 16 bytes lie in `x` `[m, ldx = k]`, `w` `[n, k]`, and with
+    // `SPLIT` their low parts; `k` a multiple of 32 keeps them 16-byte aligned. `stage * STAGE +
+    // swizzled32(row < 64, chunk < 4) + 4 <= 3 * STAGE`, the contract's tile size. A stage is
+    // overwritten only after the barrier that follows its last `ldmatrix`.
     let load = |step: usize, stage: usize| unsafe {
         #[unroll]
         for j in 0..2 {
@@ -406,7 +442,7 @@ pub(crate) fn linear16_body<const SPLIT: bool>(
         for e in 0..2 {
             let col = col0 + warp_n * 32 + nt * 8 + c_lane + e;
             if col < n {
-                // SAFETY: `col < n`, and `b` holds `n` biases.
+                // SAFETY: `col < n`, and by this function's contract `b` holds `n` biases.
                 bias[nt][e] = unsafe { *b.get_unchecked(col) };
             }
         }
@@ -430,19 +466,22 @@ pub(crate) fn linear16_body<const SPLIT: bool>(
                         value = 0.5 * value * (1.0 + libm::erff(value * core::f32::consts::FRAC_1_SQRT_2));
                     }
                     if mode & 2 != 0 {
-                        // SAFETY: `row < m`, `col < n`; with `mode & 2` the launcher passes a
-                        // residual `[m, ldr = n]`.
+                        // SAFETY: `row < m`, `col < n <= ldr`; with `mode & 2` this function's
+                        // contract has `r` hold `[m, ldr]`.
                         value += unsafe { *r.get_unchecked(row * ldr + col) };
                     }
                     let at = row * ldy + col;
                     if mode & 4 != 0 {
-                        // SAFETY: `row < m` and `col < n = ldy`; the launcher sets `mode & 4` only
-                        // with an FP32 output `[m, n]`. Each (row, col) belongs to one lane of one
-                        // block.
+                        // SAFETY: `row < m` and `col < n <= ldy`; with `mode & 4` this function's
+                        // contract has `y` hold `[m, ldy]`. Each (row, col) belongs to one lane of
+                        // one block.
                         unsafe { *y.get_unchecked_mut(at) = value };
                     }
                     if mode & 8 != 0 {
-                        store_activation((&mut *y, &mut *y_hi, &mut *y_lo), next, at, value);
+                        // SAFETY: `at = row * ldy + col` with `row < m`, `col < n <= ldy`: inside
+                        // `y_hi` (and `y_lo`, which `next = 2` selects with `SPLIT`) `[m, ldy]` by
+                        // this function's contract; each (row, col) is one lane's of one block.
+                        unsafe { store_activation((&mut *y, &mut *y_hi, &mut *y_lo), next, at, value) };
                     }
                 }
             }
@@ -453,8 +492,14 @@ pub(crate) fn linear16_body<const SPLIT: bool>(
 /// `acc[i][j] += Σ_t a[(r0 + i) * lda + t] w[(c0 + j) * ldw + t]` over
 /// `t < k` (a multiple of 4): four rows of a shared tile by four weight
 /// rows, in 16-byte loads. Row starts are 16-byte aligned.
+///
+/// # Safety
+///
+/// `a` and `w` must be 16-byte aligned, `lda` and `ldw` multiples of 4, and `k` a multiple of 4
+/// with `k <= lda, ldw`. The first `k` values of rows `r0..r0 + 4` of `a` and `c0..c0 + 4` of `w`
+/// must be readable and, in shared memory, written before a barrier and not written until the next.
 #[device]
-pub(crate) fn product4x4(
+pub(crate) unsafe fn product4x4(
     (a, lda, r0): (*const f32, usize, usize),
     (w, ldw, c0): (*const f32, usize, usize),
     k: usize,
@@ -466,10 +511,8 @@ pub(crate) fn product4x4(
         let mut wv = [[0.0f32; 4]; 4];
         #[unroll]
         for i in 0..4 {
-            // SAFETY: callers pass rows `r0..r0 + 4` of `a` (`lda` values each) and `c0..c0 + 4` of
-            // `w` (`ldw`), with `t + 4 <= k <= lda, ldw` and 16-byte aligned rows: shared `[32,
-            // 128]` or `[32, 256]` tiles with `r0 + 4 <= 32`, and `[n, k]` weights with `c0 + 4 <=
-            // n`.
+            // SAFETY: by this function's contract, row `r0 + i` of `a` is readable for `t + 4 <= k`
+            // values, and `lda`, `t`, and the base keep the 16-byte load aligned.
             av[i] = unsafe { *a.add((r0 + i) * lda + t).cast::<F32x4>() }.0;
             // SAFETY: as above, for `w`.
             wv[i] = unsafe { *w.add((c0 + i) * ldw + t).cast::<F32x4>() }.0;
@@ -491,8 +534,14 @@ pub(crate) fn product4x4(
 /// Rows `[row0, row0 + 32)` of `x[.., 128]` through `LayerNorm` (epsilon
 /// 1e-5) into the FP32 tile `a` `[32, 128]`; rows from `m` on read as zeros.
 /// Each of 8 warps normalizes four rows, four values per lane.
+///
+/// # Safety
+///
+/// All 256 threads of the block must call it. `xp` must be 16-byte aligned and valid for reading
+/// rows `[row0, m)` of `[.., 128]`. `a` must point to a 16-byte aligned shared `[32, 128]` tile
+/// that no other thread accesses until the barrier after this call.
 #[device]
-pub(crate) fn load_normed_f32(
+pub(crate) unsafe fn load_normed_f32(
     xp: *const f32,
     gamma: &[f32],
     beta: &[f32],
@@ -507,15 +556,15 @@ pub(crate) fn load_normed_f32(
         let row = warp_id * 4 + i;
         let col = lane * 4;
         let v = if row0 + row < m {
-            // SAFETY: `row0 + row < m` and `col + 4 <= 128`: 16 aligned bytes inside the caller's
-            // `x` `[m, 128]`.
+            // SAFETY: `row0 + row < m` and `col + 4 <= 128`: by this function's contract, 16
+            // aligned readable bytes of `x`.
             unsafe { *xp.add((row0 + row) * 128 + col).cast::<F32x4>() }.0
         } else {
             [0.0; 4]
         };
         let y = normed4(v, gamma, beta, col);
-        // SAFETY: `row < 32` and `col + 4 <= 128`: inside the caller's `a` `[32, 128]`, 16-byte
-        // aligned; each lane writes its own four values, read after the caller's barrier.
+        // SAFETY: `row = warp_id * 4 + i < 32` (256 threads) and `col + 4 <= 128`: inside the
+        // contract's `a` `[32, 128]`, 16-byte aligned; each lane writes its own four values.
         unsafe { *a.add(row * 128 + col).cast::<F32x4>() = F32x4(y) };
     }
 }
