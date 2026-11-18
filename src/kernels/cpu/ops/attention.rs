@@ -1,7 +1,6 @@
 //! Attention: score and value tiles, softmax, and packed BF16 values.
 
 #![allow(
-    dead_code,
     unsafe_code,
     clippy::needless_range_loop,
     clippy::similar_names,
@@ -12,8 +11,6 @@
 )]
 
 use crate::kernels::cpu::*;
-
-pub(crate) const MAX_PACKED_ATTENTION_QUERY_ROWS: usize = 16;
 
 /// Run head-major FP32 attention natively unless `backend` is `Portable`:
 /// through Accelerate when it is large enough, else with the short-source
@@ -427,20 +424,6 @@ pub(crate) fn softmax_exp_sum_for_target(_backend: Isa, _scores: &mut [f32], _ma
 #[cfg(not(target_arch = "x86_64"))]
 pub(crate) fn attention_score_maximum_for_target(_backend: Isa, _scores: &[f32]) -> Option<(f32, bool)> {
     None
-}
-
-#[inline]
-#[allow(clippy::cast_possible_truncation)]
-pub(crate) fn fast_exp_negative(value: f32) -> f32 {
-    let value = value.max(-87.0);
-    let exponent = (value * core::f32::consts::LOG2_E).round() as i32;
-    let remainder = value - exponent as f32 * core::f32::consts::LN_2;
-    let mut polynomial = 1.0_f32 / 5_040.0;
-    for coefficient in [1.0 / 720.0, 1.0 / 120.0, 1.0 / 24.0, 1.0 / 6.0, 0.5, 1.0, 1.0] {
-        polynomial = polynomial.mul_add(remainder, coefficient);
-    }
-    let exponent_bits = u32::try_from(exponent + 127).expect("clamped exp exponent is non-negative");
-    polynomial * f32::from_bits(exponent_bits << 23)
 }
 
 #[cfg(not(any(
