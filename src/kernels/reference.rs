@@ -100,7 +100,7 @@ pub fn affine_f32(
     }
     require_length(output, output_len, "affine output")?;
 
-    if super::native::affine_f32(input, rows, input_dim, weight, bias, output_dim, output) {
+    if super::cpu::affine_f32(input, rows, input_dim, weight, bias, output_dim, output) {
         return Ok(());
     }
 
@@ -142,7 +142,7 @@ pub(crate) fn affine_input3_transposed_f32(
         checked_elements(rows, output_dim, "affine output")?,
         "affine output",
     )?;
-    if super::native::affine_input3_transposed_f32(input, rows, weight, bias, output_dim, output) {
+    if super::cpu::affine_input3_transposed_f32(input, rows, weight, bias, output_dim, output) {
         return Ok(());
     }
     for (input, output) in input
@@ -236,9 +236,7 @@ pub fn layer_norm_f32(
         require_length(bias, width, "layer norm bias")?;
     }
     require_length(output, elements, "layer norm output")?;
-    if !cfg!(feature = "exact-math")
-        && super::native::layer_norm_f32(input, rows, width, weight, bias, output)
-    {
+    if !cfg!(feature = "exact-math") && super::cpu::layer_norm_f32(input, rows, width, weight, bias, output) {
         return Ok(());
     }
     for (input_row, output_row) in input.chunks_exact(width).zip(output.chunks_exact_mut(width)) {
@@ -258,7 +256,7 @@ pub fn layer_norm_f32(
 pub fn gelu_f32(input: &[f32], output: &mut [f32]) -> Result<()> {
     let _profile = profile::scope(Category::Gelu);
     require_length(output, input.len(), "GELU output")?;
-    if !cfg!(feature = "exact-math") && super::native::gelu_f32(input, output) {
+    if !cfg!(feature = "exact-math") && super::cpu::gelu_f32(input, output) {
         return Ok(());
     }
     for (input, output) in input.iter().zip(output) {
@@ -568,7 +566,7 @@ pub fn tiled_online_scaled_dot_product_attention_f32(
         head_dim,
         query_block_rows,
         key_tile_rows,
-        super::native::attention_backend(),
+        super::cpu::Isa::detect(),
         scratch,
         output,
     )
@@ -586,7 +584,7 @@ pub(crate) fn tiled_online_scaled_dot_product_attention_with_backend_f32(
     head_dim: usize,
     query_block_rows: usize,
     key_tile_rows: usize,
-    backend: super::native::AttentionBackend,
+    backend: super::cpu::Isa,
     scratch: &mut OnlineAttentionScratch<'_>,
     output: &mut [f32],
 ) -> Result<()> {
@@ -610,7 +608,7 @@ pub(crate) fn tiled_online_scaled_dot_product_attention_with_backend_f32(
     require_length(key, source_elements, "attention key")?;
     require_length(value, source_elements, "attention value")?;
     require_length(output, query_elements, "attention output")?;
-    if super::native::attention_f32(
+    if super::cpu::attention_f32(
         backend,
         query,
         query_rows,
@@ -662,7 +660,7 @@ pub(crate) fn tiled_online_scaled_dot_product_attention_with_backend_f32(
                 let source_tile_start = (head * source_rows + source_start) * head_dim;
                 let key_tile = &key[source_tile_start..][..sources * head_dim];
                 let score_tile = &mut scratch.scores[..rows * sources];
-                if !super::native::attention_score_tile_f32(
+                if !super::cpu::attention_score_tile_f32(
                     backend, query_tile, rows, key_tile, sources, head_dim, scale, score_tile,
                 ) {
                     for row in 0..rows {
@@ -670,7 +668,7 @@ pub(crate) fn tiled_online_scaled_dot_product_attention_with_backend_f32(
                         let scores = &mut score_tile[row * sources..][..sources];
                         for source in 0..sources {
                             let key_row = &key_tile[source * head_dim..][..head_dim];
-                            let dot = super::native::attention_dot_f32(backend, query_row, key_row)
+                            let dot = super::cpu::attention_dot_f32(backend, query_row, key_row)
                                 .unwrap_or_else(|| {
                                     query_row
                                         .iter()
@@ -703,7 +701,7 @@ pub(crate) fn tiled_online_scaled_dot_product_attention_with_backend_f32(
                         }
                         scratch.denominator[state] *= old_scale;
                     }
-                    if let Some(sum) = super::native::softmax_exp_sum_f32(backend, scores, maximum) {
+                    if let Some(sum) = super::cpu::softmax_exp_sum_f32(backend, scores, maximum) {
                         scratch.denominator[state] += sum;
                     } else {
                         for score in &mut *scores {
@@ -717,7 +715,7 @@ pub(crate) fn tiled_online_scaled_dot_product_attention_with_backend_f32(
                 let value_tile = &value[source_tile_start..][..sources * head_dim];
                 let output_tile_start = (head * query_rows + query_start) * head_dim;
                 let output_tile = &mut output[output_tile_start..][..rows * head_dim];
-                if !super::native::attention_value_tile_fma_f32(
+                if !super::cpu::attention_value_tile_fma_f32(
                     backend,
                     score_tile,
                     rows,
@@ -730,7 +728,7 @@ pub(crate) fn tiled_online_scaled_dot_product_attention_with_backend_f32(
                         let output_row = &mut output_tile[row * head_dim..][..head_dim];
                         for source in 0..sources {
                             let value_row = &value_tile[source * head_dim..][..head_dim];
-                            if !super::native::attention_value_fma_f32(
+                            if !super::cpu::attention_value_fma_f32(
                                 backend,
                                 score_tile[row * sources + source],
                                 value_row,
@@ -777,7 +775,7 @@ pub(crate) fn source_major_online_attention_with_backend_f32(
     query_block_rows: usize,
     key_tile_rows: usize,
     key_is_packed: bool,
-    backend: super::native::AttentionBackend,
+    backend: super::cpu::Isa,
     scratch: &mut OnlineAttentionScratch<'_>,
     output: &mut [f32],
 ) -> Result<()> {
@@ -802,7 +800,7 @@ pub(crate) fn source_major_online_attention_with_backend_f32(
     require_length(value, source_elements, "attention value")?;
     require_length(output, query_elements, "attention output")?;
     if !key_is_packed
-        && super::native::attention_f32(
+        && super::cpu::attention_f32(
             backend,
             query,
             query_rows,
@@ -865,7 +863,7 @@ pub(crate) fn source_major_online_attention_with_backend_f32(
                 let query_tile = &query[query_tile_start..][..rows * head_dim];
                 let score_tile = &mut scratch.scores[..rows * sources];
                 let packed_score = if key_is_packed {
-                    super::native::attention_score_packed_key_tile_f32(
+                    super::cpu::attention_score_packed_key_tile_f32(
                         backend,
                         query_tile,
                         rows,
@@ -876,7 +874,7 @@ pub(crate) fn source_major_online_attention_with_backend_f32(
                         score_tile,
                     )
                 } else {
-                    super::native::attention_score_packed_key_padded_tile_f32(
+                    super::cpu::attention_score_packed_key_padded_tile_f32(
                         backend,
                         query_tile,
                         rows,
@@ -899,7 +897,7 @@ pub(crate) fn source_major_online_attention_with_backend_f32(
                                 }) * scale;
                             }
                         }
-                    } else if !super::native::attention_score_tile_f32(
+                    } else if !super::cpu::attention_score_tile_f32(
                         backend, query_tile, rows, key_tile, sources, head_dim, scale, score_tile,
                     ) {
                         for row in 0..rows {
@@ -907,7 +905,7 @@ pub(crate) fn source_major_online_attention_with_backend_f32(
                             let scores = &mut score_tile[row * sources..][..sources];
                             for source in 0..sources {
                                 let key_row = &key_tile[source * head_dim..][..head_dim];
-                                let dot = super::native::attention_dot_f32(backend, query_row, key_row)
+                                let dot = super::cpu::attention_dot_f32(backend, query_row, key_row)
                                     .unwrap_or_else(|| {
                                         query_row
                                             .iter()
@@ -941,7 +939,7 @@ pub(crate) fn source_major_online_attention_with_backend_f32(
                         }
                         scratch.denominator[state] *= old_scale;
                     }
-                    if let Some(sum) = super::native::softmax_exp_sum_f32(backend, scores, maximum) {
+                    if let Some(sum) = super::cpu::softmax_exp_sum_f32(backend, scores, maximum) {
                         scratch.denominator[state] += sum;
                     } else {
                         for score in &mut *scores {
@@ -954,7 +952,7 @@ pub(crate) fn source_major_online_attention_with_backend_f32(
                 }
                 let output_tile_start = (head * query_rows + query_start) * head_dim;
                 let output_tile = &mut output[output_tile_start..][..rows * head_dim];
-                if !super::native::attention_value_tile_fma_f32(
+                if !super::cpu::attention_value_tile_fma_f32(
                     backend,
                     score_tile,
                     rows,
@@ -967,7 +965,7 @@ pub(crate) fn source_major_online_attention_with_backend_f32(
                         let output_row = &mut output_tile[row * head_dim..][..head_dim];
                         for source in 0..sources {
                             let value_row = &value_tile[source * head_dim..][..head_dim];
-                            if !super::native::attention_value_fma_f32(
+                            if !super::cpu::attention_value_fma_f32(
                                 backend,
                                 score_tile[row * sources + source],
                                 value_row,
@@ -1014,7 +1012,7 @@ pub(crate) fn source_major_online_attention_bf16_with_backend_f32(
     query_block_rows: usize,
     key_tile_rows: usize,
     key_is_packed: bool,
-    backend: super::native::AttentionBackend,
+    backend: super::cpu::Isa,
     scratch: &mut OnlineAttentionScratch<'_>,
     output: &mut [f32],
 ) -> Result<()> {
@@ -1086,7 +1084,7 @@ pub(crate) fn source_major_online_attention_bf16_with_backend_f32(
                 let query_tile_start = (head * query_rows + query_start) * head_dim;
                 let query_tile = &query[query_tile_start..][..rows * head_dim];
                 let score_tile = &mut scratch.scores[..rows * sources];
-                let packed_score = super::native::attention_score_packed_key_bf16_tile_f32(
+                let packed_score = super::cpu::attention_score_packed_key_bf16_tile_f32(
                     backend,
                     query_tile,
                     rows,
@@ -1112,7 +1110,7 @@ pub(crate) fn source_major_online_attention_bf16_with_backend_f32(
                                 }) * scale;
                             }
                         }
-                    } else if !super::native::attention_score_tile_bf16_f32(
+                    } else if !super::cpu::attention_score_tile_bf16_f32(
                         backend, query_tile, rows, key_tile, sources, head_dim, scale, score_tile,
                     ) {
                         for row in 0..rows {
@@ -1150,7 +1148,7 @@ pub(crate) fn source_major_online_attention_bf16_with_backend_f32(
                         }
                         scratch.denominator[state] *= old_scale;
                     }
-                    if let Some(sum) = super::native::softmax_exp_sum_f32(backend, scores, maximum) {
+                    if let Some(sum) = super::cpu::softmax_exp_sum_f32(backend, scores, maximum) {
                         scratch.denominator[state] += sum;
                     } else {
                         for score in &mut *scores {
@@ -1163,7 +1161,7 @@ pub(crate) fn source_major_online_attention_bf16_with_backend_f32(
                 }
                 let output_tile_start = (head * query_rows + query_start) * head_dim;
                 let output_tile = &mut output[output_tile_start..][..rows * head_dim];
-                if !super::native::attention_value_tile_bf16_fma_f32(
+                if !super::cpu::attention_value_tile_bf16_fma_f32(
                     backend,
                     score_tile,
                     rows,
@@ -1218,7 +1216,7 @@ pub(crate) fn source_major_online_attention_f32_key_bf16_value_with_backend_f32(
     query_block_rows: usize,
     key_tile_rows: usize,
     key_is_packed: bool,
-    backend: super::native::AttentionBackend,
+    backend: super::cpu::Isa,
     scratch: &mut OnlineAttentionScratch<'_>,
     output: &mut [f32],
 ) -> Result<()> {
@@ -1280,7 +1278,7 @@ pub(crate) fn source_major_online_attention_f32_key_bf16_value_with_backend_f32(
             let key_tile = &key[source_tile_start..][..tile_elements];
             let value_tile = &value[source_tile_start..][..tile_elements];
             let value_is_packed = packed_value.as_mut().is_some_and(|packed| {
-                super::native::pack_attention_value_bf16(
+                super::cpu::pack_attention_value_bf16(
                     value_tile,
                     sources,
                     head_dim,
@@ -1306,7 +1304,7 @@ pub(crate) fn source_major_online_attention_f32_key_bf16_value_with_backend_f32(
                 let score_tile = &mut scratch.scores[..rows * sources];
                 let packed_score = {
                     let _profile = profile::scope(Category::AttentionScore);
-                    super::native::attention_score_packed_key_tile_f32(
+                    super::cpu::attention_score_packed_key_tile_f32(
                         backend,
                         query_tile,
                         rows,
@@ -1328,7 +1326,7 @@ pub(crate) fn source_major_online_attention_f32_key_bf16_value_with_backend_f32(
                                 }) * scale;
                             }
                         }
-                    } else if !super::native::attention_score_tile_f32(
+                    } else if !super::cpu::attention_score_tile_f32(
                         backend, query_tile, rows, key_tile, sources, head_dim, scale, score_tile,
                     ) {
                         for row in 0..rows {
@@ -1336,7 +1334,7 @@ pub(crate) fn source_major_online_attention_f32_key_bf16_value_with_backend_f32(
                             let scores = &mut score_tile[row * sources..][..sources];
                             for source in 0..sources {
                                 let key_row = &key_tile[source * head_dim..][..head_dim];
-                                let dot = super::native::attention_dot_f32(backend, query_row, key_row)
+                                let dot = super::cpu::attention_dot_f32(backend, query_row, key_row)
                                     .unwrap_or_else(|| {
                                         query_row
                                             .iter()
@@ -1377,7 +1375,7 @@ pub(crate) fn source_major_online_attention_f32_key_bf16_value_with_backend_f32(
                             }
                             scratch.denominator[state] *= old_scale;
                         }
-                        if let Some(sum) = super::native::softmax_exp_sum_f32(backend, scores, maximum) {
+                        if let Some(sum) = super::cpu::softmax_exp_sum_f32(backend, scores, maximum) {
                             scratch.denominator[state] += sum;
                         } else {
                             for score in &mut *scores {
@@ -1394,7 +1392,7 @@ pub(crate) fn source_major_online_attention_f32_key_bf16_value_with_backend_f32(
                 {
                     let _profile = profile::scope(Category::AttentionValue);
                     let used_bf16_dot = value_is_packed
-                        && super::native::attention_value_packed_bf16_dot_f32(
+                        && super::cpu::attention_value_packed_bf16_dot_f32(
                             backend,
                             score_tile,
                             rows,
@@ -1406,7 +1404,7 @@ pub(crate) fn source_major_online_attention_f32_key_bf16_value_with_backend_f32(
                                 [..rows * sources],
                         );
                     if !used_bf16_dot
-                        && !super::native::attention_value_tile_bf16_fma_f32(
+                        && !super::cpu::attention_value_tile_bf16_fma_f32(
                             backend,
                             score_tile,
                             rows,
@@ -1455,8 +1453,8 @@ pub(crate) fn source_major_online_attention_f32_key_bf16_value_with_backend_f32(
     Ok(())
 }
 
-fn attention_score_maximum(backend: super::native::AttentionBackend, scores: &[f32]) -> Result<f32> {
-    if let Some((maximum, has_nan)) = super::native::attention_score_maximum_f32(backend, scores) {
+fn attention_score_maximum(backend: super::cpu::Isa, scores: &[f32]) -> Result<f32> {
+    if let Some((maximum, has_nan)) = super::cpu::attention_score_maximum_f32(backend, scores) {
         if has_nan {
             return Err(Error::InvalidArgument("softmax input contains NaN".into()));
         }
@@ -1900,7 +1898,7 @@ mod tests {
                 query_block_rows,
                 key_tile_rows,
                 false,
-                crate::kernels::native::attention_backend(),
+                crate::kernels::cpu::Isa::detect(),
                 &mut OnlineAttentionScratch {
                     scores: &mut source_major_scores,
                     maximum: &mut source_major_maximum,
@@ -1936,7 +1934,7 @@ mod tests {
                 query_block_rows,
                 key_tile_rows,
                 true,
-                crate::kernels::native::attention_backend(),
+                crate::kernels::cpu::Isa::detect(),
                 &mut OnlineAttentionScratch {
                     scores: &mut source_major_scores,
                     maximum: &mut source_major_maximum,
@@ -2009,7 +2007,7 @@ mod tests {
             8,
             128,
             false,
-            crate::kernels::native::attention_backend(),
+            crate::kernels::cpu::Isa::detect(),
             &mut OnlineAttentionScratch {
                 scores: &mut scores,
                 maximum: &mut maximum,
