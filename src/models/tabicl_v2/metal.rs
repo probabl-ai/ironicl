@@ -109,8 +109,9 @@ struct Rope<'t> {
     key: (&'t Tensor, &'t Tensor),
 }
 
-// SAFETY (all methods): plain `MPSGraph` construction. Shapes come from fixed
-// TabICLv2 dimensions and weights checked by the model artifact.
+// SAFETY (all methods): plain `MPSGraph` construction on `self.graph`, as in
+// the `Builder` impl: every tensor came from `self.graph`, names are `None`, and
+// no call touches buffer memory.
 impl Builder<'_, '_> {
     /// A `QASSMax` base scale, `[heads, head_dim]` values, shaped to scale
     /// `[lead, heads, rows, head_dim]` queries.
@@ -154,6 +155,7 @@ impl Builder<'_, '_> {
             let ssmax = format!("{attn}.ssmax_layer");
             let hidden = self.gelu(&self.linear(&query, &format!("{ssmax}.query_mlp.0"), head_dim, 64)?);
             let modulation = self.linear(&hidden, &format!("{ssmax}.query_mlp.2"), 64, head_dim)?;
+            // SAFETY: graph construction on `self.graph` (impl comment).
             let gate = self.add(
                 &unsafe { self.graph.tanhWithTensor_name(&modulation, None) },
                 &self.scalar(1.0),
@@ -180,12 +182,14 @@ impl Builder<'_, '_> {
         // Reduced-precision caches: attention runs in their type, so the
         // caches are read as stored instead of converted to an FP32 copy.
         // Stored 16-bit caches set the attention type; otherwise `self.attention` does.
+        // SAFETY: a property read of a live tensor.
         let stored = unsafe { key.dataType() };
         let kind = if stored == FLOAT {
             self.attention.get()
         } else {
             stored
         };
+        // SAFETY: graph construction on `self.graph` (impl comment).
         let attended = unsafe {
             self.graph
                 .scaledDotProductAttentionWithQueryTensor_keyTensor_valueTensor_scale_name(
@@ -377,8 +381,11 @@ struct Prepared {
     results: Retained<NSArray<MPSGraphTensorData>>,
 }
 
-// SAFETY: the Objective-C objects are immutable after construction, and every
-// graph run holds the `prepared` lock.
+// SAFETY: after `new`, `graph`, the tensors, and the bindings are only used by
+// `prepare` and `run`, which hold the `prepared` lock, so one thread at a time
+// compiles or runs this graph and writes its input buffer. The `Gpu` device and
+// queue are thread-safe (`Send + Sync` in objc2-metal); its descriptors are
+// shared with other graphs but only read. Retain and release are atomic.
 unsafe impl Send for PredictGraph {}
 // SAFETY: as above.
 unsafe impl Sync for PredictGraph {}
@@ -388,7 +395,9 @@ impl PredictGraph {
     /// `[B, H + 4, 8, 128, 16]` cache, `icl_keys` and `icl_values` each ICL
     /// block's `[B, 8, N, 64]` in `icl`'s storage type, and `base_scales` each
     /// ICL block's `[8, 64]`. With `page_aligned`, the caches are wrapped in
-    /// place instead of copied.
+    /// place instead of copied: each must start a page of page-padded memory
+    /// that stays alive and unwritten while the graph lives ([`Gpu::wrap`]'s
+    /// contract; `GpuContext::_storage` keeps it alive).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         model: &ModelWeights,
@@ -487,7 +496,8 @@ impl PredictGraph {
         let (b, h) = (self.shape.ensembles, self.shape.features);
         let input = self.gpu.empty(b * h * rows * 3)?;
         // Padding rows must be finite; they never mix with real rows.
-        // SAFETY: the new buffer holds `b * h * rows * 3` floats.
+        // SAFETY: `empty` made a shared buffer of `b * h * rows * 3` floats that no
+        // one else has yet; `contents` is its CPU-visible, page-aligned start.
         unsafe { std::ptr::write_bytes(input.contents().as_ptr().cast::<f32>(), 0, b * h * rows * 3) };
         let output = self.gpu.empty(b * rows * self.outputs)?;
         let input = (
@@ -505,8 +515,8 @@ impl PredictGraph {
         let mut inputs = self.bindings.iter().collect::<Vec<_>>();
         inputs.push(&input);
         let (feeds, results) = (dictionary(&inputs), dictionary(&[&output]));
-        // SAFETY: compiling the graph for these inputs' shapes; every feed
-        // tensor has a value in `feeds`.
+        // SAFETY: compiles `self.graph` (under the caller's `prepared` lock) for
+        // its own feed tensors, typed with valid shapes; touches no buffer memory.
         let executable = unsafe {
             let tensors: Vec<&MPSGraphTensor> = inputs.iter().map(|item| &*item.0).collect();
             let types: Vec<_> = inputs
@@ -528,7 +538,7 @@ impl PredictGraph {
                     Some(&self.gpu.compilation),
                 )
         };
-        // SAFETY: reading the compiled executable's feed order.
+        // SAFETY: a property read of the executable compiled above.
         let order =
             unsafe { executable.feedTensors() }.ok_or_else(|| metal_error("compiled graph has no feeds"))?;
         let ordered = order
@@ -582,15 +592,18 @@ impl PredictGraph {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(entry) => entry.insert(self.prepare(rows)?),
         };
-        // SAFETY: the lock gives this call sole use of the buffer, which holds
-        // `b * h * rows * 3` floats.
+        // SAFETY: `prepare(rows)` sized the shared buffer to `b * h * rows * 3`
+        // floats; the held lock excludes other writers and the GPU, whose runs
+        // on this buffer are synchronous and also take the lock.
         let input = unsafe {
             std::slice::from_raw_parts_mut(prepared.input.contents().as_ptr().cast::<f32>(), b * h * rows * 3)
         };
         if !fill(input, rows) {
             return Ok(None);
         }
-        // SAFETY: synchronous run; the arrays keep their buffers alive.
+        // SAFETY: `executable_execution` waits until completion; the tensor data in
+        // `prepared` may not retain their buffers, but `prepared` and `self.bindings`
+        // do, and the page-aligned caches outlive `self` (`GpuContext::_storage`).
         unsafe {
             prepared
                 .executable
@@ -601,7 +614,8 @@ impl PredictGraph {
                     Some(&self.gpu.executable_execution),
                 );
         }
-        // SAFETY: the run is complete and wrote `[b, rows, outputs]` floats.
+        // SAFETY: the synchronous run above finished, the shared buffer holds
+        // `b * rows * outputs` floats (`prepare`), and the lock is still held.
         let output = unsafe {
             std::slice::from_raw_parts(
                 prepared.output.contents().as_ptr().cast::<f32>(),
@@ -626,8 +640,9 @@ impl PredictGraph {
 /// `icl_labels` `[B, N, 512]`. The keys and values are written in place into
 /// `outputs`, page-aligned regions in context order: each column block's key
 /// and value as `[B, H + 4, 8, 128, 16]` with zero reserved streams, then each
-/// ICL block's as `[B, 8, N, 64]` in `icl_storage`'s type. Returns an error
-/// if any written value is not finite, including FP16 overflow.
+/// ICL block's as `[B, 8, N, 64]` in `icl_storage`'s type. Each region must
+/// satisfy [`Gpu::wrap`]'s contract and stay untouched until this returns.
+/// Returns an error if any written value is not finite, including FP16 overflow.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // One linear graph definition.
 pub(crate) fn build_context(
     model: &ModelWeights,
@@ -746,9 +761,9 @@ pub(crate) fn build_context(
     }
     // One NaN-propagating max |value| over every output, as stored, so the
     // CPU checks a single float instead of scanning the whole context.
-    // SAFETY (both closures): plain `MPSGraph` construction, as in `Builder`.
     let largest = targets
         .iter()
+        // SAFETY: graph construction on `builder.graph`, as in `Builder`.
         .map(|(tensor, _, _)| unsafe {
             let largest = builder.graph.reductionMaximumPropagateNaNWithTensor_axis_name(
                 &builder.reshape(&builder.graph.absoluteWithTensor_name(tensor, None), &[-1]),
@@ -757,6 +772,7 @@ pub(crate) fn build_context(
             );
             builder.cast(&largest, FLOAT)
         })
+        // SAFETY: as above.
         .reduce(|left, right| unsafe {
             builder
                 .graph
@@ -777,7 +793,8 @@ pub(crate) fn build_context(
         &bindings.iter().collect::<Vec<_>>(),
         &outputs.iter().collect::<Vec<_>>(),
     );
-    // SAFETY: the run is complete and wrote one float.
+    // SAFETY: `gpu.run` returned after the GPU finished, and the last output is a
+    // live shared buffer of one float (`gpu.empty(1)`); any bit pattern is an `f32`.
     let largest = unsafe { *outputs[outputs.len() - 1].1.contents().as_ptr().cast::<f32>() };
     if !largest.is_finite() {
         return Err(metal_error("the built context contains a non-finite value"));

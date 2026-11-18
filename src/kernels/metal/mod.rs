@@ -85,7 +85,8 @@ impl Gpu {
         // Optimization level 0 measured as fast as the default level 1 on an
         // M1 Max. Level 1's pass that places operations on the Neural Engine
         // or CPU printed "Failed to import MPS module" on every compile.
-        // SAFETY: plain descriptor construction.
+        // SAFETY: fresh descriptors, configured before they are shared; the
+        // setters take valid enum values and an owned compilation descriptor.
         let (compilation, execution, executable_execution) = unsafe {
             let compilation = MPSGraphCompilationDescriptor::new();
             compilation.setOptimizationLevel(MPSGraphOptimization::Level0);
@@ -112,7 +113,8 @@ impl Gpu {
     pub(crate) fn buffer_bytes(&self, bytes: &[u8]) -> Result<Buffer> {
         let pointer = std::ptr::NonNull::new(bytes.as_ptr().cast_mut().cast())
             .ok_or_else(|| metal_error("empty buffer"))?;
-        // SAFETY: Metal copies the bytes of a live slice into a new shared buffer.
+        // SAFETY: `pointer` and `bytes.len()` describe the live `bytes` slice, which
+        // Metal copies into the new buffer before returning; it keeps no pointer.
         unsafe {
             self.device.newBufferWithBytes_length_options(
                 pointer,
@@ -123,11 +125,15 @@ impl Gpu {
         .ok_or_else(|| metal_error("cannot allocate a buffer"))
     }
 
-    /// Wrap `bytes` of existing page-aligned memory without copying it. The
-    /// memory must outlive the buffer.
+    /// Wrap `bytes` of existing page-aligned memory without copying it.
+    ///
+    /// Not marked `unsafe`, but callers must uphold: `pointer` starts a page and
+    /// `bytes` is a page multiple inside one live allocation; the memory outlives
+    /// every GPU use of the buffer; and no Rust reference reads it while the GPU
+    /// writes it, or writes it while the GPU reads it.
     pub(crate) fn wrap(&self, pointer: std::ptr::NonNull<u8>, bytes: usize) -> Result<Buffer> {
-        // SAFETY: callers pass a page-aligned, page-padded region that outlives
-        // the buffer; no deallocator, because the region's owner frees it.
+        // SAFETY: the caller contract above (page-aligned, page-multiple, live for
+        // the buffer's GPU use); no deallocator, because the region's owner frees it.
         unsafe {
             self.device.newBufferWithBytesNoCopy_length_options_deallocator(
                 pointer.cast(),
@@ -141,6 +147,10 @@ impl Gpu {
 
     /// A buffer over a tensor's `bytes`: wrapped in place when `page_aligned`
     /// (the bytes start on a page inside page-padded memory), otherwise copied.
+    /// With `page_aligned`, the caller must uphold [`Self::wrap`]'s contract for
+    /// `bytes` rounded up to [`TENSOR_PAGE_BYTES`](crate::format::static_context::TENSOR_PAGE_BYTES),
+    /// and must not write `bytes` while the buffer lives: the returned buffer
+    /// does not borrow them.
     pub(crate) fn tensor_buffer(&self, bytes: &[u8], page_aligned: bool) -> Result<Buffer> {
         if !page_aligned {
             return self.buffer_bytes(bytes);
@@ -167,8 +177,9 @@ impl Gpu {
 
     /// Run `graph` synchronously, feeding `inputs` and writing `outputs`.
     pub(crate) fn run(&self, graph: &MPSGraph, inputs: &[&Binding], outputs: &[&Binding]) {
-        // SAFETY: the descriptor waits until the run completes, and the
-        // dictionaries keep their buffers alive.
+        // SAFETY: `self.execution` sets `waitUntilCompleted`, so the call returns
+        // after the GPU finishes; the caller's bindings retain every buffer the
+        // tensor data (which may not retain them) refer to for that whole time.
         unsafe {
             graph.runAsyncWithMTLCommandQueue_feeds_targetOperations_resultsDictionary_executionDescriptor(
                 &self.queue,
@@ -189,7 +200,8 @@ pub(crate) fn dictionary(items: &[&Binding]) -> Dictionary {
     let data: Vec<_> = items
         .iter()
         .map(|(_, buffer, dimensions, kind)| {
-            // SAFETY: each buffer is live, shared, and at least as long as its shape.
+            // SAFETY: `buffer` is retained by the binding; every binding is built with a
+            // buffer of at least `dimensions` elements of `kind` (see the callers).
             unsafe {
                 MPSGraphTensorData::initWithMTLBuffer_shape_dataType(
                     MPSGraphTensorData::alloc(),
@@ -216,8 +228,10 @@ impl std::fmt::Debug for ModelWeights {
     }
 }
 
-// SAFETY: buffers are written once when created and only read after; the map
-// is behind a mutex.
+// SAFETY: the device and queue are thread-safe (`Send + Sync` in objc2-metal);
+// the descriptors are only read after `Gpu::new`; each buffer is filled when
+// created and only read after; the map is behind a mutex. Retain and release
+// are atomic.
 unsafe impl Send for ModelWeights {}
 // SAFETY: as above.
 unsafe impl Sync for ModelWeights {}

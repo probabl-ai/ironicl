@@ -5,6 +5,13 @@
 //! `unsafe`: each launcher passes buffers that hold the shapes it is given
 //! and the grid its kernel's docs in `kernels.rs` ask for, and nothing else
 //! launches a kernel.
+//!
+//! The kernels' slice indexing (`x[i]`) is bounds-checked and traps, so the
+//! SAFETY comments cover the rest: unchecked writes and reads, raw 16-byte
+//! vector reads, and `cp.async` copies. Launches take no completion lease on
+//! their buffers: a buffer dropped while a queued kernel still uses it (such
+//! as `peaks` in `Device::encode_fp8`) relies on `cuMemFree` synchronizing
+//! with the device.
 #![allow(unsafe_code)] // Launches of kernels that trust their grid and shapes.
 
 use cuda_core::{DeviceBuffer, DeviceCopy, LaunchConfig};
@@ -118,7 +125,10 @@ pub(super) struct SmallAttention {
     pub(super) o_tok: usize,
 }
 
-/// A size as the kernels take it; every size fits their `u32`.
+/// A size as the kernels take it, in `u32`: a build caps its buffers at
+/// `u32::MAX` values (see `build::plan`), and a prediction's counts are per
+/// run of at most 1024 rows, except the query rows `total` and `start`, which
+/// feed only bounds-checked reads and the `missing` offset.
 #[allow(clippy::cast_possible_truncation)]
 const fn n(value: usize) -> u32 {
     value as u32
@@ -190,7 +200,9 @@ impl Device {
         (ensembles, features, total, start, q): (usize, usize, usize, usize, usize),
     ) -> Result<()> {
         let config = config(threads(ensembles * features * q * COLUMN_DIM), 256);
-        // SAFETY: one thread per output value; `missing` holds `start + q` rows.
+        // SAFETY: one thread per `out[i]`, `i < B * H * q * 128`; `out` is `x0`, which
+        // `Workspace::reserve` sizes for runs of `q` rows. `missing[start + row]`, `row < q`,
+        // is within the caller's `missing`, one per query row; a row's columns all store 1.0.
         let launch = unsafe {
             self.kernels.column_input(
                 self.stream(),
@@ -221,7 +233,9 @@ impl Device {
         (total, start): (usize, usize),
     ) -> Result<()> {
         let config = config(threads(ensembles * q * (features + 4) * COLUMN_DIM), 256);
-        // SAFETY: one thread per output value; `columns` holds `total` rows.
+        // SAFETY: one thread per `rows[i]`, `i < B * q * (H + 4) * 128`; `rows` is `x1`, which
+        // `Workspace::reserve` sizes for the run's tokens. Reads of `columns` and `cls` are
+        // checked.
         let launch = unsafe {
             self.kernels.build_rows(
                 self.stream(),
@@ -251,7 +265,8 @@ impl Device {
         (first, columns): (usize, usize),
     ) -> Result<()> {
         let config = config(threads(columns * rows * COLUMN_DIM), 256);
-        // SAFETY: one thread per output value; `out` holds `columns` columns.
+        // SAFETY: one thread per `out[i]`, `i < columns * rows * 128`; `out` is a chunk's state,
+        // `[chunk.columns, rows, 128]` with `columns <= chunk.columns`. Reads are checked.
         let launch = unsafe {
             self.kernels.column_train(
                 self.stream(),
@@ -278,7 +293,8 @@ impl Device {
         (period, len): (usize, usize),
     ) -> Result<()> {
         debug_assert!(period <= source.len() && len <= out.len());
-        // SAFETY: one thread per output value, within `out`.
+        // SAFETY: one thread per `out[i]`, `i < len`; `len <= out.len()` is asserted in debug
+        // builds only: the one caller writes `count * 128 * 128` into `[chunk.columns, 128, 128]`.
         let launch = unsafe {
             self.kernels.repeat(
                 self.stream(),
@@ -303,7 +319,8 @@ impl Device {
             len <= source.len() && offset + len <= out.len(),
             "copy past its buffers"
         );
-        // SAFETY: one thread per value, within both buffers.
+        // SAFETY: one thread per `out[offset + i]`, `i < len`, and the assert keeps
+        // `offset + len <= out.len()`.
         let launch = unsafe {
             self.kernels.copy_into(
                 self.stream(),
@@ -326,7 +343,8 @@ impl Device {
         columns: usize,
     ) -> Result<()> {
         assert!(keys.len() >= columns * 128 * 128 && values.len() == keys.len());
-        // SAFETY: one thread per key value, within the caches.
+        // SAFETY: one thread per key value, writing index `(column * 8 + head) * 2048 + point * 16
+        // + d < columns * 128 * 128`, which the assert keeps within `keys` and `values`.
         let launch = unsafe {
             self.kernels.column_kv(
                 self.stream(),
@@ -351,7 +369,8 @@ impl Device {
     ) -> Result<()> {
         let len = ensembles * q * width;
         assert!(len <= x.len() && ensembles * total * width <= labels.len());
-        // SAFETY: one thread per value, within both buffers.
+        // SAFETY: one thread per `x[i]`, `i < len`, which the assert keeps within `x`; reads of
+        // `labels` are checked.
         let launch = unsafe {
             self.kernels.add_labels(
                 self.stream(),
@@ -385,7 +404,8 @@ impl Device {
         let config = config(threads(ensembles * q * 512), 256);
         let (ensembles, q, start, np) = (n(ensembles), n(q), n(start), n(np));
         let stream = self.stream();
-        // SAFETY: one thread per key value, within the caches.
+        // SAFETY: one thread per key value of `B * q * 512`, writing row `start + row < np` of
+        // pair `b * 8 + head < B * 8`, below `B * 8 * np * 64`: the assert keeps it in both caches.
         let launch = unsafe {
             match cache {
                 CacheOutput::F32(keys, values) => self
@@ -416,8 +436,8 @@ impl Device {
         let mut packed = self.zeroed::<u16>(pairs * np * HEAD_DIM / 2).map_err(gpu_error)?;
         let (stride32, rows32, chunks32) = (n(stride), n(rows), n(chunks));
         let stream = self.stream();
-        // SAFETY: one thread per peak, scale, and pair of bytes, within their
-        // buffers; `values` holds `pairs * stride` rows.
+        // SAFETY: each kernel runs one thread per value of its output (`peaks`, `scales`,
+        // `packed`) and writes only index `i < len`, that buffer's length; its reads are checked.
         unsafe {
             let len = peaks.len();
             self.kernels
@@ -473,7 +493,8 @@ impl Device {
         len: usize,
     ) -> Result<()> {
         let config = config(threads(seqs * 4 * COLUMN_DIM), 256);
-        // SAFETY: one thread per output value.
+        // SAFETY: one thread per `cls[i]`, `i < seqs * 512`; `cls` is the workspace's
+        // `[B q, 4, 128]`. Reads of `rows` are checked.
         let launch = unsafe {
             self.kernels
                 .gather_cls(self.stream(), config, rows, cls, n(seqs), n(len))
@@ -494,7 +515,9 @@ impl Device {
         let mut unused = Unused::new(self)?;
         let (y, hi, lo, format) = unused.outputs(Some(out));
         let config = config(threads(rows * 32), 256);
-        // SAFETY: one warp per row.
+        // SAFETY: one warp per row (`rows * 32` threads), writing `row * width + i < rows * width`
+        // only to the buffers `format` names, which `Unused::outputs` matches to `out`'s; every
+        // caller's `out` holds `rows * width` values.
         let launch = unsafe {
             self.kernels.layer_norm(
                 self.stream(),
@@ -530,7 +553,10 @@ impl Device {
         let config = config((rows.div_ceil(32), 1, 1), 256);
         let kernel = match precision {
             Precision::Fp32 => {
-                // SAFETY: one block per 32 rows.
+                // SAFETY: one block of 256 threads per 32 rows, as the kernel asks. It reads rows
+                // `< rows` of `x` as unchecked 16-byte vectors and writes `out` below `rows *
+                // width`; callers' buffers hold `rows * 128` and `rows * width`, with `width`
+                // 128 or 384.
                 let launch = unsafe {
                     self.kernels.block_head_f32(
                         self.stream(),
@@ -553,7 +579,8 @@ impl Device {
             Precision::Half => LoadedModule::block_head_half,
             Precision::Split => LoadedModule::block_head_split,
         };
-        // SAFETY: one block per 32 rows.
+        // SAFETY: as above; `width <= 384`, the in-projection's rows, also keeps the unchecked
+        // fragment-order reads of `w.hi` and `w.lo` (`[width / 8, 8, 32, 2]` u32) in bounds.
         let launch = unsafe {
             kernel(
                 &self.kernels,
@@ -596,7 +623,9 @@ impl Device {
         let config = config((rows.div_ceil(32), 1, 1), 256);
         let kernel = match precision {
             Precision::Fp32 => {
-                // SAFETY: one block per 32 rows.
+                // SAFETY: one block of 256 threads per 32 rows, as the kernel asks. It reads
+                // `attended` and reads and writes `state` unchecked at rows `< rows`, 128 values
+                // each, and every caller's buffers hold `rows * 128`.
                 let launch = unsafe {
                     self.kernels.block_tail_f32(
                         self.stream(),
@@ -619,7 +648,8 @@ impl Device {
             Precision::Half => LoadedModule::block_tail_half,
             Precision::Split => LoadedModule::block_tail_split,
         };
-        // SAFETY: one block per 32 rows.
+        // SAFETY: as above; the fragment-order weights hold the fixed 128- and 256-wide layers
+        // whose unchecked reads the kernel makes.
         let launch = unsafe {
             kernel(
                 &self.kernels,
@@ -667,7 +697,10 @@ impl Device {
         let config = config((q.div_ceil(32), ensembles * features, 1), 256);
         let kernel = match precision {
             Precision::Fp32 => {
-                // SAFETY: one block per 32 rows of each column.
+                // SAFETY: grid (ceil(q / 32), B * H) of 256 threads, as the kernel asks. It reads
+                // and writes `state` rows `< B * H * q` (`x0` or a chunk's state holds them) and
+                // reads `keys` and `values` unchecked below `B * (H + reserved) * 16384`, which
+                // callers' caches hold (debug-asserted; a context's checked at load).
                 let launch = unsafe {
                     self.kernels.column_block_f32(
                         self.stream(),
@@ -697,7 +730,7 @@ impl Device {
             Precision::Half => LoadedModule::column_block_half,
             Precision::Split => LoadedModule::column_block_split,
         };
-        // SAFETY: one block per 32 rows of each column.
+        // SAFETY: as above, with the weights in fragment order for the block's fixed shapes.
         let launch = unsafe {
             kernel(
                 &self.kernels,
@@ -741,7 +774,11 @@ impl Device {
         let l = layout;
         let kernel = match precision {
             Precision::Fp32 => {
-                // SAFETY: one thread per query of each (sequence, head).
+                // SAFETY: grid (ceil(lq / 64), 8, seqs) of 64 threads, one per query, as the
+                // kernel asks. Each caller's layout keeps the unchecked reads `k_base + kv0 + key *
+                // kv_tok + 16 <= k.len()` (`key < lk`, likewise `v`) and writes `seq * o_seq +
+                // query * o_tok + head * 16 + 16 <= out.len()`; its strides are multiples of 4
+                // values, aligning the 16-byte key and value reads.
                 let launch = unsafe {
                     self.kernels.attention16_f32(
                         self.stream(),
@@ -772,7 +809,9 @@ impl Device {
         };
         let config = config((l.lq.div_ceil(64), HEADS, l.seqs), 128);
         let scale = 0.25; // 1 / sqrt(16)
-        // SAFETY: one block per 64 queries of each (sequence, head).
+        // SAFETY: the same grid of 128 threads, four warps of 16 queries, as the kernel asks;
+        // bounds as above, and its unchecked query reads stay below `seq * q_seq + query * q_tok +
+        // head * 16 + 16 <= q.len()` for `query < lq`.
         let launch = unsafe {
             kernel(
                 &self.kernels,
@@ -840,8 +879,10 @@ impl Device {
             Activation::Split { .. } => LoadedModule::linear16_split,
             _ => LoadedModule::linear16,
         };
-        // SAFETY: one block per 64 x 64 output tile; `depth` is a multiple of
-        // 32, as the kernels' k-steps require.
+        // SAFETY: grid (ceil(width / 64), ceil(rows / 64)) of 128 threads, as `linear16_body`
+        // asks. Callers' `depth` is 64, 512, or 1024 (a multiple of 32: 16-byte rows); `input`
+        // holds `rows * depth`, `dense` is `[width, depth]`, `residual` and `y` hold `rows *
+        // width`, and `next`'s form matches `input`'s, so no write reaches an empty `Unused`.
         let launch = unsafe {
             kernel(
                 &self.kernels,
@@ -893,8 +934,10 @@ impl Device {
         );
         let grid = config((width.div_ceil(64), rows.div_ceil(64), splits), 256);
         let (m, w, k) = (n(rows), n(width), n(depth));
-        // SAFETY: one block per 64 x 64 output tile and `chunk` of the depth;
-        // more than one chunk writes `partial`, which holds them all.
+        // SAFETY: grid (ceil(width / 64), ceil(rows / 64), splits) of 256 threads, as `linear64`
+        // asks; `depth` (64, 512, or 1024) and `chunk` (a multiple of 16) meet its multiples, and
+        // `cuMemAlloc` its 16-byte alignment. `input` holds `rows * depth`, `dense.w` is `[width,
+        // depth]`, `out` holds `rows * width`, and the assert keeps the partials in `partial`.
         let launch = unsafe {
             self.kernels.linear64(
                 self.stream(),
@@ -920,7 +963,8 @@ impl Device {
             return Ok(());
         }
         let config = config(threads(rows * width), 256);
-        // SAFETY: one thread per output value.
+        // SAFETY: one thread per output, writing `row * width + col < rows * width`, within `out`;
+        // reads of `partial` are checked.
         let launch = unsafe {
             self.kernels.linear_reduce(
                 self.stream(),
@@ -954,7 +998,9 @@ impl Device {
         let mut unused = Unused::new(self)?;
         let (y, hi, _, format) = unused.outputs(Some(packed));
         let config = config(threads(ensembles * q * 512), 256);
-        // SAFETY: one thread per query value.
+        // SAFETY: one thread per query value of `B * q * 512`, writing row `row < q <= qp` of pair
+        // `b * 8 + head` to the buffer `format` names; `packed` and `packed32` hold
+        // `B * 8 * padded_query_rows(run) * 64` (`Workspace::reserve`), and `qp` is at most that.
         let launch = unsafe {
             self.kernels.qass_pack(
                 self.stream(),
@@ -997,8 +1043,11 @@ impl Device {
         let (qp, np, splits32) = (n(padded_queries), n(padded_rows(rows)), n(splits));
         let scale = 0.125 / std::f32::consts::LN_2; // 1 / sqrt(64), in the exp2 domain
         let stream = self.stream();
-        // SAFETY: one block per `block_rows` query rows of each pair and chunk
-        // of `chunk_tiles` key tiles; the cache holds padded rows.
+        // SAFETY: grid (qp / block_rows, pairs * splits) of 128 threads, `block_rows` being the
+        // chosen kernel's rows per block; `qp` (`padded_query_rows`) is a multiple of it, so the
+        // unchecked query copies stay in `[pairs, qp, 64]`. The caches hold `pairs * np * 64`
+        // values of the precision's width (`BlockCache`); `part` and `lse` hold every chunk, as
+        // `Workspace::reserve` sizes them by this `icl_split`. Chunks start below `np / 64` tiles.
         let launch = unsafe {
             match (precision, queries) {
                 (Precision::Fp32, Activation::F32(queries)) => self.kernels.icl_attention_f32(
@@ -1049,7 +1098,8 @@ impl Device {
         };
         launch.map_err(gpu_error)?;
         let config = config(threads(pairs * padded_queries * HEAD_DIM), 256);
-        // SAFETY: one thread per output value.
+        // SAFETY: every access of `icl_attention_merge` is bounds-checked (its write goes through
+        // `get_mut`); one thread per output value of `[pairs, qp, 64]`.
         let launch = unsafe {
             self.kernels
                 .icl_attention_merge(self.stream(), config, part, lse, out, n(pairs), qp, splits32)
@@ -1068,7 +1118,8 @@ impl Device {
         let mut unused = Unused::new(self)?;
         let (y, hi, lo, format) = unused.outputs(Some(out));
         let config = config(threads(ensembles * q * 512), 256);
-        // SAFETY: one thread per token value.
+        // SAFETY: one thread per token value, writing `i < B * q * 512` to the buffers `format`
+        // names; `out` is the workspace's `a` halves or `attended`, both at least `[B q, 512]`.
         let launch = unsafe {
             self.kernels.heads_to_tokens(
                 self.stream(),

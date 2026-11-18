@@ -33,6 +33,9 @@ pub(crate) fn store_activation(
     at: usize,
     value: f32,
 ) {
+    // SAFETY: callers pass `at` inside the buffer `format` selects (`y` for 0, `hi` for 1, `hi` and
+    // `lo` for 2), which their launcher sizes, and own `at` alone: `layer_norm`, `heads_to_tokens`,
+    // and `linear16_body` store one element per (row, column) per thread.
     unsafe {
         if format == 0 {
             *y.get_unchecked_mut(at) = value;
@@ -83,7 +86,10 @@ pub(crate) fn add_correction(
     b_hi: [u32; 2],
     b_lo: [u32; 2],
 ) -> [f32; 4] {
+    // SAFETY: a full-warp product on the caller's fragments: every caller runs it on all 32 lanes
+    // under warp-uniform control flow.
     let mut c = unsafe { mma_m16n8k16_f16_f16([0; 2], a_hi, b_lo) };
+    // SAFETY: as above.
     c = unsafe { mma_m16n8k16_f16_f16(c, a_lo, b_hi) };
     let (c0, c1) = cvt_f32x2_f16x2(c[0]);
     let (c2, c3) = cvt_f32x2_f16x2(c[1]);
@@ -100,6 +106,8 @@ pub(crate) fn tile_at(stride: usize, row: usize, col: usize) -> usize {
 /// Store an (even, odd) column pair as FP16, and its low parts with `SPLIT`.
 #[inline(always)]
 pub(crate) fn store_pair<const SPLIT: bool>(hi: *mut u32, lo: *mut u32, at: usize, a: f32, b: f32) {
+    // SAFETY: callers pass `at` inside their shared tiles `hi` and, with `SPLIT`, `lo` (`tile_at`
+    // of a row below 32), and own that word until the next barrier.
     unsafe {
         *hi.add(at) = pack_f16(a, b);
         if SPLIT {
@@ -129,8 +137,12 @@ pub(crate) fn warp_product<const SPLIT: bool, const NT: usize>(
     let mut step = 0;
     while step < ks {
         let at = row * stride + (((step * 2 + lane / 16) ^ (row & 7)) * 4);
+        // SAFETY: row `row0 + lane % 16 < 32` and chunk `(step * 2 + lane / 16) ^ (row & 7) < 2 *
+        // ks` address an aligned 16-byte run inside the caller's tile, `stride = 8 * ks` u32 per
+        // row (64 with 8 steps, 128 with 16), written before a barrier; the whole warp executes it.
         let fa = unsafe { ldmatrix_x4(a_hi.add(at)) };
         let fal = if SPLIT {
+            // SAFETY: as above, in `a_lo`.
             unsafe { ldmatrix_x4(a_lo.add(at)) }
         } else {
             [0u32; 4]
@@ -138,9 +150,14 @@ pub(crate) fn warp_product<const SPLIT: bool, const NT: usize>(
         #[unroll]
         for nt in 0..NT {
             let index = (((nt0 + nt) * ks + step) * 32 + lane) * 2;
+            // SAFETY: `index + 1 < (n / 8) * ks * 64`, the length of the fragment-order weight:
+            // callers keep `nt0 + nt < n / 8` (Wo, W2, Wq: 16 n-tiles; W1: 32; the in-projection:
+            // `n / 8`).
             let fb = unsafe { [*w_hi.get_unchecked(index), *w_hi.get_unchecked(index + 1)] };
+            // SAFETY: a full-warp product on the fragments above; the loop bounds are warp-uniform.
             acc[nt] = unsafe { mma_m16n8k16_f32_f16(acc[nt], fa, fb) };
             if SPLIT {
+                // SAFETY: as for `fb`, in `w_lo`, which `SPLIT` callers pass in the same shape.
                 let fbl = unsafe { [*w_lo.get_unchecked(index), *w_lo.get_unchecked(index + 1)] };
                 corr[nt] = add_correction(corr[nt], fa, fal, fb, fbl);
             }
@@ -174,6 +191,8 @@ pub(crate) fn load_normed<const SPLIT: bool>(
         let row = warp_id * 4 + i;
         let col = lane * 4;
         let v = if row0 + row < m {
+            // SAFETY: `row0 + row < m` and `col + 4 <= 128`: 16 aligned bytes inside the caller's
+            // `x` `[m, 128]`.
             unsafe { *xp.add((row0 + row) * 128 + col).cast::<F32x4>() }.0
         } else {
             [0.0; 4]
@@ -251,6 +270,11 @@ pub(crate) fn linear16_body<const SPLIT: bool>(
         a_src[j] = (a_row * ldx + chunk * 8, swizzled32(row, chunk));
         b_src[j] = b_row * k + chunk * 8;
     }
+    // SAFETY: rows are clamped below `m` and `n` (at least 1: the grid has a block) and `step < k /
+    // 32`, so each 16 bytes lie in `x` `[m, ldx = k]`, `w` `[n, k]`, and with `SPLIT` their low
+    // parts; `k` a multiple of 32 keeps them 16-byte aligned. `stage * STAGE + swizzled32(row < 64,
+    // chunk < 4) + 4 <= 3 * STAGE`. A stage is overwritten only after the barrier that follows its
+    // last `ldmatrix`.
     let load = |step: usize, stage: usize| unsafe {
         #[unroll]
         for j in 0..2 {
@@ -284,6 +308,8 @@ pub(crate) fn linear16_body<const SPLIT: bool>(
         if s < steps {
             load(s, s);
         }
+        // SAFETY: commits this thread's copies of the prologue stage (or an empty group), one group
+        // per stage for the waits below.
         unsafe { cp_async_commit_group() };
     }
     // One sub-step's fragments: A and B, high parts then low parts.
@@ -292,10 +318,16 @@ pub(crate) fn linear16_body<const SPLIT: bool>(
         let mut f = [[[0u32; 4]; 2]; 4];
         #[unroll]
         for i in 0..2 {
+            // SAFETY: fragment rows below 64 at chunks below 4 of `stage < 3`: aligned 16-byte runs
+            // inside the tiles, whose copies the last wait and barrier completed; the whole warp
+            // executes it.
             f[0][i] = unsafe { ldmatrix_x4(a_hi.add(base + a_frag[kstep][i])) };
+            // SAFETY: as above.
             f[1][i] = unsafe { ldmatrix_x4(b_hi.add(base + b_frag[kstep][i])) };
             if SPLIT {
+                // SAFETY: as above.
                 f[2][i] = unsafe { ldmatrix_x4(a_lo.add(base + a_frag[kstep][i])) };
+                // SAFETY: as above.
                 f[3][i] = unsafe { ldmatrix_x4(b_lo.add(base + b_frag[kstep][i])) };
             }
         }
@@ -312,6 +344,8 @@ pub(crate) fn linear16_body<const SPLIT: bool>(
                 for half in 0..2 {
                     let nt = pair * 2 + half;
                     let bh = [f[1][pair][half * 2], f[1][pair][half * 2 + 1]];
+                    // SAFETY: a full-warp product on `ldmatrix` fragments; all loop bounds are
+                    // block-uniform.
                     acc[mt][nt] = unsafe { mma_m16n8k16_f32_f16(acc[mt][nt], f[0][mt], bh) };
                     if SPLIT {
                         let bl = [f[3][pair][half * 2], f[3][pair][half * 2 + 1]];
@@ -325,6 +359,8 @@ pub(crate) fn linear16_body<const SPLIT: bool>(
     // product's fragments load one sub-step ahead, the next stage's first ones
     // after its wait and barrier, which also retire the stage the next copy
     // overwrites.
+    // SAFETY: `PENDING` is a constant: stage 0's group completes, and the barrier after publishes
+    // it.
     unsafe { cp_async_wait_group(PENDING) };
     thread::sync_threads();
     let (mut read, mut write) = (0usize, STAGES - 1);
@@ -333,12 +369,16 @@ pub(crate) fn linear16_body<const SPLIT: bool>(
         if t + STAGES - 1 < steps {
             load(t + STAGES - 1, write);
         }
+        // SAFETY: commits this step's copies (or an empty group), so that each wait counts one
+        // group per stage.
         unsafe { cp_async_commit_group() };
         let second = fragments(read, 1);
         product(&mut acc, &mut corr, first);
         read = if read + 1 == STAGES { 0 } else { read + 1 };
         write = if write + 1 == STAGES { 0 } else { write + 1 };
         if t + 1 < steps {
+            // SAFETY: as above: the group of step `t + 1` completes, and the barrier after
+            // publishes it.
             unsafe { cp_async_wait_group(PENDING) };
             thread::sync_threads();
             first = fragments(read, 0);
@@ -355,6 +395,7 @@ pub(crate) fn linear16_body<const SPLIT: bool>(
         for e in 0..2 {
             let col = col0 + warp_n * 32 + nt * 8 + c_lane + e;
             if col < n {
+                // SAFETY: `col < n`, and `b` holds `n` biases.
                 bias[nt][e] = unsafe { *b.get_unchecked(col) };
             }
         }
@@ -378,10 +419,15 @@ pub(crate) fn linear16_body<const SPLIT: bool>(
                         value = 0.5 * value * (1.0 + libm::erff(value * core::f32::consts::FRAC_1_SQRT_2));
                     }
                     if mode & 2 != 0 {
+                        // SAFETY: `row < m`, `col < n`; with `mode & 2` the launcher passes a
+                        // residual `[m, ldr = n]`.
                         value += unsafe { *r.get_unchecked(row * ldr + col) };
                     }
                     let at = row * ldy + col;
                     if mode & 4 != 0 {
+                        // SAFETY: `row < m` and `col < n = ldy`; the launcher sets `mode & 4` only
+                        // with an FP32 output `[m, n]`. Each (row, col) belongs to one lane of one
+                        // block.
                         unsafe { *y.get_unchecked_mut(at) = value };
                     }
                     if mode & 8 != 0 {
@@ -409,7 +455,12 @@ pub(crate) fn product4x4(
         let mut wv = [[0.0f32; 4]; 4];
         #[unroll]
         for i in 0..4 {
+            // SAFETY: callers pass rows `r0..r0 + 4` of `a` (`lda` values each) and `c0..c0 + 4` of
+            // `w` (`ldw`), with `t + 4 <= k <= lda, ldw` and 16-byte aligned rows: shared `[32,
+            // 128]` or `[32, 256]` tiles with `r0 + 4 <= 32`, and `[n, k]` weights with `c0 + 4 <=
+            // n`.
             av[i] = unsafe { *a.add((r0 + i) * lda + t).cast::<F32x4>() }.0;
+            // SAFETY: as above, for `w`.
             wv[i] = unsafe { *w.add((c0 + i) * ldw + t).cast::<F32x4>() }.0;
         }
         #[unroll]
@@ -445,11 +496,15 @@ pub(crate) fn load_normed_f32(
         let row = warp_id * 4 + i;
         let col = lane * 4;
         let v = if row0 + row < m {
+            // SAFETY: `row0 + row < m` and `col + 4 <= 128`: 16 aligned bytes inside the caller's
+            // `x` `[m, 128]`.
             unsafe { *xp.add((row0 + row) * 128 + col).cast::<F32x4>() }.0
         } else {
             [0.0; 4]
         };
         let y = normed4(v, gamma, beta, col);
+        // SAFETY: `row < 32` and `col + 4 <= 128`: inside the caller's `a` `[32, 128]`, 16-byte
+        // aligned; each lane writes its own four values, read after the caller's barrier.
         unsafe { *a.add(row * 128 + col).cast::<F32x4>() = F32x4(y) };
     }
 }

@@ -231,6 +231,8 @@ pub(crate) mod device {
         for j in 0..16 {
             let i = lane + 32 * j;
             if i < width {
+                // SAFETY: `row < rows` (returned above, warp-uniformly) and `i < width = ldx`; the
+                // launcher passes `x` as `[rows, width]`.
                 values[j] = unsafe { *x.get_unchecked(row * ldx + i) };
                 sum += values[j];
             }
@@ -283,7 +285,11 @@ pub(crate) mod device {
     ) {
         static mut AS: SharedArray<f32, { 2 * 16 * 64 }, 16> = SharedArray::UNINIT;
         static mut BS: SharedArray<f32, { 2 * 16 * 64 }, 16> = SharedArray::UNINIT;
+        // SAFETY: `AS` and `BS` are this kernel's own shared statics, reached only through these
+        // raw pointers; every access below stays in their `2 * 16 * 64` floats and is ordered by
+        // `sync_threads`.
         let a_tile = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(AS)) };
+        // SAFETY: as above, for `BS`.
         let b_tile = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(BS)) };
         let tid = thread::threadIdx_x() as usize;
         let (m, n, k) = (m as usize, n as usize, k as usize);
@@ -305,11 +311,16 @@ pub(crate) mod device {
             let gk = k0 + load_k;
             let (gr, gc) = (row0 + load_row, col0 + load_row);
             let a = if gr < m && gk < k_end {
+                // SAFETY: `gr < m` and `gk < k_end <= k <= ldx`, with `gk`, `k_end`, and `k`
+                // multiples of 4, so all 16 bytes lie in `x` `[m, ldx]`; 16-byte aligned since
+                // `ldx` and `gk` are multiples of 4 and `x` is aligned.
                 unsafe { *xp.add(gr * ldx + gk).cast::<F32x4>() }
             } else {
                 F32x4::splat(0.0)
             };
             let bv = if gc < n && gk < k_end {
+                // SAFETY: `gc < n` and, as for `x`, `gk + 4 <= k`, so the 16 aligned bytes lie in
+                // `w` `[n, k]`.
                 unsafe { *wp.add(gc * k + gk).cast::<F32x4>() }
             } else {
                 F32x4::splat(0.0)
@@ -319,6 +330,9 @@ pub(crate) mod device {
         let store = |buf: usize, (a, bv): (F32x4, F32x4)| {
             #[unroll]
             for i in 0..4 {
+                // SAFETY: `buf < 2`, `load_k + i < 16`, and `load_row = tid / 4 < 64` (256
+                // threads), so the index is below the tiles' `2 * 1024` floats; each thread writes
+                // only its own slots, into the buffer no thread reads before the next barrier.
                 unsafe {
                     *a_tile.add(buf * 1024 + (load_k + i) * 64 + load_row) = a.0[i];
                     *b_tile.add(buf * 1024 + (load_k + i) * 64 + load_row) = bv.0[i];
@@ -340,7 +354,11 @@ pub(crate) mod device {
             #[unroll]
             for kk in 0..16 {
                 let base = buf * 1024 + kk * 64;
+                // SAFETY: `buf < 2`, `kk < 16`, `ty < 16`: `base + ty * 4 + 4 <= 2 * 1024`, a
+                // 16-byte aligned offset of the 16-byte aligned tile, stored before the last
+                // barrier.
                 let a = unsafe { *(a_tile.add(base + ty * 4) as *const F32x4) };
+                // SAFETY: as above, with `tx < 16`.
                 let bv = unsafe { *(b_tile.add(base + tx * 4) as *const F32x4) };
                 #[unroll]
                 for i in 0..4 {
@@ -365,6 +383,9 @@ pub(crate) mod device {
                     let col = col0 + tx * 4 + j;
                     if col < n {
                         if splits > 1 {
+                            // SAFETY: `split < splits`, `row < m`, `col < n`; with more than one
+                            // split the launcher asserts `splits * m * n <= partial.len()`, and
+                            // each (split, row, col) belongs to this thread alone.
                             unsafe { *partial.get_unchecked_mut((split * m + row) * n + col) = acc[i][j] };
                         } else {
                             let mut value = acc[i][j] + b[col];
@@ -376,6 +397,8 @@ pub(crate) mod device {
                             if mode & 2 != 0 {
                                 value += r[row * ldr + col];
                             }
+                            // SAFETY: `row < m` and `col < n = ldy` (the launcher), inside its `[m,
+                            // n]` output; each (row, col) belongs to this thread alone.
                             unsafe { *y.get_unchecked_mut(row * ldy + col) = value };
                         }
                     }
@@ -417,6 +440,8 @@ pub(crate) mod device {
         if mode & 2 != 0 {
             value += r[row * ldr as usize + col];
         }
+        // SAFETY: `i < m * n` and `ldy = n` (the launcher), so the index is `i`: this thread's own,
+        // inside `y` `[m, n]`.
         unsafe { *y.get_unchecked_mut(row * ldy as usize + col) = value };
     }
 
@@ -456,9 +481,14 @@ pub(crate) mod device {
         #[allow(clippy::float_cmp)] // The all-missing marker is exactly -100.
         let marked = group[0] == -100.0 && group[1] == -100.0 && group[2] == -100.0;
         if c == 0 && marked {
+            // SAFETY: `row < rows`, and the launcher's `missing` holds `start + rows` rows. Not
+            // exclusive: the `c == 0` thread of every (e, f) may store the same 1.0 to this row, a
+            // same-value race that `get_unchecked_mut`'s contract does not allow.
             unsafe { *missing.get_unchecked_mut(start as usize + row) = 1.0 };
         }
         let value = group[0] * w[c * 3] + group[1] * w[c * 3 + 1] + group[2] * w[c * 3 + 2] + b[c];
+        // SAFETY: `i < ensembles * H * rows * 128`, the size of the launcher's `out` `[B * H, rows,
+        // 128]`; `i` is this thread's own.
         unsafe { *out.get_unchecked_mut(i) = value };
     }
 
@@ -488,6 +518,8 @@ pub(crate) mod device {
             let (b, query) = (seq / q, seq % q);
             columns[((b * h + token - 4) * total as usize + start as usize + query) * 128 + c]
         };
+        // SAFETY: `i < ensembles * q * (H + 4) * 128`, the size of the launcher's `rows`; `i` is
+        // this thread's own.
         unsafe { *rows.get_unchecked_mut(i) = value };
     }
 
@@ -499,6 +531,7 @@ pub(crate) mod device {
             return;
         }
         let (c, token, seq) = (i % 128, (i / 128) % 4, i / 512);
+        // SAFETY: `i < seqs * 4 * 128`, the size of the launcher's `cls`; `i` is this thread's own.
         unsafe { *cls.get_unchecked_mut(i) = rows[(seq * len as usize + token) * 128 + c] };
     }
 
@@ -530,6 +563,9 @@ pub(crate) mod device {
         let gate = 1.0 + modulation[(token * 8 + head) * 64 + d].tanh();
         let value = query[i] * base[head * 64 + d] * gate * key_scale[(b * 8 + head) * 64 + d];
         let at = ((b * 8 + head) * qp as usize + row) * 64 + d;
+        // SAFETY: `b < ensembles`, `head < 8`, `row < q <= qp`, `d < 64`: `at` lies in `[B * 8, qp,
+        // 64]` and is this thread's alone. `format` selects the buffer the launcher sized
+        // (`Unused::outputs`); the other may be empty and is not touched.
         unsafe {
             if format == 0 {
                 *packed.get_unchecked_mut(at) = value;
@@ -602,6 +638,8 @@ pub(crate) mod device {
             x[base + (f + 4) % h],
         ];
         let value = group[0] * w[c * 3] + group[1] * w[c * 3 + 1] + group[2] * w[c * 3 + 2] + b[c];
+        // SAFETY: `i < columns * rows * 128`, the size of the launcher's `out`; `i` is this
+        // thread's own.
         unsafe { *out.get_unchecked_mut(i) = value + labels[(e * rows + row) * 128 + c] };
     }
 
@@ -610,6 +648,8 @@ pub(crate) mod device {
     pub fn repeat(source: &[f32], mut out: DisjointSlice<f32>, period: u32, len: u32) {
         let i = thread::index_1d().get();
         if i < len as usize {
+            // SAFETY: `i < len`, and the launcher passes `len <= out.len()` (checked by
+            // `debug_assert!` only); `i` is this thread's own.
             unsafe { *out.get_unchecked_mut(i) = source[i % period as usize] };
         }
     }
@@ -619,6 +659,8 @@ pub(crate) mod device {
     pub fn copy_into(source: &[f32], mut out: DisjointSlice<f32>, offset: u32, len: u32) {
         let i = thread::index_1d().get();
         if i < len as usize {
+            // SAFETY: `offset + i < offset + len <= out.len()`, asserted by the launcher; each
+            // thread writes its own index.
             unsafe { *out.get_unchecked_mut(offset as usize + i) = source[i] };
         }
     }
@@ -636,6 +678,8 @@ pub(crate) mod device {
         let (d, head, point, column) = (i % 16, (i / 16) % 8, (i / 128) % 128, i / (128 * 128));
         let from = (column * 128 + point) * 384 + head * 16 + d;
         let to = (column * 8 + head) * 128 * 16 + point * 16 + d;
+        // SAFETY: `to < columns * 128 * 128 <= keys.len() == values.len()`, asserted by the
+        // launcher; `i` maps to `to` one to one, so each thread writes its own slots.
         unsafe {
             *keys.get_unchecked_mut(to) = kv[from + 128];
             *values.get_unchecked_mut(to) = kv[from + 256];
@@ -662,6 +706,8 @@ pub(crate) mod device {
         let (c, token) = (i % width, i / width);
         let (e, row) = (token / q, token % q);
         let label = labels[(e * total as usize + start as usize + row) * width + c];
+        // SAFETY: `i < len <= x.len()`, asserted by the launcher; the thread reads and writes only
+        // `x[i]`.
         unsafe { *x.get_unchecked_mut(i) += label };
     }
 
@@ -686,6 +732,9 @@ pub(crate) mod device {
         let (d, head, token) = (i % 64, (i / 64) % 8, i / 512);
         let (b, row) = (token / q, token % q);
         let to = ((b * 8 + head) * np as usize + start as usize + row) * 64 + d;
+        // SAFETY: `b < ensembles`, `head < 8`, `start + row < start + q <= np`, `d < 64`, and the
+        // launcher asserts both caches hold `[B * 8, np, 64]`; distinct threads write distinct
+        // `to`.
         unsafe {
             *keys.get_unchecked_mut(to) = (kv[token * 1024 + head * 64 + d] as f16).to_bits();
             *values.get_unchecked_mut(to) = (kv[token * 1024 + 512 + head * 64 + d] as f16).to_bits();
@@ -711,6 +760,8 @@ pub(crate) mod device {
         let (d, head, token) = (i % 64, (i / 64) % 8, i / 512);
         let (b, row) = (token / q, token % q);
         let to = ((b * 8 + head) * np as usize + start as usize + row) * 64 + d;
+        // SAFETY: as in [`icl_kv`]: `to` lies in the launcher-checked `[B * 8, np, 64]` caches and
+        // is this thread's own.
         unsafe {
             *keys.get_unchecked_mut(to) = kv[token * 1024 + head * 64 + d];
             *values.get_unchecked_mut(to) = kv[token * 1024 + 512 + head * 64 + d];
@@ -746,6 +797,7 @@ pub(crate) mod device {
             let value = f16::from_bits(values[(pair * stride as usize + row) * 64 + dim]) as f32;
             peak = peak.max(value.abs());
         }
+        // SAFETY: `i < len = peaks.len()` (the launcher); `i` is this thread's own.
         unsafe { *peaks.get_unchecked_mut(i) = peak };
     }
 
@@ -763,6 +815,7 @@ pub(crate) mod device {
         for chunk in 0..chunks {
             peak = peak.max(peaks[(pair * chunks + chunk) * 64 + dim]);
         }
+        // SAFETY: `i < len = scales.len()` (the launcher); `i` is this thread's own.
         unsafe { *scales.get_unchecked_mut(i) = if peak > 0.0 { peak / 448.0 } else { 1.0 } };
     }
 
@@ -794,6 +847,7 @@ pub(crate) mod device {
         }
         #[allow(clippy::cast_possible_truncation)] // Two bytes.
         let bytes = bytes as u16;
+        // SAFETY: `i < len = packed.len()` (the launcher); `i` is this thread's own.
         unsafe { *packed.get_unchecked_mut(i) = bytes };
     }
 
@@ -1037,7 +1091,10 @@ pub(crate) mod device {
     ) {
         static mut AS: SharedArray<u32, { 3 * 64 * 16 }, 128> = SharedArray::UNINIT;
         static mut BS: SharedArray<u32, { 3 * 64 * 16 }, 128> = SharedArray::UNINIT;
+        // SAFETY: `AS` and `BS` are this kernel's own shared statics, reached only through these
+        // raw pointers, which [`linear16_body`] keeps in bounds and orders by its barriers.
         let a = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(AS)) };
+        // SAFETY: as above, for `BS`.
         let bt = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(BS)) };
         linear16_body::<false>(
             (a, a, bt, bt),
@@ -1073,6 +1130,8 @@ pub(crate) mod device {
         static mut AL: SharedArray<u32, { 3 * 64 * 16 }, 128> = SharedArray::UNINIT;
         static mut BH: SharedArray<u32, { 3 * 64 * 16 }, 128> = SharedArray::UNINIT;
         static mut BL: SharedArray<u32, { 3 * 64 * 16 }, 128> = SharedArray::UNINIT;
+        // SAFETY: this kernel's own four shared statics, reached only through these raw pointers,
+        // which [`linear16_body`] keeps in bounds and orders by its barriers.
         let tiles = unsafe {
             (
                 SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(AH)),
@@ -1119,6 +1178,9 @@ pub(crate) mod device {
         len: u32,
     ) {
         static mut AS: SharedArray<f32, { 32 * 128 }, 16> = SharedArray::UNINIT;
+        // SAFETY: `AS` is this kernel's own shared static, reached only through this pointer:
+        // `load_normed_f32` writes its rows below 32, and after the barrier `product4x4` only reads
+        // them.
         let a = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(AS)) };
         let tid = thread::threadIdx_x() as usize;
         let (r0, lane) = ((tid / 32) * 4, tid % 32);
@@ -1158,6 +1220,8 @@ pub(crate) mod device {
                 if row < m {
                     #[unroll]
                     for j in 0..4 {
+                        // SAFETY: `row < m` and `c0 + j < (pass + 1) * 128 <= n`: inside `out` `[m,
+                        // n]`; each (row, column) belongs to one thread of one block.
                         unsafe { *out.get_unchecked_mut(row * n + c0 + j) = acc[i][j] };
                     }
                 }
@@ -1185,7 +1249,10 @@ pub(crate) mod device {
     ) {
         static mut AS: SharedArray<f32, { 32 * 128 }, 16> = SharedArray::UNINIT;
         static mut HS: SharedArray<f32, { 32 * 256 }, 16> = SharedArray::UNINIT;
+        // SAFETY: `AS` and `HS` are this kernel's own shared statics, reached only through these
+        // pointers, here and in [`block_tail_core_f32`], in bounds and between barriers.
         let a = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(AS)) };
+        // SAFETY: as above, for `HS`.
         let h = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(HS)) };
         let tid = thread::threadIdx_x() as usize;
         let m = m as usize;
@@ -1196,10 +1263,14 @@ pub(crate) mod device {
             let index = tid + i * 256;
             let (row, col) = (index / 32, (index % 32) * 4);
             let v = if row0 + row < m {
+                // SAFETY: `row0 + row < m` and `col + 4 <= 128`: 16 aligned bytes inside `attended`
+                // `[m, 128]`.
                 unsafe { *ap.add((row0 + row) * 128 + col).cast::<F32x4>() }
             } else {
                 F32x4::splat(0.0)
             };
+            // SAFETY: `row < 32` (`index < 1024`) and `col + 4 <= 128`: inside `AS` `[32, 128]`,
+            // 16-byte aligned; each thread writes its own four values, read after the barrier.
             unsafe { *a.add(row * 128 + col).cast::<F32x4>() = v };
         }
         thread::sync_threads();
@@ -1245,7 +1316,10 @@ pub(crate) mod device {
     ) {
         static mut AS: SharedArray<f32, { 32 * 128 }, 16> = SharedArray::UNINIT;
         static mut HS: SharedArray<f32, { 32 * 256 }, 16> = SharedArray::UNINIT;
+        // SAFETY: `AS` and `HS` are this kernel's own shared statics, reached only through these
+        // pointers, here and in [`block_tail_core_f32`], in bounds and between barriers.
         let a = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(AS)) };
+        // SAFETY: as above, for `HS`.
         let h = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(HS)) };
         let tid = thread::threadIdx_x() as usize;
         let (r0, c0) = ((tid / 32) * 4, (tid % 32) * 4);
@@ -1268,6 +1342,8 @@ pub(crate) mod device {
                 acc[i][2] + bq[c0 + 2],
                 acc[i][3] + bq[c0 + 3],
             ];
+            // SAFETY: `r0 + i < 32` and `c0 + 4 <= 128`: inside `HS` `[32, 256]`, 16-byte aligned;
+            // each thread writes its own values, read only after the barrier.
             unsafe { *h.add((r0 + i) * 256 + c0).cast::<F32x4>() = F32x4(y) };
         }
         thread::sync_threads();
@@ -1280,6 +1356,8 @@ pub(crate) mod device {
         let mut query = [0.0f32; 16];
         #[unroll]
         for c in 0..4 {
+            // SAFETY: `row < 32` and `head * 16 + c * 4 + 4 <= 128`: inside `HS`, 16-byte aligned,
+            // written before the last barrier.
             let v = unsafe { *h.add(row * 256 + head * 16 + c * 4).cast::<F32x4>() }.0;
             #[unroll]
             for t in 0..4 {
@@ -1301,6 +1379,8 @@ pub(crate) mod device {
         #[unroll]
         for c in 0..4 {
             let y = [out[c * 4], out[c * 4 + 1], out[c * 4 + 2], out[c * 4 + 3]];
+            // SAFETY: as for the read above, inside `AS` `[32, 128]`; `product4x4` finished reading
+            // A before the last barrier, and each (row, head) slot is one thread's.
             unsafe { *a.add(row * 128 + head * 16 + c * 4).cast::<F32x4>() = F32x4(y) };
         }
         thread::sync_threads();
@@ -1363,6 +1443,8 @@ pub(crate) mod device {
         let at = seq * o_seq as usize + query_row * o_tok as usize + head * 16;
         #[unroll]
         for d in 0..16 {
+            // SAFETY: `at + d` lies in `out` `[seqs, lq, 128]`: the launchers' layouts have `o_tok
+            // = 128` and `o_seq = lq * 128`, so each (sequence, query, head, dim) has its own slot.
             unsafe { *out.get_unchecked_mut(at + d) = result[d] };
         }
     }
@@ -1395,9 +1477,15 @@ pub(crate) mod device {
         static mut KS: SharedArray<f32, { 32 * 68 }, 16> = SharedArray::UNINIT;
         static mut VS: SharedArray<f32, { 32 * 64 }, 16> = SharedArray::UNINIT;
         static mut PS: SharedArray<f32, { 32 * 33 }, 16> = SharedArray::UNINIT;
+        // SAFETY: `QS`, `KS`, `VS`, and `PS` are this kernel's own shared statics, reached only
+        // through these pointers; indices stay in their sizes, and the key loop's barriers order
+        // the accesses.
         let qs = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(QS)) };
+        // SAFETY: as above.
         let ks = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(KS)) };
+        // SAFETY: as above.
         let vs = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(VS)) };
+        // SAFETY: as above.
         let ps = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(PS)) };
         let tid = thread::threadIdx_x() as usize;
         let (ty, tx) = (tid / 16, tid % 16);
@@ -1414,10 +1502,15 @@ pub(crate) mod device {
             let index = tid + i * 128;
             let (row, c) = (index / 16, (index % 16) * 4);
             let value = if q0 + row < qp {
+                // SAFETY: `q0 + row < qp`, `c + 4 <= 64`, and `bh < pairs` by the grid: 16 aligned
+                // bytes inside `q` `[pairs, qp, 64]`.
                 unsafe { *q.as_ptr().add((bh * qp + q0 + row) * 64 + c).cast::<F32x4>() }
             } else {
                 F32x4::splat(0.0)
             };
+            // SAFETY: `row < 32` (`index < 512`) and `c + 4 <= 64`, so `row * 68 + c + 4 <= 32 *
+            // 68`; 16-byte aligned since a row is 272 bytes. Read only after the key loop's first
+            // barrier.
             unsafe { *qs.add(row * 68 + c).cast::<F32x4>() = value };
         }
 
@@ -1435,6 +1528,10 @@ pub(crate) mod device {
                 let index = tid + i * 128;
                 let (key, c) = (index / 16, (index % 16) * 4);
                 let at = (bh * np + key0 + key) * 64 + c;
+                // SAFETY: `first_tile < np / 64` (the launcher's chunks), so `key0 + key <
+                // (first_tile + tiles) * 64 <= np` and, with `bh < pairs`, 16 aligned bytes lie in
+                // the FP32 `[pairs, np, 64]` caches; the shared indices stay in `KS` and `VS`,
+                // whose readers the barrier above retired.
                 unsafe {
                     *ks.add(key * 68 + c).cast::<F32x4>() = *kp.add(at).cast::<F32x4>();
                     *vs.add(key * 64 + c).cast::<F32x4>() = *vp.add(at).cast::<F32x4>();
@@ -1449,10 +1546,14 @@ pub(crate) mod device {
                 let mut qv = [[0.0f32; 4]; 4];
                 #[unroll]
                 for i in 0..4 {
+                    // SAFETY: `ty + 8 * i < 32` and `c + 4 <= 64`: inside `QS`, 16-byte aligned,
+                    // written before a barrier.
                     qv[i] = unsafe { *qs.add((ty + 8 * i) * 68 + c).cast::<F32x4>() }.0;
                 }
                 #[unroll]
                 for j in 0..2 {
+                    // SAFETY: `tx + 16 * j < 32` and `c + 4 <= 64`: inside `KS`, 16-byte aligned,
+                    // written before the barrier above.
                     let kv = unsafe { *ks.add((tx + 16 * j) * 68 + c).cast::<F32x4>() }.0;
                     #[unroll]
                     for i in 0..4 {
@@ -1487,6 +1588,9 @@ pub(crate) mod device {
                 for e in 0..4 {
                     acc[i][e] *= alpha;
                 }
+                // SAFETY: row `ty + 8 * i < 32` and column `tx + 16 < 32`: inside `PS` `[32, 33]`;
+                // each slot is this thread's, and the previous step's readers passed the loop's
+                // first barrier.
                 unsafe {
                     *ps.add((ty + 8 * i) * 33 + tx) = p0;
                     *ps.add((ty + 8 * i) * 33 + tx + 16) = p1;
@@ -1496,9 +1600,13 @@ pub(crate) mod device {
 
             // O += P V.
             for key in 0..32 {
+                // SAFETY: `key < 32` and `tx * 4 + 4 <= 64`: inside `VS`, 16-byte aligned, written
+                // before a barrier.
                 let value = unsafe { *vs.add(key * 64 + tx * 4).cast::<F32x4>() }.0;
                 #[unroll]
                 for i in 0..4 {
+                    // SAFETY: `ty + 8 * i < 32` and `key < 32`: inside `PS`, written before the
+                    // barrier above.
                     let p = unsafe { *ps.add((ty + 8 * i) * 33 + key) };
                     #[unroll]
                     for e in 0..4 {
@@ -1515,11 +1623,16 @@ pub(crate) mod device {
             if q0 + row < qp {
                 #[unroll]
                 for e in 0..4 {
+                    // SAFETY: `q0 + row < qp`, so `out_row + row` is a row of `part` `[pairs *
+                    // splits, qp, 64]` (the workspace reserves chunks times padded rows); each
+                    // (row, dim) belongs to this thread.
                     unsafe {
                         *part.get_unchecked_mut((out_row + row) * 64 + tx * 4 + e) = acc[i][e] / total[i];
                     }
                 }
                 if tx == 0 {
+                    // SAFETY: as above, inside `lse` `[pairs * splits, qp]`; only the `tx == 0`
+                    // thread writes the row.
                     unsafe { *lse.get_unchecked_mut(out_row + row) = max[i] + total[i].log2() };
                 }
             }

@@ -48,9 +48,15 @@ pub(crate) fn block_tail_body<const SPLIT: bool>(
     static mut AL: SharedArray<u32, { 32 * 64 }, 128> = SharedArray::UNINIT;
     static mut HH: SharedArray<u32, { 32 * 128 }, 128> = SharedArray::UNINIT;
     static mut HL: SharedArray<u32, { 32 * 128 }, 128> = SharedArray::UNINIT;
+    // SAFETY: `AH`, `AL`, `HH`, and `HL` are this function's own shared statics, reached only
+    // through these pointers, here and in [`block_tail_core`], which keep indices in their sizes
+    // and accesses between barriers.
     let ah = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(AH)) };
+    // SAFETY: as above.
     let al = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(AL)) };
+    // SAFETY: as above.
     let hh = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(HH)) };
+    // SAFETY: as above.
     let hl = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(HL)) };
     let tid = thread::threadIdx_x() as usize;
     let m = m as usize;
@@ -63,6 +69,8 @@ pub(crate) fn block_tail_body<const SPLIT: bool>(
         let index = tid + i * 256;
         let (row, col) = (index / 32, (index % 32) * 4);
         let v = if row0 + row < m {
+            // SAFETY: `row0 + row < m` and `col + 4 <= 128`: 16 aligned bytes inside `attended`
+            // `[m, 128]`.
             unsafe { *ap.add((row0 + row) * 128 + col).cast::<F32x4>() }.0
         } else {
             [0.0; 4]
@@ -130,6 +138,8 @@ pub(crate) fn block_tail_core<const SPLIT: bool>(
             let row = row0 + wm * 16 + lr + (e / 2) * 8;
             let col = wn * 32 + nt * 8 + lc + e % 2;
             if row < m {
+                // SAFETY: `row < m`: inside `state` `[m, 128]`; this lane alone touches (row, col)
+                // in this block, and other blocks own other rows.
                 let mut value = acc[nt][e] + bo[col] + unsafe { *state.get_unchecked_mut(row * 128 + col) };
                 if SPLIT {
                     value += corr[nt][e] * (1.0 / LO_SCALE);
@@ -148,6 +158,8 @@ pub(crate) fn block_tail_core<const SPLIT: bool>(
         sums[half] += warp::shuffle_xor_f32(sums[half], 2);
     }
     if lane % 4 == 0 {
+        // SAFETY: slots `row * 4 + wn < 128` of `HH`, which holds no H yet and was last read before
+        // a barrier; one lane per (row, quarter).
         unsafe {
             *stats.add((wm * 16 + lr) * 4 + wn) = sums[0];
             *stats.add((wm * 16 + lr + 8) * 4 + wn) = sums[1];
@@ -158,6 +170,7 @@ pub(crate) fn block_tail_core<const SPLIT: bool>(
     #[unroll]
     for half in 0..2 {
         let row = wm * 16 + lr + half * 8;
+        // SAFETY: slots below 128, published by the barrier above.
         unsafe {
             mean[half] = (*stats.add(row * 4)
                 + *stats.add(row * 4 + 1)
@@ -181,6 +194,8 @@ pub(crate) fn block_tail_core<const SPLIT: bool>(
         squares[half] += warp::shuffle_xor_f32(squares[half], 2);
     }
     if lane % 4 == 0 {
+        // SAFETY: slots `128 + row * 4 + wn < 256`, apart from the means other warps may still
+        // read; one lane per (row, quarter).
         unsafe {
             *stats.add(128 + (wm * 16 + lr) * 4 + wn) = squares[0];
             *stats.add(128 + (wm * 16 + lr + 8) * 4 + wn) = squares[1];
@@ -191,6 +206,7 @@ pub(crate) fn block_tail_core<const SPLIT: bool>(
     #[unroll]
     for half in 0..2 {
         let row = 128 + (wm * 16 + lr + half * 8) * 4;
+        // SAFETY: slots below 256, published by the barrier above.
         let variance =
             unsafe { *stats.add(row) + *stats.add(row + 1) + *stats.add(row + 2) + *stats.add(row + 3) }
                 * (1.0 / 128.0);
@@ -274,6 +290,8 @@ pub(crate) fn block_tail_core<const SPLIT: bool>(
                 if SPLIT {
                     value += corr3[nt][e] * (1.0 / LO_SCALE);
                 }
+                // SAFETY: `row < m`: inside `state` `[m, 128]`, the (row, col) this lane alone read
+                // above.
                 unsafe { *state.get_unchecked_mut(row * 128 + col) = value };
             }
         }
@@ -305,7 +323,10 @@ pub(crate) fn block_head_body<const SPLIT: bool>(
 ) {
     static mut AH: SharedArray<u32, { 32 * 64 }, 128> = SharedArray::UNINIT;
     static mut AL: SharedArray<u32, { 32 * 64 }, 128> = SharedArray::UNINIT;
+    // SAFETY: `AH` and `AL` are this function's own shared statics, reached only through these
+    // pointers by `load_normed` and `warp_product`, between barriers.
     let ah = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(AH)) };
+    // SAFETY: as above.
     let al = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(AL)) };
     let tid = thread::threadIdx_x() as usize;
     let (warp_id, lane) = (tid / 32, tid % 32);
@@ -370,6 +391,8 @@ pub(crate) fn block_head_body<const SPLIT: bool>(
                 let row = row0 + wm * 16 + lr + (e / 2) * 8;
                 let col = col0 + nt * 8 + lc + e % 2;
                 if row < m {
+                    // SAFETY: `row < m` and `col < col0 + 32 <= (wn + 1) * quarter <= n`: inside
+                    // `out` `[m, n]`; each (row, col) belongs to one lane of one block.
                     unsafe { *out.get_unchecked_mut(row * n + col) = value[nt][e] };
                 }
             }
@@ -415,10 +438,15 @@ pub(crate) fn column_block_body<const SPLIT: bool>(
     static mut AL: SharedArray<u32, { 32 * 64 }, 128> = SharedArray::UNINIT;
     static mut HH: SharedArray<u32, { 32 * 128 }, 128> = SharedArray::UNINIT;
     static mut HL: SharedArray<u32, { 32 * 128 }, 128> = SharedArray::UNINIT;
+    // SAFETY: `AH` and `HH` (and `AL` and `HL` below) are this function's own shared statics,
+    // reached only through these pointers, here and in [`block_tail_core`], in bounds and between
+    // barriers.
     let ah = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(AH)) };
+    // SAFETY: as above.
     let hh = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(HH)) };
     // FP16 never touches the low parts, so it leaves their buffers unused.
     let (al, hl) = if SPLIT {
+        // SAFETY: as above.
         unsafe {
             (
                 SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(AL)),
@@ -485,8 +513,12 @@ pub(crate) fn column_block_body<const SPLIT: bool>(
     for mt in 0..2 {
         let row = mt * 16 + lane % 16;
         let at = row * 64 + (((head * 2 + lane / 16) ^ (row & 7)) * 4);
+        // SAFETY: row `mt * 16 + lane % 16 < 32` at chunk `(head * 2 + lane / 16) ^ (row & 7) <
+        // 16`: an aligned 16-byte run of the Q tile in `HH` (64 u32 per row), published by the
+        // barrier above; the whole warp executes it.
         qa[mt] = unsafe { ldmatrix_x4(hh.add(at)) };
         if SPLIT {
+            // SAFETY: as above, in `HL`.
             qal[mt] = unsafe { ldmatrix_x4(hl.add(at)) };
         }
     }
@@ -502,6 +534,9 @@ pub(crate) fn column_block_body<const SPLIT: bool>(
         #[unroll]
         for nt in 0..4 {
             let at = kv0 + (key0 + nt * 8 + lr) * 16 + lc;
+            // SAFETY: `at + 9 <= kv0 + 127 * 16 + 15`: key `key0 + nt * 8 + lr < 128` of stream `e
+            // * (H + reserved) + f + reserved` of `B * (H + reserved)`, which the launcher's caches
+            // `[B, H + reserved, 8, 128, 16]` hold (checked by `debug_assert!` only).
             let (k0, k1, k8, k9) =
                 unsafe { (*kp.add(at), *kp.add(at + 1), *kp.add(at + 8), *kp.add(at + 9)) };
             let kb = [pack_f16(k0, k1), pack_f16(k8, k9)];
@@ -512,6 +547,7 @@ pub(crate) fn column_block_body<const SPLIT: bool>(
             };
             #[unroll]
             for mt in 0..2 {
+                // SAFETY: a full-warp product; the key loop's bounds are uniform.
                 let mut c = unsafe { mma_m16n8k16_f32_f16([0.0; 4], qa[mt], kb) };
                 if SPLIT {
                     let cl = add_correction([0.0; 4], qa[mt], qal[mt], kb, kbl);
@@ -568,6 +604,8 @@ pub(crate) fn column_block_body<const SPLIT: bool>(
             #[unroll]
             for nt in 0..2 {
                 let at = kv0 + (key0 + kk * 16 + lc) * 16 + nt * 8 + lr;
+                // SAFETY: `at + 144 <= kv0 + 118 * 16 + 15 + 144 = kv0 + 2047`: inside the stream,
+                // as for the keys.
                 let (v0, v1, v8, v9) = unsafe {
                     (
                         *vp.add(at),
@@ -591,6 +629,7 @@ pub(crate) fn column_block_body<const SPLIT: bool>(
                         pack_f16(s1[0], s1[1]),
                         pack_f16(s1[2], s1[3]),
                     ];
+                    // SAFETY: a full-warp product, as above.
                     out[mt][nt] = unsafe { mma_m16n8k16_f32_f16(out[mt][nt], pa, vb) };
                     if SPLIT {
                         let pal = [
@@ -659,6 +698,8 @@ pub(crate) fn block_tail_core_f32(
         #[unroll]
         for j in 0..4 {
             let residual = if row < m {
+                // SAFETY: `row < m`: inside `state` `[m, 128]`; this thread alone reads and later
+                // writes the (row, column).
                 unsafe { *state.get_unchecked_mut(row * 128 + c0 + j) }
             } else {
                 0.0
@@ -671,6 +712,9 @@ pub(crate) fn block_tail_core_f32(
     #[unroll]
     for i in 0..4 {
         let y = normed4(mid[i], gamma, beta, c0);
+        // SAFETY: `r0 + i < 32` and `c0 + 4 <= 128`: inside `a` `[32, 128]`, 16-byte aligned; every
+        // thread finished reading A in `product4x4` before the barrier above, and each slot is this
+        // thread's.
         unsafe { *a.add((r0 + i) * 128 + c0).cast::<F32x4>() = F32x4(y) };
     }
     thread::sync_threads();
@@ -688,6 +732,8 @@ pub(crate) fn block_tail_core_f32(
                 gelu(acc[i][2] + b1[c + 2]),
                 gelu(acc[i][3] + b1[c + 3]),
             ];
+            // SAFETY: `r0 + i < 32` and `c + 4 <= 256`: inside `h` `[32, 256]`, 16-byte aligned;
+            // each slot is this thread's, read after the barrier below.
             unsafe { *h.add((r0 + i) * 256 + c).cast::<F32x4>() = F32x4(y) };
         }
     }
@@ -701,6 +747,8 @@ pub(crate) fn block_tail_core_f32(
         if row < m {
             #[unroll]
             for j in 0..4 {
+                // SAFETY: `row < m`: as for the residual read above, this thread's own (row,
+                // column).
                 unsafe {
                     *state.get_unchecked_mut(row * 128 + c0 + j) = mid[i][j] + out[i][j] + b2[c0 + j];
                 }

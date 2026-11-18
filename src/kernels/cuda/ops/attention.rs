@@ -73,11 +73,21 @@ pub(crate) fn fast_body<const KW: usize, const DECODE: bool, const HALF: bool, c
     let q0 = thread::blockIdx_x() as usize * rows_per_block;
     let (qp, np) = (qp as usize, np as usize);
     let first_tile = chunk * chunk_tiles as usize;
+    // SAFETY: `QS`, `KS`, and `VS` are this function's own shared statics, reached only through
+    // these pointers; each kernel calls `fast_body` once, and the indices below stay in the arrays'
+    // sizes, ordered by the barriers.
     let qs = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(QS)) };
+    // SAFETY: as above.
     let ks = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(KS)) };
+    // SAFETY: as above.
     let vs = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(VS)) };
 
     // Q tile, then K/V stage 0, as two async-copy groups.
+    // SAFETY: `row < rows_per_block` and `q0 + rows_per_block <= qp` (`qp` is 16 for the one-block
+    // decode grid, else a multiple of 64: `padded_query_rows`), and `bh < pairs` by the grid, so
+    // the source is 16 aligned bytes inside `q` `[pairs, qp, 64]`; the destination `swizzled(row,
+    // c) + 4 <= 64 * 32`, 16-byte aligned. QS is read only after `cp_async_wait_group` and a
+    // barrier.
     unsafe {
         let mut i = tid;
         while i < rows_per_block * 8 {
@@ -89,6 +99,10 @@ pub(crate) fn fast_body<const KW: usize, const DECODE: bool, const HALF: bool, c
         cp_async_commit_group();
     }
     // FP16: two async 16-byte copies per thread and tensor.
+    // SAFETY: `tile < np / 64` (see `tiles` below) and `bh < pairs`, so the 16 bytes at byte `off`
+    // lie in the FP16 `[pairs, np, 64]` caches, 16-byte aligned; `dst + 4 <= (buf + 1) * 2048` with
+    // `buf < 2`. The stage's previous readers passed the barrier that ends their stage, and it is
+    // read only after a wait and a barrier.
     let load_stage = |tile: usize, buf: usize| unsafe {
         let base = (bh * np + tile * 64) * 64;
         let mut i = tid;
@@ -112,6 +126,8 @@ pub(crate) fn fast_body<const KW: usize, const DECODE: bool, const HALF: bool, c
         for j in 0..2 {
             let i = tid + 128 * j;
             let off = base + (i / 4) * 64 + (i % 4) * 16;
+            // SAFETY: `i < 256`: row `i / 4 < 64` of tile `tile < np / 64`, bytes `(i % 4) *
+            // 16..+16` of 64, so 16 aligned bytes inside the FP8 `[pairs, np, 64]` caches.
             unsafe {
                 out[j] = (*k.as_ptr().add(off).cast::<F32x4>()).0.map(f32::to_bits);
                 out[2 + j] = (*v.as_ptr().add(off).cast::<F32x4>()).0.map(f32::to_bits);
@@ -135,6 +151,9 @@ pub(crate) fn fast_body<const KW: usize, const DECODE: bool, const HALF: bool, c
                     let word = bytes[t][half * 2 + w];
                     #[allow(clippy::cast_possible_truncation)] // The word's two halves.
                     let (low, high) = (word as u16, (word >> 16) as u16);
+                    // SAFETY: `buf < 2`, `row < 64`, chunk `c + half < 8`, and `2 * w + 1 < 4`:
+                    // inside the 16-byte chunk at `at`, within `KS` or `VS`; each thread writes its
+                    // own words, into the stage no thread reads before the next barrier.
                     unsafe {
                         *shared.add(at + 2 * w) = e4m3x2_to_f16x2(low);
                         *shared.add(at + 2 * w + 1) = e4m3x2_to_f16x2(high);
@@ -170,6 +189,8 @@ pub(crate) fn fast_body<const KW: usize, const DECODE: bool, const HALF: bool, c
                 ahead = fetch8(first_tile + t + 1);
             }
             if t == 0 {
+                // SAFETY: waits for this thread's Q copy; the barrier after it publishes Q and the
+                // stage-0 stores.
                 unsafe { cp_async_wait_group(0) };
                 thread::sync_threads();
             }
@@ -177,8 +198,12 @@ pub(crate) fn fast_body<const KW: usize, const DECODE: bool, const HALF: bool, c
             if t + 1 < tiles {
                 load_stage(first_tile + t + 1, (t + 1) % 2);
             } else {
+                // SAFETY: commits an empty group, so that the wait below always leaves only the
+                // next stage's group pending.
                 unsafe { cp_async_commit_group() };
             }
+            // SAFETY: leaves only the newest group (the next stage) pending: Q and this stage's
+            // copies are complete, and the barrier after it publishes them.
             unsafe { cp_async_wait_group(1) };
             thread::sync_threads();
         }
@@ -187,6 +212,9 @@ pub(crate) fn fast_body<const KW: usize, const DECODE: bool, const HALF: bool, c
             for kstep in 0..4 {
                 let row = row_base + lane % 16;
                 let c = kstep * 2 + lane / 16;
+                // SAFETY: row `row_base + lane % 16` is below the 16 (decode) or 64 Q rows copied,
+                // chunk `c < 8`: an aligned 16-byte row of `QS`, published by the barrier above;
+                // the whole warp executes it.
                 qf[kstep] = unsafe { ldmatrix_x4(qs.add(swizzled(row, c))) };
             }
         }
@@ -200,13 +228,21 @@ pub(crate) fn fast_body<const KW: usize, const DECODE: bool, const HALF: bool, c
             for pair in 0..nt_count / 2 {
                 let row = key_base + pair * 16 + (lane / 16) * 8 + lane % 8;
                 let c = kstep * 2 + (lane / 8) % 2;
+                // SAFETY: row `key_base + pair * 16 + 15 < key_base + KW <= 64` and chunk `c < 8`:
+                // an aligned 16-byte row of stage `buf` of `KS`, published by the barrier above;
+                // the whole warp executes it.
                 let b = unsafe { ldmatrix_x4(ks.add(buf * 64 * 32 + swizzled(row, c))) };
                 if HALF {
+                    // SAFETY: every lane runs these m16n8k16 products on its `ldmatrix` fragments:
+                    // the loop bounds are compile-time or block-uniform, and no lane has exited.
                     s16[2 * pair] = unsafe { mma_m16n8k16_f16_f16(s16[2 * pair], qf[kstep], [b[0], b[1]]) };
+                    // SAFETY: as above.
                     s16[2 * pair + 1] =
                         unsafe { mma_m16n8k16_f16_f16(s16[2 * pair + 1], qf[kstep], [b[2], b[3]]) };
                 } else {
+                    // SAFETY: as above.
                     s[2 * pair] = unsafe { mma_m16n8k16_f32_f16(s[2 * pair], qf[kstep], [b[0], b[1]]) };
+                    // SAFETY: as above.
                     s[2 * pair + 1] =
                         unsafe { mma_m16n8k16_f32_f16(s[2 * pair + 1], qf[kstep], [b[2], b[3]]) };
                 }
@@ -295,12 +331,19 @@ pub(crate) fn fast_body<const KW: usize, const DECODE: bool, const HALF: bool, c
             for dp in 0..4 {
                 let row = key_base + kk * 16 + ((lane / 8) % 2) * 8 + lane % 8;
                 let c = dp * 2 + lane / 16;
+                // SAFETY: row `key_base + kk * 16 + 15 < 64` and chunk `c < 8`: an aligned 16-byte
+                // row of stage `buf` of `VS`, published by the barrier above; the whole warp
+                // executes it.
                 let b = unsafe { ldmatrix_x4_trans(vs.add(buf * 64 * 32 + swizzled(row, c))) };
                 if HALF {
+                    // SAFETY: full-warp products, as for the scores.
                     pv[2 * dp] = unsafe { mma_m16n8k16_f16_f16(pv[2 * dp], a, [b[0], b[1]]) };
+                    // SAFETY: as above.
                     pv[2 * dp + 1] = unsafe { mma_m16n8k16_f16_f16(pv[2 * dp + 1], a, [b[2], b[3]]) };
                 } else {
+                    // SAFETY: as above.
                     acc[2 * dp] = unsafe { mma_m16n8k16_f32_f16(acc[2 * dp], a, [b[0], b[1]]) };
+                    // SAFETY: as above.
                     acc[2 * dp + 1] = unsafe { mma_m16n8k16_f32_f16(acc[2 * dp + 1], a, [b[2], b[3]]) };
                 }
             }
@@ -328,6 +371,9 @@ pub(crate) fn fast_body<const KW: usize, const DECODE: bool, const HALF: bool, c
             #[unroll]
             for j in 0..2 {
                 let dim = nt * 8 + col + j;
+                // SAFETY: `row_base + r + 8 < 64` and `q0 + 64 <= qp`, so both rows lie in `part`
+                // `[pairs * splits, qp, 64]` (the workspace reserves chunks times padded rows);
+                // each (row, dim) belongs to one lane of one warp of one block.
                 unsafe {
                     *part.get_unchecked_mut(row0 * 64 + dim) = acc[nt][j] / l0;
                     *part.get_unchecked_mut(row1 * 64 + dim) = acc[nt][2 + j] / l1;
@@ -335,6 +381,8 @@ pub(crate) fn fast_body<const KW: usize, const DECODE: bool, const HALF: bool, c
             }
         }
         if lane.is_multiple_of(4) {
+            // SAFETY: the same rows, in `lse` `[pairs * splits, qp]`; only lane `4 * r` writes
+            // them.
             unsafe {
                 *lse.get_unchecked_mut(row0) = m0 + l0.log2();
                 *lse.get_unchecked_mut(row1) = m1 + l1.log2();
@@ -346,6 +394,9 @@ pub(crate) fn fast_body<const KW: usize, const DECODE: bool, const HALF: bool, c
     // DECODE: combine the four warps' partial results through shared memory.
     let accs = ks.cast::<f32>(); // 4 warps x 16 rows x 64 dims
     let stats = qs.cast::<f32>(); // m and l: 4 warps x 16 rows each
+    // SAFETY: `accs` reuses `KS` (4 * 16 * 64 = 2 * 64 * 32 words) and `stats` the first 128 words
+    // of `QS`; the key loop's closing barrier retired their readers, and no copy is pending (only
+    // an empty group). Each (warp, row, dim) and stat slot belongs to one lane.
     unsafe {
         #[unroll]
         for nt in 0..8 {
@@ -367,6 +418,9 @@ pub(crate) fn fast_body<const KW: usize, const DECODE: bool, const HALF: bool, c
     let mut e = tid;
     while e < 16 * 64 {
         let (row, dim) = (e / 64, e % 64);
+        // SAFETY: `row < 16`, `w < 4`: inside `accs` and `stats`, published by the barrier above.
+        // The decode grid has `qp = 16` and `q0 = 0`, so `out_row + row` is a row of `part` and
+        // `lse`; each (row, dim) is one thread's, and only `dim == 0` writes `lse`.
         unsafe {
             let mut m = f32::NEG_INFINITY;
             #[unroll]
@@ -426,9 +480,15 @@ pub(crate) fn attention16_tc_body<const SPLIT: bool>(
     static mut KL: SharedArray<u32, { 64 * 12 }, 16> = SharedArray::UNINIT;
     static mut VH: SharedArray<u32, { 16 * 36 }, 16> = SharedArray::UNINIT;
     static mut VL: SharedArray<u32, { 16 * 36 }, 16> = SharedArray::UNINIT;
+    // SAFETY: `KH`, `KL`, `VH`, and `VL` are this function's own shared statics, reached only
+    // through these pointers; the indices below stay in their sizes, between the key loop's
+    // barriers.
     let kh = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(KH)) };
+    // SAFETY: as above.
     let kl = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(KL)) };
+    // SAFETY: as above.
     let vh = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(VH)) };
+    // SAFETY: as above.
     let vl = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(VL)) };
     let tid = thread::threadIdx_x() as usize;
     let (warp_id, lane) = (tid / 32, tid % 32);
@@ -447,6 +507,9 @@ pub(crate) fn attention16_tc_body<const SPLIT: bool>(
         let query = query0 + row;
         if query < lq {
             let at = seq * q_seq as usize + query * q_tok as usize + head * 16 + dim;
+            // SAFETY: `query < lq` and `dim + 1 < 16`: the launchers' `SmallAttention` layouts
+            // place each sequence's queries at `seq * q_seq + query * q_tok`, with the head's 16
+            // values inside `q`.
             unsafe { (*qp.add(at), *qp.add(at + 1)) }
         } else {
             (0.0, 0.0)
@@ -484,15 +547,22 @@ pub(crate) fn attention16_tc_body<const SPLIT: bool>(
             let key = chunk + pair * 2;
             let at = kv0 + key * kv_tok + dim;
             let (k0, v0) = if key < lk {
+                // SAFETY: `key < lk` and `dim < 16`: the launchers' layouts place key `key` of this
+                // (sequence, head) at `kv0 + key * kv_tok` past `k_base` and `v_base`, 16 values
+                // inside `k` and `v`.
                 unsafe { (*kp.add(at), *vp.add(at)) }
             } else {
                 (0.0, 0.0)
             };
             let (k1, v1) = if key + 1 < lk {
+                // SAFETY: as above, for key `key + 1 < lk`.
                 unsafe { (*kp.add(at + kv_tok), *vp.add(at + kv_tok)) }
             } else {
                 (0.0, 0.0)
             };
+            // SAFETY: `pair < 32`, `dim < 16`: half-word `(2 * pair + 1) * 24 + dim < 64 * 24` of
+            // `KH` and `KL`, word `dim * 36 + pair < 16 * 36` of `VH` and `VL`; each thread writes
+            // its own slots after the barrier that retired the previous chunk's readers.
             unsafe {
                 // K is stored by key, so a key pair writes two half-words.
                 let kh16 = kh.cast::<u16>();
@@ -519,10 +589,15 @@ pub(crate) fn attention16_tc_body<const SPLIT: bool>(
                 #[unroll]
                 for nt in 0..4 {
                     let at = (step * 32 + nt * 8 + lr) * 12 + lc / 2;
+                    // SAFETY: row `step * 32 + nt * 8 + lr < 64` and word `lc / 2 + 4 < 12`: inside
+                    // `KH`, published by the barrier above.
                     let kb = unsafe { [*kh.add(at), *kh.add(at + 4)] };
                     let mut c = [0.0f32; 4];
+                    // SAFETY: a full-warp product: `query0` is uniform within the warp, and so are
+                    // the step bounds.
                     c = unsafe { mma_m16n8k16_f32_f16(c, qa, kb) };
                     if SPLIT {
+                        // SAFETY: as for `kb`, inside `KL`.
                         let kbl = unsafe { [*kl.add(at), *kl.add(at + 4)] };
                         let cl = add_correction([0.0; 4], qa, qal, kb, kbl);
                         #[unroll]
@@ -609,9 +684,13 @@ pub(crate) fn attention16_tc_body<const SPLIT: bool>(
                     #[unroll]
                     for nt in 0..2 {
                         let at = (nt * 8 + lr) * 36 + (step * 32 + kk * 16 + lc) / 2;
+                        // SAFETY: row `nt * 8 + lr < 16` and word `(step * 32 + kk * 16 + lc) / 2 +
+                        // 4 < 36`: inside `VH`, published by the barrier above.
                         let vb = unsafe { [*vh.add(at), *vh.add(at + 4)] };
+                        // SAFETY: a full-warp product, as for the scores.
                         acc[nt] = unsafe { mma_m16n8k16_f32_f16(acc[nt], pa, vb) };
                         if SPLIT {
+                            // SAFETY: as for `vb`, inside `VL`.
                             let vbl = unsafe { [*vl.add(at), *vl.add(at + 4)] };
                             corr[nt] = add_correction(corr[nt], pa, pal, vb, vbl);
                         }
@@ -638,6 +717,9 @@ pub(crate) fn attention16_tc_body<const SPLIT: bool>(
                 }
                 let total = if e < 2 { l0 } else { l1 };
                 let at = seq * o_seq as usize + query * o_tok as usize + head * 16 + nt * 8 + lc + e % 2;
+                // SAFETY: `query < lq` and dim `nt * 8 + lc + e % 2 < 16`: the launchers' layouts
+                // (`o_tok = 128`, `o_seq = lq * 128`) give each (sequence, query, head, dim) its
+                // own slot in `out`, written by one lane.
                 unsafe { *out.get_unchecked_mut(at) = value / total };
             }
         }
@@ -662,6 +744,9 @@ pub(crate) fn attend16_f32(
         let mut dot = 0.0f32;
         #[unroll]
         for c in 0..4 {
+            // SAFETY: callers pass keys `[from, to)` of 16 values, `stride` apart and 16-byte
+            // aligned, at `kp`: `column_block_f32` a cache stream (`kv0`, stride 16, 128 keys),
+            // `attention16_f32` the `SmallAttention` layouts (offsets and strides multiples of 4).
             let k = unsafe { *kp.add(key * stride + c * 4).cast::<F32x4>() }.0;
             #[unroll]
             for e in 0..4 {
@@ -682,6 +767,7 @@ pub(crate) fn attend16_f32(
         total += p;
         #[unroll]
         for c in 0..4 {
+            // SAFETY: as for the key, at `vp`.
             let v = unsafe { *vp.add(key * stride + c * 4).cast::<F32x4>() }.0;
             #[unroll]
             for e in 0..4 {

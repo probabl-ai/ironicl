@@ -118,6 +118,8 @@ unsafe_code = "warn"
 [lints.clippy]
 all = "warn"
 pedantic = "warn"
+# Every `unsafe` block states the invariant that makes it sound.
+undocumented_unsafe_blocks = "warn"
 
 # One codegen unit and fat LTO let the kernels inline into their callers: about
 # 7% faster CPU fit and predict (M1 Max), for a slower release build.
