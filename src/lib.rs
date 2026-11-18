@@ -5,7 +5,6 @@
 pub mod artifact;
 pub mod backend;
 pub mod benchmark;
-pub mod cache;
 pub mod checkpoint;
 pub mod checkpoint_cache;
 pub mod cli;
@@ -32,7 +31,6 @@ pub mod static_context;
 
 pub use backend::{BackendKind, BackendPreference, resolve_backend};
 pub use benchmark::BenchmarkStats;
-pub use cache::{CacheEstimate, MemoryPlan, estimate_memory};
 pub use checkpoint::{CheckpointProfile, CheckpointSummary, import_checkpoint, inspect_checkpoint};
 pub use checkpoint_cache::{PreparedCheckpoint, prepare_checkpoint};
 pub use cli::{
@@ -49,6 +47,7 @@ pub use input_bundle::{
     CLASSIFIER_INPUT_BUNDLE_KIND, CLASSIFIER_INPUT_BUNDLE_MAGIC, CLASSIFIER_INPUT_BUNDLE_VERSION,
     InputBundle, QueryRequest, Request,
 };
+pub use memory::{CacheEstimate, MemoryPlan, estimate_memory};
 pub use model_artifact::{
     MODEL_ARTIFACT_MAGIC, MODEL_ARTIFACT_VERSION, ModelArtifact, ModelArtifactSummary, ModelConfig,
     ModelProfile, ModelTensorF32, inspect_model_artifact, load_model_artifact,
