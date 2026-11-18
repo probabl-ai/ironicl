@@ -288,7 +288,7 @@ impl DecoderOutputs {
 pub struct Executor {
     model: Arc<ModelArtifact>,
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-    gpu_weights: Arc<OnceLock<Option<Arc<crate::metal::ModelWeights>>>>,
+    gpu_weights: Arc<OnceLock<Option<Arc<crate::models::tabicl_v2::metal::ModelWeights>>>>,
     #[cfg(feature = "cuda")]
     cuda_weights: Arc<OnceLock<Result<Option<Arc<crate::cuda::ModelWeights>>>>>,
 }
@@ -296,9 +296,9 @@ pub struct Executor {
 /// One context's Metal buffers and the graph that reads them.
 #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
 struct GpuContext {
-    predict: crate::metal::PredictGraph,
+    predict: crate::models::tabicl_v2::metal::PredictGraph,
     /// How queries split into graph runs, `(chunk, small)` from
-    /// [`crate::metal::PredictGraph::query_split`], which keeps the buckets the
+    /// [`crate::models::tabicl_v2::metal::PredictGraph::query_split`], which keeps the buckets the
     /// graph keeps within the device's share of memory.
     split: (usize, usize),
     /// Keeps page-aligned context memory alive while GPU buffers wrap it.
@@ -480,14 +480,14 @@ impl Executor {
     /// use and shared by every context of the model. `None` without a GPU or
     /// with `IRONICL_NO_METAL` set.
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-    fn gpu_weights(&self) -> Option<Arc<crate::metal::ModelWeights>> {
+    fn gpu_weights(&self) -> Option<Arc<crate::models::tabicl_v2::metal::ModelWeights>> {
         if std::env::var_os("IRONICL_NO_METAL").is_some() {
             return None;
         }
         self.gpu_weights
             .get_or_init(|| {
-                let gpu = crate::metal::Gpu::new().ok().flatten()?;
-                Some(Arc::new(crate::metal::ModelWeights::new(gpu)))
+                let gpu = crate::kernels::metal::Gpu::new().ok().flatten()?;
+                Some(Arc::new(crate::models::tabicl_v2::metal::ModelWeights::new(gpu)))
             })
             .clone()
     }
@@ -512,7 +512,7 @@ impl Executor {
             // accurate than FP16, so `Fast` uses FP16 until it gets more.
             Optimize::Auto | Optimize::Fast => TensorStorage::F16,
         };
-        if n < crate::metal::GPU_MIN_BUILD_ROWS {
+        if n < crate::models::tabicl_v2::metal::GPU_MIN_BUILD_ROWS {
             return Ok(None);
         }
         let Some(gpu_weights) = self.gpu_weights() else {
@@ -521,7 +521,7 @@ impl Executor {
         // Each feature grouped with its neighbors, `[B * H, N, 3]`.
         let Some(grouped) = x
             .chunks_exact(n * h)
-            .map(|x| crate::metal::group_features(x, n, h))
+            .map(|x| crate::models::tabicl_v2::metal::group_features(x, n, h))
             .collect::<Option<Vec<_>>>()
         else {
             return Ok(None);
@@ -533,8 +533,8 @@ impl Executor {
         // and by the memory limit. When one estimator does not fit the device,
         // the CPU builds the context.
         let pools = shared_gpu_pools(gpu_weights.gpu(), limits);
-        let estimator_bytes =
-            u64::try_from(crate::metal::gpu_build_estimator_bytes(n, h)).unwrap_or(u64::MAX);
+        let estimator_bytes = u64::try_from(crate::models::tabicl_v2::metal::gpu_build_estimator_bytes(n, h))
+            .unwrap_or(u64::MAX);
         let Some(group) = crate::memory::gpu_build_group(b as u64, estimator_bytes, pools) else {
             return Ok(None);
         };
@@ -557,10 +557,10 @@ impl Executor {
         crate::progress::report(Stage::Build, 0, b)?;
         for start in (0..b).step_by(group) {
             let output = scratch.as_mut().unwrap_or(&mut context);
-            crate::metal::build_context(
+            crate::models::tabicl_v2::metal::build_context(
                 &gpu_weights,
                 &|name| self.tensor(name),
-                crate::metal::Shape {
+                crate::models::tabicl_v2::metal::Shape {
                     ensembles: group,
                     features: h,
                     training_rows: n,
@@ -1886,10 +1886,10 @@ impl StaticExecutor {
             return Ok(self);
         }
         let metadata = self.context.metadata();
-        let predict = crate::metal::PredictGraph::new(
+        let predict = crate::models::tabicl_v2::metal::PredictGraph::new(
             &gpu_weights,
             &weights,
-            crate::metal::Shape {
+            crate::models::tabicl_v2::metal::Shape {
                 ensembles: metadata.ensemble_count,
                 features: metadata.feature_count,
                 training_rows: metadata.training_rows,
@@ -1934,7 +1934,12 @@ impl StaticExecutor {
                 .chunks_exact_mut(h * stride * 3)
                 .enumerate()
                 .all(|(ensemble, input)| {
-                    crate::metal::group_features_into(&x[ensemble * q * h..][..q * h], (q, h), stride, input)
+                    crate::models::tabicl_v2::metal::group_features_into(
+                        &x[ensemble * q * h..][..q * h],
+                        (q, h),
+                        stride,
+                        input,
+                    )
                 })
         })?
         else {
@@ -4648,7 +4653,7 @@ pub fn plan_context(
 /// This machine's memory pools with `gpu` as a device that shares the host's
 /// RAM, limited by Metal's recommended working set and by `limits`.
 #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-fn shared_gpu_pools(gpu: &crate::metal::Gpu, limits: MemoryLimits) -> Pools {
+fn shared_gpu_pools(gpu: &crate::kernels::metal::Gpu, limits: MemoryLimits) -> Pools {
     let working_set = u64::try_from(gpu.working_set_bytes()).unwrap_or(u64::MAX);
     Pools {
         device: Some(crate::memory::DeviceMemory::Shared { limit: working_set }),
@@ -4662,8 +4667,10 @@ fn shared_gpu_pools(gpu: &crate::metal::Gpu, limits: MemoryLimits) -> Pools {
 #[allow(unused_variables)]
 fn gpu_working_set(rows: usize) -> Option<u64> {
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-    if std::env::var_os("IRONICL_NO_METAL").is_none() && rows >= crate::metal::GPU_MIN_BUILD_ROWS {
-        return crate::metal::system_working_set();
+    if std::env::var_os("IRONICL_NO_METAL").is_none()
+        && rows >= crate::models::tabicl_v2::metal::GPU_MIN_BUILD_ROWS
+    {
+        return crate::kernels::metal::system_working_set();
     }
     None
 }
