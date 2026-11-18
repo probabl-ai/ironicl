@@ -7,8 +7,53 @@ use cuda_core::{CudaContext, DeviceBuffer, DeviceCopy, DriverError, PinnedHostBu
 use super::kernels::device::{self as kernels, LoadedModule};
 use crate::error::{Error, Result};
 
-/// The kernels built at `sm_89`, or nothing for a build without them.
-const PTX_SM89: &str = include_str!(concat!(env!("OUT_DIR"), "/kernels_sm89.ptx"));
+/// Which GPUs a module's PTX loads on (see `build.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Kind {
+    /// `sm_XY`: compute capability X.Y and later.
+    Plain,
+    /// `sm_XYf`: X.Y and later X.* GPUs.
+    Family,
+    /// `sm_XYa`: X.Y only.
+    Specific,
+}
+
+/// One build of the kernels.
+struct Module {
+    /// Its target: `sm_<major><minor>`, then `f` or `a` for those kinds.
+    name: &'static str,
+    /// The PTX, or `None` for the build cuda-oxide embeds itself.
+    ptx: Option<&'static str>,
+}
+
+impl Module {
+    /// The target's kind, major version, and minor version.
+    fn target(&self) -> (Kind, i32, i32) {
+        let digits = self.name.trim_start_matches("sm_");
+        let (digits, kind) = if let Some(digits) = digits.strip_suffix('a') {
+            (digits, Kind::Specific)
+        } else if let Some(digits) = digits.strip_suffix('f') {
+            (digits, Kind::Family)
+        } else {
+            (digits, Kind::Plain)
+        };
+        let version: i32 = digits.parse().unwrap_or(0);
+        (kind, version / 10, version % 10)
+    }
+
+    fn loads_on(&self, device: (i32, i32)) -> bool {
+        let (kind, major, minor) = self.target();
+        match kind {
+            Kind::Plain => (major, minor) <= device,
+            Kind::Family => major == device.0 && minor <= device.1,
+            Kind::Specific => (major, minor) == device,
+        }
+    }
+}
+
+/// The builds of the kernels, from `IRONICL_CUDA_ARCH`; the first is
+/// cuda-oxide's own.
+const MODULES: &[Module] = include!(concat!(env!("OUT_DIR"), "/cuda_modules.rs"));
 
 pub(super) fn gpu_error(error: impl Display) -> Error {
     Error::UnsupportedBackend(format!("CUDA: {error}"))
@@ -19,13 +64,16 @@ pub(super) fn out_of_memory(error: DriverError) -> bool {
     error.0 == cuda_core::sys::cudaError_enum_CUDA_ERROR_OUT_OF_MEMORY
 }
 
-/// Which build of the kernels a device runs.
+/// Which build of the kernels a device runs: its target, such as `sm_89`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Arch {
-    /// `sm_80`, for Ampere: FP8 decodes in software.
-    Ampere,
-    /// `sm_89`, for Ada and later: FP8 converts in hardware.
-    Ada,
+pub struct Arch(&'static str);
+
+impl Arch {
+    /// The target, such as `sm_89`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        self.0
+    }
 }
 
 /// Device 0, with the kernels for its architecture loaded.
@@ -52,14 +100,16 @@ impl std::fmt::Debug for Device {
 
 impl Device {
     /// Device 0 with the kernels loaded, or `None` without a CUDA driver or
-    /// an Ampere or later device, or with `IRONICL_NO_CUDA` set. Ada and later
-    /// GPUs run the `sm_89` kernels when the build has them, unless the driver
-    /// is too old for their PTX or `IRONICL_CUDA_MODULE=sm80` asks for the
-    /// Ampere ones.
+    /// an Ampere or later device, or with `IRONICL_NO_CUDA` set. The device
+    /// runs the build that loads on it with the most specific target: an `a`
+    /// target, then an `f` one, then the newest plain one; a build whose PTX
+    /// the driver is too old for gives way to the next. `IRONICL_CUDA_MODULE`
+    /// names the one build to consider, such as `sm_80`, to test it.
     ///
     /// # Errors
     ///
-    /// Returns an error if a device exists but the kernels fail to load.
+    /// Returns an error if a device exists but no build loads on it, or the
+    /// kernels fail to load.
     pub fn new() -> Result<Option<Self>> {
         if std::env::var_os("IRONICL_NO_CUDA").is_some() {
             return Ok(None);
@@ -71,22 +121,38 @@ impl Device {
         if capability < (8, 0) {
             return Ok(None);
         }
-        // IRONICL_CUDA_MODULE=sm80 loads the Ampere kernels on any GPU, to test them.
-        let ada = !PTX_SM89.is_empty()
-            && capability >= (8, 9)
-            && std::env::var_os("IRONICL_CUDA_MODULE").is_none_or(|module| module != "sm80");
-        let ada = if ada {
-            match context.load_module_from_ptx_src(PTX_SM89) {
-                Ok(module) => Some(kernels::from_module(module).map_err(gpu_error)?),
-                Err(error) if error.is_unsupported_ptx_version() => None,
-                Err(error) => return Err(gpu_error(error)),
-            }
-        } else {
-            None
-        };
-        let (kernels, arch) = match ada {
-            Some(kernels) => (kernels, Arch::Ada),
-            None => (kernels::load(&context).map_err(gpu_error)?, Arch::Ampere),
+        let only = std::env::var("IRONICL_CUDA_MODULE")
+            .ok()
+            .filter(|name| !name.is_empty());
+        let mut candidates: Vec<&Module> = MODULES
+            .iter()
+            .filter(|module| module.loads_on(capability))
+            .filter(|module| only.as_deref().is_none_or(|name| name == module.name))
+            .collect();
+        candidates.sort_by_key(|module| std::cmp::Reverse(module.target()));
+        let mut loaded = None;
+        for module in candidates {
+            let kernels = match module.ptx {
+                None => kernels::load(&context).map_err(gpu_error)?,
+                Some(ptx) => match context.load_module_from_ptx_src(ptx) {
+                    Ok(ptx) => kernels::from_module(ptx).map_err(gpu_error)?,
+                    Err(error) if error.is_unsupported_ptx_version() => continue,
+                    Err(error) => return Err(gpu_error(error)),
+                },
+            };
+            loaded = Some((kernels, Arch(module.name)));
+            break;
+        }
+        let Some((kernels, arch)) = loaded else {
+            let built: Vec<&str> = MODULES.iter().map(|module| module.name).collect();
+            return Err(gpu_error(format!(
+                "no build of the kernels loads on this sm_{}{} GPU{}: built for {}; rebuild with \
+                 IRONICL_CUDA_ARCH listing a target for it",
+                capability.0,
+                capability.1,
+                only.map_or_else(String::new, |name| format!(" with IRONICL_CUDA_MODULE={name}")),
+                built.join(", "),
+            )));
         };
         let stream = context.new_stream().map_err(gpu_error)?;
         let copy = context.new_stream().map_err(gpu_error)?;
@@ -166,7 +232,7 @@ mod tests {
 
     use cuda_core::embedded::{ArtifactPayloadKind, embedded_modules_from_current_exe};
 
-    use super::PTX_SM89;
+    use super::MODULES;
 
     /// A PTX module's `.version`, `.target`, and entries.
     fn module(ptx: &str) -> (&str, &str, BTreeSet<&str>) {
@@ -193,14 +259,16 @@ mod tests {
             .iter()
             .find(|module| module.name() == env!("CARGO_PKG_NAME"))
             .and_then(|module| module.payload(ArtifactPayloadKind::Ptx))
-            .expect("the embedded sm_80 PTX");
-        let (version, target, ampere) = module(std::str::from_utf8(ptx).expect("PTX is text"));
-        assert_eq!(target, "sm_80");
-        assert!(version.starts_with("7."), "sm_80 kernels at PTX ISA {version}");
-        if !PTX_SM89.is_empty() {
-            let (_, target, ada) = module(PTX_SM89);
-            assert_eq!(target, "sm_89");
-            assert_eq!(ada, ampere);
+            .expect("the embedded PTX");
+        let (version, target, entries) = module(std::str::from_utf8(ptx).expect("PTX is text"));
+        assert_eq!(target, MODULES[0].name);
+        if target == "sm_80" {
+            assert!(version.starts_with("7."), "sm_80 kernels at PTX ISA {version}");
+        }
+        for build in &MODULES[1..] {
+            let (_, target, other) = module(build.ptx.expect("nested builds carry their PTX"));
+            assert_eq!(target, build.name);
+            assert_eq!(other, entries, "{} kernels differ", build.name);
         }
     }
 }
