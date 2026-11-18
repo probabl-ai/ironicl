@@ -6,6 +6,8 @@
 // Tensor dimensions are model constants or validated sizes far below `isize::MAX`.
 #![allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
 
+use std::{collections::HashMap, sync::Mutex};
+
 use objc2::{AllocAnyThread, rc::Retained, runtime::ProtocolObject};
 use objc2_foundation::{NSArray, NSDictionary, NSNumber};
 use objc2_metal::{MTLBuffer, MTLCommandQueue, MTLCreateSystemDefaultDevice, MTLDevice, MTLResourceOptions};
@@ -27,6 +29,8 @@ pub(crate) fn kind(storage: TensorStorage) -> MPSDataType {
 }
 
 pub(crate) const FLOAT: MPSDataType = MPSDataType::Float32;
+
+pub(crate) mod builder;
 
 pub(crate) type Tensor = Retained<MPSGraphTensor>;
 pub(crate) type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
@@ -197,4 +201,49 @@ pub(crate) fn dictionary(items: &[&Binding]) -> Dictionary {
         })
         .collect();
     NSDictionary::from_retained_objects(&tensors, &data)
+}
+
+/// A model's weights in shared GPU buffers, converted once and reused by every
+/// context's graphs.
+pub(crate) struct ModelWeights {
+    pub(crate) gpu: Gpu,
+    pub(crate) buffers: Mutex<HashMap<String, Buffer>>,
+}
+
+impl std::fmt::Debug for ModelWeights {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ModelWeights")
+    }
+}
+
+// SAFETY: buffers are written once when created and only read after; the map
+// is behind a mutex.
+unsafe impl Send for ModelWeights {}
+// SAFETY: as above.
+unsafe impl Sync for ModelWeights {}
+
+impl ModelWeights {
+    pub(crate) fn new(gpu: Gpu) -> Self {
+        Self {
+            gpu,
+            buffers: Mutex::default(),
+        }
+    }
+
+    pub(crate) fn gpu(&self) -> &Gpu {
+        &self.gpu
+    }
+
+    pub(crate) fn get(&self, key: &str, values: impl FnOnce() -> Vec<f32>) -> Result<Buffer> {
+        let mut buffers = self
+            .buffers
+            .lock()
+            .map_err(|_| metal_error("weight cache lock poisoned"))?;
+        if let Some(buffer) = buffers.get(key) {
+            return Ok(buffer.clone());
+        }
+        let buffer = self.gpu.buffer(&values())?;
+        buffers.insert(key.to_owned(), buffer.clone());
+        Ok(buffer)
+    }
 }
