@@ -4,7 +4,7 @@ use std::{fs::File, io::Read, path::Path};
 
 use crate::{
     Error, QueryRequest, Result,
-    artifact::{ByteReader, CHECKSUM_BYTES, sha256},
+    format::{ByteReader, CHECKSUM_BYTES, sha256},
 };
 
 /// Magic bytes at the start of a static-context query bundle.

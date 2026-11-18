@@ -7,8 +7,8 @@
 use std::{fs::File, io::Read, path::Path};
 
 use crate::{
-    artifact::{ByteReader, CHECKSUM_BYTES, encode_sha256, sha256, write_u32, write_u64},
     error::{Error, Result},
+    format::{ByteReader, CHECKSUM_BYTES, encode_sha256, sha256, write_u32, write_u64},
 };
 
 /// Magic bytes at the start of a classifier input bundle.

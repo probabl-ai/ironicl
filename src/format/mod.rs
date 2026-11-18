@@ -7,6 +7,11 @@
 //! all share. Each format still owns its own header layout, magic, version, and
 //! dtype numbering; only the mechanics live here.
 
+pub mod input_bundle;
+pub mod model;
+pub mod query_bundle;
+pub mod static_context;
+
 use std::fmt;
 
 use sha2::{Digest, Sha256};

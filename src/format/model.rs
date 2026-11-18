@@ -9,11 +9,11 @@ use std::{
 
 use crate::{
     TaskKind,
-    artifact::{
+    error::{Error, Result},
+    format::{
         ByteReader, CHECKSUM_BYTES, TENSOR_ALIGNMENT, align_up, artifact_error, encode_sha256,
         pad_to_alignment, sha256, u64_to_usize, usize_to_u32, usize_to_u64, write_u16, write_u32, write_u64,
     },
-    error::{Error, Result},
 };
 
 pub const MODEL_ARTIFACT_MAGIC: [u8; 8] = *b"IRMODEL\0";
