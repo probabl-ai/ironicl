@@ -133,12 +133,13 @@ impl Gpu {
 
     /// Wrap `bytes` of existing page-aligned memory without copying it.
     ///
-    /// Not marked `unsafe`, but callers must uphold: `pointer` starts a page and
-    /// `bytes` is a page multiple inside one live allocation; the memory outlives
-    /// every GPU use of the buffer; and no Rust reference reads it while the GPU
+    /// # Safety
+    ///
+    /// `pointer` starts a page and `bytes` is a page multiple inside one live allocation; the
+    /// memory outlives every GPU use of the buffer; and no Rust reference reads it while the GPU
     /// writes it, or writes it while the GPU reads it.
-    pub(crate) fn wrap(&self, pointer: std::ptr::NonNull<u8>, bytes: usize) -> Result<Buffer> {
-        // SAFETY: the caller contract above (page-aligned, page-multiple, live for
+    pub(crate) unsafe fn wrap(&self, pointer: std::ptr::NonNull<u8>, bytes: usize) -> Result<Buffer> {
+        // SAFETY: the caller upholds the contract above (page-aligned, page-multiple, live for
         // the buffer's GPU use); no deallocator, because the region's owner frees it.
         unsafe {
             self.device.newBufferWithBytesNoCopy_length_options_deallocator(
@@ -153,21 +154,26 @@ impl Gpu {
 
     /// A buffer over a tensor's `bytes`: wrapped in place when `page_aligned`
     /// (the bytes start on a page inside page-padded memory), otherwise copied.
-    /// With `page_aligned`, the caller must uphold [`Self::wrap`]'s contract for
-    /// `bytes` rounded up to [`TENSOR_PAGE_BYTES`](crate::format::static_context::TENSOR_PAGE_BYTES),
-    /// and must not write `bytes` while the buffer lives: the returned buffer
-    /// does not borrow them.
-    pub(crate) fn tensor_buffer(&self, bytes: &[u8], page_aligned: bool) -> Result<Buffer> {
+    ///
+    /// # Safety
+    ///
+    /// With `page_aligned`, [`Self::wrap`]'s contract holds for `bytes` rounded up to
+    /// [`TENSOR_PAGE_BYTES`](crate::format::static_context::TENSOR_PAGE_BYTES), and nothing
+    /// writes `bytes` while the buffer lives: the returned buffer does not borrow them.
+    pub(crate) unsafe fn tensor_buffer(&self, bytes: &[u8], page_aligned: bool) -> Result<Buffer> {
         if !page_aligned {
             return self.buffer_bytes(bytes);
         }
         let pointer = std::ptr::NonNull::from(bytes).cast::<u8>();
-        self.wrap(
-            pointer,
-            bytes
-                .len()
-                .next_multiple_of(crate::format::static_context::TENSOR_PAGE_BYTES),
-        )
+        // SAFETY: the caller upholds `wrap`'s contract for the rounded length (see above).
+        unsafe {
+            self.wrap(
+                pointer,
+                bytes
+                    .len()
+                    .next_multiple_of(crate::format::static_context::TENSOR_PAGE_BYTES),
+            )
+        }
     }
 
     /// The memory Metal recommends the device use without paging.

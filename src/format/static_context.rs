@@ -249,14 +249,18 @@ impl PageAlignedTensors {
     /// order given to [`Self::new`]. The pointers stay valid while `self` and
     /// the artifact made from it live.
     pub(crate) fn regions(&mut self) -> Vec<(std::ptr::NonNull<u8>, usize)> {
-        let mapping = &mut self.mapping;
+        // One pointer to the whole mapping, so each region's pointer may reach its full length.
+        let (base, length) = (self.mapping.as_mut_ptr(), self.mapping.len());
         self.layout
             .iter()
             .map(|(_, _, _, offset, bytes)| {
-                (
-                    std::ptr::NonNull::from(&mut mapping[*offset]),
-                    bytes.next_multiple_of(TENSOR_PAGE_BYTES),
-                )
+                let padded = bytes.next_multiple_of(TENSOR_PAGE_BYTES);
+                assert!(
+                    offset + padded <= length,
+                    "page-aligned tensors lie within the mapping"
+                );
+                let start = std::ptr::NonNull::new(base.wrapping_add(*offset));
+                (start.expect("a mapping's pointers are non-null"), padded)
             })
             .collect()
     }
@@ -457,6 +461,11 @@ impl StaticContextArtifact {
 
     /// Read, decode, and verify an artifact from a bounded file.
     ///
+    /// The file is memory-mapped, not copied: it must not change while the artifact lives.
+    /// Another process writing it makes the mapped tensors change underneath Rust references,
+    /// and truncating it makes the next read fault (`SIGBUS`). Serving artifacts are written
+    /// once and replaced atomically, never edited in place.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::Artifact`] when the file cannot be read or is invalid.
@@ -473,6 +482,11 @@ impl StaticContextArtifact {
     }
 
     /// Map, verify, and borrow tensors directly from an immutable artifact.
+    ///
+    /// The file is memory-mapped, not copied: it must not change while the artifact lives.
+    /// Another process writing it makes the mapped tensors change underneath Rust references,
+    /// and truncating it makes the next read fault (`SIGBUS`). Serving artifacts are written
+    /// once and replaced atomically, never edited in place.
     ///
     /// # Errors
     ///

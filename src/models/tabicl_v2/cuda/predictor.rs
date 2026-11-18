@@ -21,6 +21,38 @@ use crate::{
     progress::Stage,
 };
 
+/// Whether `context` matches its shape and the model, since the kernels index it unchecked: each
+/// column block's keys and values `[B, H + 4, 8, 128, 16]`, a base scale per ICL block, the CLS
+/// tokens, and no more outputs than the decoder has rows.
+fn check(weights: &ModelWeights, context: &ContextTensors<'_>) -> Result<()> {
+    let Shape {
+        ensembles: b,
+        features: h,
+        outputs,
+        ..
+    } = context.shape;
+    let column = b
+        .checked_mul(h + RESERVED)
+        .and_then(|len| len.checked_mul(COLUMN_CACHE));
+    let consistent = column.is_some_and(|len| {
+        context.column.len() == COLUMN_BLOCKS
+            && context
+                .column
+                .iter()
+                .all(|(keys, values)| keys.len() == len && values.len() == len)
+    }) && context.base_scales.len() == ICL_BLOCKS
+        && context.base_scales.iter().all(|scale| scale.len() == ICL_DIM)
+        && context.cls_tokens.len() >= 4 * COLUMN_DIM
+        && (1..=weights.decoder.out.b.len()).contains(&outputs);
+    if consistent {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgument(
+            "CUDA context tensors do not match their shape or the model".into(),
+        ))
+    }
+}
+
 /// A context's tensors the predictor takes.
 pub struct ContextTensors<'a> {
     /// Estimators, features, training rows, and decoder outputs per row.
@@ -128,6 +160,7 @@ impl Predictor {
         context: &ContextTensors<'_>,
         built: Option<BuiltCache>,
     ) -> Result<Option<Self>> {
+        check(&weights, context)?;
         let device = &weights.device;
         let shape = context.shape;
         let (b, h, n) = (shape.ensembles, shape.features, shape.rows);

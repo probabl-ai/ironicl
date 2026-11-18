@@ -294,7 +294,7 @@ impl Device {
         out: &mut DeviceBuffer<f32>,
         (period, len): (usize, usize),
     ) -> Result<()> {
-        debug_assert!(period <= source.len() && len <= out.len());
+        assert!(period <= source.len() && len <= out.len());
         // SAFETY: one thread per `out[i]`, `i < len`; `len <= out.len()` is asserted in debug
         // builds only: the one caller writes `count * 128 * 128` into `[chunk.columns, 128, 128]`.
         let launch = unsafe {
@@ -513,7 +513,7 @@ impl Device {
         rows: usize,
         width: usize,
     ) -> Result<()> {
-        debug_assert!(width <= 512);
+        assert!(width <= 512);
         let mut unused = Unused::new(self)?;
         let (y, hi, lo, format) = unused.outputs(Some(out));
         let config = config(threads(rows * 32), 256);
@@ -687,7 +687,7 @@ impl Device {
         (keys, values): (&DeviceBuffer<f32>, &DeviceBuffer<f32>),
         (ensembles, features, q, reserved): (usize, usize, usize, usize),
     ) -> Result<()> {
-        debug_assert!(keys.len() >= ensembles * (features + reserved) * HEADS * 128 * 16);
+        assert!(keys.len() >= ensembles * (features + reserved) * HEADS * 128 * 16);
         let TokenBlock {
             norm1,
             in_proj: w,
@@ -874,7 +874,19 @@ impl Device {
             Activation::Half(hi) => (hi, &blank.hi, &blank.lo),
             Activation::Split { hi, lo } => (hi, lo, &dense.lo),
         };
-        debug_assert!(depth.is_multiple_of(32));
+        // `linear16` writes `next` in its input's form, so another form would write into an empty
+        // `Unused` buffer.
+        if !matches!(
+            (&input, &next),
+            (_, None)
+                | (Activation::Half(_), Some(Output::Half(_)))
+                | (Activation::Split { .. }, Some(Output::Split { .. }))
+        ) {
+            return Err(gpu_error(
+                "a tensor-core product writes its next activation in its input's form",
+            ));
+        }
+        assert!(depth.is_multiple_of(32));
         let mode = mode | if out.is_some() { 4 } else { 0 } | if next.is_some() { 8 } else { 0 };
         let (unused_y, next_hi, next_lo, _) = unused.outputs(next);
         let y = out.unwrap_or(unused_y);
@@ -999,7 +1011,7 @@ impl Device {
         packed: Output<'_>,
         (ensembles, q, qp): (usize, usize, usize),
     ) -> Result<()> {
-        debug_assert!(!matches!(packed, Output::Split { .. }));
+        assert!(!matches!(packed, Output::Split { .. }));
         let mut unused = Unused::new(self)?;
         let (y, hi, _, format) = unused.outputs(Some(packed));
         let config = config(threads(ensembles * q * 512), 256);

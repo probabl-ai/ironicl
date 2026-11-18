@@ -420,18 +420,34 @@ impl IclCache {
         if let Some(released) = slot.released.take() {
             stream.wait(&released).map_err(gpu_error)?;
         }
-        for (to, from) in [
-            (&mut slot.block.keys, &slot.staged_keys),
-            (&mut slot.block.values, &slot.staged_values),
-        ] {
-            // SAFETY: `from` stays alive and unwritten until `copied`, recorded below, completes:
-            // the next `stage` into this slot and `Slot::drop` synchronize it first. The copy
-            // stream waited above for `released`, so no kernel still reads `to`, and kernels read
-            // it only after `acquire` makes their stream wait for `copied`. Both hold `2 * units`.
-            unsafe { to.copy_from_pinned_host_async(stream, from) }.map_err(gpu_error)?;
+        let mut enqueue = || {
+            for (to, from) in [
+                (&mut slot.block.keys, &slot.staged_keys),
+                (&mut slot.block.values, &slot.staged_values),
+            ] {
+                // SAFETY: `from` stays alive and unwritten until `copied`, recorded below,
+                // completes: the next `stage` into this slot and `Slot::drop` synchronize it
+                // first, and on failure the stream is synchronized below before returning. The
+                // copy stream waited above for `released`, so no kernel still reads `to`, and
+                // kernels read it only after `acquire` makes their stream wait for `copied`. Both
+                // hold `2 * units`.
+                unsafe { to.copy_from_pinned_host_async(stream, from) }.map_err(gpu_error)?;
+            }
+            stream.record_event(None).map_err(gpu_error)
+        };
+        match enqueue() {
+            Ok(copied) => {
+                slot.copied = Some(copied);
+                Ok(())
+            }
+            Err(error) => {
+                // A copy that did start may still read the staging buffers, which the next
+                // `stage` rewrites and `Slot::drop` frees: wait for it. Nothing more to do if
+                // this fails too.
+                let _ = stream.synchronize();
+                Err(error)
+            }
         }
-        slot.copied = Some(stream.record_event(None).map_err(gpu_error)?);
-        Ok(())
     }
 }
 

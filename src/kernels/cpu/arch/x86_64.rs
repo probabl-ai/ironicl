@@ -60,11 +60,14 @@ pub(crate) fn bf16_storage_supported_for_target() -> bool {
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn convert_f32_to_bf16(input: &[f32], output: &mut [u16]) -> bool {
-    if input.len() != output.len() || !std::is_x86_feature_detected!("avx512bf16") {
+    if input.len() != output.len()
+        || !std::is_x86_feature_detected!("avx512f")
+        || !std::is_x86_feature_detected!("avx512bf16")
+    {
         return false;
     }
-    // SAFETY: avx512bf16 was detected and `input.len() == output.len()` checked just above.
-    // avx512f is not detected here; it is implied in practice (no AVX512_BF16 CPU lacks AVX512F).
+    // SAFETY: avx512f and avx512bf16 were detected and `input.len() == output.len()` checked
+    // just above.
     unsafe { convert_f32_to_bf16_avx512(input, output) };
     true
 }
@@ -1148,9 +1151,19 @@ pub(crate) fn attention_value_packed_bf16_dot_for_target(
     head_dim: usize,
     output: &mut [f32],
 ) -> bool {
-    // SAFETY: nothing is checked here. `attention_value_packed_bf16_dot_f32`, the only caller,
-    // checks `backend == Isa::Avx512`, `packed_bf16_affine_supported_for_target()` (f, bw, bf16),
-    // `query_rows` in 1..=8, even `source_rows`, `head_dim % 16 == 0`, and all lengths.
+    let fits = |count: Option<usize>, len: usize| count.is_some_and(|count| len >= count);
+    if !packed_bf16_affine_supported_for_target()
+        || !(1..=8).contains(&query_rows)
+        || !source_rows.is_multiple_of(2)
+        || !head_dim.is_multiple_of(16)
+        || !fits(query_rows.checked_mul(source_rows), weights.len())
+        || !fits(source_rows.checked_mul(head_dim), packed_value.len())
+        || !fits(query_rows.checked_mul(head_dim), output.len())
+    {
+        return false;
+    }
+    // SAFETY: checked above: the CPU features (f, bw, bf16), `query_rows` in 1..=8, even
+    // `source_rows`, `head_dim % 16 == 0`, and every length.
     unsafe {
         attention_value_packed_bf16_dot_avx512(
             weights,
@@ -1240,8 +1253,11 @@ pub(crate) unsafe fn attention_value_packed_bf16_dot_avx512(
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn attention_dot_for_target(backend: Isa, left: &[f32], right: &[f32]) -> Option<f32> {
-    // SAFETY: `backend == Isa::Avx512` implies avx512f was detected (module doc). Callers pass
-    // equal-length rows, as `attention_dot_f32` documents.
+    if right.len() < left.len() {
+        return None;
+    }
+    // SAFETY: `backend == Isa::Avx512` implies avx512f was detected (module doc), and
+    // `right.len() >= left.len()` was checked above.
     (backend == Isa::Avx512).then(|| unsafe { attention_dot_avx512(left, right) })
 }
 
@@ -1281,9 +1297,12 @@ pub(crate) fn attention_value_fma_for_target(
     value: &[f32],
     output: &mut [f32],
 ) -> bool {
+    if output.len() < value.len() {
+        return false;
+    }
     if backend == Isa::Avx512 {
-        // SAFETY: `backend == Isa::Avx512` implies avx512f was detected (module doc). Callers pass
-        // equal-length rows, as `attention_value_fma_f32` documents.
+        // SAFETY: `backend == Isa::Avx512` implies avx512f was detected (module doc), and
+        // `output.len() >= value.len()` was checked above.
         unsafe { attention_value_fma_avx512(weight, value, output) }
         true
     } else {
@@ -1321,9 +1340,11 @@ pub(crate) unsafe fn attention_value_fma_avx512(weight: f32, value: &[f32], outp
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn gelu_for_target(input: &[f32], output: &mut [f32]) -> bool {
+    if output.len() < input.len() {
+        return false;
+    }
     if std::is_x86_feature_detected!("avx512f") {
-        // SAFETY: avx512f was detected just above. `output.len() >= input.len()` is not checked
-        // here; `reference::gelu_f32` checks equal lengths.
+        // SAFETY: avx512f was detected just above, and `output.len() >= input.len()` above that.
         unsafe { gelu_avx512(input, output) }
         true
     } else {
@@ -1340,9 +1361,17 @@ pub(crate) fn layer_norm_for_target(
     bias: Option<&[f32]>,
     output: &mut [f32],
 ) -> bool {
+    let fits = rows
+        .checked_mul(width)
+        .is_some_and(|len| input.len() >= len && output.len() >= len)
+        && weight.len() >= width
+        && bias.is_none_or(|bias| bias.len() >= width);
+    if !width.is_multiple_of(16) || !fits {
+        return false;
+    }
     if std::is_x86_feature_detected!("avx512f") {
-        // SAFETY: avx512f was detected just above. `width % 16 == 0` is checked by
-        // `cpu::layer_norm_f32` and the lengths by `reference::layer_norm_f32`, not here.
+        // SAFETY: avx512f was detected just above; `width % 16 == 0` and every length were
+        // checked above that.
         unsafe { layer_norm_avx512(input, rows, width, weight, bias, output) }
         true
     } else {
@@ -1515,9 +1544,16 @@ pub(crate) fn affine_for_target(
     output_dim: usize,
     output: &mut [f32],
 ) -> bool {
+    let fits = |count: Option<usize>, len: usize| count.is_some_and(|count| len >= count);
+    if !fits(rows.checked_mul(input_dim), input.len())
+        || !fits(output_dim.checked_mul(input_dim), weight.len())
+        || !fits(rows.checked_mul(output_dim), output.len())
+        || bias.is_some_and(|bias| bias.len() < output_dim)
+    {
+        return false;
+    }
     if std::is_x86_feature_detected!("avx512f") {
-        // SAFETY: avx512f was detected just above. The lengths are checked by
-        // `reference::affine_f32`, the only caller.
+        // SAFETY: avx512f was detected just above, and every length checked above that.
         unsafe {
             affine_avx512(input, rows, input_dim, weight, bias, output_dim, output);
         }

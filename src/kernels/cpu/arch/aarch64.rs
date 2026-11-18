@@ -341,8 +341,11 @@ pub(crate) mod accelerate {
 
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn attention_dot_for_target(backend: Isa, left: &[f32], right: &[f32]) -> Option<f32> {
-    // SAFETY: NEON is baseline on AArch64 (and `Isa::Neon` was selected). The callers
-    // (`attention_dot_f32`) pass equal-length rows, so `right.len() >= left.len()`.
+    if right.len() < left.len() {
+        return None;
+    }
+    // SAFETY: NEON is baseline on AArch64 (and `Isa::Neon` was selected), and
+    // `right.len() >= left.len()` was checked above.
     (backend == Isa::Neon).then(|| unsafe { attention_dot_neon(left, right) })
 }
 
@@ -379,9 +382,12 @@ pub(crate) fn attention_value_fma_for_target(
     value: &[f32],
     output: &mut [f32],
 ) -> bool {
+    if output.len() < value.len() {
+        return false;
+    }
     if backend == Isa::Neon {
-        // SAFETY: NEON is baseline on AArch64. The callers (`attention_value_fma_f32`) pass
-        // equal-length rows, so `output.len() >= value.len()`.
+        // SAFETY: NEON is baseline on AArch64, and `output.len() >= value.len()` was checked
+        // above.
         unsafe { attention_value_fma_neon(weight, value, output) }
         true
     } else {
@@ -413,8 +419,10 @@ pub(crate) unsafe fn attention_value_fma_neon(weight: f32, value: &[f32], output
 
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn gelu_for_target(input: &[f32], output: &mut [f32]) -> bool {
-    // SAFETY: NEON is baseline on AArch64. `reference::gelu_f32`, the only non-test caller,
-    // requires `output.len() == input.len()`.
+    if output.len() < input.len() {
+        return false;
+    }
+    // SAFETY: NEON is baseline on AArch64, and `output.len() >= input.len()` was checked above.
     unsafe { gelu_neon(input, output) }
     true
 }
@@ -428,9 +436,16 @@ pub(crate) fn layer_norm_for_target(
     bias: Option<&[f32]>,
     output: &mut [f32],
 ) -> bool {
-    // SAFETY: NEON is baseline on AArch64. `layer_norm_f32` checked `width % 16 == 0`, and its
-    // caller (`reference::layer_norm_f32`) that `input` and `output` hold `rows * width` values
-    // and `weight` and `bias` hold `width`.
+    let fits = rows
+        .checked_mul(width)
+        .is_some_and(|len| input.len() >= len && output.len() >= len)
+        && weight.len() >= width
+        && bias.is_none_or(|bias| bias.len() >= width);
+    if !width.is_multiple_of(16) || !fits {
+        return false;
+    }
+    // SAFETY: NEON is baseline on AArch64; `width % 16 == 0` and every length were checked
+    // above.
     unsafe { layer_norm_neon(input, rows, width, weight, bias, output) }
     true
 }
@@ -550,14 +565,21 @@ pub(crate) fn affine_for_target(
     output_dim: usize,
     output: &mut [f32],
 ) -> bool {
+    let fits = |count: Option<usize>, len: usize| count.is_some_and(|count| len >= count);
+    if !fits(rows.checked_mul(input_dim), input.len())
+        || !fits(output_dim.checked_mul(input_dim), weight.len())
+        || !fits(rows.checked_mul(output_dim), output.len())
+        || bias.is_some_and(|bias| bias.len() < output_dim)
+    {
+        return false;
+    }
     #[cfg(target_os = "macos")]
     if affine_uses_sgemm(rows) && accelerate::affine(input, rows, input_dim, weight, bias, output_dim, output)
     {
         return true;
     }
-    // SAFETY: NEON is baseline on AArch64, including Apple Silicon. `reference::affine_f32`,
-    // the only non-test caller of `affine_f32`, checks `input`, `weight`, `bias`, and `output`
-    // against `rows`, `input_dim`, and `output_dim` with overflow-checked products.
+    // SAFETY: NEON is baseline on AArch64, including Apple Silicon, and every length was
+    // above.
     unsafe {
         affine_neon(input, rows, input_dim, weight, bias, output_dim, output);
     }

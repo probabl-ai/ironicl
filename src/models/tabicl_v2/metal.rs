@@ -436,10 +436,11 @@ impl PredictGraph {
             let prefix = format!("col_embedder.tf_col.blocks.{block}.multihead_attn2");
             // The cached path never reads the reserved streams.
             let cache = |values: &[f32]| -> Result<Tensor> {
-                let full = builder.bound(
-                    gpu.tensor_buffer(bytemuck::cast_slice(values), page_aligned)?,
-                    &column_shape,
-                );
+                // SAFETY: with `page_aligned`, the caches lie in the context's page-aligned
+                // storage, which `GpuContext::_storage` keeps alive while this graph lives, and
+                // nothing writes them.
+                let buffer = unsafe { gpu.tensor_buffer(bytemuck::cast_slice(values), page_aligned)? };
+                let full = builder.bound(buffer, &column_shape);
                 Ok(builder.reshape(
                     &builder.slice(&full, 1, RESERVED as isize, h),
                     &[b * h, HEADS as isize, INDUCING as isize, COLUMN_HEAD_DIM as isize],
@@ -461,16 +462,15 @@ impl PredictGraph {
         for block in 0..ICL_BLOCKS {
             let prefix = format!("icl_predictor.tf_icl.blocks.{block}");
             // Attention runs in the caches' stored type.
-            let key = builder.bound_typed(
-                gpu.tensor_buffer(icl_keys[block], page_aligned)?,
-                &icl_shape,
-                kind(icl_storage),
-            );
-            let value = builder.bound_typed(
-                gpu.tensor_buffer(icl_values[block], page_aligned)?,
-                &icl_shape,
-                kind(icl_storage),
-            );
+            // SAFETY: as for the column caches above.
+            let (key, value) = unsafe {
+                (
+                    gpu.tensor_buffer(icl_keys[block], page_aligned)?,
+                    gpu.tensor_buffer(icl_values[block], page_aligned)?,
+                )
+            };
+            let key = builder.bound_typed(key, &icl_shape, kind(icl_storage));
+            let value = builder.bound_typed(value, &icl_shape, kind(icl_storage));
             let base_scale = builder.base_scale(&base_scales[block], ICL_HEAD_DIM);
             (hidden, _, _) = builder.block(
                 &hidden,
@@ -798,7 +798,11 @@ pub(crate) fn build_context(
         .into_iter()
         .zip(outputs)
         .map(|((tensor, dimensions, kind), &(pointer, bytes))| {
-            Ok((tensor, gpu.wrap(pointer, bytes)?, dimensions, kind))
+            // SAFETY: `outputs` are `PageAlignedTensors::regions()`: each starts a page, spans a
+            // page multiple of one live mapping that outlives this build, and nothing else
+            // touches it until `gpu.run` below returns.
+            let buffer = unsafe { gpu.wrap(pointer, bytes)? };
+            Ok((tensor, buffer, dimensions, kind))
         })
         .collect::<Result<Vec<Binding>>>()?;
     outputs.push((largest, gpu.empty(1)?, vec![1], FLOAT));
