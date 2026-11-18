@@ -49,7 +49,7 @@ impl FromStr for TaskKind {
 ///
 /// This is the one storage-dtype vocabulary shared by the config surface and the
 /// on-disk artifact directories. Model *import* dtypes are a separate concern
-/// (`model_artifact::ModelTensorDType`), since a checkpoint weight may be
+/// (`format::model::ModelTensorDType`), since a checkpoint weight may be
 /// `i64`/`f64`/`u8` that a cache never stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StorageDType {

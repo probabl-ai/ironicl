@@ -12,12 +12,12 @@ use memmap2::Advice;
 use memmap2::{Mmap, MmapMut, MmapOptions};
 
 use crate::{
-    artifact::{
+    config::StorageDType,
+    error::{Error, Result},
+    format::{
         ByteReader, CHECKSUM_BYTES, TENSOR_ALIGNMENT, align_up, pad_to_alignment, sha256, write_u16,
         write_u32, write_u64,
     },
-    config::StorageDType,
-    error::{Error, Result},
 };
 
 /// Magic bytes at the start of a static-context artifact.

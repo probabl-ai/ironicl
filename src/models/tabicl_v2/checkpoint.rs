@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     TaskKind,
     error::{Error, Result},
-    model_artifact::{ModelArtifactData, ModelConfig, ModelTensor, ModelTensorDType, write_model_artifact},
+    format::model::{ModelArtifactData, ModelConfig, ModelTensor, ModelTensorDType, write_model_artifact},
 };
 
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;

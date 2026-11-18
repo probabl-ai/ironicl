@@ -25,6 +25,7 @@ use crate::progress::Stage;
 use crate::{
     Error, ModelArtifact, QueryRequest, RegressionOutput, Request, Result, StaticContextArtifact,
     StaticContextMetadata, StaticContextTensor, StaticContextTensorData, StaticQueryBundle, TaskKind,
+    format::static_context::{PageAlignedTensors, TensorStorage},
     kernels::{
         cpu::{
             Bf16AffineCompensation, PackedBf16Affine, PackedF32Affine, packed_bf16_affine_supported,
@@ -42,7 +43,6 @@ use crate::{
     models::tabicl_v2::execution_plan::ExecutionPlan,
     models::tabicl_v2::quantiles::summarize,
     profile::{self, Category},
-    static_context::{PageAlignedTensors, TensorStorage},
 };
 
 pub(crate) const COLUMN_DIM: usize = 128;
@@ -1857,8 +1857,8 @@ impl StaticExecutor {
                 .collect()
         };
         // ICL caches in whatever type the context stores, as raw bytes.
-        let icl = |kind: &str| -> Option<(Vec<&[u8]>, crate::static_context::TensorStorage)> {
-            use crate::static_context::TensorStorage;
+        let icl = |kind: &str| -> Option<(Vec<&[u8]>, crate::format::static_context::TensorStorage)> {
+            use crate::format::static_context::TensorStorage;
             let mut storage = None;
             let blocks = (0..ICL_BLOCKS)
                 .map(|block| {
@@ -3851,7 +3851,7 @@ fn validate_class_count(task: TaskKind, classes: usize) -> Result<()> {
 }
 
 fn model_hash_matches(model_hash: &[u8], context_hash: &[u8; 32]) -> bool {
-    model_hash == crate::artifact::encode_sha256(context_hash).as_bytes()
+    model_hash == crate::format::encode_sha256(context_hash).as_bytes()
 }
 
 /// Pack FP32 context tensors into page-aligned memory: the tensors `reduced`

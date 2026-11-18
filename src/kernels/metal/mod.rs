@@ -15,7 +15,7 @@ use objc2_metal_performance_shaders_graph::{
     MPSGraphExecutionDescriptor, MPSGraphOptimization, MPSGraphTensor, MPSGraphTensorData,
 };
 
-use crate::{Error, Result, static_context::TensorStorage};
+use crate::{Error, Result, format::static_context::TensorStorage};
 
 /// The `MPSGraph` element type for a stored tensor type.
 pub(crate) fn kind(storage: TensorStorage) -> MPSDataType {
@@ -146,7 +146,7 @@ impl Gpu {
             pointer,
             bytes
                 .len()
-                .next_multiple_of(crate::static_context::TENSOR_PAGE_BYTES),
+                .next_multiple_of(crate::format::static_context::TENSOR_PAGE_BYTES),
         )
     }
 
