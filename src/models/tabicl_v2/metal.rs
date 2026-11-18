@@ -392,8 +392,8 @@ struct Prepared {
 // SAFETY: after `new`, `graph`, the tensors, and the bindings are only used by
 // `prepare` and `run`, which hold the `prepared` lock, so one thread at a time
 // compiles or runs this graph and writes its input buffer. The `Gpu` device and
-// queue are thread-safe (`Send + Sync` in objc2-metal); its descriptors are
-// shared with other graphs but only read. Retain and release are atomic.
+// queue are thread-safe (`Send + Sync` in objc2-metal), and descriptors are made
+// per compile and run, never shared. Retain and release are atomic.
 unsafe impl Send for PredictGraph {}
 // SAFETY: as above.
 unsafe impl Sync for PredictGraph {}
@@ -546,7 +546,7 @@ impl PredictGraph {
                     &NSDictionary::from_retained_objects(&tensors, &types),
                     &NSArray::from_slice(&[&*self.logits]),
                     None,
-                    Some(&self.gpu.compilation),
+                    Some(&Gpu::compilation()),
                 )
         };
         // SAFETY: a property read of the executable compiled above.
@@ -612,6 +612,11 @@ impl PredictGraph {
         if !fill(input, rows) {
             return Ok(None);
         }
+        // SAFETY: as for `input`: the output buffer holds `b * rows * outputs >= 1` floats, and
+        // the held lock excludes other writers and the GPU, which is not running.
+        let first = unsafe { &mut *prepared.output.contents().as_ptr().cast::<f32>() };
+        // NaN until the run writes it: a run that fails without a word leaves it.
+        *first = f32::NAN;
         // SAFETY: `executable_execution` waits until completion; the tensor data in
         // `prepared` may not retain their buffers, but `prepared` and `self.bindings`
         // do, and the page-aligned caches outlive `self` (`GpuContext::_storage`).
@@ -622,7 +627,7 @@ impl PredictGraph {
                     &self.gpu.queue,
                     &prepared.inputs,
                     Some(&prepared.results),
-                    Some(&self.gpu.executable_execution),
+                    Some(&Gpu::executable_execution()),
                 );
         }
         // SAFETY: the synchronous run above finished, the shared buffer holds
@@ -633,6 +638,9 @@ impl PredictGraph {
                 b * rows * self.outputs,
             )
         };
+        if output[0].is_nan() {
+            return Err(metal_error("the GPU run failed or wrote NaN"));
+        }
         Ok(Some(
             output
                 .chunks_exact(rows * self.outputs)
@@ -805,7 +813,8 @@ pub(crate) fn build_context(
             Ok((tensor, buffer, dimensions, kind))
         })
         .collect::<Result<Vec<Binding>>>()?;
-    outputs.push((largest, gpu.empty(1)?, vec![1], FLOAT));
+    // NaN until the run writes it, so a run that fails without a word fails the check below.
+    outputs.push((largest, gpu.buffer(&[f32::NAN])?, vec![1], FLOAT));
     let bindings = builder.bindings.into_inner();
     gpu.run(
         &builder.graph,
@@ -813,7 +822,7 @@ pub(crate) fn build_context(
         &outputs.iter().collect::<Vec<_>>(),
     );
     // SAFETY: `gpu.run` returned after the GPU finished, and the last output is a
-    // live shared buffer of one float (`gpu.empty(1)`); any bit pattern is an `f32`.
+    // live shared buffer of one float (`gpu.buffer`); any bit pattern is an `f32`.
     let largest = unsafe { *outputs[outputs.len() - 1].1.contents().as_ptr().cast::<f32>() };
     if !largest.is_finite() {
         return Err(metal_error("the built context contains a non-finite value"));
