@@ -40,6 +40,7 @@ use crate::{
         },
     },
     memory::{Builder, ContextShape, MemoryLimits, Plan, Pools, Storage},
+    models::tabicl_v2::Device,
     models::tabicl_v2::execution_plan::ExecutionPlan,
     models::tabicl_v2::quantiles::summarize,
     profile::{self, Category},
@@ -293,25 +294,6 @@ pub struct Executor {
     cuda_weights: Arc<OnceLock<Result<Option<Arc<crate::models::tabicl_v2::cuda::ModelWeights>>>>>,
 }
 
-/// One context's Metal buffers and the graph that reads them.
-#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-struct GpuContext {
-    predict: crate::models::tabicl_v2::metal::PredictGraph,
-    /// How queries split into graph runs, `(chunk, small)` from
-    /// [`crate::models::tabicl_v2::metal::PredictGraph::query_split`], which keeps the buckets the
-    /// graph keeps within the device's share of memory.
-    split: (usize, usize),
-    /// Keeps page-aligned context memory alive while GPU buffers wrap it.
-    _storage: Option<Arc<memmap2::Mmap>>,
-}
-
-#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-impl std::fmt::Debug for GpuContext {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("GpuContext")
-    }
-}
-
 /// Attention keys and values in head-major `[heads, rows, head_dim]` order.
 type KeyValue = (Vec<f32>, Vec<f32>);
 
@@ -339,10 +321,7 @@ pub struct StaticExecutor {
     bf16_dense_compensation: Bf16AffineCompensation,
     isa: crate::kernels::cpu::Isa,
     sparse_attention_stats: Arc<SparseAttentionStats>,
-    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-    gpu: Option<Arc<GpuContext>>,
-    #[cfg(feature = "cuda")]
-    cuda: Option<Arc<crate::models::tabicl_v2::cuda::Predictor>>,
+    device: Device,
 }
 
 /// Sparse ICL attention decisions since the last reset.
@@ -1733,29 +1712,17 @@ impl StaticExecutor {
             bf16_dense_compensation,
             isa: crate::kernels::cpu::Isa::detect(),
             sparse_attention_stats: Arc::new(SparseAttentionStats::default()),
-            #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-            gpu: None,
-            #[cfg(feature = "cuda")]
-            cuda: None,
+            device: Device::Cpu,
         }
         .with_gpu(limits)
     }
 
-    /// Where predictions run: `"cuda"` with the ICL cache on the GPU,
-    /// `"cuda-streamed"` with it streamed from host memory on every pass, or
-    /// `"cpu"` (Metal included).
+    /// Where predictions run: `"metal"`, `"cuda"` with the ICL cache on the
+    /// GPU, `"cuda-streamed"` with it streamed from host memory on every pass,
+    /// or `"cpu"`.
     #[must_use]
-    #[cfg_attr(not(feature = "cuda"), allow(clippy::unused_self))]
     pub fn device(&self) -> &'static str {
-        #[cfg(feature = "cuda")]
-        if let Some(predictor) = &self.cuda {
-            return if predictor.streamed() {
-                "cuda-streamed"
-            } else {
-                "cuda"
-            };
-        }
-        "cpu"
+        self.device.name()
     }
 
     /// Query rows a prediction should bring at once: a streamed pass's, so
@@ -1764,7 +1731,7 @@ impl StaticExecutor {
     #[cfg_attr(not(feature = "cuda"), allow(clippy::unused_self))]
     pub fn batch_rows(&self) -> Option<usize> {
         #[cfg(feature = "cuda")]
-        if let Some(predictor) = &self.cuda
+        if let Device::Cuda(predictor) = &self.device
             && predictor.streamed()
         {
             return Some(predictor.pass_rows());
@@ -1829,7 +1796,9 @@ impl StaticExecutor {
             built,
         )?;
         // Without room even to stream the ICL cache, the CPU predicts.
-        self.cuda = predictor.map(Arc::new);
+        if let Some(predictor) = predictor {
+            self.device = Device::Cuda(Arc::new(predictor));
+        }
         Ok(self)
     }
 
@@ -1907,7 +1876,7 @@ impl StaticExecutor {
             self.context.page_aligned_storage().is_some(),
         )?;
         let (budget, _) = crate::memory::device_share(shared_gpu_pools(gpu_weights.gpu(), limits));
-        self.gpu = Some(Arc::new(GpuContext {
+        self.device = Device::Metal(Arc::new(crate::models::tabicl_v2::metal::GpuContext {
             split: predict.query_split(budget),
             predict,
             _storage: self.context.page_aligned_storage().cloned(),
@@ -1928,7 +1897,7 @@ impl StaticExecutor {
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
     fn predict_logits_gpu(
         &self,
-        gpu: &GpuContext,
+        gpu: &crate::models::tabicl_v2::metal::GpuContext,
         request: QueryRequest<'_>,
         values: &mut [f32],
     ) -> Result<bool> {
@@ -1991,7 +1960,7 @@ impl StaticExecutor {
         }
         let classes = self.outputs()?;
         #[cfg(feature = "cuda")]
-        if let Some(cuda) = &self.cuda {
+        if let Device::Cuda(cuda) = &self.device {
             let (b, q, h) = (
                 metadata.ensemble_count,
                 request.query_rows(),
@@ -2078,7 +2047,7 @@ impl StaticExecutor {
     #[allow(clippy::unused_self)] // Without Metal.
     fn query_split(&self) -> (usize, usize) {
         #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-        if let Some(gpu) = &self.gpu {
+        if let Device::Metal(gpu) = &self.device {
             return gpu.split;
         }
         (QUERY_CHUNK_ROWS, QUERY_CHUNK_ROWS)
@@ -2123,7 +2092,7 @@ impl StaticExecutor {
         let ensemble_output_elements =
             checked_product(&[request.query_rows(), shape[2]], "static ensemble output")?;
         #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-        if let Some(gpu) = &self.gpu
+        if let Device::Metal(gpu) = &self.device
             && self.predict_logits_gpu(gpu, request, &mut values)?
         {
             return Ok(DecoderOutputs { shape, values });

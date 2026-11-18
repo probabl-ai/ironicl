@@ -274,9 +274,9 @@ impl Context {
             .collect())
     }
 
-    /// Where predictions run: `"cuda"` with the ICL cache on the GPU,
-    /// `"cuda-streamed"` with it streamed from host memory on every pass, or
-    /// `"cpu"` (Metal included).
+    /// Where predictions run: `"metal"`, `"cuda"` with the ICL cache on the
+    /// GPU, `"cuda-streamed"` with it streamed from host memory on every pass,
+    /// or `"cpu"`.
     #[getter]
     fn device(&self) -> &'static str {
         self.0.device()
