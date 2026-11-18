@@ -58,10 +58,9 @@ class ProgressTest(unittest.TestCase):
         if len(pieces) < 3:
             self.skipTest(f"this device predicts the rows in {len(pieces)} piece(s)")
 
-        # Ctrl-C arrives as the first piece finishes. A thread sending it would race the pieces,
-        # which a GPU can enqueue faster than the thread wakes; raising it here does not.
-        # Python handles it in this callback or at Rust's next check between pieces, and either
-        # way the prediction must stop before its last piece.
+        # Ctrl-C arrives as the first piece finishes. Python handles it in this callback or at
+        # Rust's next check between pieces, and either way the prediction must stop before its
+        # last piece.
         reports = []
 
         def progress(*report):
@@ -69,8 +68,14 @@ class ProgressTest(unittest.TestCase):
             if len(reports) == 1:
                 signal.raise_signal(signal.SIGINT)
 
-        with self.assertRaises(KeyboardInterrupt):
-            model.context_.predict_proba(rows, 0.9, False, progress)
+        # A process started in the background inherits SIGINT ignored, and Python then keeps it
+        # ignored: install the handler that raises KeyboardInterrupt for this test.
+        previous = signal.signal(signal.SIGINT, signal.default_int_handler)
+        try:
+            with self.assertRaises(KeyboardInterrupt):
+                model.context_.predict_proba(rows, 0.9, False, progress)
+        finally:
+            signal.signal(signal.SIGINT, previous)
         self.assertLess(len(reports), len(pieces))
 
 
