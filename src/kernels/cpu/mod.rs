@@ -1,6 +1,11 @@
 //! CPU kernels, chosen after runtime feature checks: the operations in
 //! `ops`, with the instruction-set versions in `arch`.
 
+// The AArch64 kernels are NEON code gated on the architecture; a target without NEON (a
+// soft-float one) must not build them.
+#[cfg(all(target_arch = "aarch64", not(target_feature = "neon")))]
+compile_error!("Ironicl's AArch64 kernels need NEON");
+
 #[allow(
     clippy::wildcard_imports,
     reason = "each file reaches its siblings through the cpu module; which items exist differs per target"

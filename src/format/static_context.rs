@@ -554,6 +554,12 @@ impl StaticContextArtifact {
                 "mapped FP32 contexts require a little-endian host",
             ));
         }
+        // The file may have changed size since its metadata was read: check what was mapped.
+        if !(HEADER_BYTES + CHECKSUM_BYTES..=MAX_ARTIFACT_BYTES).contains(&mapping.len()) {
+            return Err(artifact_error(
+                "static context length is outside the resource limit",
+            ));
+        }
         let checksum_offset = mapping.len() - CHECKSUM_BYTES;
         if sha256(&mapping[..checksum_offset]).as_slice() != &mapping[checksum_offset..] {
             return Err(artifact_error("static context checksum does not match"));

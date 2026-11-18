@@ -763,7 +763,9 @@ mod platform {
     pub(super) fn host_memory() -> Option<HostMemory> {
         const HOST_VM_INFO64: i32 = 4;
         unsafe extern "C" {
+            static mach_task_self_: u32;
             fn mach_host_self() -> u32;
+            fn mach_port_deallocate(task: u32, name: u32) -> i32;
             fn host_page_size(host: u32, page_size: *mut usize) -> i32;
             fn host_statistics64(host: u32, flavor: i32, info: *mut i32, count: *mut u32) -> i32;
             fn sysctlbyname(
@@ -780,17 +782,20 @@ mod platform {
         // SAFETY: `VmStatistics64` mirrors `struct vm_statistics64` (152 bytes, so `count` is
         // `HOST_VM_INFO64_COUNT` = 38 words); `page_size` is a `vm_size_t` (usize), the name is
         // NUL-terminated, `total` holds `length` bytes, and every out-pointer is a live local.
+        // `mach_host_self` adds a send right to the host port, released after the queries;
+        // `mach_task_self_` is the task's port, set before `main`.
         let ok = unsafe {
             let host = mach_host_self();
-            host_page_size(host, &raw mut page_size) == 0
-                && host_statistics64(host, HOST_VM_INFO64, (&raw mut stats).cast(), &raw mut count) == 0
-                && sysctlbyname(
-                    c"hw.memsize".as_ptr(),
-                    (&raw mut total).cast(),
-                    &raw mut length,
-                    std::ptr::null(),
-                    0,
-                ) == 0
+            let ok = host_page_size(host, &raw mut page_size) == 0
+                && host_statistics64(host, HOST_VM_INFO64, (&raw mut stats).cast(), &raw mut count) == 0;
+            mach_port_deallocate(mach_task_self_, host);
+            ok && sysctlbyname(
+                c"hw.memsize".as_ptr(),
+                (&raw mut total).cast(),
+                &raw mut length,
+                std::ptr::null(),
+                0,
+            ) == 0
         };
         if !ok || length != size_of::<u64>() {
             return None;
