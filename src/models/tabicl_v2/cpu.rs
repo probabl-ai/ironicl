@@ -25,7 +25,6 @@ use crate::progress::Stage;
 use crate::{
     Error, ModelArtifact, QueryRequest, RegressionOutput, Request, Result, StaticContextArtifact,
     StaticContextMetadata, StaticContextTensor, StaticContextTensorData, StaticQueryBundle, TaskKind,
-    execution_plan::ExecutionPlan,
     kernels::{
         cpu::{
             Bf16AffineCompensation, PackedBf16Affine, PackedF32Affine, packed_bf16_affine_supported,
@@ -40,8 +39,9 @@ use crate::{
         },
     },
     memory::{Builder, ContextShape, MemoryLimits, Plan, Pools, Storage},
+    models::tabicl_v2::execution_plan::ExecutionPlan,
+    models::tabicl_v2::quantiles::summarize,
     profile::{self, Category},
-    quantiles::summarize,
     static_context::{PageAlignedTensors, TensorStorage},
 };
 

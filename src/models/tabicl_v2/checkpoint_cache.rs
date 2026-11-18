@@ -5,9 +5,9 @@ use std::{
 
 use crate::{
     CheckpointCacheOptions, ModelArtifactSummary, ModelProfile,
-    checkpoint::{checkpoint_sha256, inspect_checkpoint},
     error::{Error, Result},
     import_checkpoint, inspect_model_artifact,
+    models::tabicl_v2::checkpoint::{checkpoint_sha256, inspect_checkpoint},
 };
 
 /// Result of preparing a checkpoint for execution.
