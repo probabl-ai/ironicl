@@ -504,7 +504,7 @@ fn print_help(topic: Option<HelpTopic>) {
                --cache kv|repr\n\
                --weights fp32|bf16|int8\n\
                --kv-dtype fp32|bf16|int8\n\
-               --backend auto|portable|zen5\n\
+               --isa auto|portable|neon|avx512\n\
                --bandwidth-gbps N"
         }
     };
