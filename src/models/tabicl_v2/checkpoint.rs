@@ -1038,7 +1038,7 @@ impl PicklePreflight {
     }
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines, reason = "one flat match over the pickle opcodes")]
 fn preflight_pickle(bytes: &[u8]) -> Result<()> {
     let mut cursor = PickleCursor::new(bytes);
     let mut state = PicklePreflight::new();

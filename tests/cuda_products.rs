@@ -13,7 +13,10 @@ fn values(len: usize, seed: u64) -> Vec<f32> {
             state = state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1_442_695_040_888_963_407);
-            #[allow(clippy::cast_precision_loss)]
+            #[allow(
+                clippy::cast_precision_loss,
+                reason = "test data from small integer indices, exact in f32"
+            )]
             let unit = (state >> 40) as f32 / (1u64 << 24) as f32;
             (unit - 0.5) * 0.2
         })
@@ -25,7 +28,10 @@ fn gelu(v: f64) -> f64 {
 }
 
 /// `act(x wᵀ + b)` in FP64, its inputs first rounded to FP16 when `half`.
-#[allow(clippy::many_single_char_names)]
+#[allow(
+    clippy::many_single_char_names,
+    reason = "m, n, k name the product's dimensions"
+)]
 fn product(x: &[f64], w: &[f32], b: &[f32], (m, n, k): (usize, usize, usize), half: bool) -> Vec<f64> {
     let round = |v: f64| {
         if half {

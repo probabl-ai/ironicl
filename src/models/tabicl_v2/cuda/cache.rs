@@ -7,7 +7,7 @@
 //! makes the kernels wait for a block's copy, and [`IclCache::release`] marks
 //! the slot free once the block's kernels are queued and stages the block two
 //! ahead into it.
-#![allow(unsafe_code)] // Asynchronous copies from pinned staging buffers.
+#![expect(unsafe_code, reason = "Asynchronous copies from pinned staging buffers")]
 
 use std::sync::Arc;
 

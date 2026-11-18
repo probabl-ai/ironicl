@@ -3,7 +3,10 @@
 //! Python owns validation and preprocessing. This module loads the model,
 //! builds the training context, and predicts against it.
 
-#![allow(clippy::needless_pass_by_value)] // PyO3 and `map_err` pass arguments by value.
+#![expect(
+    clippy::needless_pass_by_value,
+    reason = "PyO3 and `map_err` pass arguments by value"
+)]
 
 use std::{
     path::PathBuf,
@@ -108,7 +111,7 @@ impl Model {
     /// `"auto"`, or `"fast"`. The memory limits are sizes such as `"16G"`;
     /// `None` reads `IRONICL_MEMORY_LIMIT` and `IRONICL_DEVICE_MEMORY_LIMIT`.
     /// `progress` receives `("build", estimators built, estimators)`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments, reason = "mirrors the Python call's parameters")]
     #[pyo3(signature = (
         x, y_train, class_permutations, feature_permutations, optimize, threads,
         memory_limit=None, device_memory_limit=None, progress=None,
@@ -323,7 +326,7 @@ impl Context {
 #[pyo3(signature = (
     task, estimators, rows, features, optimize, memory_limit=None, device_memory_limit=None, load=false,
 ))]
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments, reason = "mirrors the Python call's parameters")]
 fn plan_memory<'py>(
     py: Python<'py>,
     task: &str,

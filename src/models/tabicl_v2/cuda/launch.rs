@@ -12,7 +12,7 @@
 //! their buffers: a buffer dropped while a queued kernel still uses it (such
 //! as `peaks` in `Device::encode_fp8`) relies on `cuMemFree` synchronizing
 //! with the device.
-#![allow(unsafe_code)] // Launches of kernels that trust their grid and shapes.
+#![expect(unsafe_code, reason = "Launches of kernels that trust their grid and shapes")]
 
 use cuda_core::{DeviceBuffer, DeviceCopy, LaunchConfig};
 
@@ -82,7 +82,6 @@ impl Unused {
 
     /// The FP32, FP16 high, and low outputs of a kernel writing `out`, empty
     /// where it writes none, and the format code its `store_activation` takes.
-    #[allow(clippy::type_complexity)]
     fn outputs<'a>(
         &'a mut self,
         out: Option<Output<'a>>,
@@ -129,7 +128,10 @@ pub(super) struct SmallAttention {
 /// `u32::MAX` values (see `build::plan`), and a prediction's counts are per
 /// run of at most 1024 rows, except the query rows `total` and `start`, which
 /// feed only bounds-checked reads and the `missing` offset.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "callers pass sizes the build plan caps below u32::MAX"
+)]
 const fn n(value: usize) -> u32 {
     value as u32
 }
@@ -845,7 +847,10 @@ impl Device {
     /// next product's operand), or both: on tensor cores from an FP16 or split
     /// `input`, else on the CUDA cores, which write FP32 only into `out`,
     /// through split-K partial sums in `partial`.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a launcher takes its kernel's buffers and shape as plain arguments"
+    )]
     pub(super) fn product(
         &self,
         input: Activation<'_>,

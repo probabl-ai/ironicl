@@ -1,18 +1,32 @@
 //! `TabICLv2`'s fused kernels: the 128-wide transformer block head and tail, and the column block.
 
-#![allow(
-    unsafe_code, // Shared memory, tensor-core intrinsics, and unchecked indexing.
-    clippy::no_mangle_with_rust_abi, // How cuda-oxide's `#[kernel]` exports entries.
-    clippy::too_many_arguments, // A kernel's parameters are its launch ABI.
-    clippy::too_many_lines,
-    clippy::many_single_char_names, // The math's names: q, k, v, m, n, k.
-    clippy::similar_names, // Paired high and low parts: `w_hi`, `w_lo`.
-    clippy::needless_range_loop, // `#[unroll]` loops over register-array indices.
-    clippy::inline_always, // Device helpers inline into their kernels.
-    clippy::cast_ptr_alignment, // Vector loads at offsets aligned by construction.
-    clippy::items_after_statements, // `#[launch_bounds]` expands ahead of a kernel's shared statics.
-    clippy::wildcard_imports, // The other ops, through ops/mod.rs.
+#![expect(
+    unsafe_code,
+    reason = "shared memory, tensor-core intrinsics, and unchecked indexing; each unsafe block states its invariant"
 )]
+#![expect(
+    clippy::no_mangle_with_rust_abi,
+    reason = "cuda-oxide exports kernels and device functions with #[no_mangle] and the Rust ABI"
+)]
+#![expect(
+    clippy::too_many_arguments,
+    reason = "a kernel's parameters are its launch ABI, which device bodies take on"
+)]
+#![expect(clippy::too_many_lines, reason = "a kernel body is one loop nest, kept whole")]
+#![expect(clippy::many_single_char_names, reason = "the math's names: q, k, v, m, n, k")]
+#![expect(
+    clippy::similar_names,
+    reason = "paired high and low parts such as w_hi and w_lo"
+)]
+#![expect(
+    clippy::needless_range_loop,
+    reason = "#[unroll] loops index register arrays in step"
+)]
+#![expect(
+    clippy::cast_ptr_alignment,
+    reason = "vector loads at offsets aligned by construction"
+)]
+#![allow(clippy::wildcard_imports, reason = "the other ops, through ops/mod.rs")]
 
 use cuda_device::vector::F32x4;
 use cuda_device::wmma::{ldmatrix_x4, mma_m16n8k16_f32_f16};

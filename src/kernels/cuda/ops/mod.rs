@@ -1,8 +1,6 @@
 //! The device code the kernels in `kernels.rs` call: cuda-oxide compiles
 //! every function reachable from a kernel, wherever it lives in the crate.
 
-#![allow(clippy::wildcard_imports)] // One namespace for the kernels and their ops.
-
 pub(crate) mod attention;
 pub(crate) mod fp8;
 pub(crate) mod linear;

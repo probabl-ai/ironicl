@@ -1,15 +1,5 @@
 //! Affine layers: packed FP32 and BF16 weights, and their portable paths.
 
-#![allow(
-    unsafe_code,
-    clippy::needless_range_loop,
-    clippy::similar_names,
-    clippy::too_many_lines,
-    clippy::cast_precision_loss,
-    clippy::missing_transmute_annotations,
-    clippy::wildcard_imports // Sibling items differ per target.
-)]
-
 use crate::kernels::cpu::*;
 
 pub(crate) const MIN_SIMD_INPUT_DIM: usize = 16;
@@ -181,7 +171,10 @@ impl PackedBf16Affine {
     }
 
     /// Execute with optional first-order input and weight residual terms.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a kernel takes its buffers and their shape as plain arguments"
+    )]
     pub(crate) fn run_f32_compensated(
         &self,
         input: &[f32],
@@ -315,7 +308,6 @@ pub(crate) fn affine_packed_bf16_for_target(
 /// Run a native affine kernel when this host has a supported SIMD implementation.
 ///
 /// The caller validates all slice lengths and dimensions before calling this function.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn affine_f32(
     input: &[f32],
     rows: usize,

@@ -1,20 +1,18 @@
 //! `WebAssembly` kernels: SIMD128.
 
-#![allow(
+#![expect(
     unsafe_code,
-    clippy::needless_range_loop,
-    clippy::similar_names,
-    clippy::too_many_lines,
-    clippy::cast_precision_loss,
-    clippy::missing_transmute_annotations,
-    clippy::wildcard_imports // Sibling items differ per target.
+    reason = "SIMD128 loads and stores; each unsafe block states its invariant"
 )]
 
 use crate::kernels::cpu::*;
 
 /// Scores are an affine product of query rows with key rows, then scaled.
 #[cfg(all(target_family = "wasm", target_feature = "simd128"))]
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn attention_score_tile_for_target(
     _backend: Isa,
     query: &[f32],
@@ -38,7 +36,6 @@ pub(crate) fn attention_score_tile_for_target(
 /// accumulate in order, as in the portable loop, but each product rounds
 /// before its sum: WebAssembly has no fused multiply-add.
 #[cfg(all(target_family = "wasm", target_feature = "simd128"))]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn attention_value_tile_fma_for_target(
     _backend: Isa,
     weights: &[f32],
@@ -99,7 +96,7 @@ pub(crate) fn attention_value_simd128_rows<const ROWS: usize>(
 }
 
 #[cfg(all(target_family = "wasm", target_feature = "simd128"))]
-#[allow(clippy::unnecessary_wraps)] // The other targets' signature.
+#[expect(clippy::unnecessary_wraps, reason = "The other targets' signature")]
 pub(crate) fn attention_dot_for_target(_backend: Isa, left: &[f32], right: &[f32]) -> Option<f32> {
     use core::arch::wasm32::{f32x4_add, f32x4_mul, f32x4_splat};
 
@@ -219,7 +216,10 @@ pub(crate) fn affine_simd128_rows<const ROWS: usize>(
 }
 
 #[cfg(all(target_family = "wasm", target_feature = "simd128"))]
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn affine_simd128_block<const ROWS: usize, const CHANNELS: usize>(
     input: &[f32],
     row: usize,

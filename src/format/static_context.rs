@@ -43,7 +43,7 @@ const MAX_CLASS_COUNT: usize = 4096;
 
 /// `bytes`, or the largest possible allocation (`isize::MAX`) where that is
 /// smaller, as on 32-bit WebAssembly.
-#[allow(clippy::cast_possible_truncation)] // Only after checking that it fits.
+#[expect(clippy::cast_possible_truncation, reason = "Only after checking that it fits")]
 const fn byte_limit(bytes: u64) -> usize {
     const LARGEST: usize = usize::MAX >> 1;
     if bytes > LARGEST as u64 {
@@ -155,8 +155,8 @@ enum StaticContextStorage {
     /// page multiple, so a GPU can wrap each tensor without copying it.
     #[cfg_attr(
         not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
-        allow(dead_code)
-    )] // Metal only.
+        allow(dead_code, reason = "only the Metal build uses page-aligned storage")
+    )]
     PageAligned(Arc<Mmap>),
 }
 
@@ -164,16 +164,16 @@ enum StaticContextStorage {
 /// multiple of 4 KiB pages elsewhere.
 #[cfg_attr(
     not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
-    allow(dead_code)
-)] // Metal only.
+    allow(dead_code, reason = "only the Metal build uses page-aligned storage")
+)]
 pub(crate) const TENSOR_PAGE_BYTES: usize = 16 * 1024;
 
 /// FP32, FP16, or BF16 tensors being written into page-aligned anonymous memory, for
 /// [`StaticContextArtifact::from_page_aligned`].
 #[cfg_attr(
     not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
-    allow(dead_code)
-)] // Metal only.
+    allow(dead_code, reason = "only the Metal build uses page-aligned storage")
+)]
 pub(crate) struct PageAlignedTensors {
     mapping: MmapMut,
     /// Name, dimensions, element type, byte offset, and byte length of each tensor.
@@ -184,8 +184,8 @@ pub(crate) struct PageAlignedTensors {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(
     not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
-    allow(dead_code)
-)] // Metal only.
+    allow(dead_code, reason = "only the Metal build uses page-aligned storage")
+)]
 pub(crate) enum TensorStorage {
     Fp32,
     F16,
@@ -194,8 +194,8 @@ pub(crate) enum TensorStorage {
 
 #[cfg_attr(
     not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
-    allow(dead_code)
-)] // Metal only.
+    allow(dead_code, reason = "only the Metal build uses page-aligned storage")
+)]
 impl TensorStorage {
     pub(crate) const fn bytes(self) -> usize {
         match self {
@@ -207,8 +207,8 @@ impl TensorStorage {
 
 #[cfg_attr(
     not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
-    allow(dead_code)
-)] // Metal only.
+    allow(dead_code, reason = "only the Metal build uses page-aligned storage")
+)]
 impl PageAlignedTensors {
     /// Reserve zeroed, page-aligned space for each `(name, dimensions, storage)`.
     pub(crate) fn new(specs: Vec<(String, Vec<u64>, TensorStorage)>) -> Result<Self> {
@@ -263,7 +263,10 @@ impl PageAlignedTensors {
 
     /// Each tensor's bytes, in the order given to [`Self::new`], for writing
     /// in its storage type.
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))] // CUDA only.
+    #[cfg_attr(
+        not(feature = "cuda"),
+        allow(dead_code, reason = "only the CUDA build fills tensors in place")
+    )]
     pub(crate) fn tensors_mut(&mut self) -> Vec<&mut [u8]> {
         let mut rest = &mut self.mapping[..];
         let mut at = 0;
@@ -375,8 +378,8 @@ impl StaticContextArtifact {
     /// Returns [`Error::Artifact`] when metadata, names, or shapes are invalid.
     #[cfg_attr(
         not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
-        allow(dead_code)
-    )] // Metal only.
+        allow(dead_code, reason = "only the Metal build uses page-aligned storage")
+    )]
     pub(crate) fn from_page_aligned(
         metadata: StaticContextMetadata,
         tensors: PageAlignedTensors,
@@ -423,8 +426,8 @@ impl StaticContextArtifact {
     /// The page-aligned memory holding every tensor, if the artifact has it.
     #[cfg_attr(
         not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
-        allow(dead_code)
-    )] // Metal only.
+        allow(dead_code, reason = "only the Metal build uses page-aligned storage")
+    )]
     pub(crate) fn page_aligned_storage(&self) -> Option<&Arc<Mmap>> {
         match &self.storage {
             StaticContextStorage::PageAligned(mapping) => Some(mapping),
@@ -499,7 +502,10 @@ impl StaticContextArtifact {
         Self::read_mapped_file(&file, length, true)
     }
 
-    #[allow(unsafe_code)]
+    #[expect(
+        unsafe_code,
+        reason = "memory-maps the artifact file; see the SAFETY comments"
+    )]
     fn read_mapped_file(file: &File, length: usize, prefault: bool) -> Result<Self> {
         if !(HEADER_BYTES + CHECKSUM_BYTES..=MAX_ARTIFACT_BYTES).contains(&length) {
             return Err(artifact_error(
@@ -527,7 +533,7 @@ impl StaticContextArtifact {
     }
 
     /// Verify and decode a mapped artifact, borrowing its tensors from `mapping`.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines, reason = "one pass over the format, field by field")]
     fn from_mapping(mapping: Mmap) -> Result<Self> {
         if !cfg!(target_endian = "little") {
             return Err(artifact_error(
@@ -846,7 +852,7 @@ impl StaticContextArtifact {
 
     /// The header, permutations, tensor directory, and padding that precede
     /// the payload, and the whole encoded length.
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines, reason = "one pass over the format, field by field")]
     fn head(&self) -> Result<(Vec<u8>, usize)> {
         // Version 1 when every tensor is FP32; version 2 tags each tensor's dtype.
         let version = if self
@@ -1190,7 +1196,7 @@ fn artifact_error(message: impl std::fmt::Display) -> Error {
 /// Ask Windows to start reading a mapping's pages, like `madvise(WILLNEED)`.
 /// A hint: failure is ignored. `PrefetchVirtualMemory` needs Windows 8 or later.
 #[cfg(windows)]
-#[allow(unsafe_code)] // One Win32 call; memmap2 does not expose it.
+#[expect(unsafe_code, reason = "One Win32 call; memmap2 does not expose it")]
 fn prefetch(mapping: &Mmap) {
     use windows_sys::Win32::System::{
         Memory::{PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY},

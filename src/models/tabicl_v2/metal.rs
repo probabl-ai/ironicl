@@ -7,10 +7,15 @@
 //! keys and values). Model weights live once per model in shared GPU buffers
 //! and are fed to the graphs as placeholders, so contexts do not copy them.
 
-#![allow(unsafe_code)]
-// Objective-C calls; each `unsafe` block states its invariant.
-// Tensor dimensions are model constants or validated sizes far below `isize::MAX`.
-#![allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
+#![expect(
+    unsafe_code,
+    reason = "Objective-C calls; each unsafe block states its invariant"
+)]
+#![allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    reason = "tensor dimensions are model constants or validated sizes far below isize::MAX"
+)]
 
 use std::{collections::HashMap, sync::Mutex};
 
@@ -76,7 +81,7 @@ pub(crate) fn group_features(x: &[f32], rows: usize, h: usize) -> Option<Vec<f32
 
 /// [`group_features`] into `[H, stride, 3]` output, leaving rows past `rows`
 /// untouched. Returns false on the all-missing marker.
-#[allow(clippy::float_cmp)] // The marker is an exact sentinel value.
+#[expect(clippy::float_cmp, reason = "The marker is an exact sentinel value")]
 pub(crate) fn group_features_into(
     x: &[f32],
     (rows, h): (usize, usize),
@@ -131,7 +136,10 @@ impl Builder<'_, '_> {
     /// One pre-norm transformer block: attention with a residual, then a GELU
     /// feed-forward with a residual. `input` is `[lead, q_rows, dim]`. Returns
     /// the output and the head-major keys and values it attended to.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a graph stage takes its inputs, weights, and shape as plain arguments"
+    )]
     fn block(
         &self,
         input: &Tensor,
@@ -398,7 +406,10 @@ impl PredictGraph {
     /// place instead of copied: each must start a page of page-padded memory
     /// that stays alive and unwritten while the graph lives ([`Gpu::wrap`]'s
     /// contract; `GpuContext::_storage` keeps it alive).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a graph stage takes its inputs, weights, and shape as plain arguments"
+    )]
     pub(crate) fn new(
         model: &ModelWeights,
         weights: &Weights<'_, '_>,
@@ -643,7 +654,11 @@ impl PredictGraph {
 /// ICL block's as `[B, 8, N, 64]` in `icl_storage`'s type. Each region must
 /// satisfy [`Gpu::wrap`]'s contract and stay untouched until this returns.
 /// Returns an error if any written value is not finite, including FP16 overflow.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // One linear graph definition.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "One linear graph definition"
+)]
 pub(crate) fn build_context(
     model: &ModelWeights,
     weights: &Weights<'_, '_>,

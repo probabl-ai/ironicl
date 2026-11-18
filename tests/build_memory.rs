@@ -1,5 +1,5 @@
 #![cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-#![allow(unsafe_code)] // One libproc call to read the process's peak footprint.
+#![allow(unsafe_code, reason = "one libproc call to read the process's peak footprint")]
 
 use std::path::Path;
 
@@ -37,7 +37,10 @@ fn executor() -> Executor {
     Executor::new(model)
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "test data from small integer indices, exact in f32"
+)]
 fn value(index: usize) -> f32 {
     ((index * 7919) % 1000) as f32 / 250.0 - 2.0
 }
@@ -48,7 +51,10 @@ fn value(index: usize) -> f32 {
 /// stay near the plan's peak, whatever this machine has free.
 #[test]
 #[ignore = "needs official checkpoint fixtures; run with --ignored once IRONICL_CHECKPOINT_FIXTURES is set. See CONTRIBUTING.md"]
-#[allow(clippy::cast_precision_loss)]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "test data from small integer indices, exact in f32"
+)]
 fn wide_gpu_build_stays_within_the_memory_plan() {
     let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let executor = executor();
@@ -91,7 +97,10 @@ fn wide_gpu_build_stays_within_the_memory_plan() {
 /// fit the device's share, here the memory limit.
 #[test]
 #[ignore = "needs official checkpoint fixtures; run with --ignored once IRONICL_CHECKPOINT_FIXTURES is set. See CONTRIBUTING.md"]
-#[allow(clippy::cast_precision_loss)]
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "test data from small integer indices, exact in f32"
+)]
 fn gpu_predict_keeps_buckets_within_the_memory_limit() {
     let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (b, n, h) = (8, 2_000, 100);

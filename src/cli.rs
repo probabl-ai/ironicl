@@ -151,7 +151,6 @@ fn parse_no_args(args: &[String], topic: HelpTopic, command: Command) -> Result<
     Ok(command)
 }
 
-#[allow(clippy::too_many_lines)]
 fn parse_plan(args: &[String]) -> Result<Command> {
     if is_help(args) {
         return Ok(Command::Help(Some(HelpTopic::Plan)));

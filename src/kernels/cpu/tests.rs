@@ -1,10 +1,6 @@
 #![allow(
-    unsafe_code,
-    clippy::needless_range_loop,
-    clippy::similar_names,
-    clippy::too_many_lines,
     clippy::cast_precision_loss,
-    clippy::missing_transmute_annotations
+    reason = "test data from small integer indices, exact in f32"
 )]
 
 #[cfg(target_arch = "x86_64")]
@@ -23,7 +19,6 @@ fn bf16_to_f32(value: u16) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 #[test]
-#[allow(clippy::float_cmp)]
 fn native_attention_maximum_handles_tails_and_nan() {
     let backend = Isa::detect();
     let mut scores = (0..35).map(|index| index as f32 * 0.25 - 3.0).collect::<Vec<_>>();
@@ -59,7 +54,6 @@ fn packed_bf16_value_layout_groups_source_pairs_by_dimension_lane() {
 
 #[cfg(target_arch = "x86_64")]
 #[test]
-#[allow(clippy::cast_precision_loss)]
 fn packed_bf16_value_dot_matches_quantized_weight_reference() {
     use super::{Isa, attention_value_packed_bf16_dot_f32};
 
@@ -111,7 +105,6 @@ fn packed_bf16_value_dot_matches_quantized_weight_reference() {
 #[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "release-only Zen 5 kernel benchmark"]
-#[allow(clippy::cast_precision_loss)]
 fn benchmark_bf16_value_dot_8x128x64() {
     use std::{hint::black_box, time::Instant};
 
@@ -198,7 +191,6 @@ fn benchmark_bf16_value_dot_8x128x64() {
 }
 
 #[test]
-#[allow(clippy::float_cmp)]
 fn packed_f32_affine_layout_groups_output_lanes_by_input() {
     let input_dim = 3;
     let output_dim = 16;
@@ -221,7 +213,6 @@ fn packed_f32_affine_layout_groups_output_lanes_by_input() {
 
 #[cfg(target_arch = "x86_64")]
 #[test]
-#[allow(clippy::cast_precision_loss, clippy::float_cmp)]
 fn packed_f32_affine_matches_scalar_order() {
     if !std::is_x86_feature_detected!("avx512f") {
         return;
@@ -254,7 +245,6 @@ fn packed_f32_affine_matches_scalar_order() {
 #[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "release-only Zen 5 kernel benchmark"]
-#[allow(clippy::cast_precision_loss)]
 fn benchmark_packed_f32_affine_transformer_shapes() {
     use std::hint::black_box;
     use std::time::Instant;
@@ -355,7 +345,6 @@ fn packed_bf16_affine_layout_groups_input_pairs_by_output_lane() {
 
 #[cfg(target_arch = "x86_64")]
 #[test]
-#[allow(clippy::cast_precision_loss)]
 fn first_order_bf16_affine_tracks_fp32() {
     if !std::is_x86_feature_detected!("avx512bf16") {
         return;
@@ -408,7 +397,6 @@ fn packed_bf16_affine_rejects_unsupported_shapes() {
 
 #[cfg(target_arch = "x86_64")]
 #[test]
-#[allow(clippy::cast_precision_loss)]
 fn packed_bf16_affine_matches_expanded_bf16_reference() {
     if !std::is_x86_feature_detected!("avx512bf16") {
         return;
@@ -454,7 +442,10 @@ fn packed_bf16_affine_matches_expanded_bf16_reference() {
 #[cfg(target_arch = "x86_64")]
 #[test]
 #[ignore = "release-only Zen 5 kernel benchmark"]
-#[allow(clippy::cast_precision_loss)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one benchmark: setup, three timed variants, and checks"
+)]
 fn benchmark_packed_bf16_affine_8x16x512() {
     use std::hint::black_box;
     use std::time::Instant;
@@ -614,7 +605,6 @@ fn benchmark_packed_bf16_affine_8x16x512() {
 
 #[cfg(target_arch = "x86_64")]
 #[test]
-#[allow(clippy::cast_precision_loss)]
 fn softmax_exponential_tracks_exact_exp() {
     let mut maximum_relative_error = 0.0_f32;
     for index in -80_000..=0 {
@@ -658,7 +648,6 @@ fn activation_approximations_track_libm_across_the_useful_domain() {
 }
 
 #[test]
-#[allow(clippy::cast_precision_loss)]
 fn native_activations_match_approximations_with_tails() {
     let input = (0..35)
         .map(|index| (index as f32 - 17.0) * 0.37)
@@ -673,7 +662,6 @@ fn native_activations_match_approximations_with_tails() {
 }
 
 #[test]
-#[allow(clippy::cast_precision_loss)]
 fn native_layer_norm_tracks_scalar_rows() {
     let (rows, width) = (3, 128);
     let input = (0..rows * width)
@@ -702,7 +690,6 @@ fn native_layer_norm_tracks_scalar_rows() {
 }
 
 #[test]
-#[allow(clippy::cast_precision_loss)]
 fn native_affine_matches_scalar_with_a_tail() {
     let rows = 5;
     let input_dim = 19;

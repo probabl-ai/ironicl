@@ -1,15 +1,5 @@
 //! Layer norm.
 
-#![allow(
-    unsafe_code,
-    clippy::needless_range_loop,
-    clippy::similar_names,
-    clippy::too_many_lines,
-    clippy::cast_precision_loss,
-    clippy::missing_transmute_annotations,
-    clippy::wildcard_imports // Sibling items differ per target.
-)]
-
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use crate::kernels::cpu::*;
 

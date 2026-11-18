@@ -15,16 +15,34 @@ use cuda_host::cuda_module;
 
 #[cuda_module]
 #[allow(
-    unsafe_code, // Shared memory, tensor-core intrinsics, and unchecked indexing.
-    clippy::no_mangle_with_rust_abi, // How cuda-oxide's `#[kernel]` exports entries.
-    clippy::too_many_arguments, // A kernel's parameters are its launch ABI.
-    clippy::too_many_lines,
-    clippy::many_single_char_names, // The math's names: q, k, v, m, n, k.
-    clippy::similar_names, // Paired high and low parts: `w_hi`, `w_lo`.
-    clippy::needless_range_loop, // `#[unroll]` loops over register-array indices.
-    clippy::inline_always, // Device helpers inline into their kernels.
-    clippy::cast_ptr_alignment, // Vector loads at offsets aligned by construction.
-    clippy::items_after_statements // `#[launch_bounds]` expands ahead of a kernel's shared statics.
+    unsafe_code,
+    reason = "shared memory, tensor-core intrinsics, and unchecked indexing; each unsafe block states its invariant"
+)]
+#[allow(
+    clippy::no_mangle_with_rust_abi,
+    reason = "cuda-oxide exports kernels and device functions with #[no_mangle] and the Rust ABI"
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "a kernel's parameters are its launch ABI, which device bodies take on"
+)]
+#[allow(clippy::too_many_lines, reason = "a kernel body is one loop nest, kept whole")]
+#[allow(clippy::many_single_char_names, reason = "the math's names: q, k, v, m, n, k")]
+#[allow(
+    clippy::similar_names,
+    reason = "paired high and low parts such as w_hi and w_lo"
+)]
+#[allow(
+    clippy::needless_range_loop,
+    reason = "#[unroll] loops index register arrays in step"
+)]
+#[allow(
+    clippy::cast_ptr_alignment,
+    reason = "vector loads at offsets aligned by construction"
+)]
+#[allow(
+    clippy::items_after_statements,
+    reason = "#[launch_bounds] expands ahead of a kernel's shared statics"
 )]
 pub(crate) mod device {
     use cuda_device::vector::F32x4;
@@ -237,7 +255,7 @@ pub(crate) mod device {
                 sum += values[j];
             }
         }
-        #[allow(clippy::cast_precision_loss)] // At most 512.
+        #[allow(clippy::cast_precision_loss, reason = "At most 512")]
         let count = width as f32;
         let mean = warp::reduce_sum_f32(sum) / count;
         let mut squares = 0.0f32;
@@ -478,7 +496,7 @@ pub(crate) mod device {
             x[base + (f + 2) % h],
             x[base + (f + 4) % h],
         ];
-        #[allow(clippy::float_cmp)] // The all-missing marker is exactly -100.
+        #[allow(clippy::float_cmp, reason = "The all-missing marker is exactly -100")]
         let marked = group[0] == -100.0 && group[1] == -100.0 && group[2] == -100.0;
         if c == 0 && marked {
             // SAFETY: `row < rows`, and the launcher's `missing` holds `start + rows` rows. Not
@@ -845,7 +863,7 @@ pub(crate) mod device {
             let high = f16::from_bits(values[at + 1]) as f32 / scales[pair * 64 + dim + 1];
             bytes = e4m3(low) | (e4m3(high) << 8);
         }
-        #[allow(clippy::cast_possible_truncation)] // Two bytes.
+        #[allow(clippy::cast_possible_truncation, reason = "Two bytes")]
         let bytes = bytes as u16;
         // SAFETY: `i < len = packed.len()` (the launcher); `i` is this thread's own.
         unsafe { *packed.get_unchecked_mut(i) = bytes };

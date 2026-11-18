@@ -1,18 +1,33 @@
 //! Attention: the ICL attention bodies on tensor cores, and attention over 16 keys.
 
-#![allow(
-    unsafe_code, // Shared memory, tensor-core intrinsics, and unchecked indexing.
-    clippy::no_mangle_with_rust_abi, // How cuda-oxide's `#[kernel]` exports entries.
-    clippy::too_many_arguments, // A kernel's parameters are its launch ABI.
-    clippy::too_many_lines,
-    clippy::many_single_char_names, // The math's names: q, k, v, m, n, k.
-    clippy::similar_names, // Paired high and low parts: `w_hi`, `w_lo`.
-    clippy::needless_range_loop, // `#[unroll]` loops over register-array indices.
-    clippy::inline_always, // Device helpers inline into their kernels.
-    clippy::cast_ptr_alignment, // Vector loads at offsets aligned by construction.
-    clippy::items_after_statements, // `#[launch_bounds]` expands ahead of a kernel's shared statics.
-    clippy::wildcard_imports, // The other ops, through ops/mod.rs.
+#![expect(
+    unsafe_code,
+    reason = "shared memory, tensor-core intrinsics, and unchecked indexing; each unsafe block states its invariant"
 )]
+#![expect(
+    clippy::no_mangle_with_rust_abi,
+    reason = "cuda-oxide exports kernels and device functions with #[no_mangle] and the Rust ABI"
+)]
+#![expect(
+    clippy::too_many_arguments,
+    reason = "a kernel's parameters are its launch ABI, which device bodies take on"
+)]
+#![expect(clippy::too_many_lines, reason = "a kernel body is one loop nest, kept whole")]
+#![expect(clippy::many_single_char_names, reason = "the math's names: q, k, v, m, n, k")]
+#![expect(
+    clippy::similar_names,
+    reason = "paired high and low parts such as w_hi and w_lo"
+)]
+#![expect(
+    clippy::needless_range_loop,
+    reason = "#[unroll] loops index register arrays in step"
+)]
+#![expect(
+    clippy::cast_ptr_alignment,
+    reason = "vector loads at offsets aligned by construction"
+)]
+#![expect(clippy::inline_always, reason = "device helpers inline into their kernels")]
+#![allow(clippy::wildcard_imports, reason = "the other ops, through ops/mod.rs")]
 
 use cuda_device::async_copy::{cp_async_cg_16, cp_async_commit_group, cp_async_wait_group};
 use cuda_device::convert::{cvt_f16x2_f32, cvt_f32x2_f16x2};
@@ -149,7 +164,7 @@ pub(crate) fn fast_body<const KW: usize, const DECODE: bool, const HALF: bool, c
                 #[unroll]
                 for w in 0..2 {
                     let word = bytes[t][half * 2 + w];
-                    #[allow(clippy::cast_possible_truncation)] // The word's two halves.
+                    #[expect(clippy::cast_possible_truncation, reason = "The word's two halves")]
                     let (low, high) = (word as u16, (word >> 16) as u16);
                     // SAFETY: `buf < 2`, `row < 64`, chunk `c + half < 8`, and `2 * w + 1 < 4`:
                     // inside the 16-byte chunk at `at`, within `KS` or `VS`; each thread writes its
