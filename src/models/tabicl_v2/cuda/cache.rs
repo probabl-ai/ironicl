@@ -424,9 +424,10 @@ impl IclCache {
             (&mut slot.block.keys, &slot.staged_keys),
             (&mut slot.block.values, &slot.staged_values),
         ] {
-            // SAFETY: the staging buffers stay untouched until `copied`
-            // completes: the next `stage` into this slot and the slot's drop
-            // wait for it.
+            // SAFETY: `from` stays alive and unwritten until `copied`, recorded below, completes:
+            // the next `stage` into this slot and `Slot::drop` synchronize it first. The copy
+            // stream waited above for `released`, so no kernel still reads `to`, and kernels read
+            // it only after `acquire` makes their stream wait for `copied`. Both hold `2 * units`.
             unsafe { to.copy_from_pinned_host_async(stream, from) }.map_err(gpu_error)?;
         }
         slot.copied = Some(stream.record_event(None).map_err(gpu_error)?);

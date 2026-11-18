@@ -25,12 +25,15 @@ pub(crate) struct Builder<'w, 'a> {
     pub(crate) attention: std::cell::Cell<MPSDataType>,
 }
 
-// SAFETY (all methods): plain `MPSGraph` construction. Shapes come from the
-// model's fixed dimensions and weights checked by its artifact.
+// SAFETY (all methods): plain `MPSGraph` construction on `self.graph`. Every
+// tensor argument was made by `self.graph` (each model builds one graph per
+// `Builder`), shapes are `NSNumber` arrays from [`shape`], names are `None`, and
+// no call touches buffer memory. Shapes come from the model's fixed dimensions
+// and weights the model artifact's manifest checks; MPSGraph validates them.
 impl<'w, 'a> Builder<'w, 'a> {
     pub(crate) fn new(model: &'w ModelWeights, weights: &'w Weights<'w, 'a>) -> Self {
-        // SAFETY: see the impl comment.
         Self {
+            // SAFETY: a new, empty graph (impl comment).
             graph: unsafe { MPSGraph::new() },
             weights,
             model,
@@ -48,6 +51,7 @@ impl<'w, 'a> Builder<'w, 'a> {
     }
 
     pub(crate) fn placeholder(&self, dimensions: &[isize]) -> Tensor {
+        // SAFETY: graph construction on `self.graph` (impl comment).
         unsafe {
             self.graph
                 .placeholderWithShape_dataType_name(Some(&shape(dimensions)), FLOAT, None)
@@ -61,6 +65,7 @@ impl<'w, 'a> Builder<'w, 'a> {
 
     /// A placeholder of element type `kind` bound to `buffer`, in that type.
     pub(crate) fn bound_typed(&self, buffer: Buffer, dimensions: &[isize], kind: MPSDataType) -> Tensor {
+        // SAFETY: graph construction on `self.graph` (impl comment).
         let tensor = unsafe {
             self.graph
                 .placeholderWithShape_dataType_name(Some(&shape(dimensions)), kind, None)
@@ -73,9 +78,11 @@ impl<'w, 'a> Builder<'w, 'a> {
 
     /// `input` converted to element type `kind`; a no-op for the same type.
     pub(crate) fn cast(&self, input: &Tensor, kind: MPSDataType) -> Tensor {
+        // SAFETY: a property read of a live tensor (impl comment).
         if unsafe { input.dataType() } == kind {
             return input.clone();
         }
+        // SAFETY: graph construction on `self.graph` (impl comment).
         unsafe { self.graph.castTensor_toType_name(input, kind, None) }
     }
 
@@ -96,6 +103,8 @@ impl<'w, 'a> Builder<'w, 'a> {
 
     pub(crate) fn constant(&self, values: &[f32], dimensions: &[isize]) -> Tensor {
         let bytes = NSData::with_bytes(bytemuck::cast_slice(values));
+        // SAFETY: as the impl comment; `bytes` is an owned copy, and callers pass
+        // exactly `product(dimensions)` values (base scales, `RoPE` tables).
         unsafe {
             self.graph
                 .constantWithData_shape_dataType(&bytes, &shape(dimensions), FLOAT)
@@ -103,10 +112,12 @@ impl<'w, 'a> Builder<'w, 'a> {
     }
 
     pub(crate) fn scalar(&self, value: f64) -> Tensor {
+        // SAFETY: graph construction on `self.graph` (impl comment).
         unsafe { self.graph.constantWithScalar_dataType(value, FLOAT) }
     }
 
     pub(crate) fn zeros(&self, dimensions: &[isize]) -> Tensor {
+        // SAFETY: graph construction on `self.graph` (impl comment).
         unsafe {
             self.graph
                 .constantWithScalar_shape_dataType(0.0, &shape(dimensions), FLOAT)
@@ -114,6 +125,7 @@ impl<'w, 'a> Builder<'w, 'a> {
     }
 
     pub(crate) fn concat(&self, left: &Tensor, right: &Tensor, dimension: isize) -> Tensor {
+        // SAFETY: graph construction on `self.graph` (impl comment).
         unsafe {
             self.graph
                 .concatTensor_withTensor_dimension_name(left, right, dimension, None)
@@ -121,6 +133,7 @@ impl<'w, 'a> Builder<'w, 'a> {
     }
 
     pub(crate) fn add(&self, left: &Tensor, right: &Tensor) -> Tensor {
+        // SAFETY: graph construction on `self.graph` (impl comment).
         unsafe {
             self.graph
                 .additionWithPrimaryTensor_secondaryTensor_name(left, right, None)
@@ -128,6 +141,7 @@ impl<'w, 'a> Builder<'w, 'a> {
     }
 
     pub(crate) fn multiply(&self, left: &Tensor, right: &Tensor) -> Tensor {
+        // SAFETY: graph construction on `self.graph` (impl comment).
         unsafe {
             self.graph
                 .multiplicationWithPrimaryTensor_secondaryTensor_name(left, right, None)
@@ -135,6 +149,7 @@ impl<'w, 'a> Builder<'w, 'a> {
     }
 
     pub(crate) fn matmul(&self, left: &Tensor, right: &Tensor) -> Tensor {
+        // SAFETY: graph construction on `self.graph` (impl comment).
         unsafe {
             self.graph
                 .matrixMultiplicationWithPrimaryTensor_secondaryTensor_name(left, right, None)
@@ -142,6 +157,7 @@ impl<'w, 'a> Builder<'w, 'a> {
     }
 
     pub(crate) fn reshape(&self, input: &Tensor, dimensions: &[isize]) -> Tensor {
+        // SAFETY: graph construction on `self.graph` (impl comment).
         unsafe {
             self.graph
                 .reshapeTensor_withShape_name(input, &shape(dimensions), None)
@@ -149,6 +165,7 @@ impl<'w, 'a> Builder<'w, 'a> {
     }
 
     pub(crate) fn transpose(&self, input: &Tensor, first: usize, second: usize) -> Tensor {
+        // SAFETY: graph construction on `self.graph` (impl comment).
         unsafe {
             self.graph
                 .transposeTensor_dimension_withDimension_name(input, first, second, None)
@@ -156,6 +173,7 @@ impl<'w, 'a> Builder<'w, 'a> {
     }
 
     pub(crate) fn slice(&self, input: &Tensor, dimension: usize, start: isize, length: isize) -> Tensor {
+        // SAFETY: graph construction on `self.graph` (impl comment).
         unsafe {
             self.graph
                 .sliceTensor_dimension_start_length_name(input, dimension, start, length, None)
@@ -212,6 +230,7 @@ impl<'w, 'a> Builder<'w, 'a> {
     /// Exact GELU: `0.5 * x * (1 + erf(x / sqrt(2)))`.
     pub(crate) fn gelu(&self, input: &Tensor) -> Tensor {
         let scaled = self.multiply(input, &self.scalar(std::f64::consts::FRAC_1_SQRT_2));
+        // SAFETY: graph construction on `self.graph` (impl comment).
         let one_plus = self.add(
             &unsafe { self.graph.erfWithTensor_name(&scaled, None) },
             &self.scalar(1.0),
@@ -223,6 +242,7 @@ impl<'w, 'a> Builder<'w, 'a> {
         let axes = shape(&[-1]);
         let gamma = self.named_weight(&format!("{prefix}.weight"), &[width as isize])?;
         let beta = self.named_weight(&format!("{prefix}.bias"), &[width as isize])?;
+        // SAFETY: graph construction on `self.graph` (impl comment).
         unsafe {
             let mean = self.graph.meanOfTensor_axes_name(input, &axes, None);
             let variance = self

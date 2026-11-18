@@ -1,4 +1,11 @@
 //! x86-64 kernels: AVX2 and AVX-512.
+//!
+//! Safety contract. Every `*_avx512` kernel is an `unsafe fn` with `#[target_feature]`; its
+//! `# Safety` section lists the CPU features and slice lengths it needs. The safe `*_for_target`
+//! dispatchers check the CPU features (directly, or through `backend == Isa::Avx512`, which
+//! `Isa::detect` and `Isa::resolve` return only when `avx512f` was detected), but most do not
+//! check slice lengths: their callers in `ops/` and `kernels/reference.rs` do. Each SAFETY
+//! comment names the check it relies on.
 
 #![allow(
     dead_code,
@@ -30,6 +37,8 @@ pub(crate) fn bf16_storage_supported_for_target() -> bool {
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn bf16_to_f32_for_target(input: &[u16], output: &mut [f32]) -> bool {
     if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw") {
+        // SAFETY: avx512f and avx512bw were detected just above. `output.len() >= input.len()` is
+        // not checked here; `bf16_to_f32`, the only caller, checks equal lengths.
         unsafe { bf16_to_f32_avx512(input, output) };
         true
     } else {
@@ -37,6 +46,11 @@ pub(crate) fn bf16_to_f32_for_target(input: &[u16], output: &mut [f32]) -> bool 
     }
 }
 
+/// Expands BF16 bits to FP32: 16 lanes per step, then a scalar tail.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f` and `avx512bw`, and `output.len() >= input.len()`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
 pub(crate) unsafe fn bf16_to_f32_avx512(input: &[u16], output: &mut [f32]) {
@@ -44,6 +58,8 @@ pub(crate) unsafe fn bf16_to_f32_avx512(input: &[u16], output: &mut [f32]) {
         __m256i, _mm256_loadu_si256, _mm512_castsi512_ps, _mm512_cvtepu16_epi32, _mm512_slli_epi32,
         _mm512_storeu_ps,
     };
+    // SAFETY: each step reads `input[offset..offset + 16]` and writes the same range of `output`,
+    // and `offset + 16 <= end <= input.len() <= output.len()`. The tail uses checked indexing.
     unsafe {
         let end = input.len() / 16 * 16;
         for offset in (0..end).step_by(16) {
@@ -66,15 +82,25 @@ pub(crate) fn convert_f32_to_bf16(input: &[f32], output: &mut [u16]) -> bool {
     if input.len() != output.len() || !std::is_x86_feature_detected!("avx512bf16") {
         return false;
     }
+    // SAFETY: avx512bf16 was detected and `input.len() == output.len()` checked just above.
+    // avx512f is not detected here; it is implied in practice (no AVX512_BF16 CPU lacks AVX512F).
     unsafe { convert_f32_to_bf16_avx512(input, output) };
     true
 }
 
+/// Converts FP32 to BF16 with round-to-nearest-even: 16 lanes per step, then a scalar tail.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f` and `avx512bf16`, and `output.len() >= input.len()`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bf16")]
 pub(crate) unsafe fn convert_f32_to_bf16_avx512(input: &[f32], output: &mut [u16]) {
     use core::arch::x86_64::{__m256i, _mm256_storeu_si256, _mm512_cvtneps_pbh, _mm512_loadu_ps};
 
+    // SAFETY: each step reads `input[offset..offset + 16]` and writes 16 `u16` (32 bytes) to the
+    // same range of `output`; `offset + 16 <= end <= input.len() <= output.len()`. The transmute
+    // is `__m256bh` to `__m256i`, both 32 bytes. The tail uses checked indexing.
     unsafe {
         let end = input.len() / 16 * 16;
         for offset in (0..end).step_by(16) {
@@ -106,6 +132,8 @@ pub(crate) fn affine_packed_f32_for_target(
     output: &mut [f32],
 ) -> bool {
     if packed_f32_affine_supported_for_target() {
+        // SAFETY: avx512f was detected by `packed_f32_affine_supported_for_target`. The lengths are
+        // checked by `PackedF32Affine::run`, the only caller.
         unsafe { affine_packed_f32_avx512(input, rows, packed, bias, output) };
         true
     } else {
@@ -113,6 +141,14 @@ pub(crate) fn affine_packed_f32_for_target(
     }
 }
 
+/// Runs `output = input * weight^T + bias` from weights packed by `PackedF32Affine::new`.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f`. `packed.values.len() >= packed.input_dim * packed.output_dim`
+/// (as `PackedF32Affine::new` builds it), `input.len() >= rows * packed.input_dim`,
+/// `output.len() >= rows * packed.output_dim`, and `bias`, if any, holds `packed.output_dim`
+/// values.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 pub(crate) unsafe fn affine_packed_f32_avx512(
@@ -126,6 +162,10 @@ pub(crate) unsafe fn affine_packed_f32_avx512(
         _mm512_fmadd_ps, _mm512_loadu_ps, _mm512_set1_ps, _mm512_setzero_ps, _mm512_storeu_ps,
     };
 
+    // SAFETY: for block `b = block_start + block < output_dim / 16`, the bias load reads
+    // `bias[b * 16..][..16]`, the weight load reads `values[(b * input_dim + column) * 16..][..16]`
+    // (below `output_dim * input_dim`), and the store writes 16 values of output row
+    // `row_start + row < rows` at column `b * 16`. The input read uses checked indexing.
     unsafe {
         let output_blocks = packed.output_dim / F32_AFFINE_OUTPUT_BLOCK;
         for row_start in (0..rows).step_by(F32_AFFINE_MAX_ROWS) {
@@ -190,6 +230,8 @@ pub(crate) fn affine_packed_bf16_for_target(
         && std::is_x86_feature_detected!("avx512bw")
         && std::is_x86_feature_detected!("avx512bf16")
     {
+        // SAFETY: avx512f, avx512bw, and avx512bf16 were detected just above. The lengths are
+        // checked by `PackedBf16Affine::run_bf16_components`, the only caller.
         unsafe {
             affine_packed_bf16_avx512(
                 input,
@@ -207,6 +249,16 @@ pub(crate) fn affine_packed_bf16_for_target(
     }
 }
 
+/// Runs a BF16 affine layer with FP32 accumulation through `VDPBF16PS`, from weights packed by
+/// `PackedBf16Affine::new`, optionally adding input or weight residual terms.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f`, `avx512bw`, and `avx512bf16`. `packed.values` (and
+/// `packed.residual_values` when `use_weight_residual`) hold at least
+/// `packed.input_dim / 2 * packed.output_dim * 2` values (as `PackedBf16Affine::new` builds
+/// them); `input` and `input_residual`, if any, hold `rows * packed.input_dim`; `output` holds
+/// `rows * packed.output_dim`; and `bias`, if any, holds `packed.output_dim`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512bf16")]
 pub(crate) unsafe fn affine_packed_bf16_avx512(
@@ -223,6 +275,11 @@ pub(crate) unsafe fn affine_packed_bf16_avx512(
         _mm512_setzero_ps, _mm512_storeu_ps,
     };
 
+    // SAFETY: for `block < output_dim / 16` and `pair < input_dim / 2`, each weight load reads 32
+    // `u16` at `(block * input_pairs + pair) * 32`, inside `values`/`residual_values`; each input
+    // read takes 2 `u16` at `row * input_dim + pair * 2`, inside row `row_start + row < rows`, via
+    // `read_unaligned`; each store writes 16 values inside that output row. The bias load reads
+    // `bias[block * 16..][..16]`. The transmutes are between 64-byte vector types.
     unsafe {
         let input_pairs = packed.input_dim / 2;
         let output_blocks = packed.output_dim / BF16_AFFINE_OUTPUT_BLOCK;
@@ -294,6 +351,9 @@ pub(crate) fn attention_score_tile_for_target(
     scores: &mut [f32],
 ) -> bool {
     if backend == Isa::Avx512 && matches!(head_dim, 16 | 64) {
+        // SAFETY: `backend == Isa::Avx512` implies avx512f was detected (see the module doc), and
+        // `head_dim` is 16 or 64. Callers pass `query_rows * head_dim` query, `source_rows *
+        // head_dim` key, and `query_rows * source_rows` scores (`reference.rs` slices the tiles).
         unsafe {
             attention_score_tile_avx512(query, query_rows, key, source_rows, head_dim, scale, scores);
         }
@@ -320,6 +380,7 @@ pub(crate) fn attention_score_tile_bf16_for_target(
         && query_rows <= MAX_PACKED_ATTENTION_QUERY_ROWS
         && matches!(head_dim, 16 | 64)
     {
+        // SAFETY: as in `attention_score_tile_for_target`; avx512bw was detected here.
         unsafe {
             attention_score_tile_bf16_avx512(query, query_rows, key, source_rows, head_dim, scale, scores);
         }
@@ -346,6 +407,9 @@ pub(crate) fn attention_score_packed_key_tile_for_target(
         && source_rows.is_multiple_of(16)
         && matches!(head_dim, 16 | 64)
     {
+        // SAFETY: avx512f via `backend` (module doc); `source_rows % 16 == 0` and `head_dim` are
+        // checked here. Callers pass `head_dim * source_rows` packed key and `query_rows *
+        // source_rows` scores (`source_major_online_attention_with_backend_f32`).
         unsafe {
             attention_score_packed_key_tile_avx512(
                 query,
@@ -384,6 +448,9 @@ pub(crate) fn attention_score_packed_key_padded_tile_for_target(
         && packed_source_rows == source_rows.div_ceil(16) * 16
         && matches!(head_dim, 16 | 64)
     {
+        // SAFETY: avx512f via `backend` (module doc); the padding relation between `source_rows`
+        // and `packed_source_rows` is checked here. Callers pass `head_dim * packed_source_rows`
+        // packed key and `query_rows * source_rows` scores.
         unsafe {
             attention_score_packed_key_padded_tile_avx512(
                 query,
@@ -420,6 +487,9 @@ pub(crate) fn attention_score_packed_key_bf16_tile_for_target(
         && source_rows.is_multiple_of(16)
         && matches!(head_dim, 16 | 64)
     {
+        // SAFETY: avx512f via `backend` (module doc), avx512bw detected here, and
+        // `source_rows % 16 == 0`. Callers pass `head_dim * source_rows` packed key and
+        // `query_rows * source_rows` scores (`source_major_online_attention_bf16_with_backend_f32`).
         unsafe {
             attention_score_packed_key_bf16_tile_avx512(
                 query,
@@ -449,6 +519,9 @@ pub(crate) fn attention_value_tile_fma_for_target(
     output: &mut [f32],
 ) -> bool {
     if backend == Isa::Avx512 && matches!(head_dim, 16 | 64) {
+        // SAFETY: avx512f via `backend` (module doc) and `head_dim` is 16 or 64. Callers pass
+        // `query_rows * source_rows` weights, `source_rows * head_dim` value, and
+        // `query_rows * head_dim` output (`reference.rs` slices the tiles).
         unsafe {
             attention_value_tile_fma_avx512(weights, query_rows, value, source_rows, head_dim, output);
         }
@@ -470,6 +543,7 @@ pub(crate) fn attention_value_tile_bf16_fma_for_target(
     output: &mut [f32],
 ) -> bool {
     if backend == Isa::Avx512 && std::is_x86_feature_detected!("avx512bw") && matches!(head_dim, 16 | 64) {
+        // SAFETY: as in `attention_value_tile_fma_for_target`; avx512bw was detected here.
         unsafe {
             attention_value_tile_bf16_fma_avx512(weights, query_rows, value, source_rows, head_dim, output);
         }
@@ -481,14 +555,22 @@ pub(crate) fn attention_value_tile_bf16_fma_for_target(
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn softmax_exp_sum_for_target(backend: Isa, scores: &mut [f32], maximum: f32) -> Option<f32> {
+    // SAFETY: `backend == Isa::Avx512` implies avx512f was detected (module doc); the kernel
+    // has no length preconditions.
     (backend == Isa::Avx512).then(|| unsafe { softmax_exp_sum_avx512(scores, maximum) })
 }
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn attention_score_maximum_for_target(backend: Isa, scores: &[f32]) -> Option<(f32, bool)> {
+    // SAFETY: as in `softmax_exp_sum_for_target`.
     (backend == Isa::Avx512).then(|| unsafe { attention_score_maximum_avx512(scores) })
 }
 
+/// Returns the maximum of `scores` and whether any score is NaN.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 pub(crate) unsafe fn attention_score_maximum_avx512(scores: &[f32]) -> (f32, bool) {
@@ -497,6 +579,7 @@ pub(crate) unsafe fn attention_score_maximum_avx512(scores: &[f32]) -> (f32, boo
         _mm512_set1_ps,
     };
 
+    // SAFETY: each load reads `scores[offset..offset + 16]` with `offset + 16 <= end <= len`.
     unsafe {
         let mut maximum = _mm512_set1_ps(f32::NEG_INFINITY);
         let mut has_nan = false;
@@ -515,6 +598,11 @@ pub(crate) unsafe fn attention_score_maximum_avx512(scores: &[f32]) -> (f32, boo
     }
 }
 
+/// Replaces each score with `exp(score - maximum)` and returns their sum.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 pub(crate) unsafe fn softmax_exp_sum_avx512(scores: &mut [f32], maximum: f32) -> f32 {
@@ -528,6 +616,8 @@ pub(crate) unsafe fn softmax_exp_sum_avx512(scores: &mut [f32], maximum: f32) ->
     const LOG2_E: f32 = core::f32::consts::LOG2_E;
     const LN_2: f32 = core::f32::consts::LN_2;
     const MINIMUM: f32 = -87.0;
+    // SAFETY: each load and store covers `scores[offset..offset + 16]` with
+    // `offset + 16 <= end <= scores.len()`. The tail uses checked indexing.
     unsafe {
         let maximum_vector = _mm512_set1_ps(maximum);
         let minimum = _mm512_set1_ps(MINIMUM);
@@ -563,6 +653,12 @@ pub(crate) unsafe fn softmax_exp_sum_avx512(scores: &mut [f32], maximum: f32) ->
     }
 }
 
+/// Computes a row-major `[query_rows, source_rows]` score tile from row-major FP32 Q and K.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f`; `head_dim` is a multiple of 16; `query.len() >=
+/// query_rows * head_dim`; and `key.len() >= source_rows * head_dim`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 #[allow(clippy::too_many_arguments)]
@@ -576,6 +672,9 @@ pub(crate) unsafe fn attention_score_tile_avx512(
     scores: &mut [f32],
 ) {
     use core::arch::x86_64::{_mm512_fmadd_ps, _mm512_loadu_ps, _mm512_reduce_add_ps, _mm512_setzero_ps};
+    // SAFETY: the loads read `query[row * head_dim + dimension..][..16]` and
+    // `key[source * head_dim + dimension..][..16]` with `dimension + 16 <= head_dim`,
+    // `row < query_rows`, and `source < source_rows`. The score write uses checked indexing.
     unsafe {
         for source in 0..source_rows {
             let key = key.as_ptr().add(source * head_dim);
@@ -595,6 +694,13 @@ pub(crate) unsafe fn attention_score_tile_avx512(
     }
 }
 
+/// Computes a row-major score tile from FP32 Q and row-major BF16 K.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f` and `avx512bw`; `head_dim` is a multiple of 16;
+/// `query.len() >= query_rows * head_dim`; and `key.len() >= source_rows * head_dim`.
+/// (`query_rows > 16` panics on the accumulator index.)
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
 #[allow(clippy::too_many_arguments)]
@@ -611,6 +717,9 @@ pub(crate) unsafe fn attention_score_tile_bf16_avx512(
         __m256i, _mm256_loadu_si256, _mm512_castsi512_ps, _mm512_cvtepu16_epi32, _mm512_fmadd_ps,
         _mm512_loadu_ps, _mm512_reduce_add_ps, _mm512_setzero_ps, _mm512_slli_epi32,
     };
+    // SAFETY: the key load reads 16 `u16` at `source * head_dim + dimension` and the query load 16
+    // values at `row * head_dim + dimension`, with `dimension + 16 <= head_dim`, `source <
+    // source_rows`, and `row < query_rows`. The score write uses checked indexing.
     unsafe {
         for source in 0..source_rows {
             let key = key.as_ptr().add(source * head_dim);
@@ -637,6 +746,13 @@ pub(crate) unsafe fn attention_score_tile_bf16_avx512(
     }
 }
 
+/// Computes a row-major score tile from dimension-major packed FP32 K (`[head_dim,
+/// source_rows]`), with SIMD lanes over source rows.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f`; `source_rows % 16 == 0`; `packed_key.len() >= head_dim *
+/// source_rows`; and `scores.len() >= query_rows * source_rows`. (`query_rows > 16` panics.)
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 #[allow(clippy::too_many_arguments)]
@@ -652,6 +768,10 @@ pub(crate) unsafe fn attention_score_packed_key_tile_avx512(
     use core::arch::x86_64::{
         _mm512_fmadd_ps, _mm512_loadu_ps, _mm512_mul_ps, _mm512_set1_ps, _mm512_setzero_ps, _mm512_storeu_ps,
     };
+    // SAFETY: with `source + 16 <= source_rows` (a multiple of 16), the key load reads
+    // `packed_key[dimension * source_rows + source..][..16]` with `dimension < head_dim`, and the
+    // store writes `scores[row * source_rows + source..][..16]` with `row < query_rows`. The
+    // 16-row call has the same contract. The query read uses checked indexing.
     unsafe {
         if query_rows == 16 {
             attention_score_packed_key_tile_avx512_rows::<16>(
@@ -687,6 +807,11 @@ pub(crate) unsafe fn attention_score_packed_key_tile_avx512(
     }
 }
 
+/// `attention_score_packed_key_tile_avx512` unrolled for `QUERY_ROWS` query rows.
+///
+/// # Safety
+///
+/// As for `attention_score_packed_key_tile_avx512` with `query_rows == QUERY_ROWS`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 pub(crate) unsafe fn attention_score_packed_key_tile_avx512_rows<const QUERY_ROWS: usize>(
@@ -700,6 +825,7 @@ pub(crate) unsafe fn attention_score_packed_key_tile_avx512_rows<const QUERY_ROW
     use core::arch::x86_64::{
         _mm512_fmadd_ps, _mm512_loadu_ps, _mm512_mul_ps, _mm512_set1_ps, _mm512_setzero_ps, _mm512_storeu_ps,
     };
+    // SAFETY: as in `attention_score_packed_key_tile_avx512`, with `row < QUERY_ROWS`.
     unsafe {
         let scale = _mm512_set1_ps(scale);
         for source in (0..source_rows).step_by(16) {
@@ -724,6 +850,14 @@ pub(crate) unsafe fn attention_score_packed_key_tile_avx512_rows<const QUERY_ROW
     }
 }
 
+/// Computes a row-major score tile from packed FP32 K padded to `packed_source_rows`, storing
+/// only the first `source_rows` scores of each row.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f`; `packed_source_rows == source_rows.div_ceil(16) * 16` and
+/// `source_rows > 0`; `packed_key.len() >= head_dim * packed_source_rows`; and
+/// `scores.len() >= query_rows * source_rows`. (`query_rows > 16` panics.)
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 #[allow(clippy::too_many_arguments)]
@@ -742,6 +876,10 @@ pub(crate) unsafe fn attention_score_packed_key_padded_tile_avx512(
         _mm512_setzero_ps,
     };
 
+    // SAFETY: the key load reads `packed_key[dimension * packed_source_rows + source..][..16]`
+    // with `source + 16 <= packed_source_rows`. `source` is a multiple of 16 below
+    // `packed_source_rows`, so `source < source_rows`, `lanes >= 1`, and the masked store writes
+    // only `scores[row * source_rows + source..][..lanes]`, inside row `row < query_rows`.
     unsafe {
         let scale = _mm512_set1_ps(scale);
         for source in (0..packed_source_rows).step_by(16) {
@@ -773,6 +911,13 @@ pub(crate) unsafe fn attention_score_packed_key_padded_tile_avx512(
     }
 }
 
+/// Computes a row-major score tile from dimension-major packed BF16 K.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f` and `avx512bw`; `source_rows % 16 == 0`;
+/// `packed_key.len() >= head_dim * source_rows`; and `scores.len() >= query_rows *
+/// source_rows`. (`query_rows > 8` panics on the accumulator index.)
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
 #[allow(clippy::too_many_arguments)]
@@ -789,6 +934,9 @@ pub(crate) unsafe fn attention_score_packed_key_bf16_tile_avx512(
         __m256i, _mm256_loadu_si256, _mm512_castsi512_ps, _mm512_cvtepu16_epi32, _mm512_fmadd_ps,
         _mm512_mul_ps, _mm512_set1_ps, _mm512_setzero_ps, _mm512_slli_epi32, _mm512_storeu_ps,
     };
+    // SAFETY: as in `attention_score_packed_key_tile_avx512`: the key load reads 16 `u16` at
+    // `dimension * source_rows + source` with `source + 16 <= source_rows`, and the store writes
+    // `scores[row * source_rows + source..][..16]` with `row < query_rows`.
     unsafe {
         let scale = _mm512_set1_ps(scale);
         for source in (0..source_rows).step_by(16) {
@@ -823,6 +971,13 @@ pub(crate) unsafe fn attention_score_packed_key_bf16_tile_avx512(
     }
 }
 
+/// Accumulates `output += weights * value` for a `[query_rows, source_rows]` weight tile and
+/// row-major FP32 V.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f`; `head_dim` is a multiple of 16; `value.len() >= source_rows *
+/// head_dim`; and `output.len() >= query_rows * head_dim`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 pub(crate) unsafe fn attention_value_tile_fma_avx512(
@@ -836,6 +991,10 @@ pub(crate) unsafe fn attention_value_tile_fma_avx512(
     use core::arch::x86_64::{
         _mm512_fmadd_ps, _mm512_loadu_ps, _mm512_set1_ps, _mm512_setzero_ps, _mm512_storeu_ps,
     };
+    // SAFETY: with `dimension + 16 <= head_dim`, the output loads and stores cover
+    // `output[(row_start + row) * head_dim + dimension..][..16]` with `row_start + row <
+    // query_rows`, and the value load covers `value[source * head_dim + dimension..][..16]` with
+    // `source < source_rows`. The weight read uses checked indexing.
     unsafe {
         for dimension in (0..head_dim).step_by(16) {
             for row_start in (0..query_rows).step_by(8) {
@@ -866,6 +1025,12 @@ pub(crate) unsafe fn attention_value_tile_fma_avx512(
     }
 }
 
+/// Accumulates `output += weights * value` from row-major BF16 V.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f` and `avx512bw`; otherwise as for
+/// `attention_value_tile_fma_avx512`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
 pub(crate) unsafe fn attention_value_tile_bf16_fma_avx512(
@@ -880,6 +1045,8 @@ pub(crate) unsafe fn attention_value_tile_bf16_fma_avx512(
         __m256i, _mm256_loadu_si256, _mm512_castsi512_ps, _mm512_cvtepu16_epi32, _mm512_fmadd_ps,
         _mm512_loadu_ps, _mm512_set1_ps, _mm512_setzero_ps, _mm512_slli_epi32, _mm512_storeu_ps,
     };
+    // SAFETY: as in `attention_value_tile_fma_avx512`; the value load reads 16 `u16` at
+    // `source * head_dim + dimension`. The 16-row call has the same contract.
     unsafe {
         if query_rows == 16 {
             attention_value_tile_bf16_fma_avx512_rows::<16>(weights, value, source_rows, head_dim, output);
@@ -924,6 +1091,11 @@ pub(crate) unsafe fn attention_value_tile_bf16_fma_avx512(
     }
 }
 
+/// `attention_value_tile_bf16_fma_avx512` unrolled for `QUERY_ROWS` query rows.
+///
+/// # Safety
+///
+/// As for `attention_value_tile_bf16_fma_avx512` with `query_rows == QUERY_ROWS`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
 pub(crate) unsafe fn attention_value_tile_bf16_fma_avx512_rows<const QUERY_ROWS: usize>(
@@ -937,6 +1109,7 @@ pub(crate) unsafe fn attention_value_tile_bf16_fma_avx512_rows<const QUERY_ROWS:
         __m256i, _mm256_loadu_si256, _mm512_castsi512_ps, _mm512_cvtepu16_epi32, _mm512_fmadd_ps,
         _mm512_loadu_ps, _mm512_set1_ps, _mm512_setzero_ps, _mm512_slli_epi32, _mm512_storeu_ps,
     };
+    // SAFETY: as in `attention_value_tile_bf16_fma_avx512`, with `row < QUERY_ROWS`.
     unsafe {
         for dimension in (0..head_dim).step_by(16) {
             let mut accumulators = [_mm512_setzero_ps(); QUERY_ROWS];
@@ -982,6 +1155,9 @@ pub(crate) fn attention_value_packed_bf16_dot_for_target(
     head_dim: usize,
     output: &mut [f32],
 ) -> bool {
+    // SAFETY: nothing is checked here. `attention_value_packed_bf16_dot_f32`, the only caller,
+    // checks `backend == Isa::Avx512`, `packed_bf16_affine_supported_for_target()` (f, bw, bf16),
+    // `query_rows` in 1..=8, even `source_rows`, `head_dim % 16 == 0`, and all lengths.
     unsafe {
         attention_value_packed_bf16_dot_avx512(
             weights,
@@ -995,6 +1171,15 @@ pub(crate) fn attention_value_packed_bf16_dot_for_target(
     true
 }
 
+/// Accumulates BF16 softmax weights times packed BF16 V (`pack_attention_value_bf16` layout)
+/// into FP32 output through `VDPBF16PS`.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f`, `avx512bw`, and `avx512bf16`; `head_dim % 16 == 0`;
+/// `source_rows` is even; `packed_value.len() >= source_rows * head_dim`; `weights.len() >=
+/// query_rows * source_rows`; and `output.len() >= query_rows * head_dim`. (`query_rows > 8`
+/// panics on the accumulator index.)
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw,avx512bf16")]
 pub(crate) unsafe fn attention_value_packed_bf16_dot_avx512(
@@ -1010,6 +1195,10 @@ pub(crate) unsafe fn attention_value_packed_bf16_dot_avx512(
         _mm512_setzero_ps, _mm512_storeu_ps,
     };
 
+    // SAFETY: for block `b < head_dim / 16`, the output loads and stores cover 16 values at
+    // `row * head_dim + b * 16`; the value load reads 32 `u16` at `(b * source_pairs + pair) * 32`,
+    // below `head_dim * source_rows`; the weight read takes 2 `u16` at `row * source_rows +
+    // pair * 2` via `read_unaligned`. The transmutes are between 64-byte vector types.
     unsafe {
         let source_pairs = source_rows / 2;
         let dimension_blocks = head_dim / 16;
@@ -1058,15 +1247,24 @@ pub(crate) unsafe fn attention_value_packed_bf16_dot_avx512(
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn attention_dot_for_target(backend: Isa, left: &[f32], right: &[f32]) -> Option<f32> {
+    // SAFETY: `backend == Isa::Avx512` implies avx512f was detected (module doc). Callers pass
+    // equal-length rows, as `attention_dot_f32` documents.
     (backend == Isa::Avx512).then(|| unsafe { attention_dot_avx512(left, right) })
 }
 
+/// Returns the dot product of `left` and `right`.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f`, and `right.len() >= left.len()`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 pub(crate) unsafe fn attention_dot_avx512(left: &[f32], right: &[f32]) -> f32 {
     use core::arch::x86_64::{_mm512_fmadd_ps, _mm512_loadu_ps, _mm512_reduce_add_ps, _mm512_setzero_ps};
     let end = left.len() / 16 * 16;
     let mut accumulator = _mm512_setzero_ps();
+    // SAFETY: both loads read `[offset..offset + 16]` with `offset + 16 <= end <= left.len() <=
+    // right.len()`.
     unsafe {
         for offset in (0..end).step_by(16) {
             accumulator = _mm512_fmadd_ps(
@@ -1091,6 +1289,8 @@ pub(crate) fn attention_value_fma_for_target(
     output: &mut [f32],
 ) -> bool {
     if backend == Isa::Avx512 {
+        // SAFETY: `backend == Isa::Avx512` implies avx512f was detected (module doc). Callers pass
+        // equal-length rows, as `attention_value_fma_f32` documents.
         unsafe { attention_value_fma_avx512(weight, value, output) }
         true
     } else {
@@ -1098,11 +1298,18 @@ pub(crate) fn attention_value_fma_for_target(
     }
 }
 
+/// Applies `output = weight * value + output` elementwise.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f`, and `output.len() >= value.len()`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 pub(crate) unsafe fn attention_value_fma_avx512(weight: f32, value: &[f32], output: &mut [f32]) {
     use core::arch::x86_64::{_mm512_fmadd_ps, _mm512_loadu_ps, _mm512_set1_ps, _mm512_storeu_ps};
     let end = value.len() / 16 * 16;
+    // SAFETY: the loads and the store cover `[offset..offset + 16]` with `offset + 16 <= end <=
+    // value.len() <= output.len()`.
     unsafe {
         let weight = _mm512_set1_ps(weight);
         for offset in (0..end).step_by(16) {
@@ -1122,6 +1329,8 @@ pub(crate) unsafe fn attention_value_fma_avx512(weight: f32, value: &[f32], outp
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn gelu_for_target(input: &[f32], output: &mut [f32]) -> bool {
     if std::is_x86_feature_detected!("avx512f") {
+        // SAFETY: avx512f was detected just above. `output.len() >= input.len()` is not checked
+        // here; `reference::gelu_f32` checks equal lengths.
         unsafe { gelu_avx512(input, output) }
         true
     } else {
@@ -1139,6 +1348,8 @@ pub(crate) fn layer_norm_for_target(
     output: &mut [f32],
 ) -> bool {
     if std::is_x86_feature_detected!("avx512f") {
+        // SAFETY: avx512f was detected just above. `width % 16 == 0` is checked by
+        // `cpu::layer_norm_f32` and the lengths by `reference::layer_norm_f32`, not here.
         unsafe { layer_norm_avx512(input, rows, width, weight, bias, output) }
         true
     } else {
@@ -1155,6 +1366,8 @@ pub(crate) fn layer_norm_statistics_for_target(
     scale: &mut [f32],
 ) -> bool {
     if width.is_multiple_of(16) && std::is_x86_feature_detected!("avx512f") {
+        // SAFETY: avx512f was detected and `width % 16 == 0` checked just above. The input
+        // length is the caller's obligation; there is no caller outside tests.
         unsafe { layer_norm_statistics_avx512(input, rows, width, mean, scale) }
         true
     } else {
@@ -1172,6 +1385,8 @@ pub(crate) fn qass_modulate_for_target(
     output: &mut [f32],
 ) -> bool {
     if std::is_x86_feature_detected!("avx512f") {
+        // SAFETY: avx512f was detected just above. The lengths are the caller's obligation; no
+        // caller checks them, and only tests call `qass_modulate_f32`.
         unsafe { qass_modulate_avx512(queries, base_scale, heads, rows, head_dim, output) }
         true
     } else {
@@ -1179,6 +1394,11 @@ pub(crate) fn qass_modulate_for_target(
     }
 }
 
+/// Applies the erf-based GELU approximation.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f`, and `output.len() >= input.len()`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 pub(crate) unsafe fn gelu_avx512(input: &[f32], output: &mut [f32]) {
@@ -1191,6 +1411,8 @@ pub(crate) unsafe fn gelu_avx512(input: &[f32], output: &mut [f32]) {
     };
     const ROUND: i32 = _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC;
     let end = input.len() / 16 * 16;
+    // SAFETY: the load reads `input[offset..offset + 16]` and the store writes the same range of
+    // `output`, with `offset + 16 <= end <= input.len() <= output.len()`.
     unsafe {
         let zero = _mm512_setzero_ps();
         let one = _mm512_set1_ps(1.0);
@@ -1243,6 +1465,12 @@ pub(crate) unsafe fn gelu_avx512(input: &[f32], output: &mut [f32]) {
     }
 }
 
+/// Applies `LayerNorm` to `rows` rows of `width` values.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f`; `width % 16 == 0`; `input.len()` and `output.len()` are at
+/// least `rows * width`; and `weight` and `bias`, if any, hold at least `width` values.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 pub(crate) unsafe fn layer_norm_avx512(
@@ -1257,6 +1485,9 @@ pub(crate) unsafe fn layer_norm_avx512(
         _mm512_add_ps, _mm512_fmadd_ps, _mm512_loadu_ps, _mm512_mul_ps, _mm512_reduce_add_ps, _mm512_set1_ps,
         _mm512_setzero_ps, _mm512_storeu_ps, _mm512_sub_ps,
     };
+    // SAFETY: with `row < rows` and `column + 16 <= width` (a multiple of 16), the loads read
+    // `input[row * width + column..][..16]`, `weight[column..][..16]`, and `bias[column..][..16]`,
+    // and the store writes `output[row * width + column..][..16]`.
     unsafe {
         for row in 0..rows {
             let offset = row * width;
@@ -1294,6 +1525,11 @@ pub(crate) unsafe fn layer_norm_avx512(
     }
 }
 
+/// Computes `LayerNorm` row means and inverse standard deviations.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f`; `width % 16 == 0`; and `input.len() >= rows * width`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 pub(crate) unsafe fn layer_norm_statistics_avx512(
@@ -1307,6 +1543,8 @@ pub(crate) unsafe fn layer_norm_statistics_avx512(
         _mm512_add_ps, _mm512_fmadd_ps, _mm512_loadu_ps, _mm512_reduce_add_ps, _mm512_set1_ps,
         _mm512_setzero_ps, _mm512_sub_ps,
     };
+    // SAFETY: with `row < rows` and `column + 16 <= width`, the loads read
+    // `input[row * width + column..][..16]`. The `mean` and `scale` writes use checked indexing.
     unsafe {
         for row in 0..rows {
             let input = input.as_ptr().add(row * width);
@@ -1329,6 +1567,12 @@ pub(crate) unsafe fn layer_norm_statistics_avx512(
     }
 }
 
+/// Applies `output = query * base_scale * (1 + tanh(output))` over head-major rows.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f`; `queries.len()` and `output.len()` are at least
+/// `heads * rows * head_dim`; and `base_scale.len() >= heads * head_dim`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 pub(crate) unsafe fn qass_modulate_avx512(
@@ -1340,6 +1584,10 @@ pub(crate) unsafe fn qass_modulate_avx512(
     output: &mut [f32],
 ) {
     use core::arch::x86_64::{_mm512_loadu_ps, _mm512_storeu_ps};
+    // SAFETY: with `head < heads`, `row < rows`, and `dimension + 16 <= end <= head_dim`, the
+    // loads and the store cover `[offset + dimension..][..16]` of row `head * rows + row`, and the
+    // scale reads stay in `base_scale[head * head_dim..][..head_dim]`. The transmutes are between
+    // `__m512` and `[f32; 16]`, both 64 bytes with every bit pattern valid.
     unsafe {
         for head in 0..heads {
             let scale = base_scale.as_ptr().add(head * head_dim);
@@ -1379,6 +1627,8 @@ pub(crate) fn affine_input3_transposed_for_target(
     output: &mut [f32],
 ) -> bool {
     if std::is_x86_feature_detected!("avx512f") {
+        // SAFETY: avx512f was detected just above. The lengths are checked by
+        // `reference::affine_input3_transposed_f32`, the only caller.
         unsafe {
             affine_input3_transposed_avx512(input, rows, weight, bias, output_dim, output);
         }
@@ -1398,6 +1648,8 @@ pub(crate) fn affine_for_target(
     output: &mut [f32],
 ) -> bool {
     if std::is_x86_feature_detected!("avx512f") {
+        // SAFETY: avx512f was detected just above. The lengths are checked by
+        // `reference::affine_f32`, the only caller.
         unsafe {
             affine_avx512(input, rows, input_dim, weight, bias, output_dim, output);
         }
@@ -1406,6 +1658,12 @@ pub(crate) fn affine_for_target(
     false
 }
 
+/// Runs a `3 -> output_dim` affine layer with input-major `[3, output_dim]` weights.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f`; `input.len() >= rows * 3`; `weight.len() >= 3 * output_dim`;
+/// `bias.len() >= output_dim`; and `output.len() >= rows * output_dim`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 pub(crate) unsafe fn affine_input3_transposed_avx512(
@@ -1418,6 +1676,9 @@ pub(crate) unsafe fn affine_input3_transposed_avx512(
 ) {
     use core::arch::x86_64::{_mm512_fmadd_ps, _mm512_loadu_ps, _mm512_set1_ps, _mm512_storeu_ps};
 
+    // SAFETY: with `row < rows`, the input reads are `input[row * 3..][..3]`; vector loads and
+    // stores at `channel + 16 <= vector_end <= output_dim` stay inside `bias`, each weight row,
+    // and output row `row`; the scalar tail writes `channel < output_dim` of that row.
     unsafe {
         let vector_end = output_dim / 16 * 16;
         for row in 0..rows {
@@ -1452,6 +1713,13 @@ pub(crate) unsafe fn affine_input3_transposed_avx512(
     }
 }
 
+/// Runs `output = input * weight^T + bias` with PyTorch-layout `[output_dim, input_dim]`
+/// weights.
+///
+/// # Safety
+///
+/// The CPU must support `avx512f`; `input.len() >= rows * input_dim`; `weight.len() >=
+/// output_dim * input_dim`; and `output.len() >= rows * output_dim`. `bias` uses checked indexing.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 pub(crate) unsafe fn affine_avx512(
@@ -1465,6 +1733,10 @@ pub(crate) unsafe fn affine_avx512(
 ) {
     use core::arch::x86_64::{_mm512_fmadd_ps, _mm512_loadu_ps, _mm512_reduce_add_ps, _mm512_setzero_ps};
 
+    // SAFETY: each `affine_avx512_rows::<N>` call has `row + N <= rows` by its loop condition and
+    // the final single-row call has `row < rows`. The two-row loop reads input rows `row` and
+    // `row + 1 < rows` and weight rows `channel + lane < output_dim`, at columns below `input_dim`
+    // (vector loads end at `vector_end <= input_dim`). Output writes use checked indexing.
     unsafe {
         let vector_end = input_dim / 16 * 16;
         let mut row = 0;
@@ -1575,6 +1847,12 @@ pub(crate) unsafe fn affine_avx512(
     }
 }
 
+/// `affine_avx512` for input rows `row..row + ROWS`.
+///
+/// # Safety
+///
+/// As for `affine_avx512`, and `row + ROWS <= rows`, so `input.len() >= (row + ROWS) *
+/// input_dim`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 pub(crate) unsafe fn affine_avx512_rows<const ROWS: usize>(
@@ -1588,6 +1866,9 @@ pub(crate) unsafe fn affine_avx512_rows<const ROWS: usize>(
 ) {
     use core::arch::x86_64::{_mm512_fmadd_ps, _mm512_loadu_ps, _mm512_reduce_add_ps, _mm512_setzero_ps};
 
+    // SAFETY: input pointers address rows `row..row + ROWS`; weight pointers address rows
+    // `channel..channel + 4 <= output_dim` (or `channel < output_dim`); vector loads end at
+    // `vector_end <= input_dim` and scalar reads at `input_dim`. Output writes use checked indexing.
     unsafe {
         let inputs: [*const f32; ROWS] =
             std::array::from_fn(|index| input.as_ptr().add((row + index) * input_dim));
@@ -1684,6 +1965,11 @@ pub(crate) unsafe fn affine_avx512_rows<const ROWS: usize>(
     }
 }
 
+/// `affine_avx512` for input row `row` only.
+///
+/// # Safety
+///
+/// As for `affine_avx512`, and `row < rows`, so `input.len() >= (row + 1) * input_dim`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
 pub(crate) unsafe fn affine_avx512_single_row(
@@ -1697,6 +1983,7 @@ pub(crate) unsafe fn affine_avx512_single_row(
 ) {
     use core::arch::x86_64::{_mm512_fmadd_ps, _mm512_loadu_ps, _mm512_reduce_add_ps, _mm512_setzero_ps};
 
+    // SAFETY: as in `affine_avx512_rows` with one input row `row`.
     unsafe {
         let input_row = input.as_ptr().add(row * input_dim);
         let vector_end = input_dim / 16 * 16;

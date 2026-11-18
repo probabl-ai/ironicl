@@ -4097,7 +4097,8 @@ fn performance_cores() -> Option<usize> {
     }
     let mut cores = 0_i32;
     let mut length = std::mem::size_of::<i32>();
-    // SAFETY: the name is NUL-terminated and `cores` holds `length` bytes.
+    // SAFETY: the name is a NUL-terminated C string, `cores` is a live `i32` and `length`
+    // starts at its size, so sysctl writes at most 4 bytes; there is no new value to set.
     let status = unsafe {
         sysctlbyname(
             c"hw.perflevel0.physicalcpu".as_ptr(),

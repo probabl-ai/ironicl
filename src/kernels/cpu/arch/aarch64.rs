@@ -37,9 +37,9 @@ pub(crate) fn small_attention(
     }
     assert!(query.len() >= heads * query_rows * head_dim && output.len() >= heads * query_rows * head_dim);
     assert!(key.len() >= heads * source_rows * head_dim && value.len() >= heads * source_rows * head_dim);
-    // SAFETY: NEON is mandatory on AArch64. The assertions bound every slice
-    // access, `source_rows <= SMALL_ATTENTION_MAX_SOURCES` bounds the stack
-    // score array, and `head_dim % 4 == 0` matches the 4-lane loads.
+    // SAFETY: NEON is a baseline feature of the AArch64 targets this crate builds for. The
+    // assertions above give the slice lengths `small_attention_neon` requires, the early return
+    // gives `0 < source_rows <= SMALL_ATTENTION_MAX_SOURCES` and `head_dim % 4 == 0`.
     unsafe {
         small_attention_neon(
             query,
@@ -55,6 +55,12 @@ pub(crate) fn small_attention(
     true
 }
 
+/// # Safety
+///
+/// The CPU must support NEON. `query` and `output` must hold at least
+/// `heads * query_rows * head_dim` values, `key` and `value` at least
+/// `heads * source_rows * head_dim`, and `head_dim` must be a multiple of 4.
+/// `source_rows > SMALL_ATTENTION_MAX_SOURCES` panics rather than overflowing.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 #[allow(clippy::too_many_arguments)]
@@ -71,6 +77,9 @@ pub(crate) unsafe fn small_attention_neon(
     use core::arch::aarch64::{vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32, vst1q_f32};
     let scale = (head_dim as f32).sqrt().recip();
     let mut scores = [0.0_f32; SMALL_ATTENTION_MAX_SOURCES];
+    // SAFETY: by the caller's length contract, query/output row `(head * query_rows + row)` and
+    // key/value row `head * source_rows + source` lie in bounds, and each 4-lane access at
+    // `column < head_dim` (step 4, `head_dim % 4 == 0`) stays inside its row.
     unsafe {
         for head in 0..heads {
             let key = key.as_ptr().add(head * source_rows * head_dim);
@@ -195,7 +204,10 @@ pub(crate) mod accelerate {
                 let rows = (q_rows - start).min(ATTENTION_TILE);
                 let scores = &mut scores[..rows * source_rows];
                 let tile = i32::try_from(rows).expect("tile rows fit i32");
-                // SAFETY: the assertions above keep every BLAS access inside the slices.
+                // SAFETY: row-major `A = query[start..start + rows, dim]` (lda = dim), `B^T` with
+                // `B = key[source, dim]` (ldb = dim), `C = scores[rows, source]` (ldc = source).
+                // The assertions give `(start + rows) * dim <= q_rows * dim` and `source * dim`
+                // within this head's slices; `scores` holds exactly `rows * source`.
                 unsafe {
                     cblas_sgemm(
                         ROW_MAJOR,
@@ -219,8 +231,9 @@ pub(crate) mod accelerate {
                 for (row, sum) in scores.chunks_exact_mut(source_rows).zip(&mut sums) {
                     let row_ptr = row.as_mut_ptr();
                     let mut negated_maximum = 0.0_f32;
-                    // SAFETY: `row` holds exactly `source_rows` values; these vDSP and
-                    // vForce calls read and write only that range, in place.
+                    // SAFETY: `row` holds exactly `source_rows` values (`source` as i32 for
+                    // vForce); these vDSP and vForce calls read and write only that range, in
+                    // place (both allow it), and the scalar out-pointers are live locals.
                     unsafe {
                         vDSP_maxv(row_ptr, 1, &raw mut negated_maximum, source_rows);
                         negated_maximum = -negated_maximum;
@@ -229,7 +242,9 @@ pub(crate) mod accelerate {
                         vDSP_sve(row_ptr, 1, sum, source_rows);
                     }
                 }
-                // SAFETY: as above.
+                // SAFETY: `A = scores[rows, source]` (lda = source), `B = value[source, dim]`
+                // (ldb = dim), `C = output[start..start + rows, dim]` (ldc = dim); all within
+                // the slices by the assertions above, as for the first product.
                 unsafe {
                     cblas_sgemm(
                         ROW_MAJOR,
@@ -288,7 +303,9 @@ pub(crate) mod accelerate {
             }
             None => output[..rows * output_dim].fill(0.0),
         }
-        // SAFETY: the assertions above keep every BLAS access inside the slices.
+        // SAFETY: row-major `A = input[m, k]` (lda = k), `B^T` with `B = weight[n, k]`
+        // (ldb = k), `C = output[m, n]` (ldc = n); the assertions above give each slice at
+        // least those lengths, and `m`, `n`, `k` are the checked i32 forms of the dimensions.
         unsafe {
             cblas_sgemm(
                 ROW_MAJOR,
@@ -314,15 +331,21 @@ pub(crate) mod accelerate {
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::unnecessary_wraps)]
 pub(crate) fn attention_dot_for_target(backend: Isa, left: &[f32], right: &[f32]) -> Option<f32> {
+    // SAFETY: NEON is baseline on AArch64 (and `Isa::Neon` was selected). The callers
+    // (`attention_dot_f32`) pass equal-length rows, so `right.len() >= left.len()`.
     (backend == Isa::Neon).then(|| unsafe { attention_dot_neon(left, right) })
 }
 
+/// # Safety
+///
+/// The CPU must support NEON, and `right.len() >= left.len()`.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 pub(crate) unsafe fn attention_dot_neon(left: &[f32], right: &[f32]) -> f32 {
     use core::arch::aarch64::{vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32};
     let end = left.len() / 4 * 4;
     let mut accumulator = vdupq_n_f32(0.0);
+    // SAFETY: `offset + 4 <= end <= left.len() <= right.len()` (caller contract).
     unsafe {
         for offset in (0..end).step_by(4) {
             accumulator = vfmaq_f32(
@@ -347,6 +370,8 @@ pub(crate) fn attention_value_fma_for_target(
     output: &mut [f32],
 ) -> bool {
     if backend == Isa::Neon {
+        // SAFETY: NEON is baseline on AArch64. The callers (`attention_value_fma_f32`) pass
+        // equal-length rows, so `output.len() >= value.len()`.
         unsafe { attention_value_fma_neon(weight, value, output) }
         true
     } else {
@@ -354,11 +379,15 @@ pub(crate) fn attention_value_fma_for_target(
     }
 }
 
+/// # Safety
+///
+/// The CPU must support NEON, and `output.len() >= value.len()`.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 pub(crate) unsafe fn attention_value_fma_neon(weight: f32, value: &[f32], output: &mut [f32]) {
     use core::arch::aarch64::{vdupq_n_f32, vfmaq_f32, vld1q_f32, vst1q_f32};
     let end = value.len() / 4 * 4;
+    // SAFETY: `offset + 4 <= end <= value.len() <= output.len()` (caller contract).
     unsafe {
         let weight = vdupq_n_f32(weight);
         for offset in (0..end).step_by(4) {
@@ -374,6 +403,8 @@ pub(crate) unsafe fn attention_value_fma_neon(weight: f32, value: &[f32], output
 
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn gelu_for_target(input: &[f32], output: &mut [f32]) -> bool {
+    // SAFETY: NEON is baseline on AArch64. `reference::gelu_f32`, the only non-test caller,
+    // requires `output.len() == input.len()`.
     unsafe { gelu_neon(input, output) }
     true
 }
@@ -387,14 +418,19 @@ pub(crate) fn layer_norm_for_target(
     bias: Option<&[f32]>,
     output: &mut [f32],
 ) -> bool {
-    // SAFETY: NEON is mandatory on AArch64. `layer_norm_f32` checked
-    // `width % 16 == 0`, and its caller that `input` and `output` hold
-    // `rows * width` values and `weight` and `bias` hold `width`.
+    // SAFETY: NEON is baseline on AArch64. `layer_norm_f32` checked `width % 16 == 0`, and its
+    // caller (`reference::layer_norm_f32`) that `input` and `output` hold `rows * width` values
+    // and `weight` and `bias` hold `width`.
     unsafe { layer_norm_neon(input, rows, width, weight, bias, output) }
     true
 }
 
 /// NEON `LayerNorm` with the same two-pass statistics as the AVX-512 kernel.
+///
+/// # Safety
+///
+/// The CPU must support NEON, `width % 16 == 0`, `input` and `output` hold at least
+/// `rows * width` values, and `weight` and `bias` (when present) at least `width`.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 pub(crate) unsafe fn layer_norm_neon(
@@ -410,7 +446,11 @@ pub(crate) unsafe fn layer_norm_neon(
         vsubq_f32,
     };
     // Four accumulators break the add dependency chain; the caller checked width % 16 == 0.
+    /// # Safety
+    ///
+    /// The CPU must support NEON.
     unsafe fn reduce(accumulators: [float32x4_t; 4]) -> f32 {
+        // SAFETY: register-only NEON arithmetic; NEON is baseline on AArch64.
         unsafe {
             vaddvq_f32(vaddq_f32(
                 vaddq_f32(accumulators[0], accumulators[1]),
@@ -418,6 +458,9 @@ pub(crate) unsafe fn layer_norm_neon(
             ))
         }
     }
+    // SAFETY: row `row < rows` starts at `row * width`, inside `input` and `output`; the
+    // 16-wide statistics loops and 4-wide output loop cover `column + 16 <= width` and
+    // `column + 4 <= width` (`width % 16 == 0`), and `weight`/`bias` hold `width` values.
     unsafe {
         for row in 0..rows {
             let input = input.as_ptr().add(row * width);
@@ -463,17 +506,24 @@ pub(crate) fn qass_modulate_for_target(
     head_dim: usize,
     output: &mut [f32],
 ) -> bool {
+    // SAFETY: NEON is baseline on AArch64. `qass_modulate_f32`'s callers (tests only today)
+    // must pass the lengths `qass_modulate_neon` requires; nothing here checks them.
     unsafe { qass_modulate_neon(queries, base_scale, heads, rows, head_dim, output) }
     true
 }
 
 // The explicit vector loads and stores keep contiguous activation data on the SIMD path.
 // The approximation is evaluated lane-wise to retain the scalar approximation's bit behavior.
+/// # Safety
+///
+/// The CPU must support NEON, and `output.len() >= input.len()`.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 pub(crate) unsafe fn gelu_neon(input: &[f32], output: &mut [f32]) {
     use core::arch::aarch64::{vld1q_f32, vst1q_f32};
     let end = input.len() / 4 * 4;
+    // SAFETY: `offset + 4 <= end <= input.len() <= output.len()` (caller contract); the
+    // transmutes are between `float32x4_t` and `[f32; 4]`, both 16 bytes of plain `f32`.
     unsafe {
         for offset in (0..end).step_by(4) {
             let values: [f32; 4] = core::mem::transmute(vld1q_f32(input.as_ptr().add(offset)));
@@ -486,6 +536,10 @@ pub(crate) unsafe fn gelu_neon(input: &[f32], output: &mut [f32]) {
     }
 }
 
+/// # Safety
+///
+/// The CPU must support NEON. `queries` and `output` must hold at least
+/// `heads * rows * head_dim` values and `base_scale` at least `heads * head_dim`.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 pub(crate) unsafe fn qass_modulate_neon(
@@ -497,6 +551,9 @@ pub(crate) unsafe fn qass_modulate_neon(
     output: &mut [f32],
 ) {
     use core::arch::aarch64::{vld1q_f32, vst1q_f32};
+    // SAFETY: by the caller contract, row `offset = (head * rows + row) * head_dim` of
+    // `queries`/`output` and row `head * head_dim` of `base_scale` are in bounds, and
+    // `dimension + 4 <= end <= head_dim`; the transmutes are `float32x4_t` <-> `[f32; 4]`.
     unsafe {
         for head in 0..heads {
             let scale = base_scale.as_ptr().add(head * head_dim);
@@ -541,14 +598,19 @@ pub(crate) fn affine_for_target(
     {
         return true;
     }
-    // SAFETY: NEON is mandatory on AArch64, including Apple Silicon; the
-    // caller validated every slice length.
+    // SAFETY: NEON is baseline on AArch64, including Apple Silicon. `reference::affine_f32`,
+    // the only non-test caller of `affine_f32`, checks `input`, `weight`, `bias`, and `output`
+    // against `rows`, `input_dim`, and `output_dim` with overflow-checked products.
     unsafe {
         affine_neon(input, rows, input_dim, weight, bias, output_dim, output);
     }
     true
 }
 
+/// # Safety
+///
+/// The CPU must support NEON. `input` must hold at least `rows * input_dim` values and
+/// `weight` at least `output_dim * input_dim`. (`output` and `bias` are index-checked.)
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 pub(crate) unsafe fn affine_neon(
@@ -562,6 +624,10 @@ pub(crate) unsafe fn affine_neon(
 ) {
     use core::arch::aarch64::{vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32};
 
+    // SAFETY: the row loops keep `row + 1 < rows` (and `row + ROWS <= rows` for the helpers),
+    // the channel loops `channel + 3 < output_dim` or `channel < output_dim`, and column reads
+    // `column + 4 <= vector_end` or `column < input_dim`, so every input and weight read is
+    // inside the caller-guaranteed `rows * input_dim` and `output_dim * input_dim` values.
     unsafe {
         let vector_end = input_dim / 4 * 4;
         let mut row = 0;
@@ -668,6 +734,9 @@ pub(crate) unsafe fn affine_neon(
     }
 }
 
+/// # Safety
+///
+/// As [`affine_neon`], and `row + ROWS <= rows` so `input` holds rows `row..row + ROWS`.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 pub(crate) unsafe fn affine_neon_rows<const ROWS: usize>(
@@ -681,6 +750,9 @@ pub(crate) unsafe fn affine_neon_rows<const ROWS: usize>(
 ) {
     use core::arch::aarch64::{vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32};
 
+    // SAFETY: input rows `row..row + ROWS` and weight rows `channel..channel + 4` (while
+    // `channel + 3 < output_dim`) or `channel < output_dim` are in bounds by the contract;
+    // column reads stay below `vector_end` (4-wide) or `input_dim` (scalar).
     unsafe {
         let inputs: [*const f32; ROWS] =
             std::array::from_fn(|index| input.as_ptr().add((row + index) * input_dim));
@@ -776,6 +848,9 @@ pub(crate) unsafe fn affine_neon_rows<const ROWS: usize>(
     }
 }
 
+/// # Safety
+///
+/// As [`affine_neon`], and `row < rows` so `input` holds row `row`.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
 pub(crate) unsafe fn affine_neon_single_row(
@@ -789,6 +864,8 @@ pub(crate) unsafe fn affine_neon_single_row(
 ) {
     use core::arch::aarch64::{vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32};
 
+    // SAFETY: as in `affine_neon_rows` with one input row: weight rows stay below
+    // `output_dim` and columns below `vector_end` (4-wide) or `input_dim` (scalar).
     unsafe {
         let input_row = input.as_ptr().add(row * input_dim);
         let vector_end = input_dim / 4 * 4;

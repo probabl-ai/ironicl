@@ -506,8 +506,10 @@ impl StaticContextArtifact {
                 "static context length is outside the resource limit",
             ));
         }
-        // SAFETY: the mapping is read-only and retained by the artifact for every
-        // tensor borrow. Serving artifacts must remain immutable while mapped.
+        // SAFETY: `Mmap::map` requires that no one modifies or truncates the file while it is
+        // mapped; this crate never writes it, and serving artifacts must stay immutable (an
+        // outside writer breaks `&[u8]` immutability; truncation raises SIGBUS). The `Mmap` is
+        // owned by the artifact (`Arc`), so every tensor borrow ends before it is unmapped.
         let mapping = unsafe { MmapOptions::new().map(file) }.map_err(artifact_error)?;
         // Start reading the pages in now so the first prediction runs at RAM
         // speed. Advisory only; elsewhere the checksum below reads every page anyway.
@@ -1198,8 +1200,8 @@ fn prefetch(mapping: &Mmap) {
         VirtualAddress: mapping.as_ptr().cast_mut().cast(),
         NumberOfBytes: mapping.len(),
     };
-    // SAFETY: the range is this process's live mapping, which outlives the
-    // call; the call only schedules reads.
+    // SAFETY: `range` is one valid entry (count 1) describing this process's live mapping,
+    // which `mapping` keeps mapped for the call; the call only schedules reads of it.
     let _ = unsafe { PrefetchVirtualMemory(GetCurrentProcess(), 1, &raw const range, 0) };
 }
 

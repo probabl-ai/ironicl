@@ -149,7 +149,8 @@ pub(crate) fn attention_value_fma_for_target(
 #[inline]
 pub(crate) fn wasm_load(values: &[f32], offset: usize) -> core::arch::wasm32::v128 {
     let values = &values[offset..offset + 4];
-    // SAFETY: the slice holds four values; WebAssembly loads need no alignment.
+    // SAFETY: the checked reslice holds exactly four `f32` (16 bytes), and `v128_load` reads
+    // unaligned (`read_unaligned`); `simd128` is enabled at compile time by the `cfg`.
     unsafe { core::arch::wasm32::v128_load(values.as_ptr().cast()) }
 }
 
@@ -158,7 +159,8 @@ pub(crate) fn wasm_load(values: &[f32], offset: usize) -> core::arch::wasm32::v1
 #[inline]
 pub(crate) fn wasm_store(values: &mut [f32], offset: usize, vector: core::arch::wasm32::v128) {
     let values = &mut values[offset..offset + 4];
-    // SAFETY: the slice holds four values; WebAssembly stores need no alignment.
+    // SAFETY: the checked reslice holds exactly four `f32` (16 bytes) borrowed mutably, and
+    // `v128_store` writes unaligned (`write_unaligned`); `simd128` is enabled by the `cfg`.
     unsafe { core::arch::wasm32::v128_store(values.as_mut_ptr().cast(), vector) }
 }
 

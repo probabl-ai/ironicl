@@ -776,8 +776,9 @@ mod platform {
         let mut stats = VmStatistics64::default();
         let mut count = u32::try_from(size_of::<VmStatistics64>() / size_of::<i32>()).ok()?;
         let (mut page_size, mut total, mut length) = (0_usize, 0_u64, size_of::<u64>());
-        // SAFETY: `stats` holds `count` 32-bit words, the name is NUL-terminated,
-        // `total` holds `length` bytes, and every out-pointer is valid.
+        // SAFETY: `VmStatistics64` mirrors `struct vm_statistics64` (152 bytes, so `count` is
+        // `HOST_VM_INFO64_COUNT` = 38 words); `page_size` is a `vm_size_t` (usize), the name is
+        // NUL-terminated, `total` holds `length` bytes, and every out-pointer is a live local.
         let ok = unsafe {
             let host = mach_host_self();
             host_page_size(host, &raw mut page_size) == 0
@@ -824,10 +825,11 @@ mod platform {
     /// commit limit allocations fail instead of paging.
     #[allow(unsafe_code)] // Win32 calls; std has no equivalent.
     pub(super) fn host_memory() -> Option<HostMemory> {
-        // SAFETY: MEMORYSTATUSEX is plain data; all zeros is a valid value.
+        // SAFETY: MEMORYSTATUSEX holds only integers; all zeros is a valid value.
         let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
         status.dwLength = u32::try_from(size_of::<MEMORYSTATUSEX>()).ok()?;
-        // SAFETY: `status` is a valid MEMORYSTATUSEX with dwLength set.
+        // SAFETY: `status` is a live, writable MEMORYSTATUSEX whose `dwLength` is its size, as
+        // the call requires.
         if unsafe { GlobalMemoryStatusEx(&raw mut status) } == 0 {
             return None;
         }
@@ -846,10 +848,11 @@ mod platform {
     /// For a job limit this assumes the process is alone in the job.
     #[allow(unsafe_code)]
     fn job_headroom() -> Option<u64> {
-        // SAFETY: plain data; all zeros is a valid value.
+        // SAFETY: JOBOBJECT_EXTENDED_LIMIT_INFORMATION holds only integers; all zeros is valid.
         let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
-        // SAFETY: a null handle queries the calling process's job; the buffer
-        // and its length match.
+        // SAFETY: a null handle queries the calling process's job; the buffer is a live
+        // JOBOBJECT_EXTENDED_LIMIT_INFORMATION of the size passed, and the optional
+        // return-length pointer is null.
         let ok = unsafe {
             QueryInformationJobObject(
                 std::ptr::null_mut(),
@@ -870,9 +873,10 @@ mod platform {
         } else {
             return None;
         };
-        // SAFETY: plain data; all zeros is a valid value.
+        // SAFETY: PROCESS_MEMORY_COUNTERS_EX holds only integers; all zeros is valid.
         let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
-        // SAFETY: the counters buffer and its length match.
+        // SAFETY: the pseudo-handle from `GetCurrentProcess` needs no closing; `counters` is a
+        // live PROCESS_MEMORY_COUNTERS_EX (a prefix-compatible extension) and `cb` is its size.
         let ok = unsafe {
             K32GetProcessMemoryInfo(
                 GetCurrentProcess(),
