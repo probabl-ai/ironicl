@@ -1,7 +1,7 @@
 use std::{path::PathBuf, str::FromStr};
 
 use crate::{
-    BackendPreference, CacheMode, ExecutionConfig, StorageDType, TabIclV2Model, TaskKind, Workload,
+    CacheMode, ExecutionConfig, IsaPreference, StorageDType, TabIclV2Model, TaskKind, Workload,
     error::{Error, Result},
 };
 
@@ -165,7 +165,7 @@ fn parse_plan(args: &[String]) -> Result<Command> {
     let mut cache_mode = None;
     let mut weight_dtype = None;
     let mut kv_dtype = None;
-    let mut backend = None;
+    let mut isa = None;
     let mut bandwidth_gbps = None;
 
     let mut index = 0;
@@ -181,7 +181,7 @@ fn parse_plan(args: &[String]) -> Result<Command> {
             "--cache" => set_once(&mut cache_mode, CacheMode::from_str(value)?, flag)?,
             "--weights" => set_once(&mut weight_dtype, StorageDType::from_str(value)?, flag)?,
             "--kv-dtype" => set_once(&mut kv_dtype, StorageDType::from_str(value)?, flag)?,
-            "--backend" => set_once(&mut backend, BackendPreference::from_str(value)?, flag)?,
+            "--isa" => set_once(&mut isa, IsaPreference::from_str(value)?, flag)?,
             "--bandwidth-gbps" => {
                 let bandwidth = value
                     .parse::<f64>()
@@ -215,7 +215,7 @@ fn parse_plan(args: &[String]) -> Result<Command> {
         cache_mode: cache_mode.unwrap_or(defaults.cache_mode),
         weight_dtype: weight_dtype.unwrap_or(defaults.weight_dtype),
         kv_dtype: kv_dtype.unwrap_or(defaults.kv_dtype),
-        backend: backend.unwrap_or(defaults.backend),
+        isa: isa.unwrap_or(defaults.isa),
     };
     config.validate()?;
 

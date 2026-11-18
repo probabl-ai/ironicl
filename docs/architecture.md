@@ -47,7 +47,8 @@ artifact execution.
 
 ### Planner
 
-Selects a CPU backend and reports model/cache payload sizes. With a bandwidth
+Reports the CPU instruction set (`Isa`: portable, NEON, or AVX-512) and
+model/cache payload sizes. With a bandwidth
 input, it also reports ideal full-cache scan floors. The Metal GPU path is
 chosen separately at execution time (feature-gated and runtime-togglable), not
 by this planner. Scratch-memory and detailed K/V traffic reports are not yet
@@ -60,9 +61,9 @@ x86-64. It is the implementation oracle below PyTorch.
 
 ### AMD Zen 5 Backend
 
-Provides AVX-512 FP32 affine and cached-attention kernels selected through
-runtime CPUID checks. Current model weights remain in the portable canonical
-layout. Native dispatch has no effect on artifact semantics.
+Provides AVX-512 FP32 affine and cached-attention kernels (`Isa::Avx512`),
+selected through runtime CPUID checks. Current model weights remain in the
+portable canonical layout. Native dispatch has no effect on artifact semantics.
 
 ### Apple Silicon Backend
 
@@ -70,9 +71,8 @@ Provides Accelerate `cblas_sgemm` dense and attention kernels on the matrix
 coprocessor, NEON LayerNorm and short-source attention, and a Metal GPU path
 (behind the `metal` feature) that builds static contexts and runs the predict
 graph per estimator. Under `optimize=auto`/`fast` the GPU stores ICL caches and
-runs ICL attention in FP16. This backend is not represented in the `BackendKind`
-enum, which currently names only the portable and AMD Zen 5 CPU backends; the
-GPU path is selected at execution time rather than by the planner.
+runs ICL attention in FP16. The CPU kernels run as `Isa::Neon`; the GPU path is
+selected at execution time rather than by the planner.
 
 ### Request Executor
 

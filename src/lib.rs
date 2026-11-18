@@ -2,7 +2,6 @@
 // The CUDA kernels convert to FP16; CUDA builds run with `RUSTC_BOOTSTRAP`.
 #![cfg_attr(feature = "cuda", feature(f16))]
 
-pub mod backend;
 pub mod benchmark;
 pub mod cli;
 pub mod config;
@@ -11,13 +10,11 @@ pub mod format;
 pub mod kernels;
 pub mod memory;
 pub mod models;
-pub mod platform;
 pub mod profile;
 pub mod progress;
 #[cfg(feature = "python")]
 mod python;
 
-pub use backend::{BackendKind, BackendPreference, resolve_backend};
 pub use benchmark::BenchmarkStats;
 pub use cli::{
     BenchmarkArgs, CheckpointCacheOptions, Command, HelpTopic, ImportArgs, InspectArgs, ModelSource,
@@ -38,6 +35,7 @@ pub use format::static_context::{
     STATIC_CONTEXT_MAGIC, STATIC_CONTEXT_VERSION, StaticContextArtifact, StaticContextMetadata,
     StaticContextTensor, StaticContextTensorData, StaticContextTensorRef,
 };
+pub use kernels::cpu::{CpuCapabilities, Isa, IsaPreference};
 pub use memory::{CacheEstimate, MemoryPlan, estimate_memory};
 pub use models::tabicl_v2::checkpoint::{
     CheckpointProfile, CheckpointSummary, import_checkpoint, inspect_checkpoint,
@@ -48,4 +46,3 @@ pub use models::tabicl_v2::cpu::{
     SparseAttentionStatistics, StaticExecutor, TraceStage, plan_context,
 };
 pub use models::tabicl_v2::quantiles::RegressionOutput;
-pub use platform::CpuCapabilities;

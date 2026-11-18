@@ -1,8 +1,8 @@
 use std::{fmt, str::FromStr};
 
 use crate::{
-    backend::BackendPreference,
     error::{Error, Result},
+    kernels::cpu::IsaPreference,
 };
 
 /// The released `TabICLv2` task variants supported by the design.
@@ -262,7 +262,7 @@ pub struct ExecutionConfig {
     pub cache_mode: CacheMode,
     pub weight_dtype: StorageDType,
     pub kv_dtype: StorageDType,
-    pub backend: BackendPreference,
+    pub isa: IsaPreference,
 }
 
 impl Default for ExecutionConfig {
@@ -273,7 +273,7 @@ impl Default for ExecutionConfig {
             cache_mode: CacheMode::Kv,
             weight_dtype: StorageDType::Bf16,
             kv_dtype: StorageDType::Bf16,
-            backend: BackendPreference::Auto,
+            isa: IsaPreference::Auto,
         }
     }
 }
