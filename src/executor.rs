@@ -27,7 +27,7 @@ use crate::{
     StaticContextMetadata, StaticContextTensor, StaticContextTensorData, StaticQueryBundle, TaskKind,
     execution_plan::ExecutionPlan,
     kernels::{
-        native::{
+        cpu::{
             Bf16AffineCompensation, PackedBf16Affine, PackedF32Affine, packed_bf16_affine_supported,
             packed_f32_affine_supported,
         },
@@ -337,7 +337,7 @@ pub struct StaticExecutor {
     packed_f32_row: bool,
     packed_bf16_affines: Option<Arc<BTreeMap<String, PackedBf16Affine>>>,
     bf16_dense_compensation: Bf16AffineCompensation,
-    attention_backend: crate::kernels::native::AttentionBackend,
+    isa: crate::kernels::cpu::Isa,
     sparse_attention_stats: Arc<SparseAttentionStats>,
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
     gpu: Option<Arc<GpuContext>>,
@@ -674,7 +674,7 @@ impl Executor {
         }
         // On a BF16-capable CPU, `fast` stores the ICL values in BF16 (FP32
         // keys, the retained serving layout); every other case is FP32.
-        if optimize == Optimize::Fast && crate::kernels::native::bf16_storage_supported() {
+        if optimize == Optimize::Fast && crate::kernels::cpu::bf16_storage_supported() {
             let tensors = self.build_tensors_cpu(shape, x, y_train, limits)?;
             let values = |name: &str| name.starts_with("icl.") && name.rsplit('.').next() == Some("value");
             let context = StaticContextArtifact::from_page_aligned(
@@ -1435,7 +1435,7 @@ impl Executor {
                 query_block_rows,
                 ATTENTION_KEY_TILE_ROWS,
                 false,
-                crate::kernels::native::attention_backend(),
+                crate::kernels::cpu::Isa::detect(),
                 &mut OnlineAttentionScratch {
                     scores: &mut scores,
                     maximum: &mut maximum,
@@ -1725,7 +1725,7 @@ impl StaticExecutor {
             packed_f32_row,
             packed_bf16_affines,
             bf16_dense_compensation,
-            attention_backend: crate::kernels::native::attention_backend(),
+            isa: crate::kernels::cpu::Isa::detect(),
             sparse_attention_stats: Arc::new(SparseAttentionStats::default()),
             #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
             gpu: None,
@@ -2541,7 +2541,7 @@ impl StaticExecutor {
             match (key, value) {
                 (StaticContextTensorData::Fp32(key), StaticContextTensorData::Fp32(value)) => {
                     parallel_cached_attention(
-                        self.attention_backend,
+                        self.isa,
                         &q_heads,
                         q_rows,
                         key,
@@ -2555,7 +2555,7 @@ impl StaticExecutor {
                 }
                 (StaticContextTensorData::Bf16(key), StaticContextTensorData::Bf16(value)) => {
                     parallel_cached_attention_bf16(
-                        self.attention_backend,
+                        self.isa,
                         &q_heads,
                         q_rows,
                         key,
@@ -2588,7 +2588,7 @@ impl StaticExecutor {
                     }
                     if !used_sparse {
                         parallel_cached_attention_f32_key_bf16_value(
-                            self.attention_backend,
+                            self.isa,
                             &q_heads,
                             q_rows,
                             key,
@@ -2607,7 +2607,7 @@ impl StaticExecutor {
                     let widen =
                         |values: &[u16]| values.iter().map(|&bits| f16_to_f32(bits)).collect::<Vec<_>>();
                     parallel_cached_attention(
-                        self.attention_backend,
+                        self.isa,
                         &q_heads,
                         q_rows,
                         &widen(key),
@@ -2632,7 +2632,7 @@ impl StaticExecutor {
                     "column static-context caches must use FP32".into(),
                 ));
             };
-            if column_source_major_attention_enabled(self.attention_backend) {
+            if column_source_major_attention_enabled(self.isa) {
                 let query_block_rows = ATTENTION_QUERY_BLOCK_ROWS;
                 let scratch_query_rows = q_rows.min(query_block_rows);
                 let scratch_source_rows = source_rows.min(ATTENTION_KEY_TILE_ROWS);
@@ -2650,7 +2650,7 @@ impl StaticExecutor {
                     query_block_rows,
                     ATTENTION_KEY_TILE_ROWS,
                     false,
-                    self.attention_backend,
+                    self.isa,
                     &mut OnlineAttentionScratch {
                         scores: &mut scores,
                         maximum: &mut maximum,
@@ -2913,7 +2913,7 @@ impl StaticExecutor {
         let workers = workers.min(self.affine_pool.current_num_threads()).min(rows);
         // Apple Silicon always returns here: fewer than 16 rows run on one
         // thread, and more run as one Accelerate `sgemm`.
-        if workers <= 1 || rows < 16 || crate::kernels::native::affine_uses_sgemm(rows) {
+        if workers <= 1 || rows < 16 || crate::kernels::cpu::affine_uses_sgemm(rows) {
             return affine_f32(input, rows, input_dim, weight, bias, output_dim, output);
         }
         let rows_per_job = rows.div_ceil(workers);
@@ -3883,7 +3883,7 @@ fn page_aligned(
         let bytes: Vec<u8> = match storage {
             TensorStorage::Fp32 => values.flat_map(f32::to_le_bytes).collect(),
             TensorStorage::Bf16 => values
-                .flat_map(|value| crate::kernels::native::f32_to_bf16_rne(value).to_le_bytes())
+                .flat_map(|value| crate::kernels::cpu::f32_to_bf16_rne(value).to_le_bytes())
                 .collect(),
             TensorStorage::F16 => values
                 .flat_map(|value| half::f16::from_f32(value).to_bits().to_le_bytes())
@@ -4137,12 +4137,12 @@ const fn performance_cores() -> Option<usize> {
     None
 }
 
-fn column_source_major_attention_enabled(backend: crate::kernels::native::AttentionBackend) -> bool {
-    backend == crate::kernels::native::AttentionBackend::Avx512
+fn column_source_major_attention_enabled(backend: crate::kernels::cpu::Isa) -> bool {
+    backend == crate::kernels::cpu::Isa::Avx512
 }
 
 fn row_source_major_attention_enabled() -> bool {
-    crate::kernels::native::attention_backend() == crate::kernels::native::AttentionBackend::Avx512
+    crate::kernels::cpu::Isa::detect() == crate::kernels::cpu::Isa::Avx512
 }
 
 const fn sparse_attention_enabled() -> bool {
@@ -4283,7 +4283,7 @@ const fn sparse_max_omitted_mass() -> f32 {
 }
 
 fn parallel_cached_attention(
-    backend: crate::kernels::native::AttentionBackend,
+    backend: crate::kernels::cpu::Isa,
     query: &[f32],
     query_rows: usize,
     key: &[f32],
@@ -4371,7 +4371,7 @@ fn parallel_cached_attention(
 }
 
 fn parallel_cached_attention_bf16(
-    backend: crate::kernels::native::AttentionBackend,
+    backend: crate::kernels::cpu::Isa,
     query: &[f32],
     query_rows: usize,
     key: &[u16],
@@ -4462,7 +4462,7 @@ fn parallel_cached_attention_bf16(
 }
 
 fn parallel_cached_attention_f32_key_bf16_value(
-    backend: crate::kernels::native::AttentionBackend,
+    backend: crate::kernels::cpu::Isa,
     query: &[f32],
     query_rows: usize,
     key: &[f32],
@@ -4611,7 +4611,7 @@ pub fn plan_context(
     limits: MemoryLimits,
 ) -> Result<Plan> {
     let working_set = gpu_working_set(rows);
-    let bf16 = crate::kernels::native::bf16_storage_supported();
+    let bf16 = crate::kernels::cpu::bf16_storage_supported();
     // As in `Executor::build_context`.
     let storage = |optimize| match optimize {
         Optimize::Safe => Storage::FP32,
@@ -5174,7 +5174,7 @@ mod tests {
         let mut serial = vec![0.0; query.len()];
         let mut parallel = vec![0.0; query.len()];
         parallel_cached_attention_f32_key_bf16_value(
-            crate::kernels::native::AttentionBackend::Portable,
+            crate::kernels::cpu::Isa::Portable,
             &query,
             query_rows,
             &key,
@@ -5187,7 +5187,7 @@ mod tests {
         )
         .expect("serial hybrid attention");
         parallel_cached_attention_f32_key_bf16_value(
-            crate::kernels::native::AttentionBackend::Portable,
+            crate::kernels::cpu::Isa::Portable,
             &query,
             query_rows,
             &key,

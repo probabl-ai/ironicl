@@ -1,4 +1,4 @@
 //! Portable reference kernels and future architecture-specific backends.
 
-pub(crate) mod native;
+pub(crate) mod cpu;
 pub mod reference;
