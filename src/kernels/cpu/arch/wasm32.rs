@@ -96,9 +96,12 @@ pub(crate) fn attention_value_simd128_rows<const ROWS: usize>(
 }
 
 #[cfg(all(target_family = "wasm", target_feature = "simd128"))]
-#[expect(clippy::unnecessary_wraps, reason = "The other targets' signature")]
 pub(crate) fn attention_dot_for_target(_backend: Isa, left: &[f32], right: &[f32]) -> Option<f32> {
     use core::arch::wasm32::{f32x4_add, f32x4_mul, f32x4_splat};
+
+    if right.len() < left.len() {
+        return None;
+    }
 
     let end = left.len() / 4 * 4;
     let mut accumulator = f32x4_splat(0.0);
@@ -124,6 +127,10 @@ pub(crate) fn attention_value_fma_for_target(
     output: &mut [f32],
 ) -> bool {
     use core::arch::wasm32::{f32x4_add, f32x4_mul, f32x4_splat};
+
+    if output.len() < value.len() {
+        return false;
+    }
 
     let weights = f32x4_splat(weight);
     let end = value.len() / 4 * 4;
@@ -182,6 +189,14 @@ pub(crate) fn affine_for_target(
     output_dim: usize,
     output: &mut [f32],
 ) -> bool {
+    let fits = |count: Option<usize>, len: usize| count.is_some_and(|count| len >= count);
+    if !fits(rows.checked_mul(input_dim), input.len())
+        || !fits(output_dim.checked_mul(input_dim), weight.len())
+        || !fits(rows.checked_mul(output_dim), output.len())
+        || bias.is_some_and(|bias| bias.len() < output_dim)
+    {
+        return false;
+    }
     let mut row = 0;
     while row + 4 <= rows {
         affine_simd128_rows::<4>(input, row, input_dim, weight, bias, output_dim, output);

@@ -499,10 +499,14 @@ pub(crate) mod device {
         #[allow(clippy::float_cmp, reason = "The all-missing marker is exactly -100")]
         let marked = group[0] == -100.0 && group[1] == -100.0 && group[2] == -100.0;
         if c == 0 && marked {
-            // SAFETY: `row < rows`, and the launcher's `missing` holds `start + rows` rows. Not
-            // exclusive: the `c == 0` thread of every (e, f) may store the same 1.0 to this row, a
-            // same-value race that `get_unchecked_mut`'s contract does not allow.
-            unsafe { *missing.get_unchecked_mut(start as usize + row) = 1.0 };
+            // The `c == 0` thread of every (e, f) may flag the same row, so the store is atomic.
+            // SAFETY: `row < rows`, and the launcher's `missing` holds `start + rows` rows, so the
+            // pointer is in bounds and aligned for `f32`; this kernel accesses `missing` only
+            // through this atomic store.
+            let flag = unsafe {
+                cuda_device::atomic::DeviceAtomicF32::from_ptr(missing.as_mut_ptr().add(start as usize + row))
+            };
+            flag.store(1.0, cuda_device::atomic::AtomicOrdering::Relaxed);
         }
         let value = group[0] * w[c * 3] + group[1] * w[c * 3 + 1] + group[2] * w[c * 3 + 2] + b[c];
         // SAFETY: `i < ensembles * H * rows * 128`, the size of the launcher's `out` `[B * H, rows,
