@@ -243,9 +243,9 @@ The current evidence supports these narrow conclusions:
 
 - Benchmark contract: `tools/benchmark_cached_end_to_end.py`
 - Result comparator: `tools/compare_cached_end_to_end.py`
-- Ironicl executor: `src/executor.rs`
-- Static context: `src/static_context.rs`
-- CPU kernels: `src/kernels/native.rs` and `src/kernels/reference.rs`
+- Ironicl executor: `src/models/tabicl_v2/cpu.rs`
+- Static context: `src/format/static_context.rs`
+- CPU kernels: `src/kernels/cpu/` and `src/kernels/reference.rs`
 - Official classifier: `../tabicl/src/tabicl/_sklearn/classifier.py`
 - Official preprocessing: `../tabicl/src/tabicl/_sklearn/preprocessing.py`
 - Official attention: `../tabicl/src/tabicl/_model/attention.py`

@@ -11,6 +11,7 @@ records what each has verified.
 | [goals.md](goals.md) | Scope, non-goals, and success criteria |
 | [model.md](model.md) | TabICLv2 architecture and exact row-streaming boundary |
 | [architecture.md](architecture.md) | Engine components and request lifecycle |
+| [source-layout.md](source-layout.md) | How `src/` is organized, planned moves, and CUDA build targets |
 | [cli.md](cli.md) | Stable command and model-source conventions |
 | [python.md](python.md) | Python preprocessing package |
 | [native-preprocessing.md](native-preprocessing.md) | Pure-Rust preprocessing plan and parity surfaces |

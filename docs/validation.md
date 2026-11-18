@@ -165,7 +165,7 @@ The `.irinput` output is exact IRINPUT v1: `IRINPUT\0`, a 80-byte header with
 little-endian `u32` version and kind and eight little-endian `u64`
 dimension/count/byte fields, row-major FP32 `X`, FP32 `y_train`, and a SHA-256
 trailer over all preceding bytes. This is the format decoded by
-`src/input_bundle.rs`.
+`src/format/input_bundle.rs`.
 
 The `.irlogits` output is IRLOGITS v1. It has a 48-byte header of `IRLOGITS`
 (8 bytes), little-endian `u32` version (1), little-endian `u32` kind (1), and
