@@ -30,20 +30,23 @@ src/
 ├── kernels/
 │   ├── reference.rs               portable reference kernels
 │   ├── cpu/
-│   │   ├── mod.rs                 Isa: the instruction set, detected once
+│   │   ├── mod.rs                 Isa (the instruction set), CpuCapabilities
 │   │   ├── ops/                   affine, attention, norm, pointwise
 │   │   ├── arch/                  x86_64 (AVX-512), aarch64 (NEON, Accelerate),
 │   │   │                          wasm32 (SIMD128)
 │   │   └── tests.rs
-│   ├── metal/mod.rs               device, shared buffers, MPSGraph plumbing
+│   ├── metal/
+│   │   ├── mod.rs                 device, shared buffers, model weight buffers
+│   │   └── builder.rs             MPSGraph builder and generic operations
 │   └── cuda/
 │       ├── mod.rs                 Device, Arch, the embedded modules and their choice
 │       └── kernels.rs             the #[cuda_module] kernels
 ├── models/
 │   └── tabicl_v2/
+│       ├── mod.rs                 Device: where a context predicts
 │       ├── cpu.rs                 Executor, StaticExecutor
 │       ├── execution_plan.rs      worker partitioning
-│       ├── metal.rs               weights, graph builder, predict graph, build
+│       ├── metal.rs               TabICLv2 stages, predict graph, build
 │       ├── cuda/                  build, predictor, launchers, weights, cache, …
 │       ├── checkpoint.rs          checkpoint import
 │       ├── checkpoint_cache.rs    prepared checkpoints
@@ -67,7 +70,7 @@ Each step is one pull request.
 | Step | Change | Status |
 |---|---|---|
 | A | Move files into this layout: the CPU kernel split, `cache.rs` into `memory.rs`, the Metal and CUDA splits by file, `models/tabicl_v2/`, `format/`. No logic changes. | Done |
-| B | Consolidate: fold `platform.rs` and `backend.rs` into `kernels/cpu` (`Isa`); one `Device` enum for TabICLv2; separate the Metal graph builder's generic operations from the TabICLv2 stages. | Planned |
+| B | Consolidate: fold `platform.rs` and `backend.rs` into `kernels/cpu` (`Isa`); one `Device` enum for TabICLv2; separate the Metal graph builder's generic operations from the TabICLv2 stages. | Done |
 | C | Split the CUDA kernels: confirm that cuda-oxide compiles device helpers outside `#[cuda_module]`, then split `kernels/cuda/kernels.rs` into `ops/` and `arch/`, with TabICLv2's fused kernels in `ops/tabicl_v2.rs`. Move the launchers into `kernels/cuda` once they no longer take TabICLv2 weight types. Test on an NVIDIA GPU. | Planned |
 | D | Rust preprocessing: `preprocess/` and `models/tabicl_v2/preprocess.rs`, fit and transform, at parity with TabICL. | Planned |
 | E | Prediction server behind the `server` feature: `/health`, `/v1/models`, and `predict` and `predict_proba` per model, in JSON, for models loaded read-only at startup. Needs D, so it runs without Python. | Planned |
