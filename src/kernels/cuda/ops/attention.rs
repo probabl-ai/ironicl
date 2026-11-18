@@ -745,8 +745,14 @@ pub(crate) fn attention16_tc_body<const SPLIT: bool>(
 /// and `vp` (`stride` values apart, 16-byte aligned), with scale 1 / 4 in
 /// the exp2 domain and an online softmax key by key: the normalized output
 /// into `acc`, which starts at zero.
+///
+/// # Safety
+///
+/// `kp` and `vp` must be 16-byte aligned and `stride` a multiple of 4, and for every key in
+/// `[from, to)` the 16 values at `kp + key * stride` and at `vp + key * stride` must be readable
+/// and not written during the call.
 #[device]
-pub(crate) fn attend16_f32(
+pub(crate) unsafe fn attend16_f32(
     query: &[f32; 16],
     (kp, vp, stride): (*const f32, *const f32, usize),
     (from, to): (usize, usize),
@@ -759,9 +765,8 @@ pub(crate) fn attend16_f32(
         let mut dot = 0.0f32;
         #[unroll]
         for c in 0..4 {
-            // SAFETY: callers pass keys `[from, to)` of 16 values, `stride` apart and 16-byte
-            // aligned, at `kp`: `column_block_f32` a cache stream (`kv0`, stride 16, 128 keys),
-            // `attention16_f32` the `SmallAttention` layouts (offsets and strides multiples of 4).
+            // SAFETY: `key` is in `[from, to)` and `c * 4 + 4 <= 16`: by this function's contract,
+            // 16 aligned readable bytes at `kp`.
             let k = unsafe { *kp.add(key * stride + c * 4).cast::<F32x4>() }.0;
             #[unroll]
             for e in 0..4 {
