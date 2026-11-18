@@ -1,6 +1,7 @@
 //! Ironicl's CUDA kernels, compiled to PTX by cuda-oxide's codegen backend
-//! and embedded in the library. The build for Ada and later GPUs sets
-//! `ironicl_sm89`, which converts FP8 in hardware.
+//! and embedded in the library, once per target in `IRONICL_CUDA_ARCH` (see
+//! `build.rs`). A target's capabilities set `ironicl_cap_*` cfgs:
+//! `ironicl_cap_fp8_cvt` (Ada and later) converts FP8 in hardware.
 //!
 //! ICL attention: every (estimator, head) pair attends with Q query rows to N
 //! cached training rows, in Ironicl's `[estimators x heads, N, 64]` cache
@@ -27,10 +28,10 @@ use cuda_host::cuda_module;
 )]
 pub(super) mod device {
     use cuda_device::async_copy::{cp_async_cg_16, cp_async_commit_group, cp_async_wait_group};
-    #[cfg(ironicl_sm89)]
+    #[cfg(ironicl_cap_fp8_cvt)]
     use cuda_device::convert::cvt_rn_f16x2_e4m3x2;
     use cuda_device::convert::{cvt_f16x2_f32, cvt_f32x2_f16x2};
-    #[cfg(not(ironicl_sm89))]
+    #[cfg(not(ironicl_cap_fp8_cvt))]
     use cuda_device::f16x2::fma_f16x2;
     use cuda_device::vector::F32x4;
     use cuda_device::wmma::{ldmatrix_x4, ldmatrix_x4_trans, mma_m16n8k16_f16_f16, mma_m16n8k16_f32_f16};
@@ -54,11 +55,11 @@ pub(super) mod device {
     /// subnormals land on FP16 values exactly, so both ways give the same result.
     #[inline(always)]
     fn e4m3x2_to_f16x2(pair: u16) -> u32 {
-        #[cfg(ironicl_sm89)]
+        #[cfg(ironicl_cap_fp8_cvt)]
         {
             cvt_rn_f16x2_e4m3x2(pair)
         }
-        #[cfg(not(ironicl_sm89))]
+        #[cfg(not(ironicl_cap_fp8_cvt))]
         {
             let word = u32::from(pair);
             let spread = (word & 0xff) | ((word & 0xff00) << 8); // bytes at bits 0 and 16

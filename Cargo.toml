@@ -114,8 +114,6 @@ tempfile = "3.27.0"
 
 [lints.rust]
 unsafe_code = "warn"
-# Set by the CUDA build for Ada and later GPUs.
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(ironicl_sm89)"] }
 
 [lints.clippy]
 all = "warn"

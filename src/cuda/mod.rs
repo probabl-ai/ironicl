@@ -18,9 +18,9 @@
 //! cores. When the ICL cache does not fit the device with room to predict, it
 //! streams from host memory one block at a time.
 //!
-//! The kernels build twice: at `sm_80` for Ampere, embedded by the build, and
-//! at `sm_89` for Ada and later, which converts FP8 in hardware and leaves room
-//! for the instructions those GPUs add (see `build.rs` and the Makefile).
+//! The kernels build once per target in `IRONICL_CUDA_ARCH`: by default at
+//! `sm_80` for Ampere and at `sm_89` for Ada and later, which converts FP8 in
+//! hardware. Each device loads the most specific build for it (see `build.rs`).
 //!
 //! - [`kernels`]: the kernels.
 //! - [`build`]: a context's build.
