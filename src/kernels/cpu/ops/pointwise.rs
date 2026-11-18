@@ -1,15 +1,5 @@
 //! Elementwise kernels: GELU, QASS modulation, BF16 conversion, fast exp/erf/tanh.
 
-#![allow(
-    unsafe_code,
-    clippy::needless_range_loop,
-    clippy::similar_names,
-    clippy::too_many_lines,
-    clippy::cast_precision_loss,
-    clippy::missing_transmute_annotations,
-    clippy::wildcard_imports // Sibling items differ per target.
-)]
-
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use crate::kernels::cpu::*;
 
@@ -50,8 +40,12 @@ pub(crate) fn convert_f32_to_bf16(_input: &[f32], _output: &mut [u16]) -> bool {
 }
 
 #[inline]
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation, reason = "the clamped exponent fits in i32")]
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the exponent is clamped to within ±128, exact in f32"
+)]
 pub(crate) fn bounded_exp(value: f32) -> f32 {
     let value = value.clamp(-40.0, 20.0);
     let exponent = (value * core::f32::consts::LOG2_E).round() as i32;

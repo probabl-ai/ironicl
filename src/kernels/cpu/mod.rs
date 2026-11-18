@@ -1,15 +1,10 @@
 //! CPU kernels, chosen after runtime feature checks: the operations in
 //! `ops`, with the instruction-set versions in `arch`.
 
-#![allow(
-    unsafe_code,
-    clippy::needless_range_loop,
-    clippy::similar_names,
-    clippy::too_many_lines,
-    clippy::cast_precision_loss,
-    clippy::missing_transmute_annotations
+#[allow(
+    clippy::wildcard_imports,
+    reason = "each file reaches its siblings through the cpu module; which items exist differs per target"
 )]
-
 mod arch {
     #[cfg(target_arch = "aarch64")]
     pub(crate) mod aarch64;
@@ -18,6 +13,10 @@ mod arch {
     #[cfg(target_arch = "x86_64")]
     pub(crate) mod x86_64;
 }
+#[allow(
+    clippy::wildcard_imports,
+    reason = "each file reaches its siblings through the cpu module; which items exist differs per target"
+)]
 mod ops {
     pub(crate) mod affine;
     pub(crate) mod attention;
@@ -153,7 +152,7 @@ impl FromStr for IsaPreference {
 
 /// Runtime CPU capabilities relevant to Ironicl kernels.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools, reason = "one flag per detected CPU feature")]
 pub struct CpuCapabilities {
     pub architecture: &'static str,
     pub operating_system: &'static str,
@@ -169,7 +168,10 @@ pub struct CpuCapabilities {
 impl CpuCapabilities {
     #[must_use]
     pub fn detect() -> Self {
-        #[cfg_attr(not(target_arch = "x86_64"), allow(unused_mut))]
+        #[cfg_attr(
+            not(target_arch = "x86_64"),
+            expect(unused_mut, reason = "only x86-64 fills in features after construction")
+        )]
         let mut host = Self {
             architecture: std::env::consts::ARCH,
             operating_system: std::env::consts::OS,

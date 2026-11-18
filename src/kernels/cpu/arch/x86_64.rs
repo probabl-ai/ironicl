@@ -7,14 +7,13 @@
 //! check slice lengths: their callers in `ops/` and `kernels/reference.rs` do. Each SAFETY
 //! comment names the check it relies on.
 
-#![allow(
+#![expect(
     unsafe_code,
+    reason = "AVX-512 intrinsics and raw pointer loads; each unsafe block states its invariant"
+)]
+#![expect(
     clippy::needless_range_loop,
-    clippy::similar_names,
-    clippy::too_many_lines,
-    clippy::cast_precision_loss,
-    clippy::missing_transmute_annotations,
-    clippy::wildcard_imports // Sibling items differ per target.
+    reason = "loops index fixed-size accumulator and lane arrays in step with each other"
 )]
 
 use crate::kernels::cpu::*;
@@ -28,7 +27,11 @@ pub(crate) const BF16_AFFINE_MAX_ROWS: usize = 8;
 pub(crate) const MAX_PACKED_ATTENTION_QUERY_ROWS: usize = 16;
 
 #[inline]
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation, reason = "the clamped exponent fits in i32")]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the exponent is clamped to within ±128, exact in f32"
+)]
 pub(crate) fn fast_exp_negative(value: f32) -> f32 {
     let value = value.max(-87.0);
     let exponent = (value * core::f32::consts::LOG2_E).round() as i32;
@@ -317,7 +320,10 @@ pub(crate) unsafe fn affine_packed_bf16_avx512(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn attention_score_tile_for_target(
     backend: Isa,
     query: &[f32],
@@ -342,7 +348,10 @@ pub(crate) fn attention_score_tile_for_target(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn attention_score_tile_bf16_for_target(
     backend: Isa,
     query: &[f32],
@@ -369,7 +378,10 @@ pub(crate) fn attention_score_tile_bf16_for_target(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn attention_score_packed_key_tile_for_target(
     backend: Isa,
     query: &[f32],
@@ -406,7 +418,10 @@ pub(crate) fn attention_score_packed_key_tile_for_target(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn attention_score_packed_key_padded_tile_for_target(
     backend: Isa,
     query: &[f32],
@@ -448,7 +463,10 @@ pub(crate) fn attention_score_packed_key_padded_tile_for_target(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn attention_score_packed_key_bf16_tile_for_target(
     backend: Isa,
     query: &[f32],
@@ -486,7 +504,6 @@ pub(crate) fn attention_score_packed_key_bf16_tile_for_target(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn attention_value_tile_fma_for_target(
     backend: Isa,
     weights: &[f32],
@@ -510,7 +527,6 @@ pub(crate) fn attention_value_tile_fma_for_target(
 }
 
 #[cfg(target_arch = "x86_64")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn attention_value_tile_bf16_fma_for_target(
     backend: Isa,
     weights: &[f32],
@@ -639,7 +655,6 @@ pub(crate) unsafe fn softmax_exp_sum_avx512(scores: &mut [f32], maximum: f32) ->
 /// query_rows * head_dim`; and `key.len() >= source_rows * head_dim`.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn attention_score_tile_avx512(
     query: &[f32],
     query_rows: usize,
@@ -681,7 +696,6 @@ pub(crate) unsafe fn attention_score_tile_avx512(
 /// (`query_rows > 16` panics on the accumulator index.)
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn attention_score_tile_bf16_avx512(
     query: &[f32],
     query_rows: usize,
@@ -733,7 +747,6 @@ pub(crate) unsafe fn attention_score_tile_bf16_avx512(
 /// source_rows`; and `scores.len() >= query_rows * source_rows`. (`query_rows > 16` panics.)
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn attention_score_packed_key_tile_avx512(
     query: &[f32],
     query_rows: usize,
@@ -838,7 +851,10 @@ pub(crate) unsafe fn attention_score_packed_key_tile_avx512_rows<const QUERY_ROW
 /// `scores.len() >= query_rows * source_rows`. (`query_rows > 16` panics.)
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) unsafe fn attention_score_packed_key_padded_tile_avx512(
     query: &[f32],
     query_rows: usize,
@@ -898,7 +914,6 @@ pub(crate) unsafe fn attention_score_packed_key_padded_tile_avx512(
 /// source_rows`. (`query_rows > 8` panics on the accumulator index.)
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f,avx512bw")]
-#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn attention_score_packed_key_bf16_tile_avx512(
     query: &[f32],
     query_rows: usize,
@@ -1196,7 +1211,7 @@ pub(crate) unsafe fn attention_value_packed_bf16_dot_avx512(
                     let packed: __m512bh = core::mem::transmute(_mm512_loadu_epi16(
                         packed_value.as_ptr().add(offset).cast::<i16>(),
                     ));
-                    values[block] = core::mem::transmute(packed);
+                    values[block] = core::mem::transmute::<__m512bh, core::arch::x86_64::__m512>(packed);
                 }
                 for row in 0..query_rows {
                     let offset = row * source_rows + pair * 2;
@@ -1414,6 +1429,10 @@ pub(crate) unsafe fn gelu_avx512(input: &[f32], output: &mut [f32]) {
 /// least `rows * width`; and `weight` and `bias`, if any, hold at least `width` values.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "width is at most a few thousand, exact in f32"
+)]
 pub(crate) unsafe fn layer_norm_avx512(
     input: &[f32],
     rows: usize,
@@ -1571,6 +1590,11 @@ pub(crate) unsafe fn affine_input3_transposed_avx512(
 /// output_dim * input_dim`; and `output.len() >= rows * output_dim`. `bias` uses checked indexing.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx512f")]
+#[expect(
+    clippy::similar_names,
+    clippy::too_many_lines,
+    reason = "register-blocked kernel: accumulators and loads named by row and column"
+)]
 pub(crate) unsafe fn affine_avx512(
     input: &[f32],
     rows: usize,

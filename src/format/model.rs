@@ -482,7 +482,7 @@ fn encode_model_artifact(model: &ModelArtifactData) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines, reason = "one pass over the format, field by field")]
 fn parse_model_artifact_bytes(bytes: &[u8]) -> Result<ParsedModelArtifact> {
     if bytes.len() < HEADER_BYTES + CHECKSUM_BYTES {
         return Err(Error::Artifact("artifact is truncated".into()));

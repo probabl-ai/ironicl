@@ -1,11 +1,11 @@
-#![allow(
-    clippy::cast_precision_loss,
-    clippy::doc_markdown,
-    clippy::float_cmp,
-    clippy::manual_is_multiple_of,
+#![expect(
     clippy::missing_errors_doc,
-    clippy::needless_range_loop,
-    clippy::too_many_arguments
+    reason = "every kernel returns InvalidArgument for buffers that do not match its shape (or NaN \
+              softmax input) and ArithmeticOverflow for shapes that overflow"
+)]
+#![expect(
+    clippy::cast_precision_loss,
+    reason = "shapes and positions here are at most a few thousand, exact in f32"
 )]
 
 use crate::error::{Error, Result};
@@ -14,7 +14,7 @@ use crate::profile::{self, Category};
 pub(super) const LAYER_NORM_EPSILON: f32 = 1e-5;
 const SQRT_2: f32 = core::f32::consts::SQRT_2;
 
-/// Borrowed FP32 parameters for elementwise QASSMax.
+/// Borrowed FP32 parameters for elementwise `QASSMax`.
 ///
 /// `base_*` describe `Linear(1, hidden) -> GELU -> Linear(hidden, embed_dim)`.
 /// `query_*` describe `Linear(head_dim, hidden) -> GELU -> Linear(hidden, head_dim)`.
@@ -76,9 +76,9 @@ pub fn dot_f32(left: &[f32], right: &[f32]) -> Result<f32> {
         .fold(0.0_f32, |sum, (left, right)| left.mul_add(*right, sum)))
 }
 
-/// Apply a PyTorch `Linear` layer to `rows` row-major input rows.
+/// Apply a `PyTorch` `Linear` layer to `rows` row-major input rows.
 ///
-/// `weight` has PyTorch layout `[output_dim, input_dim]`. `bias`, when present,
+/// `weight` has `PyTorch` layout `[output_dim, input_dim]`. `bias`, when present,
 /// has `output_dim` elements. `output` is overwritten and has `[rows, output_dim]`.
 pub fn affine_f32(
     input: &[f32],
@@ -183,7 +183,7 @@ pub fn embedding_lookup_f32(
     Ok(())
 }
 
-/// Apply a one-hot input followed by a PyTorch `Linear` layer.
+/// Apply a one-hot input followed by a `PyTorch` `Linear` layer.
 ///
 /// `weight` has `[output_dim, classes]` layout. This differs from an embedding
 /// lookup: each class selects a column and the linear bias is added.
@@ -219,7 +219,7 @@ pub fn one_hot_linear_f32(
     Ok(())
 }
 
-/// Apply LayerNorm over the final dimension with PyTorch's default epsilon of `1e-5`.
+/// Apply `LayerNorm` over the final dimension with `PyTorch`'s default epsilon of `1e-5`.
 pub fn layer_norm_f32(
     input: &[f32],
     rows: usize,
@@ -275,7 +275,11 @@ pub fn residual_add_f32(left: &[f32], right: &[f32], output: &mut [f32]) -> Resu
     Ok(())
 }
 
-/// Project input rows with packed PyTorch Q/K/V parameters and split the result.
+/// Project input rows with packed `PyTorch` Q/K/V parameters and split the result.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub fn packed_qkv_projection_f32(
     input: &[f32],
     rows: usize,
@@ -321,7 +325,13 @@ pub fn packed_qkv_projection_f32(
     Ok(())
 }
 
-/// Apply elementwise QASSMax to `[heads, rows, head_dim]` queries.
+/// Apply elementwise `QASSMax` to `[heads, rows, head_dim]` queries.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    reason = "a kernel takes its buffers and their shape as plain arguments; the loop indexes \
+              two scratch arrays in step"
+)]
 pub fn qassmax_f32(
     queries: &[f32],
     heads: usize,
@@ -419,7 +429,7 @@ pub fn qassmax_f32(
     Ok(())
 }
 
-/// Apply checkpoint-provided non-interleaved RoPE frequencies to `[heads, rows, head_dim]`.
+/// Apply checkpoint-provided non-interleaved `RoPE` frequencies to `[heads, rows, head_dim]`.
 pub fn rope_non_interleaved_f32(
     input: &[f32],
     heads: usize,
@@ -430,7 +440,7 @@ pub fn rope_non_interleaved_f32(
     output: &mut [f32],
 ) -> Result<()> {
     let _profile = profile::scope(Category::Rope);
-    if head_dim == 0 || head_dim % 2 != 0 {
+    if head_dim == 0 || !head_dim.is_multiple_of(2) {
         return Err(Error::InvalidArgument(
             "RoPE head_dim must be a non-zero even number".into(),
         ));
@@ -465,6 +475,10 @@ pub fn rope_non_interleaved_f32(
 }
 
 /// Materialize stable scaled dot-product attention for `[heads, rows, head_dim]` tensors.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub fn scaled_dot_product_attention_f32(
     query: &[f32],
     query_rows: usize,
@@ -542,7 +556,10 @@ pub struct OnlineAttentionScratch<'a> {
 ///
 /// Input and output tensors use `[heads, rows, head_dim]` storage. The caller
 /// selects bounded query blocks and key tiles and reuses the supplied scratch.
-#[allow(clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub fn tiled_online_scaled_dot_product_attention_f32(
     query: &[f32],
     query_rows: usize,
@@ -573,7 +590,11 @@ pub fn tiled_online_scaled_dot_product_attention_f32(
 }
 
 /// Execute tiled online attention with a previously selected native backend.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn tiled_online_scaled_dot_product_attention_with_backend_f32(
     query: &[f32],
     query_rows: usize,
@@ -763,7 +784,11 @@ pub(crate) fn tiled_online_scaled_dot_product_attention_with_backend_f32(
 
 /// Execute cached attention with source tiles outermost so one K/V tile serves
 /// every bounded query block while it remains cache-resident.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn source_major_online_attention_with_backend_f32(
     query: &[f32],
     query_rows: usize,
@@ -1000,7 +1025,11 @@ pub(crate) fn source_major_online_attention_with_backend_f32(
 
 /// Execute source-major cached attention from BF16 K/V storage with FP32
 /// score, softmax, and value accumulation.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn source_major_online_attention_bf16_with_backend_f32(
     query: &[f32],
     query_rows: usize,
@@ -1204,7 +1233,11 @@ pub(crate) fn source_major_online_attention_bf16_with_backend_f32(
 
 /// Execute source-major cached attention with FP32 K, BF16 V, and FP32
 /// arithmetic. This policy preserves score precision while reducing V traffic.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn source_major_online_attention_f32_key_bf16_value_with_backend_f32(
     query: &[f32],
     query_rows: usize,
@@ -1512,7 +1545,7 @@ pub fn tokens_to_heads_f32(
     output: &mut [f32],
 ) -> Result<()> {
     let elements = checked_elements(rows, embed_dim, "token-to-head layout")?;
-    if heads == 0 || embed_dim % heads != 0 {
+    if heads == 0 || !embed_dim.is_multiple_of(heads) {
         return Err(Error::InvalidArgument(
             "embed_dim must be divisible by a non-zero head count".into(),
         ));
@@ -1815,7 +1848,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one tiled loop nest, kept whole to read against TabICL"
+    )]
     fn tiled_online_attention_matches_materialized_across_tiles_and_scores() {
         let cases = [
             (1, 1, 1, 1, 1, 1),
@@ -1949,7 +1985,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "test data from small integer indices, exact in f32"
+    )]
     fn bf16_source_major_attention_matches_dequantized_fp32() {
         let (heads, query_rows, source_rows, head_dim) = (2, 10, 129, 8);
         let mut state = 7_u32;

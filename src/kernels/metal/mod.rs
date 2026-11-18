@@ -1,10 +1,15 @@
 //! Metal on Apple Silicon: the device, shared buffers, and the `MPSGraph`
 //! plumbing models build their graphs with.
 
-#![allow(unsafe_code)]
-// Objective-C calls; each `unsafe` block states its invariant.
-// Tensor dimensions are model constants or validated sizes far below `isize::MAX`.
-#![allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
+#![expect(
+    unsafe_code,
+    reason = "Objective-C calls; each unsafe block states its invariant"
+)]
+#![allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    reason = "tensor dimensions are model constants or validated sizes far below isize::MAX"
+)]
 
 use std::{collections::HashMap, sync::Mutex};
 
@@ -58,6 +63,7 @@ pub(crate) fn system_working_set() -> Option<u64> {
 
 /// The system GPU's name and the memory Metal recommends it use, or `None`
 /// without a GPU.
+#[cfg(feature = "python")]
 pub(crate) fn system_gpu() -> Option<(String, u64)> {
     MTLCreateSystemDefaultDevice()
         .map(|device| (device.name().to_string(), device.recommendedMaxWorkingSetSize()))

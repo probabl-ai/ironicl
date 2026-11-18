@@ -1,13 +1,8 @@
 //! `AArch64` kernels: NEON, and Accelerate on macOS.
 
-#![allow(
+#![expect(
     unsafe_code,
-    clippy::needless_range_loop,
-    clippy::similar_names,
-    clippy::too_many_lines,
-    clippy::cast_precision_loss,
-    clippy::missing_transmute_annotations,
-    clippy::wildcard_imports // Sibling items differ per target.
+    reason = "NEON intrinsics, raw pointer loads, and Accelerate FFI; each unsafe block states its invariant"
 )]
 
 use crate::kernels::cpu::*;
@@ -20,7 +15,10 @@ pub(crate) const SMALL_ATTENTION_MAX_SOURCES: usize = 128;
 /// 26-token sequences. It avoids the tiled kernel's per-pair calls. Returns
 /// false when the shape is not supported.
 #[cfg(target_arch = "aarch64")]
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn small_attention(
     query: &[f32],
     query_rows: usize,
@@ -62,7 +60,14 @@ pub(crate) fn small_attention(
 /// `source_rows > SMALL_ATTENTION_MAX_SOURCES` panics rather than overflowing.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "head_dim is at most a few thousand, exact in f32"
+)]
 pub(crate) unsafe fn small_attention_neon(
     query: &[f32],
     query_rows: usize,
@@ -171,7 +176,14 @@ pub(crate) mod accelerate {
     /// Head-major attention: `softmax(q k^T / sqrt(d)) v` for each head, with
     /// `query` and `output` `[heads, q_rows, d]` and `key`, `value` `[heads, source_rows, d]`.
     /// Returns false when a dimension does not fit the BLAS integer type.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a kernel takes its buffers and their shape as plain arguments"
+    )]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "head_dim is at most a few thousand, exact in f32"
+    )]
     pub(crate) fn attention(
         query: &[f32],
         q_rows: usize,
@@ -328,7 +340,6 @@ pub(crate) mod accelerate {
 }
 
 #[cfg(target_arch = "aarch64")]
-#[allow(clippy::unnecessary_wraps)]
 pub(crate) fn attention_dot_for_target(backend: Isa, left: &[f32], right: &[f32]) -> Option<f32> {
     // SAFETY: NEON is baseline on AArch64 (and `Isa::Neon` was selected). The callers
     // (`attention_dot_f32`) pass equal-length rows, so `right.len() >= left.len()`.
@@ -432,6 +443,10 @@ pub(crate) fn layer_norm_for_target(
 /// `rows * width` values, and `weight` and `bias` (when present) at least `width`.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "width is at most a few thousand, exact in f32"
+)]
 pub(crate) unsafe fn layer_norm_neon(
     input: &[f32],
     rows: usize,
@@ -510,9 +525,14 @@ pub(crate) unsafe fn gelu_neon(input: &[f32], output: &mut [f32]) {
     // transmutes are between `float32x4_t` and `[f32; 4]`, both 16 bytes of plain `f32`.
     unsafe {
         for offset in (0..end).step_by(4) {
-            let values: [f32; 4] = core::mem::transmute(vld1q_f32(input.as_ptr().add(offset)));
+            let values = core::mem::transmute::<core::arch::aarch64::float32x4_t, [f32; 4]>(vld1q_f32(
+                input.as_ptr().add(offset),
+            ));
             let result = values.map(fast_gelu);
-            vst1q_f32(output.as_mut_ptr().add(offset), core::mem::transmute(result));
+            vst1q_f32(
+                output.as_mut_ptr().add(offset),
+                core::mem::transmute::<[f32; 4], core::arch::aarch64::float32x4_t>(result),
+            );
         }
     }
     for offset in end..input.len() {
@@ -550,6 +570,11 @@ pub(crate) fn affine_for_target(
 /// `weight` at least `output_dim * input_dim`. (`output` and `bias` are index-checked.)
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
+#[expect(
+    clippy::similar_names,
+    clippy::too_many_lines,
+    reason = "register-blocked kernel: accumulators and loads named by row and column"
+)]
 pub(crate) unsafe fn affine_neon(
     input: &[f32],
     rows: usize,
@@ -676,6 +701,10 @@ pub(crate) unsafe fn affine_neon(
 /// As [`affine_neon`], and `row + ROWS <= rows` so `input` holds rows `row..row + ROWS`.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
+#[expect(
+    clippy::needless_range_loop,
+    reason = "the loop indexes the accumulator and output arrays in step"
+)]
 pub(crate) unsafe fn affine_neon_rows<const ROWS: usize>(
     input: &[f32],
     row: usize,
@@ -790,6 +819,10 @@ pub(crate) unsafe fn affine_neon_rows<const ROWS: usize>(
 /// As [`affine_neon`], and `row < rows` so `input` holds row `row`.
 #[cfg(target_arch = "aarch64")]
 #[target_feature(enable = "neon")]
+#[expect(
+    clippy::needless_range_loop,
+    reason = "the loop indexes the accumulator and output arrays in step"
+)]
 pub(crate) unsafe fn affine_neon_single_row(
     input: &[f32],
     row: usize,

@@ -1,14 +1,5 @@
 //! Uncached scalar FP32 execution for the official `TabICLv2` classifier.
 
-#![allow(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::float_cmp,
-    clippy::many_single_char_names,
-    clippy::too_many_arguments,
-    clippy::too_many_lines
-)]
-
 use std::{
     cell::RefCell,
     collections::BTreeMap,
@@ -75,7 +66,10 @@ thread_local! {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-#[allow(clippy::struct_excessive_bools)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one switch per layer of the bf16-dense experiment"
+)]
 struct Bf16DensePolicy {
     column_q: bool,
     column_out: bool,
@@ -613,6 +607,10 @@ impl Executor {
     ///
     /// Returns an error for inconsistent dimensions or labels, invalid
     /// permutations, or when the context does not fit in memory.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
+    )]
     pub fn build_context(
         &self,
         ensembles: usize,
@@ -915,6 +913,10 @@ impl Executor {
         }
     }
 
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "b, q, h, n, c name the model's dimensions"
+    )]
     fn predict_logits_inner(&self, request: Request<'_>, trace: bool) -> Result<PredictionResult> {
         let (b, t, h, n) = (
             request.ensemble_count(),
@@ -987,6 +989,10 @@ impl Executor {
 
     /// Embed every feature stream. With `capture`, also return each feature's
     /// three `multihead_attn2` key/value pairs, in feature order.
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "b, q, h, n, c name the model's dimensions"
+    )]
     fn column_embeddings(
         &self,
         x: &[f32],
@@ -1037,7 +1043,15 @@ impl Executor {
         Ok((output, feature_caches))
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
+    )]
+    #[expect(
+        clippy::float_cmp,
+        clippy::many_single_char_names,
+        reason = "-100.0 is an exact missing-value marker; b, q, h, n, c name the model's dimensions"
+    )]
     fn column_stream(
         &self,
         x: &[f32],
@@ -1085,6 +1099,7 @@ impl Executor {
 
     /// Return the block output and the `multihead_attn2` keys and values, or no
     /// keys and values when the all-missing stream passes through unchanged.
+    #[expect(clippy::float_cmp, reason = "-100.0 is an exact missing-value marker")]
     fn isab(
         &self,
         source: Vec<f32>,
@@ -1240,7 +1255,10 @@ impl Executor {
         Ok(logits)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
+    )]
     fn block(
         &self,
         q: &[f32],
@@ -1372,6 +1390,11 @@ impl Executor {
     }
 
     /// Attend from `q` to projected sources, then apply the residual feed-forward block.
+    #[expect(clippy::too_many_lines, reason = "one attention, step by step")]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
+    )]
     fn attend(
         &self,
         q: &[f32],
@@ -1501,7 +1524,10 @@ impl Executor {
         Ok(residual)
     }
 
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
+    )]
     fn qass(
         &self,
         prefix: &str,
@@ -1728,7 +1754,6 @@ impl StaticExecutor {
     /// Query rows a prediction should bring at once: a streamed pass's, so
     /// each copy of the ICL cache serves as many rows as fit, else `None`.
     #[must_use]
-    #[cfg_attr(not(feature = "cuda"), allow(clippy::unused_self))]
     pub fn batch_rows(&self) -> Option<usize> {
         #[cfg(feature = "cuda")]
         if let Device::Cuda(predictor) = &self.device
@@ -1885,7 +1910,10 @@ impl StaticExecutor {
     }
 
     #[cfg(not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")))]
-    #[allow(clippy::unnecessary_wraps)]
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "same signature as the Metal version, which can fail"
+    )]
     fn with_gpu(self, _limits: MemoryLimits) -> Result<Self> {
         Ok(self)
     }
@@ -2044,7 +2072,10 @@ impl StaticExecutor {
 
     /// How queries split into runs, `(chunk, small)`: the GPU's split within
     /// its budget, or chunks of [`QUERY_CHUNK_ROWS`] on the CPU.
-    #[allow(clippy::unused_self)] // Without Metal.
+    #[cfg_attr(
+        not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
+        expect(clippy::unused_self, reason = "only the Metal build reads `self`")
+    )]
     fn query_split(&self) -> (usize, usize) {
         #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
         if let Device::Metal(gpu) = &self.device {
@@ -2329,7 +2360,11 @@ impl StaticExecutor {
         Ok(output)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
+    )]
+    #[expect(clippy::float_cmp, reason = "-100.0 is an exact missing-value marker")]
     fn cached_column_stream(
         &self,
         x: &[f32],
@@ -2462,7 +2497,11 @@ impl StaticExecutor {
         Ok(logits)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
+    )]
+    #[expect(clippy::too_many_lines, reason = "one transformer block, step by step")]
     fn cached_block(
         &self,
         q: &[f32],
@@ -2728,7 +2767,10 @@ impl StaticExecutor {
         Ok(residual)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
+    )]
     fn parallel_affine_named(
         &self,
         name: &str,
@@ -2762,7 +2804,10 @@ impl StaticExecutor {
         self.parallel_affine(input, rows, input_dim, weight, bias, output_dim, output, workers)
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
+    )]
     fn parallel_packed_bf16_affine(
         &self,
         packed: &PackedBf16Affine,
@@ -2805,7 +2850,10 @@ impl StaticExecutor {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
+    )]
     fn parallel_packed_f32_affine(
         &self,
         packed: &PackedF32Affine,
@@ -2841,7 +2889,6 @@ impl StaticExecutor {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn run_packed_bf16_affine(
         packed: &PackedBf16Affine,
         input: &[f32],
@@ -2878,7 +2925,10 @@ impl StaticExecutor {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
+    )]
     fn parallel_affine(
         &self,
         input: &[f32],
@@ -3011,6 +3061,10 @@ impl StaticExecutor {
         Ok(normalized)
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
+    )]
     fn uncached_block(
         &self,
         q: &[f32],
@@ -3038,6 +3092,7 @@ impl StaticExecutor {
         )
     }
 
+    #[expect(clippy::too_many_lines, reason = "one transformer block, step by step")]
     fn packed_row_block(
         &self,
         q: &[f32],
@@ -3400,7 +3455,14 @@ impl StaticExecutor {
         Ok(packed)
     }
 
-    #[allow(clippy::fn_params_excessive_bools)]
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "one switch per layer of the bf16-dense experiment"
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
+    )]
     fn pack_f32_cached_block(
         packed: &mut BTreeMap<String, PackedF32Affine>,
         model: &Executor,
@@ -3541,7 +3603,14 @@ impl StaticExecutor {
         Ok(packed)
     }
 
-    #[allow(clippy::fn_params_excessive_bools)]
+    #[expect(
+        clippy::fn_params_excessive_bools,
+        reason = "one switch per layer of the bf16-dense experiment"
+    )]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
+    )]
     fn pack_cached_block_affines(
         packed: &mut BTreeMap<String, PackedBf16Affine>,
         model: &Executor,
@@ -3613,7 +3682,7 @@ impl StaticExecutor {
 
 /// `QASSMax` base scales for `source` keys: `[heads * head_dim]`, the same for
 /// every query, so they are computed once per source length.
-#[allow(clippy::cast_precision_loss)] // ln(source) needs no more precision.
+#[expect(clippy::cast_precision_loss, reason = "ln(source) needs no more precision")]
 fn qass_base_scale(model: &Executor, prefix: &str, source: usize, width: usize) -> Result<Vec<f32>> {
     let name = |part: &str| format!("{prefix}.ssmax_layer.{part}");
     let first_weight = model.tensor(&name("base_mlp.0.weight"))?;
@@ -3640,7 +3709,10 @@ fn qass_base_scale(model: &Executor, prefix: &str, source: usize, width: usize) 
 }
 
 impl StaticExecutor {
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
+    )]
     fn qass(
         &self,
         prefix: &str,
@@ -3712,6 +3784,10 @@ fn f16_to_f32(bits: u16) -> f32 {
     }
 }
 
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "permutation entries are class indices"
+)]
 fn aggregate_classifier_probabilities(
     logits: &DecoderOutputs,
     class_permutations: &[u64],
@@ -3910,7 +3986,7 @@ fn context_page(b: usize, n: usize, h: usize, icl: TensorStorage) -> Result<Page
 /// Whether a row of `x` `[_, H]` groups a feature's neighbors into the
 /// all-missing marker, which only the CPU column stage handles.
 #[cfg(feature = "cuda")]
-#[allow(clippy::float_cmp)] // The all-missing marker is exactly -100.
+#[expect(clippy::float_cmp, reason = "The all-missing marker is exactly -100")]
 fn has_missing_marker(x: &[f32], h: usize) -> bool {
     x.par_chunks(h).any(|row| {
         (0..h).any(|feature| {
@@ -3927,7 +4003,7 @@ fn has_missing_marker(x: &[f32], h: usize) -> bool {
     feature = "cuda",
     all(feature = "metal", target_os = "macos", target_arch = "aarch64")
 ))]
-#[allow(clippy::cast_precision_loss)] // Positions are small.
+#[expect(clippy::cast_precision_loss, reason = "Positions are small")]
 pub(crate) fn rope_tables(len: usize, frequencies: &[f32]) -> (Vec<f32>, Vec<f32>) {
     let head_dim = COLUMN_DIM / HEADS;
     let half = head_dim / 2;
@@ -4084,7 +4160,7 @@ pub(crate) fn executor_threads() -> usize {
 /// the efficiency cores, and on an M1 Max (8 + 2 cores) it lets 8 estimators
 /// run in parallel instead of one at a time with each split 10 ways.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-#[allow(unsafe_code)] // One libSystem call; std has no portable equivalent.
+#[expect(unsafe_code, reason = "One libSystem call; std has no portable equivalent")]
 fn performance_cores() -> Option<usize> {
     unsafe extern "C" {
         fn sysctlbyname(
@@ -4135,7 +4211,17 @@ fn static_execution_plan(ensembles: usize, total_threads: usize) -> ExecutionPla
     ExecutionPlan::automatic(ensembles, total_threads, false)
 }
 
-#[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
+#[expect(
+    clippy::too_many_arguments,
+    clippy::cast_precision_loss,
+    reason = "a kernel takes its buffers and their shape as plain arguments; its counts are small"
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::too_many_lines,
+    reason = "sparse indices are whole non-negative f32 values, checked by validate_sparse_index_contract"
+)]
 fn sparse_cached_attention_f32_key_bf16_value(
     query: &[f32],
     query_rows: usize,
@@ -4264,6 +4350,10 @@ const fn sparse_max_omitted_mass() -> f32 {
     1e-5
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
+)]
 fn parallel_cached_attention(
     backend: crate::kernels::cpu::Isa,
     query: &[f32],
@@ -4352,6 +4442,10 @@ fn parallel_cached_attention(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
+)]
 fn parallel_cached_attention_bf16(
     backend: crate::kernels::cpu::Isa,
     query: &[f32],
@@ -4443,6 +4537,10 @@ fn parallel_cached_attention_bf16(
     })
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
+)]
 fn parallel_cached_attention_f32_key_bf16_value(
     backend: crate::kernels::cpu::Isa,
     query: &[f32],
@@ -4641,7 +4739,10 @@ fn shared_gpu_pools(gpu: &crate::kernels::metal::Gpu, limits: MemoryLimits) -> P
 /// Metal's recommended working set when the GPU would build `rows` training
 /// rows, or `None` when the CPU builds: no GPU, `IRONICL_NO_METAL` set, or too
 /// few rows.
-#[allow(unused_variables)]
+#[cfg_attr(
+    not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
+    expect(unused_variables, reason = "only the Metal build reads `rows`")
+)]
 fn gpu_working_set(rows: usize) -> Option<u64> {
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
     if std::env::var_os("IRONICL_NO_METAL").is_none()
@@ -4835,7 +4936,16 @@ fn tokens_to_heads_into(input: &[f32], rows: usize, dim: usize, heads: usize, ou
     }
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "row counts are at most a few million, close enough in f32"
+)]
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::float_cmp,
+    reason = "checks that sparse indices are whole, in range, and exact"
+)]
 fn validate_sparse_index_contract(context: &StaticContextArtifact) -> Result<()> {
     let present = SPARSE_INDEX_TENSORS.map(|name| context.tensor(name));
     if present.iter().all(Option::is_none) {
@@ -5029,6 +5139,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::cast_possible_truncation, reason = "test shapes are small")]
     fn cached_context_rejects_missing_and_wrong_shaped_tensors() {
         assert!(
             validate_static_cache_contract(&context(vec![StaticContextTensor {
@@ -5097,15 +5208,24 @@ mod tests {
     fn cached_attention_matches_source_projected_key_value() {
         let (rows, source_rows, dim, heads) = (2, 3, 8, 2);
         let head_dim = dim / heads;
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "row counts are at most a few million, close enough in f32"
+        )]
         let source = (0..source_rows * dim)
             .map(|index| index as f32 * 0.03125 - 0.2)
             .collect::<Vec<_>>();
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "row counts are at most a few million, close enough in f32"
+        )]
         let query = (0..rows * dim)
             .map(|index| index as f32 * -0.0625 + 0.4)
             .collect::<Vec<_>>();
-        #[allow(clippy::cast_precision_loss)]
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "row counts are at most a few million, close enough in f32"
+        )]
         let weight = (0..dim * dim)
             .map(|index| index as f32 * 0.007_812_5 - 0.1)
             .collect::<Vec<_>>();
@@ -5159,7 +5279,10 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "row counts are at most a few million, close enough in f32"
+    )]
     fn serial_hybrid_attention_matches_head_parallel_attention() {
         let (query_rows, source_rows, head_dim) = (2, 16, 64);
         let query = (0..super::HEADS * query_rows * head_dim)

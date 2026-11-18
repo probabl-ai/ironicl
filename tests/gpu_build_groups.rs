@@ -10,7 +10,11 @@ use ironicl::{Executor, Optimize, QueryRequest, load_model_artifact, memory::Mem
 /// `Fast`; a group copied to the wrong place is 1.6e-2 apart.
 #[test]
 #[ignore = "needs official checkpoint fixtures; run with --ignored once IRONICL_CHECKPOINT_FIXTURES is set. See CONTRIBUTING.md"]
-#[allow(clippy::cast_precision_loss, clippy::many_single_char_names)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::many_single_char_names,
+    reason = "test data from small integer indices; b, q, h, n name the model's dimensions"
+)]
 fn grouped_gpu_build_matches_one_graph_run() {
     let directory = std::env::var_os("IRONICL_CHECKPOINT_FIXTURES")
         .expect("set IRONICL_CHECKPOINT_FIXTURES to run this ignored test; see CONTRIBUTING.md");

@@ -1,10 +1,15 @@
 //! `MPSGraph` construction: placeholders bound to shared weight buffers, and
 //! the operations models build their graphs from.
 
-#![allow(unsafe_code)]
-// Objective-C calls; each `unsafe` block states its invariant.
-// Tensor dimensions are model constants or validated sizes far below `isize::MAX`.
-#![allow(clippy::cast_possible_wrap, clippy::cast_precision_loss)]
+#![expect(
+    unsafe_code,
+    reason = "Objective-C calls; each unsafe block states its invariant"
+)]
+#![allow(
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss,
+    reason = "tensor dimensions are model constants or validated sizes far below isize::MAX"
+)]
 
 use objc2::rc::Retained;
 use objc2_foundation::NSData;

@@ -1,22 +1,18 @@
 //! Attention: score and value tiles, softmax, and packed BF16 values.
 
-#![allow(
-    unsafe_code,
-    clippy::needless_range_loop,
-    clippy::similar_names,
-    clippy::too_many_lines,
-    clippy::cast_precision_loss,
-    clippy::missing_transmute_annotations,
-    clippy::wildcard_imports // Sibling items differ per target.
-)]
-
 use crate::kernels::cpu::*;
 
 /// Run head-major FP32 attention natively unless `backend` is `Portable`:
 /// through Accelerate when it is large enough, else with the short-source
 /// NEON kernel. Returns false when the caller must use its own kernel.
-#[allow(clippy::too_many_arguments)]
-#[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
+#[cfg_attr(
+    not(target_arch = "aarch64"),
+    expect(unused_variables, reason = "only the AArch64 version uses every argument")
+)]
 pub(crate) fn attention_f32(
     backend: Isa,
     query: &[f32],
@@ -80,7 +76,10 @@ pub(crate) fn attention_dot_f32(backend: Isa, left: &[f32], right: &[f32]) -> Op
 /// Compute one row-major `[query_rows, source_rows]` attention score tile.
 ///
 /// Query and key rows are contiguous. The caller validates all slice lengths.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn attention_score_tile_f32(
     backend: Isa,
     query: &[f32],
@@ -104,7 +103,10 @@ pub(crate) fn attention_score_tile_f32(
 }
 
 /// Compute one score tile directly from BF16 K storage with FP32 accumulation.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn attention_score_tile_bf16_f32(
     backend: Isa,
     query: &[f32],
@@ -128,7 +130,10 @@ pub(crate) fn attention_score_tile_bf16_f32(
 }
 
 /// Compute scores from dimension-major packed K using SIMD lanes as source rows.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn attention_score_packed_key_tile_f32(
     backend: Isa,
     query: &[f32],
@@ -152,7 +157,10 @@ pub(crate) fn attention_score_packed_key_tile_f32(
 }
 
 /// Compute scores from a dimension-major K tile padded to a SIMD source width.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn attention_score_packed_key_padded_tile_f32(
     backend: Isa,
     query: &[f32],
@@ -178,7 +186,10 @@ pub(crate) fn attention_score_packed_key_padded_tile_f32(
 }
 
 /// Compute scores from dimension-major packed BF16 K with FP32 accumulation.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn attention_score_packed_key_bf16_tile_f32(
     backend: Isa,
     query: &[f32],
@@ -218,7 +229,6 @@ pub(crate) fn attention_value_tile_fma_f32(
 }
 
 /// Accumulate one weighted-value tile directly from BF16 V storage.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn attention_value_tile_bf16_fma_f32(
     backend: Isa,
     weights: &[f32],
@@ -271,7 +281,10 @@ pub(crate) fn pack_attention_value_bf16(
 }
 
 /// Accumulate FP32 softmax weights times packed BF16 V through `VDPBF16PS`.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn attention_value_packed_bf16_dot_f32(
     backend: Isa,
     weights: &[f32],
@@ -324,7 +337,10 @@ pub(crate) fn softmax_exp_sum_f32(backend: Isa, scores: &mut [f32], maximum: f32
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn attention_score_packed_key_bf16_tile_for_target(
     _backend: Isa,
     _query: &[f32],
@@ -339,7 +355,10 @@ pub(crate) fn attention_score_packed_key_bf16_tile_for_target(
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn attention_score_packed_key_tile_for_target(
     _backend: Isa,
     _query: &[f32],
@@ -354,7 +373,10 @@ pub(crate) fn attention_score_packed_key_tile_for_target(
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn attention_score_packed_key_padded_tile_for_target(
     _backend: Isa,
     _query: &[f32],
@@ -370,7 +392,10 @@ pub(crate) fn attention_score_packed_key_padded_tile_for_target(
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn attention_score_tile_bf16_for_target(
     _backend: Isa,
     _query: &[f32],
@@ -388,7 +413,10 @@ pub(crate) fn attention_score_tile_bf16_for_target(
     target_arch = "x86_64",
     all(target_family = "wasm", target_feature = "simd128")
 )))]
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
 pub(crate) fn attention_score_tile_for_target(
     _backend: Isa,
     _query: &[f32],
@@ -403,7 +431,6 @@ pub(crate) fn attention_score_tile_for_target(
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn attention_value_tile_bf16_fma_for_target(
     _backend: Isa,
     _weights: &[f32],
@@ -430,7 +457,6 @@ pub(crate) fn attention_score_maximum_for_target(_backend: Isa, _scores: &[f32])
     target_arch = "x86_64",
     all(target_family = "wasm", target_feature = "simd128")
 )))]
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn attention_value_tile_fma_for_target(
     _backend: Isa,
     _weights: &[f32],

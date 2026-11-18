@@ -113,7 +113,10 @@ mod implementation {
             let index = category as usize;
             let nanos = NANOS[index].load(Ordering::Relaxed);
             let calls = CALLS[index].load(Ordering::Relaxed);
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "a printed timing; nanoseconds below 2^53 are exact"
+            )]
             let milliseconds = nanos as f64 / 1_000_000.0;
             eprintln!(
                 "profile_{}_ms: {:.6} calls={calls}",

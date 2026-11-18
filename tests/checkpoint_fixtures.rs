@@ -204,7 +204,8 @@ fn matches_python_classifier_oracle_when_fixtures_are_available() {
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
-    clippy::many_single_char_names
+    clippy::many_single_char_names,
+    reason = "test data from small integer indices; b, q, h, n name the model's dimensions"
 )]
 fn built_context_matches_the_uncached_forward_pass() {
     let Some(model_path) = fixture("tabicl-classifier-v2.irmodel") else {
@@ -294,7 +295,11 @@ fn built_context_matches_the_uncached_forward_pass() {
 
 #[test]
 #[ignore = "needs official checkpoint fixtures; run with --ignored once IRONICL_CHECKPOINT_FIXTURES is set. See CONTRIBUTING.md"]
-#[allow(clippy::cast_precision_loss, clippy::many_single_char_names)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::many_single_char_names,
+    reason = "test data from small integer indices; b, q, h, n name the model's dimensions"
+)]
 fn large_cached_query_runs_in_chunks() {
     let Some(model_path) = fixture("tabicl-classifier-v2.irmodel") else {
         panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
@@ -349,7 +354,11 @@ fn large_cached_query_runs_in_chunks() {
 /// CPU, which must read the FP16 caches of an `Auto` context.
 #[test]
 #[ignore = "needs official checkpoint fixtures; run with --ignored once IRONICL_CHECKPOINT_FIXTURES is set. See CONTRIBUTING.md"]
-#[allow(clippy::cast_precision_loss, clippy::many_single_char_names)]
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::many_single_char_names,
+    reason = "test data from small integer indices; b, q, h, n name the model's dimensions"
+)]
 fn reduced_precision_context_predicts_all_missing_rows() {
     let Some(model_path) = fixture("tabicl-classifier-v2.irmodel") else {
         panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");

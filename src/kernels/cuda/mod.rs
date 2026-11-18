@@ -194,9 +194,12 @@ impl Device {
     pub(crate) fn free_memory(&self) -> Result<usize> {
         self.context.bind_to_thread().map_err(gpu_error)?;
         let (mut free, mut total) = (0usize, 0usize);
+        #[expect(
+            unsafe_code,
+            reason = "one driver call for free memory; cuda-core has no wrapper"
+        )]
         // SAFETY: `cuMemGetInfo_v2` writes one `size_t` through each of two valid, distinct
         // pointers to locals; `bind_to_thread` above made the context it reports on current.
-        #[allow(unsafe_code)]
         let status = unsafe { cuda_core::sys::cuMemGetInfo_v2(&raw mut free, &raw mut total) };
         if status == 0 {
             Ok(free)

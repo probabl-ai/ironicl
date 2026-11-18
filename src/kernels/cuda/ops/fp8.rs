@@ -1,17 +1,6 @@
 //! FP8 E4M3 conversion, in hardware with `ironicl_cap_fp8_cvt`.
 
-#![allow(
-    unsafe_code, // Shared memory, tensor-core intrinsics, and unchecked indexing.
-    clippy::no_mangle_with_rust_abi, // How cuda-oxide's `#[kernel]` exports entries.
-    clippy::too_many_arguments, // A kernel's parameters are its launch ABI.
-    clippy::too_many_lines,
-    clippy::many_single_char_names, // The math's names: q, k, v, m, n, k.
-    clippy::similar_names, // Paired high and low parts: `w_hi`, `w_lo`.
-    clippy::needless_range_loop, // `#[unroll]` loops over register-array indices.
-    clippy::inline_always, // Device helpers inline into their kernels.
-    clippy::cast_ptr_alignment, // Vector loads at offsets aligned by construction.
-    clippy::items_after_statements, // `#[launch_bounds]` expands ahead of a kernel's shared statics.
-)]
+#![expect(clippy::inline_always, reason = "device helpers inline into their kernels")]
 
 #[cfg(ironicl_cap_fp8_cvt)]
 use cuda_device::convert::cvt_rn_f16x2_e4m3x2;
@@ -41,7 +30,11 @@ pub(crate) fn e4m3x2_to_f16x2(pair: u16) -> u32 {
 /// `value` as FP8 E4M3 bits, rounded to nearest even and saturated at
 /// ±448, as the host's `cache::e4m3` does.
 #[inline(always)]
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Subnormal steps: 0..=8.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "Subnormal steps: 0..=8"
+)]
 pub(crate) fn e4m3(value: f32) -> u32 {
     let sign = (value.to_bits() >> 24) & 0x80;
     let magnitude = value.abs().min(448.0);

@@ -6,9 +6,11 @@
 //! quantiles. Each estimator is summarized on its own and the results are
 //! averaged, as `TabICLRegressor.predict` does. Values stay in the standardized
 //! target units the model works in.
-// Counts here are at most a few thousand, so `as f64` is exact, and the
-// results are FP32 like TabICL's.
-#![allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+#![expect(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    reason = "counts here are at most a few thousand, so `as f64` is exact; results are FP32 like TabICL's"
+)]
 
 use crate::{
     DecoderOutputs,

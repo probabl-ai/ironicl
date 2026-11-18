@@ -1,17 +1,28 @@
 //! Dense products: tensor-core tiles in FP16 and split FP16, and FP32 tiles on the CUDA cores.
 
-#![allow(
-    unsafe_code, // Shared memory, tensor-core intrinsics, and unchecked indexing.
-    clippy::no_mangle_with_rust_abi, // How cuda-oxide's `#[kernel]` exports entries.
-    clippy::too_many_arguments, // A kernel's parameters are its launch ABI.
-    clippy::too_many_lines,
-    clippy::many_single_char_names, // The math's names: q, k, v, m, n, k.
-    clippy::similar_names, // Paired high and low parts: `w_hi`, `w_lo`.
-    clippy::needless_range_loop, // `#[unroll]` loops over register-array indices.
-    clippy::inline_always, // Device helpers inline into their kernels.
-    clippy::cast_ptr_alignment, // Vector loads at offsets aligned by construction.
-    clippy::items_after_statements, // `#[launch_bounds]` expands ahead of a kernel's shared statics.
+#![expect(
+    unsafe_code,
+    reason = "shared memory, tensor-core intrinsics, and unchecked indexing; each unsafe block states its invariant"
 )]
+#![expect(
+    clippy::no_mangle_with_rust_abi,
+    reason = "cuda-oxide exports kernels and device functions with #[no_mangle] and the Rust ABI"
+)]
+#![expect(
+    clippy::too_many_arguments,
+    reason = "a kernel's parameters are its launch ABI, which device bodies take on"
+)]
+#![expect(clippy::too_many_lines, reason = "a kernel body is one loop nest, kept whole")]
+#![expect(clippy::many_single_char_names, reason = "the math's names: q, k, v, m, n, k")]
+#![expect(
+    clippy::needless_range_loop,
+    reason = "#[unroll] loops index register arrays in step"
+)]
+#![expect(
+    clippy::cast_ptr_alignment,
+    reason = "vector loads at offsets aligned by construction"
+)]
+#![expect(clippy::inline_always, reason = "device helpers inline into their kernels")]
 
 use cuda_device::async_copy::{cp_async_cg_16, cp_async_commit_group, cp_async_wait_group};
 use cuda_device::convert::cvt_f32x2_f16x2;
@@ -245,7 +256,7 @@ pub(crate) fn linear16_body<const SPLIT: bool>(
 ) {
     const STAGES: usize = 3;
     /// Copy groups left in flight when a stage must be on hand.
-    #[allow(clippy::cast_possible_truncation)] // Three stages.
+    #[expect(clippy::cast_possible_truncation, reason = "Three stages")]
     const PENDING: u32 = STAGES as u32 - 2;
     const STAGE: usize = 64 * 16; // u32 per operand tile: 64 rows x 32 FP16
     let tid = thread::threadIdx_x() as usize;

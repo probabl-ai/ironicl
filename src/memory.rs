@@ -134,10 +134,11 @@ pub fn parse_bytes(text: &str) -> Result<u64> {
         return Err(invalid());
     }
     let scale = 1_u64 << shift;
-    #[allow(
+    #[expect(
         clippy::cast_precision_loss,
         clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
+        clippy::cast_sign_loss,
+        reason = "a size like 1.5GiB, kept below u64::MAX and positive before the cast"
     )]
     let bytes = if digits.contains('.') {
         digits
@@ -635,7 +636,7 @@ impl fmt::Display for Plan {
     }
 }
 
-#[allow(clippy::cast_precision_loss)] // Display only.
+#[expect(clippy::cast_precision_loss, reason = "Display only")]
 fn gib(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / f64::from(1 << 30))
 }
@@ -758,7 +759,7 @@ mod platform {
     /// purgeable), wired memory, and the compressor's pages: the complement of
     /// Activity Monitor's "Memory Used". File cache counts as available, since
     /// the kernel drops it without writing to swap.
-    #[allow(unsafe_code)] // Mach and sysctl calls; std has no equivalent.
+    #[expect(unsafe_code, reason = "Mach and sysctl calls; std has no equivalent")]
     pub(super) fn host_memory() -> Option<HostMemory> {
         const HOST_VM_INFO64: i32 = 4;
         unsafe extern "C" {
@@ -823,7 +824,7 @@ mod platform {
     /// Available physical memory, capped by any job memory limit and by the
     /// remaining commit charge: Windows does not overcommit, so past the
     /// commit limit allocations fail instead of paging.
-    #[allow(unsafe_code)] // Win32 calls; std has no equivalent.
+    #[expect(unsafe_code, reason = "Win32 calls; std has no equivalent")]
     pub(super) fn host_memory() -> Option<HostMemory> {
         // SAFETY: MEMORYSTATUSEX holds only integers; all zeros is a valid value.
         let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
@@ -846,7 +847,7 @@ mod platform {
 
     /// A job's process or job memory limit minus this process's private bytes.
     /// For a job limit this assumes the process is alone in the job.
-    #[allow(unsafe_code)]
+    #[expect(unsafe_code, reason = "Windows job-object queries; std has no equivalent")]
     fn job_headroom() -> Option<u64> {
         // SAFETY: JOBOBJECT_EXTENDED_LIMIT_INFORMATION holds only integers; all zeros is valid.
         let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
@@ -925,7 +926,10 @@ impl MemoryPlan {
 
     /// Ideal lower bound for one full cache scan. This excludes all compute.
     #[must_use]
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "byte counts shown or estimated in floating point"
+    )]
     pub fn cache_scan_seconds(self, bandwidth_gbps: f64) -> Option<f64> {
         if bandwidth_gbps.is_finite() && bandwidth_gbps > 0.0 {
             Some(self.cache.total_bytes() as f64 / (bandwidth_gbps * 1_000_000_000.0))
@@ -1012,7 +1016,10 @@ fn checked_product(values: &[u64], name: &'static str) -> Result<u64> {
 pub struct ByteSize(pub u64);
 
 impl fmt::Display for ByteSize {
-    #[allow(clippy::cast_precision_loss)]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "byte counts shown or estimated in floating point"
+    )]
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         const KIB: f64 = 1024.0;
         const MIB: f64 = KIB * 1024.0;
@@ -1098,7 +1105,10 @@ mod tests {
             let bytes = plan(shape(10_000, 100), storage, Builder::Cpu, host(64 * GIB), &[])
                 .expect("plan")
                 .context_bytes;
-            #[allow(clippy::cast_precision_loss)]
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "byte counts shown or estimated in floating point"
+            )]
             let gib = bytes as f64 / GIB as f64;
             assert!((gib - expected).abs() < 0.01, "{gib} GiB");
         }
