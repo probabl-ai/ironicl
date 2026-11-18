@@ -289,7 +289,7 @@ impl DecoderOutputs {
 pub struct Executor {
     model: Arc<ModelArtifact>,
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-    gpu_weights: Arc<OnceLock<Option<Arc<crate::models::tabicl_v2::metal::ModelWeights>>>>,
+    gpu_weights: Arc<OnceLock<Option<Arc<crate::kernels::metal::ModelWeights>>>>,
     #[cfg(feature = "cuda")]
     cuda_weights: Arc<OnceLock<Result<Option<Arc<crate::models::tabicl_v2::cuda::ModelWeights>>>>>,
 }
@@ -460,14 +460,14 @@ impl Executor {
     /// use and shared by every context of the model. `None` without a GPU or
     /// with `IRONICL_NO_METAL` set.
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-    fn gpu_weights(&self) -> Option<Arc<crate::models::tabicl_v2::metal::ModelWeights>> {
+    fn gpu_weights(&self) -> Option<Arc<crate::kernels::metal::ModelWeights>> {
         if std::env::var_os("IRONICL_NO_METAL").is_some() {
             return None;
         }
         self.gpu_weights
             .get_or_init(|| {
                 let gpu = crate::kernels::metal::Gpu::new().ok().flatten()?;
-                Some(Arc::new(crate::models::tabicl_v2::metal::ModelWeights::new(gpu)))
+                Some(Arc::new(crate::kernels::metal::ModelWeights::new(gpu)))
             })
             .clone()
     }
