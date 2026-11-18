@@ -3,8 +3,6 @@
 import contextlib
 import io
 import signal
-import threading
-import time
 import unittest
 from unittest import mock
 
@@ -54,17 +52,26 @@ class ProgressTest(unittest.TestCase):
         x, y = data()
         model = TabICLClassifier(cache_dir=False).fit(x, (y > 0).astype(int))
         # One Python chunk, so only Rust's pieces can notice the interrupt.
-        query = np.tile(x, (27, 1))[:8000]
-        model.predict_proba(query)  # Compile the graphs, so the timed run is steady.
-        start = time.perf_counter()
-        model.predict_proba(query)
-        full = time.perf_counter() - start
-        timer = threading.Timer(full / 5, signal.raise_signal, (signal.SIGINT,))
-        start = time.perf_counter()
-        timer.start()
+        rows = next(model._query_chunks(np.tile(x, (27, 1))[:8000]))[0]
+        pieces = []
+        model.context_.predict_proba(rows, 0.9, False, lambda *report: pieces.append(report))
+        if len(pieces) < 3:
+            self.skipTest(f"this device predicts the rows in {len(pieces)} piece(s)")
+
+        # Ctrl-C arrives as the first piece finishes. A thread sending it would race the pieces,
+        # which a GPU can enqueue faster than the thread wakes; raising it here does not.
+        # Python handles it in this callback or at Rust's next check between pieces, and either
+        # way the prediction must stop before its last piece.
+        reports = []
+
+        def progress(*report):
+            reports.append(report)
+            if len(reports) == 1:
+                signal.raise_signal(signal.SIGINT)
+
         with self.assertRaises(KeyboardInterrupt):
-            model.predict_proba(query)
-        self.assertLess(time.perf_counter() - start, full * 0.7)
+            model.context_.predict_proba(rows, 0.9, False, progress)
+        self.assertLess(len(reports), len(pieces))
 
 
 class ShowConfigTest(unittest.TestCase):
