@@ -1417,7 +1417,7 @@ pub(crate) mod device {
         let mut out = [0.0f32; 16];
         // SAFETY: `kv0`, a multiple of 2048, starts head `head` of stream `e * (H + reserved) + f +
         // reserved` of `B * (H + reserved)`; its 128 keys of stride 16 lie in the caches, which
-        // the launcher asserts hold `B * (H + reserved) * 16384` (`values`: callers check equal).
+        // the launcher asserts both hold `B * (H + reserved) * 16384`.
         unsafe {
             attend16_f32(
                 &query,

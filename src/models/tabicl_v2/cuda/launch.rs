@@ -18,6 +18,7 @@ use cuda_core::{DeviceBuffer, DeviceCopy, LaunchConfig};
 
 use super::{
     COLUMN_DIM, HEAD_DIM, HEADS, KEY_TILE, Precision,
+    cache::value_bytes,
     device::{Device, gpu_error},
     kernels::device::LoadedModule,
     weights::{ColumnInput, Dense, Norm, TokenBlock},
@@ -687,7 +688,9 @@ impl Device {
         (keys, values): (&DeviceBuffer<f32>, &DeviceBuffer<f32>),
         (ensembles, features, q, reserved): (usize, usize, usize, usize),
     ) -> Result<()> {
-        assert!(keys.len() >= ensembles * (features + reserved) * HEADS * 128 * 16);
+        assert!(
+            keys.len() >= ensembles * (features + reserved) * HEADS * 128 * 16 && values.len() == keys.len()
+        );
         let TokenBlock {
             norm1,
             in_proj: w,
@@ -1056,6 +1059,16 @@ impl Device {
     ) -> Result<()> {
         let block_rows = icl_block_rows(precision, padded_queries);
         let (chunk_tiles, splits) = self.icl_split(precision, pairs, padded_queries, rows);
+        // The kernels index the caches and the chunk outputs unchecked.
+        let cache = pairs * padded_rows(rows) * HEAD_DIM * value_bytes(precision);
+        let chunks = pairs * padded_queries * splits;
+        assert!(
+            keys.len() >= cache
+                && values.len() >= cache
+                && part.len() >= chunks * HEAD_DIM
+                && lse.len() >= chunks
+                && out.len() >= pairs * padded_queries * HEAD_DIM
+        );
         let grid = config((padded_queries.div_ceil(block_rows), pairs * splits, 1), 128);
         let (qp, np, splits32) = (n(padded_queries), n(padded_rows(rows)), n(splits));
         let scale = 0.125 / std::f32::consts::LN_2; // 1 / sqrt(64), in the exp2 domain
@@ -1063,8 +1076,8 @@ impl Device {
         // SAFETY: grid (qp / block_rows, pairs * splits) of 128 threads, `block_rows` being the
         // chosen kernel's rows per block; `qp` (`padded_query_rows`) is a multiple of it, so the
         // unchecked query copies stay in `[pairs, qp, 64]`. The caches hold `pairs * np * 64`
-        // values of the precision's width (`BlockCache`); `part` and `lse` hold every chunk, as
-        // `Workspace::reserve` sizes them by this `icl_split`. Chunks start below `np / 64` tiles.
+        // values of the precision's width and `part` and `lse` hold every chunk, as asserted above
+        // (`BlockCache` and `Workspace::reserve` size them so). Chunks start below `np / 64` tiles.
         let launch = unsafe {
             match (precision, queries) {
                 (Precision::Fp32, Activation::F32(queries)) => self.kernels.icl_attention_f32(
