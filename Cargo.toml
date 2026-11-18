@@ -36,7 +36,7 @@ attention-stats = []
 experimental = ["bf16-dense", "bf16-value-dot", "sparse-attention", "attention-stats"]
 profile = []
 python = ["dep:pyo3"]
-# NVIDIA GPUs through the kernels in src/cuda/kernels.rs (Linux). Builds only
+# NVIDIA GPUs through the kernels in src/kernels/cuda/kernels.rs (Linux). Builds only
 # through cuda-oxide's codegen backend: see tools/cuda-env.sh.
 cuda = ["dep:cuda-core", "dep:cuda-device", "dep:cuda-host"]
 

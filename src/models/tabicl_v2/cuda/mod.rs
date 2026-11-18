@@ -34,14 +34,15 @@
 
 mod build;
 mod cache;
-mod device;
-mod kernels;
 mod launch;
 mod plan;
 mod predictor;
 mod testing;
 mod weights;
 mod workspace;
+
+// The device and the kernels live in crate::kernels::cuda.
+use crate::kernels::cuda::{self as device, kernels};
 
 pub use build::{BuildInputs, BuildOutputs, build, context_bytes, fits};
 pub use cache::{BuiltCache, IclSource, IclValues};

@@ -7,8 +7,6 @@ pub mod backend;
 pub mod benchmark;
 pub mod cli;
 pub mod config;
-#[cfg(feature = "cuda")]
-pub mod cuda;
 pub mod error;
 pub mod input_bundle;
 pub mod kernels;

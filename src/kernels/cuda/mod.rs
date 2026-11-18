@@ -1,10 +1,12 @@
 //! The CUDA device: its streams and the kernels for its architecture.
 
+pub(crate) mod kernels;
+
 use std::{fmt::Display, sync::Arc};
 
 use cuda_core::{CudaContext, DeviceBuffer, DeviceCopy, DriverError, PinnedHostBuffer, Stream};
 
-use super::kernels::device::{self as kernels, LoadedModule};
+use self::kernels::device::{self as module, LoadedModule};
 use crate::error::{Error, Result};
 
 /// Which GPUs a module's PTX loads on (see `build.rs`).
@@ -55,12 +57,12 @@ impl Module {
 /// cuda-oxide's own.
 const MODULES: &[Module] = include!(concat!(env!("OUT_DIR"), "/cuda_modules.rs"));
 
-pub(super) fn gpu_error(error: impl Display) -> Error {
+pub(crate) fn gpu_error(error: impl Display) -> Error {
     Error::UnsupportedBackend(format!("CUDA: {error}"))
 }
 
 /// Whether a driver error is the device running out of memory.
-pub(super) fn out_of_memory(error: DriverError) -> bool {
+pub(crate) fn out_of_memory(error: DriverError) -> bool {
     error.0 == cuda_core::sys::cudaError_enum_CUDA_ERROR_OUT_OF_MEMORY
 }
 
@@ -85,7 +87,7 @@ pub struct Device {
     copy: Arc<Stream>,
     multiprocessors: usize,
     arch: Arch,
-    pub(super) kernels: LoadedModule,
+    pub(crate) kernels: LoadedModule,
 }
 
 impl std::fmt::Debug for Device {
@@ -133,9 +135,9 @@ impl Device {
         let mut loaded = None;
         for module in candidates {
             let kernels = match module.ptx {
-                None => kernels::load(&context).map_err(gpu_error)?,
+                None => module::load(&context).map_err(gpu_error)?,
                 Some(ptx) => match context.load_module_from_ptx_src(ptx) {
-                    Ok(ptx) => kernels::from_module(ptx).map_err(gpu_error)?,
+                    Ok(ptx) => module::from_module(ptx).map_err(gpu_error)?,
                     Err(error) if error.is_unsupported_ptx_version() => continue,
                     Err(error) => return Err(gpu_error(error)),
                 },
@@ -174,21 +176,21 @@ impl Device {
         self.arch
     }
 
-    pub(super) const fn multiprocessors(&self) -> usize {
+    pub(crate) const fn multiprocessors(&self) -> usize {
         self.multiprocessors
     }
 
     /// The kernels' stream.
-    pub(super) fn stream(&self) -> &Stream {
+    pub(crate) fn stream(&self) -> &Stream {
         &self.stream
     }
 
-    pub(super) fn copy_stream(&self) -> &Stream {
+    pub(crate) fn copy_stream(&self) -> &Stream {
         &self.copy
     }
 
     /// Device memory free now, in bytes.
-    pub(super) fn free_memory(&self) -> Result<usize> {
+    pub(crate) fn free_memory(&self) -> Result<usize> {
         self.context.bind_to_thread().map_err(gpu_error)?;
         let (mut free, mut total) = (0usize, 0usize);
         // SAFETY: two valid out-pointers; the context is current on this thread.
@@ -202,7 +204,7 @@ impl Device {
     }
 
     /// `len` zeroed elements on the device.
-    pub(super) fn zeroed<T: DeviceCopy>(
+    pub(crate) fn zeroed<T: DeviceCopy>(
         &self,
         len: usize,
     ) -> std::result::Result<DeviceBuffer<T>, DriverError> {
@@ -210,18 +212,18 @@ impl Device {
     }
 
     /// `values` copied to the device.
-    pub(super) fn upload<T: DeviceCopy>(&self, values: &[T]) -> Result<DeviceBuffer<T>> {
+    pub(crate) fn upload<T: DeviceCopy>(&self, values: &[T]) -> Result<DeviceBuffer<T>> {
         DeviceBuffer::from_host(&self.stream, values).map_err(gpu_error)
     }
 
     /// `buffer` copied to the host, once all earlier work is done.
-    pub(super) fn download<T: DeviceCopy>(&self, buffer: &DeviceBuffer<T>) -> Result<Vec<T>> {
+    pub(crate) fn download<T: DeviceCopy>(&self, buffer: &DeviceBuffer<T>) -> Result<Vec<T>> {
         buffer.to_host_vec(&self.stream).map_err(gpu_error)
     }
 
     /// `len` zeroed elements of pinned host memory, which copies to the device
     /// asynchronously.
-    pub(super) fn pinned<T: DeviceCopy>(&self, len: usize) -> Result<PinnedHostBuffer<T>> {
+    pub(crate) fn pinned<T: DeviceCopy>(&self, len: usize) -> Result<PinnedHostBuffer<T>> {
         PinnedHostBuffer::zeroed(&self.context, len).map_err(gpu_error)
     }
 }
