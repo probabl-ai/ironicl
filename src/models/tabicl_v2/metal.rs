@@ -27,7 +27,7 @@ use crate::kernels::metal::{
 };
 use crate::{
     Result,
-    executor::{
+    models::tabicl_v2::cpu::{
         COLUMN_BLOCKS, COLUMN_DIM, HEADS, ICL_BLOCKS, ICL_DIM, INDUCING, QUERY_CHUNK_ROWS, RESERVED,
         rope_tables,
     },

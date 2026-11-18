@@ -487,7 +487,8 @@ fn build_estimator_bytes(shape: ContextShape, builder: Builder) -> Result<u64> {
                 TaskKind::Classifier => 10,
                 TaskKind::Regressor => 999,
             };
-            crate::executor::cpu_build_estimator_bytes(n, h, width)? / to_usize(CPU_BUILD_ESTIMATE_DIVISOR)?
+            crate::models::tabicl_v2::cpu::cpu_build_estimator_bytes(n, h, width)?
+                / to_usize(CPU_BUILD_ESTIMATE_DIVISOR)?
         }
     };
     u64::try_from(bytes).map_err(|_| Error::ArithmeticOverflow("build bytes"))
@@ -544,7 +545,7 @@ pub(crate) fn device_share(pools: Pools) -> (u64, u64) {
 /// the available memory by the planner's halved estimate; in equal groups.
 pub(crate) fn cpu_build_group(estimators: u64, estimate_bytes: u64, available: Option<u64>) -> u64 {
     let estimate = estimate_bytes.max(1);
-    let mut fit = crate::executor::cpu_build_budget_bytes() / estimate;
+    let mut fit = crate::models::tabicl_v2::cpu::cpu_build_budget_bytes() / estimate;
     if let Some(available) = available {
         let counted = (estimate / CPU_BUILD_ESTIMATE_DIVISOR).max(1);
         fit = fit.min(available / BUILD_SHARE_DIVISOR / counted);

@@ -50,14 +50,16 @@ pub use predictor::{ContextTensors, Prediction, Predictor};
 pub use weights::ModelWeights;
 pub use workspace::Shape;
 
-use crate::executor::{COLUMN_BLOCKS, COLUMN_DIM, HEADS, ICL_DIM, INDUCING, Optimize, RESERVED};
+use crate::models::tabicl_v2::cpu::{
+    COLUMN_BLOCKS, COLUMN_DIM, HEADS, ICL_DIM, INDUCING, Optimize, RESERVED,
+};
 
 /// Attention head width the ICL kernels are built for.
 pub const HEAD_DIM: usize = 64;
 /// Keys per tile of the ICL attention kernels.
 pub const KEY_TILE: usize = 64;
 /// ICL transformer blocks.
-pub const ICL_BLOCKS: usize = crate::executor::ICL_BLOCKS;
+pub const ICL_BLOCKS: usize = crate::models::tabicl_v2::cpu::ICL_BLOCKS;
 /// Values of one column's cached inducing-point keys (or values): 8 heads x
 /// 128 inducing points x 16 dims.
 const COLUMN_CACHE: usize = HEADS * INDUCING * 16;

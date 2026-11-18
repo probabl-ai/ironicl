@@ -94,7 +94,7 @@ pub(super) struct RowTokens {
 
 impl RowTokens {
     pub(super) fn upload(device: &Device, features: usize, frequencies: &[f32], cls: &[f32]) -> Result<Self> {
-        let (cos, sin) = crate::executor::rope_tables(features + RESERVED, frequencies);
+        let (cos, sin) = crate::models::tabicl_v2::cpu::rope_tables(features + RESERVED, frequencies);
         Ok(Self {
             cls: device.upload(&cls[..RESERVED * COLUMN_DIM])?,
             cos: device.upload(&cos)?,

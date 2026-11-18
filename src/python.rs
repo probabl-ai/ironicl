@@ -410,7 +410,7 @@ fn system_info(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     dict.set_item("architecture", cpu.architecture)?;
     dict.set_item("operating_system", cpu.operating_system)?;
     dict.set_item("bf16_storage", crate::kernels::cpu::bf16_storage_supported())?;
-    dict.set_item("threads", crate::executor::executor_threads())?;
+    dict.set_item("threads", crate::models::tabicl_v2::cpu::executor_threads())?;
     let host = crate::memory::host_memory();
     dict.set_item("memory_total", host.map(|host| host.total))?;
     dict.set_item("memory_available", host.map(|host| host.available))?;
