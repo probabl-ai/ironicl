@@ -563,6 +563,23 @@ pub(crate) struct Shape {
     pub(crate) training_rows: usize,
 }
 
+/// One context's Metal buffers and the graph that reads them.
+pub(crate) struct GpuContext {
+    pub(crate) predict: PredictGraph,
+    /// How queries split into graph runs, `(chunk, small)` from
+    /// [`PredictGraph::query_split`], which keeps the buckets the
+    /// graph keeps within the device's share of memory.
+    pub(crate) split: (usize, usize),
+    /// Keeps page-aligned context memory alive while GPU buffers wrap it.
+    pub(crate) _storage: Option<std::sync::Arc<memmap2::Mmap>>,
+}
+
+impl std::fmt::Debug for GpuContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("GpuContext")
+    }
+}
+
 /// One context's prediction graph: every stage for every estimator in one
 /// run. The context's keys and values are bound to it.
 pub(crate) struct PredictGraph {
