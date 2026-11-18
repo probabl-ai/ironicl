@@ -290,7 +290,7 @@ pub struct Executor {
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
     gpu_weights: Arc<OnceLock<Option<Arc<crate::models::tabicl_v2::metal::ModelWeights>>>>,
     #[cfg(feature = "cuda")]
-    cuda_weights: Arc<OnceLock<Result<Option<Arc<crate::cuda::ModelWeights>>>>>,
+    cuda_weights: Arc<OnceLock<Result<Option<Arc<crate::models::tabicl_v2::cuda::ModelWeights>>>>>,
 }
 
 /// One context's Metal buffers and the graph that reads them.
@@ -342,7 +342,7 @@ pub struct StaticExecutor {
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
     gpu: Option<Arc<GpuContext>>,
     #[cfg(feature = "cuda")]
-    cuda: Option<Arc<crate::cuda::Predictor>>,
+    cuda: Option<Arc<crate::models::tabicl_v2::cuda::Predictor>>,
 }
 
 /// Sparse ICL attention decisions since the last reset.
@@ -464,12 +464,13 @@ impl Executor {
     /// Returns an error if a CUDA device exists but the kernels or weights
     /// fail to load; set `IRONICL_NO_CUDA` to use the CPU instead.
     #[cfg(feature = "cuda")]
-    fn cuda_weights(&self) -> Result<Option<Arc<crate::cuda::ModelWeights>>> {
+    fn cuda_weights(&self) -> Result<Option<Arc<crate::models::tabicl_v2::cuda::ModelWeights>>> {
         self.cuda_weights
             .get_or_init(|| {
-                crate::cuda::Device::new()?
+                crate::models::tabicl_v2::cuda::Device::new()?
                     .map(|device| {
-                        crate::cuda::ModelWeights::new(device, |name| self.tensor(name)).map(Arc::new)
+                        crate::models::tabicl_v2::cuda::ModelWeights::new(device, |name| self.tensor(name))
+                            .map(Arc::new)
                     })
                     .transpose()
             })
@@ -659,7 +660,7 @@ impl Executor {
         // `auto` and `fast`, as on Apple GPUs.
         #[cfg(feature = "cuda")]
         if let Some(weights) = self.cuda_weights()? {
-            let precision = crate::cuda::Precision::for_optimize(optimize);
+            let precision = crate::models::tabicl_v2::cuda::Precision::for_optimize(optimize);
             let built = self.build_tensors_cuda(&weights, shape, x, y_train, precision, limits)?;
             let (tensors, built) = if let Some(built) = built {
                 built
@@ -693,18 +694,23 @@ impl Executor {
     /// as [`cuda_icl_storage`] says, and return them with the ICL ones the build left on the device
     /// for prediction. Returns `None` when a grouped triple is the all-missing
     /// marker that only the CPU path handles, or when the context does not
-    /// [`crate::cuda::fits`] the device.
+    /// [`crate::models::tabicl_v2::cuda::fits`] the device.
     #[cfg(feature = "cuda")]
     fn build_tensors_cuda(
         &self,
-        weights: &crate::cuda::ModelWeights,
+        weights: &crate::models::tabicl_v2::cuda::ModelWeights,
         (b, n, h): (usize, usize, usize),
         x: &[f32],
         y_train: &[f32],
-        precision: crate::cuda::Precision,
+        precision: crate::models::tabicl_v2::cuda::Precision,
         limits: MemoryLimits,
-    ) -> Result<Option<(PageAlignedTensors, Option<crate::cuda::BuiltCache>)>> {
-        use crate::cuda::{BuildInputs, BuildOutputs, Shape};
+    ) -> Result<
+        Option<(
+            PageAlignedTensors,
+            Option<crate::models::tabicl_v2::cuda::BuiltCache>,
+        )>,
+    > {
+        use crate::models::tabicl_v2::cuda::{BuildInputs, BuildOutputs, Shape};
         let shape = Shape {
             ensembles: b,
             features: h,
@@ -712,7 +718,7 @@ impl Executor {
             outputs: self.decoder_width()?,
         };
         let budget = weights.budget(limits.device.map(|limit| limit.bytes))?;
-        if !crate::cuda::fits(budget, precision, shape) || has_missing_marker(x, h) {
+        if !crate::models::tabicl_v2::cuda::fits(budget, precision, shape) || has_missing_marker(x, h) {
             return Ok(None);
         }
         let (column_labels, icl_labels) = self.label_embeddings(n, y_train)?;
@@ -739,7 +745,7 @@ impl Executor {
                 .collect(),
             icl: pairs.collect(),
         };
-        let built = crate::cuda::build(
+        let built = crate::models::tabicl_v2::cuda::build(
             weights,
             precision,
             &BuildInputs {
@@ -1776,9 +1782,9 @@ impl StaticExecutor {
         mut self,
         optimize: Optimize,
         limits: MemoryLimits,
-        built: Option<crate::cuda::BuiltCache>,
+        built: Option<crate::models::tabicl_v2::cuda::BuiltCache>,
     ) -> Result<Self> {
-        let precision = crate::cuda::Precision::for_optimize(optimize);
+        let precision = crate::models::tabicl_v2::cuda::Precision::for_optimize(optimize);
         if self.context.has_packed_icl_keys() {
             return Ok(self);
         }
@@ -1803,11 +1809,11 @@ impl StaticExecutor {
         };
         let metadata = self.context.metadata();
         let budget = weights.budget(limits.device.map(|limit| limit.bytes))?;
-        let predictor = crate::cuda::Predictor::new(
+        let predictor = crate::models::tabicl_v2::cuda::Predictor::new(
             weights,
             precision,
-            &crate::cuda::ContextTensors {
-                shape: crate::cuda::Shape {
+            &crate::models::tabicl_v2::cuda::ContextTensors {
+                shape: crate::models::tabicl_v2::cuda::Shape {
                     ensembles: metadata.ensemble_count,
                     features: metadata.feature_count,
                     rows: metadata.training_rows,
@@ -3902,10 +3908,11 @@ fn page_aligned(
 /// How a context for the CUDA GPU at `precision` stores its ICL keys and
 /// values: as the GPU caches them, FP32 for `safe` and FP16 otherwise.
 #[cfg(feature = "cuda")]
-const fn cuda_icl_storage(precision: crate::cuda::Precision) -> TensorStorage {
+const fn cuda_icl_storage(precision: crate::models::tabicl_v2::cuda::Precision) -> TensorStorage {
     match precision {
-        crate::cuda::Precision::Fp32 => TensorStorage::Fp32,
-        crate::cuda::Precision::Split | crate::cuda::Precision::Half => TensorStorage::F16,
+        crate::models::tabicl_v2::cuda::Precision::Fp32 => TensorStorage::Fp32,
+        crate::models::tabicl_v2::cuda::Precision::Split
+        | crate::models::tabicl_v2::cuda::Precision::Half => TensorStorage::F16,
     }
 }
 
@@ -4974,7 +4981,10 @@ struct ContextIcl(StaticContextArtifact);
 impl ContextIcl {
     /// `None` unless every ICL block's keys and values are stored as a cache
     /// at `precision` holds them.
-    fn new(context: &StaticContextArtifact, precision: crate::cuda::Precision) -> Option<Self> {
+    fn new(
+        context: &StaticContextArtifact,
+        precision: crate::models::tabicl_v2::cuda::Precision,
+    ) -> Option<Self> {
         let context = Self(context.clone());
         (0..ICL_BLOCKS)
             .all(|block| {
@@ -4985,10 +4995,20 @@ impl ContextIcl {
             .then_some(context)
     }
 
-    fn tensors(&self, block: usize) -> Option<(crate::cuda::IclValues<'_>, crate::cuda::IclValues<'_>)> {
+    fn tensors(
+        &self,
+        block: usize,
+    ) -> Option<(
+        crate::models::tabicl_v2::cuda::IclValues<'_>,
+        crate::models::tabicl_v2::cuda::IclValues<'_>,
+    )> {
         let tensor = |kind: &str| match self.0.tensor(&format!("icl.{block}.{kind}"))?.data {
-            StaticContextTensorData::Fp32(values) => Some(crate::cuda::IclValues::F32(values)),
-            StaticContextTensorData::F16(values) => Some(crate::cuda::IclValues::F16(values)),
+            StaticContextTensorData::Fp32(values) => {
+                Some(crate::models::tabicl_v2::cuda::IclValues::F32(values))
+            }
+            StaticContextTensorData::F16(values) => {
+                Some(crate::models::tabicl_v2::cuda::IclValues::F16(values))
+            }
             StaticContextTensorData::Bf16(_) => None,
         };
         Some((tensor("key")?, tensor("value")?))
@@ -4996,8 +5016,14 @@ impl ContextIcl {
 }
 
 #[cfg(feature = "cuda")]
-impl crate::cuda::IclSource for ContextIcl {
-    fn block(&self, block: usize) -> (crate::cuda::IclValues<'_>, crate::cuda::IclValues<'_>) {
+impl crate::models::tabicl_v2::cuda::IclSource for ContextIcl {
+    fn block(
+        &self,
+        block: usize,
+    ) -> (
+        crate::models::tabicl_v2::cuda::IclValues<'_>,
+        crate::models::tabicl_v2::cuda::IclValues<'_>,
+    ) {
         self.tensors(block).expect("ContextIcl::new checked every block")
     }
 }

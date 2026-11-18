@@ -4,7 +4,7 @@
 #![cfg(feature = "cuda")]
 
 use half::f16;
-use ironicl::cuda::{Device, Precision};
+use ironicl::models::tabicl_v2::cuda::{Device, Precision};
 
 fn values(len: usize, seed: u64) -> Vec<f32> {
     let mut state = seed;

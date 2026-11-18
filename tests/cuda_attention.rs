@@ -3,7 +3,7 @@
 #![cfg(feature = "cuda")]
 
 use half::f16;
-use ironicl::cuda::{Device, HEAD_DIM, Precision};
+use ironicl::models::tabicl_v2::cuda::{Device, HEAD_DIM, Precision};
 
 const D: usize = HEAD_DIM;
 

@@ -1,7 +1,7 @@
 # Source this file from the repository root before building Ironicl's `cuda`
 # feature with a tool that runs Cargo itself, such as maturin, Clippy, or
 # `cargo test`. It sets what `cargo oxide build` sets: cuda-oxide's codegen
-# backend, which compiles the kernels in src/cuda/kernels.rs to PTX and embeds
+# backend, which compiles the kernels in src/kernels/cuda/kernels.rs to PTX and embeds
 # it, and the profile settings the backend requires. The backend also writes
 # the PTX to target/cuda-oxide/.
 #

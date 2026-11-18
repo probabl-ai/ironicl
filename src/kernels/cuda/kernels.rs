@@ -26,7 +26,7 @@ use cuda_host::cuda_module;
     clippy::cast_ptr_alignment, // Vector loads at offsets aligned by construction.
     clippy::items_after_statements // `#[launch_bounds]` expands ahead of a kernel's shared statics.
 )]
-pub(super) mod device {
+pub(crate) mod device {
     use cuda_device::async_copy::{cp_async_cg_16, cp_async_commit_group, cp_async_wait_group};
     #[cfg(ironicl_cap_fp8_cvt)]
     use cuda_device::convert::cvt_rn_f16x2_e4m3x2;

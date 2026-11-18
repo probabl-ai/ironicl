@@ -7,7 +7,7 @@
 //! nested build of this crate with that one target, in its own directory under
 //! `OUT_DIR`, whose PTX this build embeds. Every build sets the `ironicl_cap_*`
 //! cfgs of its target's capabilities. `OUT_DIR/cuda_modules.rs` lists the
-//! modules for the device to choose from at run time (see `src/cuda/device.rs`).
+//! modules for the device to choose from at run time (see `src/kernels/cuda/mod.rs`).
 
 use std::{env, fmt::Write as _, fs, path::PathBuf, process::Command};
 
