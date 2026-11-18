@@ -69,9 +69,10 @@ the FP32 reference path.
   dimension 64.
 - width-128 row and column kernels with 8 heads and head dimension 16.
 
-The native module also contains approximate GELU and QASS modulation kernels,
-but the accepted cached executor does not use them. It keeps the reference FP32
-GELU and QASS arithmetic because the approximate path failed the latency gate.
+The native module also contains an approximate GELU kernel, but the accepted
+cached executor does not use it. It keeps the reference FP32 GELU and QASS
+arithmetic because the approximate path failed the latency gate; the approximate
+QASS modulation kernel was removed.
 
 ### Reduced-Precision Kernels
 

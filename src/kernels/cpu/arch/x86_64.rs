@@ -8,7 +8,6 @@
 //! comment names the check it relies on.
 
 #![allow(
-    dead_code,
     unsafe_code,
     clippy::needless_range_loop,
     clippy::similar_names,
@@ -19,6 +18,28 @@
 )]
 
 use crate::kernels::cpu::*;
+
+pub(crate) const F32_AFFINE_OUTPUT_GROUP_BLOCKS: usize = 4;
+
+pub(crate) const F32_AFFINE_MAX_ROWS: usize = 4;
+
+pub(crate) const BF16_AFFINE_MAX_ROWS: usize = 8;
+
+pub(crate) const MAX_PACKED_ATTENTION_QUERY_ROWS: usize = 16;
+
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn fast_exp_negative(value: f32) -> f32 {
+    let value = value.max(-87.0);
+    let exponent = (value * core::f32::consts::LOG2_E).round() as i32;
+    let remainder = value - exponent as f32 * core::f32::consts::LN_2;
+    let mut polynomial = 1.0_f32 / 5_040.0;
+    for coefficient in [1.0 / 720.0, 1.0 / 120.0, 1.0 / 24.0, 1.0 / 6.0, 0.5, 1.0, 1.0] {
+        polynomial = polynomial.mul_add(remainder, coefficient);
+    }
+    let exponent_bits = u32::try_from(exponent + 127).expect("clamped exp exponent is non-negative");
+    polynomial * f32::from_bits(exponent_bits << 23)
+}
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn packed_bf16_affine_supported_for_target() -> bool {
@@ -32,49 +53,6 @@ pub(crate) fn bf16_storage_supported_for_target() -> bool {
     std::is_x86_feature_detected!("avx512f")
         && std::is_x86_feature_detected!("avx512bw")
         && std::is_x86_feature_detected!("avx512bf16")
-}
-
-#[cfg(target_arch = "x86_64")]
-pub(crate) fn bf16_to_f32_for_target(input: &[u16], output: &mut [f32]) -> bool {
-    if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx512bw") {
-        // SAFETY: avx512f and avx512bw were detected just above. `output.len() >= input.len()` is
-        // not checked here; `bf16_to_f32`, the only caller, checks equal lengths.
-        unsafe { bf16_to_f32_avx512(input, output) };
-        true
-    } else {
-        false
-    }
-}
-
-/// Expands BF16 bits to FP32: 16 lanes per step, then a scalar tail.
-///
-/// # Safety
-///
-/// The CPU must support `avx512f` and `avx512bw`, and `output.len() >= input.len()`.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx512bw")]
-pub(crate) unsafe fn bf16_to_f32_avx512(input: &[u16], output: &mut [f32]) {
-    use core::arch::x86_64::{
-        __m256i, _mm256_loadu_si256, _mm512_castsi512_ps, _mm512_cvtepu16_epi32, _mm512_slli_epi32,
-        _mm512_storeu_ps,
-    };
-    // SAFETY: each step reads `input[offset..offset + 16]` and writes the same range of `output`,
-    // and `offset + 16 <= end <= input.len() <= output.len()`. The tail uses checked indexing.
-    unsafe {
-        let end = input.len() / 16 * 16;
-        for offset in (0..end).step_by(16) {
-            #[expect(
-                clippy::cast_ptr_alignment,
-                reason = "This intrinsic accepts unaligned pointers."
-            )]
-            let packed = _mm256_loadu_si256(input.as_ptr().add(offset).cast::<__m256i>());
-            let expanded = _mm512_slli_epi32::<16>(_mm512_cvtepu16_epi32(packed));
-            _mm512_storeu_ps(output.as_mut_ptr().add(offset), _mm512_castsi512_ps(expanded));
-        }
-        for offset in end..input.len() {
-            output[offset] = f32::from_bits(u32::from(input[offset]) << 16);
-        }
-    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -1357,43 +1335,6 @@ pub(crate) fn layer_norm_for_target(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-pub(crate) fn layer_norm_statistics_for_target(
-    input: &[f32],
-    rows: usize,
-    width: usize,
-    mean: &mut [f32],
-    scale: &mut [f32],
-) -> bool {
-    if width.is_multiple_of(16) && std::is_x86_feature_detected!("avx512f") {
-        // SAFETY: avx512f was detected and `width % 16 == 0` checked just above. The input
-        // length is the caller's obligation; there is no caller outside tests.
-        unsafe { layer_norm_statistics_avx512(input, rows, width, mean, scale) }
-        true
-    } else {
-        false
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-pub(crate) fn qass_modulate_for_target(
-    queries: &[f32],
-    base_scale: &[f32],
-    heads: usize,
-    rows: usize,
-    head_dim: usize,
-    output: &mut [f32],
-) -> bool {
-    if std::is_x86_feature_detected!("avx512f") {
-        // SAFETY: avx512f was detected just above. The lengths are the caller's obligation; no
-        // caller checks them, and only tests call `qass_modulate_f32`.
-        unsafe { qass_modulate_avx512(queries, base_scale, heads, rows, head_dim, output) }
-        true
-    } else {
-        false
-    }
-}
-
 /// Applies the erf-based GELU approximation.
 ///
 /// # Safety
@@ -1520,98 +1461,6 @@ pub(crate) unsafe fn layer_norm_avx512(
                     result
                 };
                 _mm512_storeu_ps(output.add(column), result);
-            }
-        }
-    }
-}
-
-/// Computes `LayerNorm` row means and inverse standard deviations.
-///
-/// # Safety
-///
-/// The CPU must support `avx512f`; `width % 16 == 0`; and `input.len() >= rows * width`.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-pub(crate) unsafe fn layer_norm_statistics_avx512(
-    input: &[f32],
-    rows: usize,
-    width: usize,
-    mean: &mut [f32],
-    scale: &mut [f32],
-) {
-    use core::arch::x86_64::{
-        _mm512_add_ps, _mm512_fmadd_ps, _mm512_loadu_ps, _mm512_reduce_add_ps, _mm512_set1_ps,
-        _mm512_setzero_ps, _mm512_sub_ps,
-    };
-    // SAFETY: with `row < rows` and `column + 16 <= width`, the loads read
-    // `input[row * width + column..][..16]`. The `mean` and `scale` writes use checked indexing.
-    unsafe {
-        for row in 0..rows {
-            let input = input.as_ptr().add(row * width);
-            let mut sum = _mm512_setzero_ps();
-            for column in (0..width).step_by(16) {
-                sum = _mm512_add_ps(sum, _mm512_loadu_ps(input.add(column)));
-            }
-            let row_mean = _mm512_reduce_add_ps(sum) / width as f32;
-            let mean_vector = _mm512_set1_ps(row_mean);
-            let mut squared_sum = _mm512_setzero_ps();
-            for column in (0..width).step_by(16) {
-                let centered = _mm512_sub_ps(_mm512_loadu_ps(input.add(column)), mean_vector);
-                squared_sum = _mm512_fmadd_ps(centered, centered, squared_sum);
-            }
-            mean[row] = row_mean;
-            scale[row] = (_mm512_reduce_add_ps(squared_sum) / width as f32 + 1e-5_f32)
-                .sqrt()
-                .recip();
-        }
-    }
-}
-
-/// Applies `output = query * base_scale * (1 + tanh(output))` over head-major rows.
-///
-/// # Safety
-///
-/// The CPU must support `avx512f`; `queries.len()` and `output.len()` are at least
-/// `heads * rows * head_dim`; and `base_scale.len() >= heads * head_dim`.
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-pub(crate) unsafe fn qass_modulate_avx512(
-    queries: &[f32],
-    base_scale: &[f32],
-    heads: usize,
-    rows: usize,
-    head_dim: usize,
-    output: &mut [f32],
-) {
-    use core::arch::x86_64::{_mm512_loadu_ps, _mm512_storeu_ps};
-    // SAFETY: with `head < heads`, `row < rows`, and `dimension + 16 <= end <= head_dim`, the
-    // loads and the store cover `[offset + dimension..][..16]` of row `head * rows + row`, and the
-    // scale reads stay in `base_scale[head * head_dim..][..head_dim]`. The transmutes are between
-    // `__m512` and `[f32; 16]`, both 64 bytes with every bit pattern valid.
-    unsafe {
-        for head in 0..heads {
-            let scale = base_scale.as_ptr().add(head * head_dim);
-            for row in 0..rows {
-                let offset = (head * rows + row) * head_dim;
-                let end = head_dim / 16 * 16;
-                for dimension in (0..end).step_by(16) {
-                    let query: [f32; 16] =
-                        core::mem::transmute(_mm512_loadu_ps(queries.as_ptr().add(offset + dimension)));
-                    let scale: [f32; 16] = core::mem::transmute(_mm512_loadu_ps(scale.add(dimension)));
-                    let mlp: [f32; 16] =
-                        core::mem::transmute(_mm512_loadu_ps(output.as_ptr().add(offset + dimension)));
-                    let result: [f32; 16] =
-                        std::array::from_fn(|lane| query[lane] * scale[lane] * (1.0 + fast_tanh(mlp[lane])));
-                    _mm512_storeu_ps(
-                        output.as_mut_ptr().add(offset + dimension),
-                        core::mem::transmute(result),
-                    );
-                }
-                for dimension in end..head_dim {
-                    output[offset + dimension] = queries[offset + dimension]
-                        * *scale.add(dimension)
-                        * (1.0 + fast_tanh(output[offset + dimension]));
-                }
             }
         }
     }

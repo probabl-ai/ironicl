@@ -1,7 +1,6 @@
 //! `AArch64` kernels: NEON, and Accelerate on macOS.
 
 #![allow(
-    dead_code,
     unsafe_code,
     clippy::needless_range_loop,
     clippy::similar_names,
@@ -497,21 +496,6 @@ pub(crate) unsafe fn layer_norm_neon(
     }
 }
 
-#[cfg(target_arch = "aarch64")]
-pub(crate) fn qass_modulate_for_target(
-    queries: &[f32],
-    base_scale: &[f32],
-    heads: usize,
-    rows: usize,
-    head_dim: usize,
-    output: &mut [f32],
-) -> bool {
-    // SAFETY: NEON is baseline on AArch64. `qass_modulate_f32`'s callers (tests only today)
-    // must pass the lengths `qass_modulate_neon` requires; nothing here checks them.
-    unsafe { qass_modulate_neon(queries, base_scale, heads, rows, head_dim, output) }
-    true
-}
-
 // The explicit vector loads and stores keep contiguous activation data on the SIMD path.
 // The approximation is evaluated lane-wise to retain the scalar approximation's bit behavior.
 /// # Safety
@@ -533,53 +517,6 @@ pub(crate) unsafe fn gelu_neon(input: &[f32], output: &mut [f32]) {
     }
     for offset in end..input.len() {
         output[offset] = fast_gelu(input[offset]);
-    }
-}
-
-/// # Safety
-///
-/// The CPU must support NEON. `queries` and `output` must hold at least
-/// `heads * rows * head_dim` values and `base_scale` at least `heads * head_dim`.
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
-pub(crate) unsafe fn qass_modulate_neon(
-    queries: &[f32],
-    base_scale: &[f32],
-    heads: usize,
-    rows: usize,
-    head_dim: usize,
-    output: &mut [f32],
-) {
-    use core::arch::aarch64::{vld1q_f32, vst1q_f32};
-    // SAFETY: by the caller contract, row `offset = (head * rows + row) * head_dim` of
-    // `queries`/`output` and row `head * head_dim` of `base_scale` are in bounds, and
-    // `dimension + 4 <= end <= head_dim`; the transmutes are `float32x4_t` <-> `[f32; 4]`.
-    unsafe {
-        for head in 0..heads {
-            let scale = base_scale.as_ptr().add(head * head_dim);
-            for row in 0..rows {
-                let offset = (head * rows + row) * head_dim;
-                let end = head_dim / 4 * 4;
-                for dimension in (0..end).step_by(4) {
-                    let query: [f32; 4] =
-                        core::mem::transmute(vld1q_f32(queries.as_ptr().add(offset + dimension)));
-                    let scale: [f32; 4] = core::mem::transmute(vld1q_f32(scale.add(dimension)));
-                    let mlp: [f32; 4] =
-                        core::mem::transmute(vld1q_f32(output.as_ptr().add(offset + dimension)));
-                    let result: [f32; 4] =
-                        std::array::from_fn(|lane| query[lane] * scale[lane] * (1.0 + fast_tanh(mlp[lane])));
-                    vst1q_f32(
-                        output.as_mut_ptr().add(offset + dimension),
-                        core::mem::transmute(result),
-                    );
-                }
-                for dimension in end..head_dim {
-                    output[offset + dimension] = queries[offset + dimension]
-                        * *scale.add(dimension)
-                        * (1.0 + fast_tanh(output[offset + dimension]));
-                }
-            }
-        }
     }
 }
 

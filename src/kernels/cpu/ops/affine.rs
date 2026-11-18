@@ -1,7 +1,6 @@
 //! Affine layers: packed FP32 and BF16 weights, and their portable paths.
 
 #![allow(
-    dead_code,
     unsafe_code,
     clippy::needless_range_loop,
     clippy::similar_names,
@@ -17,13 +16,7 @@ pub(crate) const MIN_SIMD_INPUT_DIM: usize = 16;
 
 pub(crate) const F32_AFFINE_OUTPUT_BLOCK: usize = 16;
 
-pub(crate) const F32_AFFINE_OUTPUT_GROUP_BLOCKS: usize = 4;
-
-pub(crate) const F32_AFFINE_MAX_ROWS: usize = 4;
-
 pub(crate) const BF16_AFFINE_OUTPUT_BLOCK: usize = 16;
-
-pub(crate) const BF16_AFFINE_MAX_ROWS: usize = 8;
 
 /// Smallest affine row count that goes to Accelerate on Apple Silicon. Thresholds
 /// from 4 to 64 rows measured the same on an M1 Max.
@@ -89,6 +82,10 @@ impl PackedF32Affine {
 
 /// First-order terms used to compensate BF16 affine quantization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "the bf16-dense experiment builds with None; the x86-64 tests cover the others"
+)]
 pub(crate) enum Bf16AffineCompensation {
     None,
     Input,

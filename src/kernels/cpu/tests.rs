@@ -1,5 +1,4 @@
 #![allow(
-    dead_code,
     unsafe_code,
     clippy::needless_range_loop,
     clippy::similar_names,
@@ -9,13 +8,15 @@
 )]
 
 #[cfg(target_arch = "x86_64")]
-use super::{Bf16AffineCompensation, attention_score_maximum_f32};
 use super::{
-    Isa, PackedBf16Affine, PackedF32Affine, affine_f32, f32_to_bf16_rne, fast_erf, fast_exp_negative,
-    fast_gelu, fast_tanh, gelu_f32, layer_norm_f32, pack_attention_value_bf16, qass_modulate_f32,
-    softmax_exp_sum_f32,
+    Bf16AffineCompensation, Isa, attention_score_maximum_f32, fast_exp_negative, softmax_exp_sum_f32,
+};
+use super::{
+    PackedBf16Affine, PackedF32Affine, affine_f32, f32_to_bf16_rne, fast_erf, fast_gelu, gelu_f32,
+    layer_norm_f32, pack_attention_value_bf16,
 };
 
+#[cfg(target_arch = "x86_64")]
 fn bf16_to_f32(value: u16) -> f32 {
     f32::from_bits(u32::from(value) << 16)
 }
@@ -611,6 +612,7 @@ fn benchmark_packed_bf16_affine_8x16x512() {
     );
 }
 
+#[cfg(target_arch = "x86_64")]
 #[test]
 #[allow(clippy::cast_precision_loss)]
 fn softmax_exponential_tracks_exact_exp() {
@@ -644,17 +646,14 @@ fn softmax_exponential_tracks_exact_exp() {
 #[test]
 fn activation_approximations_track_libm_across_the_useful_domain() {
     let mut maximum_erf_error = 0.0_f32;
-    let mut maximum_tanh_error = 0.0_f32;
     let mut maximum_gelu_error = 0.0_f32;
     for index in -10_000..=10_000 {
         let value = index as f32 / 1_000.0;
         maximum_erf_error = maximum_erf_error.max((fast_erf(value) - libm::erff(value)).abs());
-        maximum_tanh_error = maximum_tanh_error.max((fast_tanh(value) - libm::tanhf(value)).abs());
         let exact_gelu = 0.5 * value * (1.0 + libm::erff(value / core::f32::consts::SQRT_2));
         maximum_gelu_error = maximum_gelu_error.max((fast_gelu(value) - exact_gelu).abs());
     }
     assert!(maximum_erf_error <= 6e-7, "erf error: {maximum_erf_error}");
-    assert!(maximum_tanh_error <= 1e-6, "tanh error: {maximum_tanh_error}");
     assert!(maximum_gelu_error <= 1e-6, "GELU error: {maximum_gelu_error}");
 }
 
@@ -698,38 +697,6 @@ fn native_layer_norm_tracks_scalar_rows() {
         for column in 0..width {
             let expected = (values[column] - mean) * scale * weight[column] + bias[column];
             assert!((actual[row * width + column] - expected).abs() <= 2e-5);
-        }
-    }
-}
-
-#[test]
-#[allow(clippy::cast_precision_loss, clippy::float_cmp)]
-fn native_qass_modulation_matches_approximation_with_head_tails() {
-    let (heads, rows, head_dim) = (3, 2, 19);
-    let queries = (0..heads * rows * head_dim)
-        .map(|index| (index as f32 - 41.0) * 0.03125)
-        .collect::<Vec<_>>();
-    let base_scale = (0..heads * head_dim)
-        .map(|index| (index as f32 - 17.0) * 0.0625)
-        .collect::<Vec<_>>();
-    let mut actual = (0..queries.len())
-        .map(|index| (index as f32 - 29.0) * 0.125)
-        .collect::<Vec<_>>();
-    let expected = actual.clone();
-    if !qass_modulate_f32(&queries, &base_scale, heads, rows, head_dim, &mut actual) {
-        return;
-    }
-    for head in 0..heads {
-        for row in 0..rows {
-            for dimension in 0..head_dim {
-                let offset = (head * rows + row) * head_dim + dimension;
-                assert_eq!(
-                    actual[offset],
-                    queries[offset]
-                        * base_scale[head * head_dim + dimension]
-                        * (1.0 + fast_tanh(expected[offset]))
-                );
-            }
         }
     }
 }

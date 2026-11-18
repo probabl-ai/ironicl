@@ -2,7 +2,6 @@
 //! `ops`, with the instruction-set versions in `arch`.
 
 #![allow(
-    dead_code,
     unsafe_code,
     clippy::needless_range_loop,
     clippy::similar_names,

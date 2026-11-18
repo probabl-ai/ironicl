@@ -1,7 +1,6 @@
 //! `WebAssembly` kernels: SIMD128.
 
 #![allow(
-    dead_code,
     unsafe_code,
     clippy::needless_range_loop,
     clippy::similar_names,

@@ -1,7 +1,6 @@
 //! Elementwise kernels: GELU, QASS modulation, BF16 conversion, fast exp/erf/tanh.
 
 #![allow(
-    dead_code,
     unsafe_code,
     clippy::needless_range_loop,
     clippy::similar_names,
@@ -14,6 +13,7 @@
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 use crate::kernels::cpu::*;
 
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(crate) const SQRT_2: f32 = core::f32::consts::SQRT_2;
 
 pub(crate) fn f32_to_bf16_rne(value: f32) -> u16 {
@@ -44,33 +44,6 @@ pub(crate) fn gelu_f32(input: &[f32], output: &mut [f32]) -> bool {
     gelu_for_target(input, output)
 }
 
-/// Apply `query * base_scale * (1 + tanh(mlp_output))` natively.
-///
-/// The caller validates the head-major slice lengths and dimensions.
-pub(crate) fn qass_modulate_f32(
-    queries: &[f32],
-    base_scale: &[f32],
-    heads: usize,
-    rows: usize,
-    head_dim: usize,
-    output: &mut [f32],
-) -> bool {
-    qass_modulate_for_target(queries, base_scale, heads, rows, head_dim, output)
-}
-
-/// Expand BF16 storage values into FP32 tile scratch.
-pub(crate) fn bf16_to_f32(input: &[u16], output: &mut [f32]) -> bool {
-    if input.len() != output.len() {
-        return false;
-    }
-    bf16_to_f32_for_target(input, output)
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-pub(crate) fn bf16_to_f32_for_target(_input: &[u16], _output: &mut [f32]) -> bool {
-    false
-}
-
 #[cfg(not(target_arch = "x86_64"))]
 pub(crate) fn convert_f32_to_bf16(_input: &[f32], _output: &mut [u16]) -> bool {
     false
@@ -78,6 +51,7 @@ pub(crate) fn convert_f32_to_bf16(_input: &[f32], _output: &mut [u16]) -> bool {
 
 #[inline]
 #[allow(clippy::cast_possible_truncation)]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(crate) fn bounded_exp(value: f32) -> f32 {
     let value = value.clamp(-40.0, 20.0);
     let exponent = (value * core::f32::consts::LOG2_E).round() as i32;
@@ -102,6 +76,7 @@ pub(crate) fn bounded_exp(value: f32) -> f32 {
 }
 
 #[inline]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(crate) fn fast_erf(value: f32) -> f32 {
     let magnitude = value.abs();
     if magnitude >= 6.0 {
@@ -121,49 +96,12 @@ pub(crate) fn fast_erf(value: f32) -> f32 {
 }
 
 #[inline]
-pub(crate) fn fast_tanh(value: f32) -> f32 {
-    let magnitude = value.abs();
-    if magnitude >= 9.0 {
-        return value.signum();
-    }
-    let result = if magnitude <= 0.5 {
-        let square = magnitude * magnitude;
-        magnitude
-            * square.mul_add(
-                square.mul_add(
-                    square.mul_add(
-                        square.mul_add(square.mul_add(-0.008_863_236, 0.021_869_488), -0.053_968_254),
-                        0.133_333_34,
-                    ),
-                    -1.0 / 3.0,
-                ),
-                1.0,
-            )
-    } else {
-        let exponential = bounded_exp(2.0 * magnitude);
-        (exponential - 1.0) / (exponential + 1.0)
-    };
-    value.signum() * result
-}
-
-#[inline]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(crate) fn fast_gelu(value: f32) -> f32 {
     0.5 * value * (1.0 + fast_erf(value / SQRT_2))
 }
 
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub(crate) fn gelu_for_target(_input: &[f32], _output: &mut [f32]) -> bool {
-    false
-}
-
-#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-pub(crate) fn qass_modulate_for_target(
-    _queries: &[f32],
-    _base_scale: &[f32],
-    _heads: usize,
-    _rows: usize,
-    _head_dim: usize,
-    _output: &mut [f32],
-) -> bool {
     false
 }
