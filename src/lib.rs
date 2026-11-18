@@ -17,9 +17,8 @@ pub mod executor;
 pub mod input_bundle;
 pub mod kernels;
 pub mod memory;
-#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-mod metal;
 pub mod model_artifact;
+mod models;
 pub mod platform;
 pub mod profile;
 pub mod progress;

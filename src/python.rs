@@ -394,10 +394,13 @@ fn system_info(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     dict.set_item("metal", metal)?;
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
     {
-        let gpu = crate::metal::system_gpu();
+        let gpu = crate::kernels::metal::system_gpu();
         dict.set_item("gpu", gpu.as_ref().map(|(name, _)| name.clone()))?;
         dict.set_item("gpu_working_set", gpu.map(|(_, bytes)| bytes))?;
-        dict.set_item("gpu_min_build_rows", crate::metal::GPU_MIN_BUILD_ROWS)?;
+        dict.set_item(
+            "gpu_min_build_rows",
+            crate::models::tabicl_v2::metal::GPU_MIN_BUILD_ROWS,
+        )?;
     }
     #[cfg(not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")))]
     for key in ["gpu", "gpu_working_set", "gpu_min_build_rows"] {
