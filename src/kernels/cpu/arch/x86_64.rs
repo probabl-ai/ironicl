@@ -2,10 +2,9 @@
 //!
 //! Safety contract. Every `*_avx512` kernel is an `unsafe fn` with `#[target_feature]`; its
 //! `# Safety` section lists the CPU features and slice lengths it needs. The safe `*_for_target`
-//! dispatchers check the CPU features (directly, or through `backend == Isa::Avx512`, which
-//! `Isa::detect` and `Isa::resolve` return only when `avx512f` was detected), but most do not
-//! check slice lengths: their callers in `ops/` and `kernels/reference.rs` do. Each SAFETY
-//! comment names the check it relies on.
+//! dispatchers check the CPU features, directly or through [`avx512`], and the lengths their
+//! kernels need, falling back to the scalar path otherwise. Each SAFETY comment names the
+//! check it relies on.
 
 #![expect(
     unsafe_code,
@@ -17,6 +16,12 @@
 )]
 
 use crate::kernels::cpu::*;
+
+/// Whether `backend` selects the AVX-512 kernels on this CPU. `Isa` is a public type anyone can
+/// build, so the feature is checked here (a cached load) rather than trusted.
+fn avx512(backend: Isa) -> bool {
+    backend == Isa::Avx512 && std::is_x86_feature_detected!("avx512f")
+}
 
 pub(crate) const F32_AFFINE_OUTPUT_GROUP_BLOCKS: usize = 4;
 
@@ -337,8 +342,8 @@ pub(crate) fn attention_score_tile_for_target(
     scale: f32,
     scores: &mut [f32],
 ) -> bool {
-    if backend == Isa::Avx512 && matches!(head_dim, 16 | 64) {
-        // SAFETY: `backend == Isa::Avx512` implies avx512f was detected (see the module doc), and
+    if avx512(backend) && matches!(head_dim, 16 | 64) {
+        // SAFETY: `avx512(backend)` detected avx512f, and
         // `head_dim` is 16 or 64. Callers pass `query_rows * head_dim` query, `source_rows *
         // head_dim` key, and `query_rows * source_rows` scores (`reference.rs` slices the tiles).
         unsafe {
@@ -365,7 +370,7 @@ pub(crate) fn attention_score_tile_bf16_for_target(
     scale: f32,
     scores: &mut [f32],
 ) -> bool {
-    if backend == Isa::Avx512
+    if avx512(backend)
         && std::is_x86_feature_detected!("avx512bw")
         && query_rows <= MAX_PACKED_ATTENTION_QUERY_ROWS
         && matches!(head_dim, 16 | 64)
@@ -395,12 +400,12 @@ pub(crate) fn attention_score_packed_key_tile_for_target(
     scale: f32,
     scores: &mut [f32],
 ) -> bool {
-    if backend == Isa::Avx512
+    if avx512(backend)
         && query_rows <= MAX_PACKED_ATTENTION_QUERY_ROWS
         && source_rows.is_multiple_of(16)
         && matches!(head_dim, 16 | 64)
     {
-        // SAFETY: avx512f via `backend` (module doc); `source_rows % 16 == 0` and `head_dim` are
+        // SAFETY: avx512f via `avx512(backend)`; `source_rows % 16 == 0` and `head_dim` are
         // checked here. Callers pass `head_dim * source_rows` packed key and `query_rows *
         // source_rows` scores (`source_major_online_attention_with_backend_f32`).
         unsafe {
@@ -436,7 +441,7 @@ pub(crate) fn attention_score_packed_key_padded_tile_for_target(
     scale: f32,
     scores: &mut [f32],
 ) -> bool {
-    if backend == Isa::Avx512
+    if avx512(backend)
         && query_rows <= MAX_PACKED_ATTENTION_QUERY_ROWS
         && source_rows > 0
         && source_rows <= packed_source_rows
@@ -444,7 +449,7 @@ pub(crate) fn attention_score_packed_key_padded_tile_for_target(
         && packed_source_rows == source_rows.div_ceil(16) * 16
         && matches!(head_dim, 16 | 64)
     {
-        // SAFETY: avx512f via `backend` (module doc); the padding relation between `source_rows`
+        // SAFETY: avx512f via `avx512(backend)`; the padding relation between `source_rows`
         // and `packed_source_rows` is checked here. Callers pass `head_dim * packed_source_rows`
         // packed key and `query_rows * source_rows` scores.
         unsafe {
@@ -480,13 +485,13 @@ pub(crate) fn attention_score_packed_key_bf16_tile_for_target(
     scale: f32,
     scores: &mut [f32],
 ) -> bool {
-    if backend == Isa::Avx512
+    if avx512(backend)
         && std::is_x86_feature_detected!("avx512bw")
         && query_rows <= 8
         && source_rows.is_multiple_of(16)
         && matches!(head_dim, 16 | 64)
     {
-        // SAFETY: avx512f via `backend` (module doc), avx512bw detected here, and
+        // SAFETY: avx512f via `avx512(backend)`, avx512bw detected here, and
         // `source_rows % 16 == 0`. Callers pass `head_dim * source_rows` packed key and
         // `query_rows * source_rows` scores (`source_major_online_attention_bf16_with_backend_f32`).
         unsafe {
@@ -516,8 +521,8 @@ pub(crate) fn attention_value_tile_fma_for_target(
     head_dim: usize,
     output: &mut [f32],
 ) -> bool {
-    if backend == Isa::Avx512 && matches!(head_dim, 16 | 64) {
-        // SAFETY: avx512f via `backend` (module doc) and `head_dim` is 16 or 64. Callers pass
+    if avx512(backend) && matches!(head_dim, 16 | 64) {
+        // SAFETY: avx512f via `avx512(backend)` and `head_dim` is 16 or 64. Callers pass
         // `query_rows * source_rows` weights, `source_rows * head_dim` value, and
         // `query_rows * head_dim` output (`reference.rs` slices the tiles).
         unsafe {
@@ -539,7 +544,7 @@ pub(crate) fn attention_value_tile_bf16_fma_for_target(
     head_dim: usize,
     output: &mut [f32],
 ) -> bool {
-    if backend == Isa::Avx512 && std::is_x86_feature_detected!("avx512bw") && matches!(head_dim, 16 | 64) {
+    if avx512(backend) && std::is_x86_feature_detected!("avx512bw") && matches!(head_dim, 16 | 64) {
         // SAFETY: as in `attention_value_tile_fma_for_target`; avx512bw was detected here.
         unsafe {
             attention_value_tile_bf16_fma_avx512(weights, query_rows, value, source_rows, head_dim, output);
@@ -552,15 +557,15 @@ pub(crate) fn attention_value_tile_bf16_fma_for_target(
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn softmax_exp_sum_for_target(backend: Isa, scores: &mut [f32], maximum: f32) -> Option<f32> {
-    // SAFETY: `backend == Isa::Avx512` implies avx512f was detected (module doc); the kernel
+    // SAFETY: `avx512(backend)` detected avx512f; the kernel
     // has no length preconditions.
-    (backend == Isa::Avx512).then(|| unsafe { softmax_exp_sum_avx512(scores, maximum) })
+    avx512(backend).then(|| unsafe { softmax_exp_sum_avx512(scores, maximum) })
 }
 
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn attention_score_maximum_for_target(backend: Isa, scores: &[f32]) -> Option<(f32, bool)> {
     // SAFETY: as in `softmax_exp_sum_for_target`.
-    (backend == Isa::Avx512).then(|| unsafe { attention_score_maximum_avx512(scores) })
+    avx512(backend).then(|| unsafe { attention_score_maximum_avx512(scores) })
 }
 
 /// Returns the maximum of `scores` and whether any score is NaN.
@@ -1256,9 +1261,9 @@ pub(crate) fn attention_dot_for_target(backend: Isa, left: &[f32], right: &[f32]
     if right.len() < left.len() {
         return None;
     }
-    // SAFETY: `backend == Isa::Avx512` implies avx512f was detected (module doc), and
+    // SAFETY: `avx512(backend)` detected avx512f, and
     // `right.len() >= left.len()` was checked above.
-    (backend == Isa::Avx512).then(|| unsafe { attention_dot_avx512(left, right) })
+    avx512(backend).then(|| unsafe { attention_dot_avx512(left, right) })
 }
 
 /// Returns the dot product of `left` and `right`.
@@ -1300,8 +1305,8 @@ pub(crate) fn attention_value_fma_for_target(
     if output.len() < value.len() {
         return false;
     }
-    if backend == Isa::Avx512 {
-        // SAFETY: `backend == Isa::Avx512` implies avx512f was detected (module doc), and
+    if avx512(backend) {
+        // SAFETY: `avx512(backend)` detected avx512f, and
         // `output.len() >= value.len()` was checked above.
         unsafe { attention_value_fma_avx512(weight, value, output) }
         true

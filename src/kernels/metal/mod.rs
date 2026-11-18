@@ -74,9 +74,6 @@ pub(crate) fn system_gpu() -> Option<(String, u64)> {
 pub(crate) struct Gpu {
     pub(crate) device: Retained<ProtocolObject<dyn MTLDevice>>,
     pub(crate) queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
-    pub(crate) compilation: Retained<MPSGraphCompilationDescriptor>,
-    pub(crate) execution: Retained<MPSGraphExecutionDescriptor>,
-    pub(crate) executable_execution: Retained<MPSGraphExecutableExecutionDescriptor>,
 }
 
 impl Gpu {
@@ -88,28 +85,7 @@ impl Gpu {
         let queue = device
             .newCommandQueue()
             .ok_or_else(|| metal_error("cannot create a command queue"))?;
-        // Optimization level 0 measured as fast as the default level 1 on an
-        // M1 Max. Level 1's pass that places operations on the Neural Engine
-        // or CPU printed "Failed to import MPS module" on every compile.
-        // SAFETY: fresh descriptors, configured before they are shared; the
-        // setters take valid enum values and an owned compilation descriptor.
-        let (compilation, execution, executable_execution) = unsafe {
-            let compilation = MPSGraphCompilationDescriptor::new();
-            compilation.setOptimizationLevel(MPSGraphOptimization::Level0);
-            let execution = MPSGraphExecutionDescriptor::new();
-            execution.setWaitUntilCompleted(true);
-            execution.setCompilationDescriptor(Some(&compilation));
-            let executable_execution = MPSGraphExecutableExecutionDescriptor::new();
-            executable_execution.setWaitUntilCompleted(true);
-            (compilation, execution, executable_execution)
-        };
-        Ok(Some(Self {
-            device,
-            queue,
-            compilation,
-            execution,
-            executable_execution,
-        }))
+        Ok(Some(Self { device, queue }))
     }
 
     pub(crate) fn buffer(&self, values: &[f32]) -> Result<Buffer> {
@@ -188,8 +164,44 @@ impl Gpu {
     }
 
     /// Run `graph` synchronously, feeding `inputs` and writing `outputs`.
+    /// A fresh compilation descriptor. Apple does not document descriptors as safe to share
+    /// across threads, so each compile and run makes its own; they are small.
+    ///
+    /// Optimization level 0 measured as fast as the default level 1 on an M1 Max. Level 1's
+    /// pass that places operations on the Neural Engine or CPU printed "Failed to import MPS
+    /// module" on every compile.
+    pub(crate) fn compilation() -> Retained<MPSGraphCompilationDescriptor> {
+        // SAFETY: a fresh descriptor; the setter takes a valid enum value.
+        unsafe {
+            let compilation = MPSGraphCompilationDescriptor::new();
+            compilation.setOptimizationLevel(MPSGraphOptimization::Level0);
+            compilation
+        }
+    }
+
+    /// A fresh descriptor for a graph run that waits until the GPU finishes.
+    fn execution() -> Retained<MPSGraphExecutionDescriptor> {
+        // SAFETY: a fresh descriptor; the setters take a bool and an owned descriptor.
+        unsafe {
+            let execution = MPSGraphExecutionDescriptor::new();
+            execution.setWaitUntilCompleted(true);
+            execution.setCompilationDescriptor(Some(&Self::compilation()));
+            execution
+        }
+    }
+
+    /// A fresh descriptor for a compiled-executable run that waits until the GPU finishes.
+    pub(crate) fn executable_execution() -> Retained<MPSGraphExecutableExecutionDescriptor> {
+        // SAFETY: a fresh descriptor; the setter takes a bool.
+        unsafe {
+            let execution = MPSGraphExecutableExecutionDescriptor::new();
+            execution.setWaitUntilCompleted(true);
+            execution
+        }
+    }
+
     pub(crate) fn run(&self, graph: &MPSGraph, inputs: &[&Binding], outputs: &[&Binding]) {
-        // SAFETY: `self.execution` sets `waitUntilCompleted`, so the call returns
+        // SAFETY: the execution descriptor sets `waitUntilCompleted`, so the call returns
         // after the GPU finishes; the caller's bindings retain every buffer the
         // tensor data (which may not retain them) refer to for that whole time.
         unsafe {
@@ -198,7 +210,7 @@ impl Gpu {
                 &dictionary(inputs),
                 None,
                 &dictionary(outputs),
-                Some(&self.execution),
+                Some(&Self::execution()),
             );
         }
     }
@@ -240,8 +252,8 @@ impl std::fmt::Debug for ModelWeights {
     }
 }
 
-// SAFETY: the device and queue are thread-safe (`Send + Sync` in objc2-metal);
-// the descriptors are only read after `Gpu::new`; each buffer is filled when
+// SAFETY: the device and queue are thread-safe (`Send + Sync` in objc2-metal),
+// and descriptors are made per compile and run, never shared; each buffer is filled when
 // created and only read after; the map is behind a mutex. Retain and release
 // are atomic.
 unsafe impl Send for ModelWeights {}
