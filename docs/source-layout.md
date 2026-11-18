@@ -40,7 +40,9 @@ src/
 │   │   └── builder.rs             MPSGraph builder and generic operations
 │   └── cuda/
 │       ├── mod.rs                 Device, Arch, the embedded modules and their choice
-│       └── kernels.rs             the #[cuda_module] kernels
+│       ├── kernels.rs             the #[kernel] entry points, in one #[cuda_module]
+│       └── ops/                   their device code: attention, fp8, linear,
+│                                  tabicl_v2 (the fused block and column kernels)
 ├── models/
 │   └── tabicl_v2/
 │       ├── mod.rs                 Device: where a context predicts
@@ -71,7 +73,8 @@ Each step is one pull request.
 |---|---|---|
 | A | Move files into this layout: the CPU kernel split, `cache.rs` into `memory.rs`, the Metal and CUDA splits by file, `models/tabicl_v2/`, `format/`. No logic changes. | Done |
 | B | Consolidate: fold `platform.rs` and `backend.rs` into `kernels/cpu` (`Isa`); one `Device` enum for TabICLv2; separate the Metal graph builder's generic operations from the TabICLv2 stages. | Done |
-| C | Split the CUDA kernels: confirm that cuda-oxide compiles device helpers outside `#[cuda_module]`, then split `kernels/cuda/kernels.rs` into `ops/` and `arch/`, with TabICLv2's fused kernels in `ops/tabicl_v2.rs`. Move the launchers into `kernels/cuda` once they no longer take TabICLv2 weight types. Test on an NVIDIA GPU. | Planned |
+| C | Split the CUDA kernels: their device code moves into `kernels/cuda/ops/`, with TabICLv2's fused kernels in `ops/tabicl_v2.rs`. The `#[kernel]` entry points stay in `kernels.rs`, because cuda-oxide generates launchers only for kernels written inline in the `#[cuda_module]` block; it compiles every function reachable from a kernel, wherever it lives. The PTX is unchanged apart from symbol names. | Done |
+| C2 | Move the generic launchers (dense products, layer norm, ICL attention, FP8 encoding, copies) into `kernels/cuda`, with the types they take: `Precision`, the activation forms, the dense and norm weight layouts, and the kernel constants. The launchers of TabICLv2's fused kernels stay with the model. | Planned |
 | D | Rust preprocessing: `preprocess/` and `models/tabicl_v2/preprocess.rs`, fit and transform, at parity with TabICL. | Planned |
 | E | Prediction server behind the `server` feature: `/health`, `/v1/models`, and `predict` and `predict_proba` per model, in JSON, for models loaded read-only at startup. Needs D, so it runs without Python. | Planned |
 
@@ -95,7 +98,9 @@ IRONICL_CUDA_ARCH=sm_120 cargo build --release --features cuda # one GPU
   capabilities, never architecture names, because newer GPUs do not always have
   older ones' instructions (`wgmma` exists only on `sm_90a`). Today the only
   capability is `ironicl_cap_fp8_cvt`, FP8 conversion in hardware, from
-  `sm_89` on.
+  `sm_89` on. Capability-gated code sits next to its portable version, as the FP8
+  conversion does in `kernels/cuda/ops/fp8.rs`; a `kernels/cuda/arch/`
+  directory waits for kernels that exist only on some targets.
 - A device loads the most specific module for it: an `a` target (that compute
   capability only), then an `f` target (later GPUs of the same major version),
   then the newest plain target at or below its capability. A module whose PTX
