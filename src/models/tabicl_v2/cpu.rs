@@ -603,6 +603,12 @@ impl Executor {
     /// memory the build plans its estimator groups for; pass
     /// `MemoryLimits::resolve(None, None)?` to read them from the environment.
     ///
+    /// With `cache_dir`, the context is loaded from `<identity>.irctx` there
+    /// when that file holds exactly this context, and otherwise built and
+    /// written there. The identity covers the Ironicl version, the model,
+    /// `optimize`, and the inputs. A missing, invalid, or mismatched entry is
+    /// rebuilt, and a failed write leaves the built context in memory only.
+    ///
     /// # Errors
     ///
     /// Returns an error for inconsistent dimensions or labels, invalid
@@ -623,9 +629,57 @@ impl Executor {
         optimize: Optimize,
         threads: Option<usize>,
         limits: MemoryLimits,
+        cache_dir: Option<&std::path::Path>,
     ) -> Result<StaticExecutor> {
         let shape = (ensembles, training_rows, features);
-        let metadata = self.context_metadata(shape, x, y_train, class_permutations, feature_permutations)?;
+        let metadata = self.context_metadata(
+            shape,
+            x,
+            y_train,
+            class_permutations,
+            feature_permutations,
+            optimize,
+        )?;
+        let Some(directory) = cache_dir else {
+            return self.build_uncached(metadata, shape, x, y_train, optimize, threads, limits);
+        };
+        let path = directory.join(format!(
+            "{}.irctx",
+            crate::format::encode_sha256(&metadata.context_sha256)
+        ));
+        if let Some(context) = StaticContextArtifact::read_cached(&path, &metadata)
+            .filter(|context| validate_static_context(&self.model, context).is_ok())
+        {
+            // The entry's last use, for `ironicl.clear_cache`.
+            let _ = std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_modified(std::time::SystemTime::now()));
+            return StaticExecutor::with_executor(self.clone(), context, optimize, threads, limits);
+        }
+        let executor = self.build_uncached(metadata, shape, x, y_train, optimize, threads, limits)?;
+        // Caching is best effort: a context that cannot be written is still returned.
+        if std::fs::create_dir_all(directory).is_ok() {
+            let _ = executor.save_context(&path);
+        }
+        Ok(executor)
+    }
+
+    /// Build the context that validated `metadata` describes, without the cache.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
+    )]
+    fn build_uncached(
+        &self,
+        metadata: StaticContextMetadata,
+        shape: (usize, usize, usize),
+        x: &[f32],
+        y_train: &[f32],
+        optimize: Optimize,
+        threads: Option<usize>,
+        limits: MemoryLimits,
+    ) -> Result<StaticExecutor> {
         #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
         if let Some(tensors) = self.build_tensors_gpu(shape, x, y_train, optimize, limits)? {
             // The build graph checked every value on the GPU.
@@ -743,7 +797,8 @@ impl Executor {
     }
 
     /// Validate a context's inputs and describe it: model and content hashes,
-    /// shape, class count, and permutations.
+    /// shape, class count, and permutations. The content hash is the context's
+    /// cache identity: it covers everything the stored tensors depend on.
     fn context_metadata(
         &self,
         (b, n, h): (usize, usize, usize),
@@ -751,6 +806,7 @@ impl Executor {
         y_train: &[f32],
         class_permutations: Vec<u64>,
         feature_permutations: Vec<u64>,
+        optimize: Optimize,
     ) -> Result<StaticContextMetadata> {
         if b == 0
             || n == 0
@@ -771,7 +827,21 @@ impl Executor {
                 .and_then(|pair| u8::from_str_radix(pair, 16).ok())
                 .ok_or_else(|| Error::Artifact("model source SHA-256 is not hexadecimal".into()))?;
         }
-        let mut context_sha256 = Sha256::new();
+        // Bump the prefix when built contexts change within an Ironicl version.
+        let mut context_sha256 = Sha256::new_with_prefix(b"ironicl-context-v2\0");
+        let optimize = match optimize {
+            Optimize::Safe => "safe",
+            Optimize::Auto => "auto",
+            Optimize::Fast => "fast",
+        };
+        for part in [
+            env!("CARGO_PKG_VERSION"),
+            &self.model.summary().source_sha256,
+            optimize,
+        ] {
+            context_sha256.update(part.as_bytes());
+            context_sha256.update([0]);
+        }
         for value in [b, n, h] {
             context_sha256.update((value as u64).to_le_bytes());
         }

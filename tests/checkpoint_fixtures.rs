@@ -261,6 +261,7 @@ fn built_context_matches_the_uncached_forward_pass() {
                 optimize,
                 None,
                 ironicl::memory::MemoryLimits::default(),
+                None,
             )
             .expect("build context");
         let actual = context
@@ -324,6 +325,7 @@ fn large_cached_query_runs_in_chunks() {
             Optimize::Safe,
             None,
             ironicl::memory::MemoryLimits::default(),
+            None,
         )
         .expect("build context");
     let all = context
@@ -385,6 +387,7 @@ fn reduced_precision_context_predicts_all_missing_rows() {
                 optimize,
                 None,
                 ironicl::memory::MemoryLimits::default(),
+                None,
             )
             .expect("build context")
             .predict_logits(QueryRequest::new(b, q, h, &query).expect("valid query"))

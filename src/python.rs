@@ -110,11 +110,13 @@ impl Model {
     /// `[B, C]` (empty for the regressor) and `[B, H]`; `optimize` is `"safe"`,
     /// `"auto"`, or `"fast"`. The memory limits are sizes such as `"16G"`;
     /// `None` reads `IRONICL_MEMORY_LIMIT` and `IRONICL_DEVICE_MEMORY_LIMIT`.
-    /// `progress` receives `("build", estimators built, estimators)`.
+    /// `progress` receives `("build", estimators built, estimators)`. With
+    /// `cache_dir`, a matching context there is loaded instead of built, and a
+    /// built one is written there when possible.
     #[expect(clippy::too_many_arguments, reason = "mirrors the Python call's parameters")]
     #[pyo3(signature = (
         x, y_train, class_permutations, feature_permutations, optimize, threads,
-        memory_limit=None, device_memory_limit=None, progress=None,
+        memory_limit=None, device_memory_limit=None, progress=None, cache_dir=None,
     ))]
     fn build_context(
         &self,
@@ -128,6 +130,7 @@ impl Model {
         memory_limit: Option<String>,
         device_memory_limit: Option<String>,
         progress: Option<Py<PyAny>>,
+        cache_dir: Option<PathBuf>,
     ) -> PyResult<Context> {
         let optimize = optimize.parse::<Optimize>().map_err(py_error)?;
         let limits = MemoryLimits::resolve(memory_limit.as_deref(), device_memory_limit.as_deref())
@@ -150,6 +153,7 @@ impl Model {
                 optimize,
                 threads,
                 limits,
+                cache_dir.as_deref(),
             )
         })
         .map(Context)
@@ -167,29 +171,9 @@ impl Model {
         self.0.source_sha256().to_owned()
     }
 
-    /// Load a persisted static context for this model from `path`. `optimize`,
+    /// Load a context from the bytes `Context.to_bytes` returned. `optimize`,
     /// `threads`, and the memory limits mean what they mean for
     /// `build_context`; `optimize` should be the level the context was built at.
-    #[pyo3(signature = (path, optimize, threads, memory_limit=None, device_memory_limit=None))]
-    fn load_context(
-        &self,
-        py: Python<'_>,
-        path: PathBuf,
-        optimize: &str,
-        threads: Option<usize>,
-        memory_limit: Option<String>,
-        device_memory_limit: Option<String>,
-    ) -> PyResult<Context> {
-        let limits = MemoryLimits::resolve(memory_limit.as_deref(), device_memory_limit.as_deref())
-            .map_err(py_error)?;
-        let optimize = optimize.parse::<Optimize>().map_err(py_error)?;
-        py.detach(|| self.0.load_context(&path, optimize, threads, limits))
-            .map(Context)
-            .map_err(py_error)
-    }
-
-    /// Load a context from the bytes `Context.to_bytes` returned, as
-    /// `load_context` does from a file.
     #[pyo3(signature = (data, optimize, threads, memory_limit=None, device_memory_limit=None))]
     fn context_from_bytes(
         &self,
@@ -293,14 +277,8 @@ impl Context {
         self.0.batch_rows()
     }
 
-    /// Write this fitted context to `path` atomically, for reuse through
-    /// `Model.load_context`.
-    fn save(&self, py: Python<'_>, path: PathBuf) -> PyResult<()> {
-        py.detach(|| self.0.save_context(&path)).map_err(py_error)
-    }
-
-    /// This context encoded as `save` writes it, for pickling. Encodes straight
-    /// into the returned bytes, without another copy.
+    /// This context encoded as the context cache writes it, for pickling.
+    /// Encodes straight into the returned bytes, without another copy.
     fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let length = self.0.context_encoded_len().map_err(py_error)?;
         PyBytes::new_with(py, length, |mut buffer: &mut [u8]| {

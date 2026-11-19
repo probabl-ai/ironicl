@@ -1,5 +1,6 @@
-"""The context cache API: cache_info and clear_cache."""
+"""The context cache: cache_info, clear_cache, and how fit uses entries."""
 
+import filecmp
 import os
 import shutil
 import tempfile
@@ -14,6 +15,7 @@ from ironicl import TabICLClassifier, cache_info, clear_cache
 from tests.test_pickle import checkpoint, data
 
 DAY = 24 * 3600
+POSIX_USER = os.name == "posix" and os.geteuid() != 0  # Root ignores permissions.
 
 
 class CacheTest(unittest.TestCase):
@@ -74,6 +76,38 @@ class CacheTest(unittest.TestCase):
         (hit,) = cache_info(self.directory / "fit").entries
         self.assertGreater(hit.last_used, entry.last_used)
         np.testing.assert_array_equal(model.predict_proba(x[:10]), expected)
+        if os.name == "posix":
+            self.assertEqual(hit.path.stat().st_mode & 0o777, 0o600)  # A context encodes its data.
+
+    def test_an_entry_of_other_data_is_rebuilt(self):
+        checkpoint(TabICLClassifier)
+        x, y = data()
+        directory = self.directory / "fit"
+        model = TabICLClassifier(cache_dir=directory, allow_auto_download=False)
+        expected = model.fit(x, (y > 0.5).astype(int)).predict_proba(x[:10])
+        (entry,) = cache_info(directory).entries
+        model.fit(x, (y > 0).astype(int))
+        (other,) = [other for other in cache_info(directory).entries if other.path != entry.path]
+        shutil.copyfile(other.path, entry.path)  # A valid context under another's name.
+        np.testing.assert_array_equal(model.fit(x, (y > 0.5).astype(int)).predict_proba(x[:10]), expected)
+        self.assertFalse(filecmp.cmp(entry.path, other.path, shallow=False))
+
+    @unittest.skipUnless(POSIX_USER, "needs POSIX permissions")
+    def test_an_unwritable_cache_does_not_fail_fit(self):
+        checkpoint(TabICLClassifier)
+        x, y = data()
+        directory = self.read_only("read-only")
+        model = TabICLClassifier(cache_dir=directory, allow_auto_download=False).fit(x, (y > 0).astype(int))
+        self.assertEqual(cache_info(directory).entries, ())
+        uncached = TabICLClassifier(allow_auto_download=False).fit(x, (y > 0).astype(int))
+        np.testing.assert_array_equal(model.predict_proba(x[:10]), uncached.predict_proba(x[:10]))
+
+    def read_only(self, name):
+        directory = self.directory / name
+        directory.mkdir()
+        directory.chmod(0o500)
+        self.addCleanup(directory.chmod, 0o700)
+        return directory
 
 
 if __name__ == "__main__":

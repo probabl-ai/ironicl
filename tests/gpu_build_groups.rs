@@ -39,6 +39,7 @@ fn grouped_gpu_build_matches_one_graph_run() {
                 optimize,
                 None,
                 limits,
+                None,
             )
             .expect("build context")
             .predict_logits(QueryRequest::new(b, q, h, &query).expect("valid query"))

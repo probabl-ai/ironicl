@@ -80,6 +80,7 @@ fn wide_gpu_build_stays_within_the_memory_plan() {
             Optimize::Auto,
             None,
             ironicl::memory::MemoryLimits::default(),
+            None,
         )
         .expect("build context");
     drop(context);
@@ -118,6 +119,7 @@ fn gpu_predict_keeps_buckets_within_the_memory_limit() {
             Optimize::Auto,
             None,
             MemoryLimits::resolve(Some("4G"), None).expect("limits"),
+            None,
         )
         .expect("build context");
     // Metal frees the build's buffers asynchronously.
