@@ -74,11 +74,14 @@ once; with a cache it is written to disk and reused when the same data, model, a
 | `None` | cache under `IRONICL_CACHE_DIR` if set, else `<XDG_CACHE_HOME or ~/.cache>/ironicl/contexts` |
 | str or `Path` | cache in that directory |
 
-Entries are content-addressed by the model identity, the preprocessed inputs, and
-`optimize`, with a `.irctx` name. A load prefaults the mapping so prediction runs
-at RAM speed from the first query. A corrupt or mismatched entry is silently
-rebuilt, and a write failure never fails `fit`. Each entry records its last
-use, when `fit` built or loaded it.
+Entries are content-addressed by the Ironicl version, the model identity, the
+preprocessed inputs, and `optimize`, with a `.irctx` name. Each entry records that
+identity, and a load uses an entry only when it matches; a corrupt or mismatched
+entry is silently rebuilt, and a write failure never fails `fit`. A load
+prefaults the mapping so prediction runs at RAM speed from the first query. On
+Unix, entries are readable only by their owner, because they encode the training
+data. Entries from other Ironicl versions are not reused; `clear_cache` removes
+them. Each entry records its last use, when `fit` built or loaded it.
 
 Nothing is evicted automatically. `ironicl.cache_info()` lists the entries,
 most recently used first, and `ironicl.clear_cache()` removes them: all by

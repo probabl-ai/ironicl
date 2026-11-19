@@ -1022,6 +1022,16 @@ impl StaticContextArtifact {
         file.persist(path).map(drop).map_err(artifact_error)
     }
 
+    /// The verified artifact at `path`, prefaulted as by
+    /// [`Self::read_mapped_prefault`], if its metadata is exactly `expected`.
+    /// `None` when the file is missing, unreadable, or invalid, or describes
+    /// another context.
+    pub(crate) fn read_cached(path: &Path, expected: &StaticContextMetadata) -> Option<Self> {
+        Self::read_mapped_prefault(path)
+            .ok()
+            .filter(|context| context.metadata() == expected)
+    }
+
     /// Verified context metadata.
     #[must_use]
     pub fn metadata(&self) -> &StaticContextMetadata {
@@ -1436,6 +1446,30 @@ mod tests {
             .map(|entry| entry.expect("directory entry").path())
             .filter(|path| path.extension().is_some_and(|extension| extension == "tmp"))
             .collect()
+    }
+
+    #[test]
+    fn cached_read_accepts_only_the_expected_context() {
+        let artifact = fixture();
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("context.irctx");
+        assert!(StaticContextArtifact::read_cached(&path, artifact.metadata()).is_none());
+
+        artifact.write(&path).expect("write context");
+        assert_eq!(
+            StaticContextArtifact::read_cached(&path, artifact.metadata()),
+            Some(artifact.clone())
+        );
+        // A valid entry of another context, as if it were stored under the wrong name.
+        let other = StaticContextMetadata {
+            context_sha256: [3; 32],
+            ..artifact.metadata().clone()
+        };
+        assert!(StaticContextArtifact::read_cached(&path, &other).is_none());
+
+        let bytes = std::fs::read(&path).expect("read context");
+        std::fs::write(&path, &bytes[..bytes.len() / 2]).expect("truncate context");
+        assert!(StaticContextArtifact::read_cached(&path, artifact.metadata()).is_none());
     }
 
     #[test]

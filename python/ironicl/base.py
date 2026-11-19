@@ -4,7 +4,6 @@ fitted context and its disk cache, threads, ``optimize``, and memory planning.""
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import os
 import pickle
 import urllib.request
@@ -250,54 +249,20 @@ class TabICLBase(BaseEstimator):
         return max(1, (os.cpu_count() or 1) + 1 + self.n_jobs)
 
     def _context(self, model, optimize, limits, train_rows, targets, class_perms, feature_perms):
-        """Build the Rust context, or load it from ``cache_dir`` when available."""
-        threads = self._resolve_threads()
-
-        def build():
-            with self._progress("Building context", "estimator") as progress:
-                return model.build_context(
-                    train_rows,
-                    targets,
-                    class_perms,
-                    feature_perms,
-                    optimize,
-                    threads,
-                    *limits,
-                    progress=progress and (lambda _stage, done, total: progress.update(done, total)),
-                )
-
-        cache_dir = _cache_dir(self.cache_dir)
-        if cache_dir is None:
-            return build()
-        key = self._cache_key(model, optimize, train_rows, targets, class_perms, feature_perms)
-        path = cache_dir / f"{key}.irctx"
-        if path.exists():
-            try:
-                context = model.load_context(str(path), optimize, threads, *limits)
-            except (OSError, ValueError, RuntimeError):
-                pass  # Corrupt, truncated, or mismatched cache entry: rebuild it.
-            else:
-                with contextlib.suppress(OSError):
-                    os.utime(path)  # The entry's last use, for clear_cache.
-                return context
-        context = build()
-        try:
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            context.save(str(path))
-        except OSError:
-            pass  # Caching is best-effort; a write failure must not fail fit.
-        return context
-
-    def _cache_key(self, model, optimize, train_rows, targets, class_perms, feature_perms) -> str:
-        """Content hash of everything the built context depends on."""
-        digest = hashlib.sha256(b"ironicl-context-cache-v1\0")
-        digest.update(model.source_sha256.encode("ascii"))
-        digest.update(optimize.encode("ascii"))
-        for array in (train_rows, targets, class_perms, feature_perms):
-            array = np.ascontiguousarray(array)
-            digest.update(f"{array.shape}{array.dtype.str}".encode("ascii"))
-            digest.update(array.tobytes())
-        return digest.hexdigest()
+        """Build the Rust context, through ``cache_dir`` when set. Rust checks and
+        writes the cache; a bad entry is rebuilt and a failed write is ignored."""
+        with self._progress("Building context", "estimator") as progress:
+            return model.build_context(
+                train_rows,
+                targets,
+                class_perms,
+                feature_perms,
+                optimize,
+                self._resolve_threads(),
+                *limits,
+                progress=progress and (lambda _stage, done, total: progress.update(done, total)),
+                cache_dir=_cache_dir(self.cache_dir),
+            )
 
     def _optimize(self) -> str:
         optimize = self.optimize if self.optimize is not None else os.environ.get("IRONICL_OPTIMIZE", "safe")

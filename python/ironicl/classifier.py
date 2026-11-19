@@ -48,8 +48,9 @@ class TabICLClassifier(ClassifierMixin, TabICLBase):
     instead of rerunning the forward pass. ``False`` (default) disables it;
     ``None`` caches under ``IRONICL_CACHE_DIR`` if set, else
     ``<XDG_CACHE_HOME or ~/.cache>/ironicl/contexts``; a path caches there (each
-    context is large, so caching is opt-in). Entries are keyed by the model,
-    inputs, and ``optimize``, and a corrupt entry is silently rebuilt.
+    context is large, so caching is opt-in). Entries are keyed by the Ironicl
+    version, the model, the inputs, and ``optimize``. An entry that is corrupt
+    or does not match is rebuilt, and a failed write never fails ``fit``.
 
     ``memory_limit``, ``device_memory_limit``, and ``memory_overflow`` are
     Ironicl's own, after ``cache_dir``. ``fit`` plans the memory it needs after
