@@ -54,6 +54,7 @@ memmap2 = "0.9.12"
 pyo3 = { version = "0.30.1", features = ["abi3-py312"], optional = true }
 rayon = "1.12.0"
 sha2 = "0.11.1"
+tempfile = "3.27.0"
 zip = { version = "9.3.0", default-features = false }
 
 # Windows memory: the planner's probe (memory status, job limits, commit
@@ -108,9 +109,6 @@ objc2-metal-performance-shaders-graph = { version = "0.3.2", default-features = 
     "MPSGraphTensorData",
     "MPSGraphTensorShapeOps",
 ], optional = true }
-
-[dev-dependencies]
-tempfile = "3.27.0"
 
 [lints.rust]
 unsafe_code = "warn"
