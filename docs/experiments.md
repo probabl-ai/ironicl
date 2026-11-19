@@ -480,7 +480,6 @@ separate upstream environment.
 | All-missing query rows fall back to CPU and still read the FP16 `auto` caches | `checkpoint_fixtures.rs::reduced_precision_context_predicts_all_missing_rows` |
 | Public `predict_proba` matches upstream TabICL within `atol=1e-4`, identical labels | `test_tabicl_classifier.py::test_predictions_match` (live parity CI job) |
 | Preprocessing matches upstream (frozen oracle and live) | `tests/test_preprocessing.py` (15 tests) and `tests/parity/test_tabicl_preprocessing.py` (11 tests) |
-| Accepted fast lane serves Covertype at the recorded rate and error | `tools/benchmark_cached_end_to_end.py` + `tools/compare_cached_end_to_end.py`; see [Benchmark commands](#benchmark-commands) |
 
 ## Next Work
 
