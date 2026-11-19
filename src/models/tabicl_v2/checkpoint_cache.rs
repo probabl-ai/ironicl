@@ -4,10 +4,10 @@ use std::{
 };
 
 use crate::{
-    CheckpointCacheOptions, ModelArtifactSummary, ModelProfile,
+    CheckpointCacheOptions, ModelArtifact, ModelArtifactSummary, ModelProfile,
     error::{Error, Result},
-    import_checkpoint, inspect_model_artifact,
-    models::tabicl_v2::checkpoint::{checkpoint_sha256, inspect_checkpoint},
+    import_checkpoint, inspect_model_artifact, load_model_artifact,
+    models::tabicl_v2::checkpoint::{checkpoint_sha256, inspect_checkpoint, model_from_checkpoint},
 };
 
 /// Result of preparing a checkpoint for execution.
@@ -67,6 +67,28 @@ pub fn prepare_checkpoint(path: &Path, options: &CheckpointCacheOptions) -> Resu
         created: true,
         summary,
     })
+}
+
+/// Load a checkpoint's executable model through the default model cache. When
+/// the cache cannot be written or read, as in a read-only home directory, the
+/// checkpoint is converted in memory instead, on every load.
+///
+/// # Errors
+///
+/// Returns [`Error::Checkpoint`] when the checkpoint is invalid and
+/// [`Error::Artifact`] when it is not an official model.
+pub fn load_checkpoint_model(path: &Path) -> Result<ModelArtifact> {
+    let cached = prepare_checkpoint(path, &CheckpointCacheOptions::default()).and_then(|prepared| {
+        let PreparedCheckpoint::Cached { path, .. } = prepared else {
+            unreachable!("the default options always use the cache");
+        };
+        load_model_artifact(&path)
+    });
+    match cached {
+        Err(Error::Checkpoint(message)) => Err(Error::Checkpoint(message)),
+        Err(_) => model_from_checkpoint(path),
+        model => model,
+    }
 }
 
 fn default_cache_dir() -> Result<PathBuf> {

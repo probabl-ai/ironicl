@@ -40,7 +40,9 @@ pub use memory::{CacheEstimate, MemoryPlan, estimate_memory};
 pub use models::tabicl_v2::checkpoint::{
     CheckpointProfile, CheckpointSummary, import_checkpoint, inspect_checkpoint,
 };
-pub use models::tabicl_v2::checkpoint_cache::{PreparedCheckpoint, prepare_checkpoint};
+pub use models::tabicl_v2::checkpoint_cache::{
+    PreparedCheckpoint, load_checkpoint_model, prepare_checkpoint,
+};
 pub use models::tabicl_v2::cpu::{
     ClassifierAggregation, ClassifierProbabilities, DecoderOutputs, Executor, ForwardTrace, Optimize,
     SparseAttentionStatistics, StaticExecutor, TraceStage, plan_context,

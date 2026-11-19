@@ -25,7 +25,9 @@ parameter names and defaults. A live parity test checks this.
 
 - Without `model_path`, `fit` downloads the released checkpoint from Hugging Face
   to `$XDG_CACHE_HOME/ironicl/checkpoints` (default `~/.cache`). The Rust
-  importer verifies its SHA-256 and caches the converted model.
+  importer verifies its SHA-256 and caches the converted model under
+  `$XDG_CACHE_HOME/ironicl/models`. When that directory is not writable, as in a
+  read-only container, it converts the checkpoint in memory on every load.
 - These values raise `NotImplementedError`: a `feat_shuffle_method` other than
   `latin`, a `class_shuffle_method` other than `shift`, a `device` other than
   `cpu`, any `inference_config`, and `random_state=None`.

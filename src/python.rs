@@ -22,10 +22,10 @@ use pyo3::{
 };
 
 use crate::{
-    CheckpointCacheOptions, ClassifierAggregation, Error, Executor, Optimize, PreparedCheckpoint,
-    QueryRequest, RegressionOutput, StaticExecutor, TaskKind, load_model_artifact,
+    ClassifierAggregation, Error, Executor, Optimize, QueryRequest, RegressionOutput, StaticExecutor,
+    TaskKind, load_checkpoint_model,
     memory::{Builder, MemoryLimits, Verdict},
-    plan_context, prepare_checkpoint,
+    plan_context,
     progress::{self, Hook, Stage},
 };
 
@@ -90,18 +90,12 @@ struct Model(Executor);
 
 #[pymethods]
 impl Model {
-    /// Import a checkpoint through the content-addressed model cache and load it.
+    /// Import a checkpoint through the content-addressed model cache, or in
+    /// memory when the cache is not writable, and load it.
     #[new]
     fn new(py: Python<'_>, checkpoint: PathBuf) -> PyResult<Self> {
-        py.detach(|| {
-            let PreparedCheckpoint::Cached { path, .. } =
-                prepare_checkpoint(&checkpoint, &CheckpointCacheOptions::default())?
-            else {
-                unreachable!("the default options always use the cache");
-            };
-            Ok(Self(Executor::new(load_model_artifact(&path)?)))
-        })
-        .map_err(py_error)
+        py.detach(|| load_checkpoint_model(&checkpoint).map(|model| Self(Executor::new(model))))
+            .map_err(py_error)
     }
 
     /// Run FP32 training rows `x[B, N, H]` with targets `y_train[B, N]` once and
