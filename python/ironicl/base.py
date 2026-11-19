@@ -77,6 +77,8 @@ class TabICLBase(BaseEstimator):
         self.n_features_in_ = preprocessor.n_features_in_
         if hasattr(preprocessor, "feature_names_in_"):
             self.feature_names_in_ = preprocessor.feature_names_in_
+        elif hasattr(self, "feature_names_in_"):
+            del self.feature_names_in_  # Left by an earlier fit on named data.
         return preprocessor
 
     def _build(self, model, optimize, limits, preprocessor, training):

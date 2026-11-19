@@ -1,17 +1,20 @@
-"""Parameter validation and n_jobs resolution for TabICLClassifier.
+"""Parameter validation, n_jobs resolution, and fitted attributes for TabICLClassifier.
 
-These exercise ``_validate_params`` and ``_resolve_threads`` directly, so they
-need neither a checkpoint nor a fitted model.
+None of these needs a checkpoint: fit runs against a stand-in for the Rust model.
 """
 
 import os
+import tempfile
 import unittest
 import warnings
 from pathlib import Path
 from unittest import mock
 
+import numpy as np
+
 from ironicl import TabICLClassifier
 from ironicl.cache import _cache_dir
+from tests.test_preprocessing import NamedArray
 
 
 class ValidateParamsTest(unittest.TestCase):
@@ -81,6 +84,28 @@ class CacheDirTest(unittest.TestCase):
         with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": "/xdg"}):
             os.environ.pop("IRONICL_CACHE_DIR", None)
             self.assertEqual(_cache_dir(TabICLClassifier(cache_dir=None).cache_dir), Path("/xdg/ironicl/contexts"))
+
+
+class FakeModel:
+    """Stands in for the Rust model, so fit runs without a checkpoint."""
+
+    task = "classifier"
+
+    def build_context(self, *args, **kwargs):
+        return object()
+
+
+class FittedAttributesTest(unittest.TestCase):
+    def test_a_refit_without_names_drops_the_previous_names(self):
+        x = np.random.default_rng(0).normal(size=(40, 3))
+        y = np.arange(40) % 2
+        with tempfile.NamedTemporaryFile() as checkpoint, mock.patch("ironicl.base._model", return_value=FakeModel()):
+            model = TabICLClassifier(model_path=checkpoint.name)
+            model.fit(NamedArray(x, ["a", "b", "c"]), y)
+            self.assertEqual(list(model.feature_names_in_), ["a", "b", "c"])
+            model.fit(x[:, :2], y)
+            self.assertFalse(hasattr(model, "feature_names_in_"))
+            self.assertEqual(model.n_features_in_, 2)
 
 
 if __name__ == "__main__":
