@@ -13,9 +13,12 @@ use candle_core::{
 use sha2::{Digest, Sha256};
 
 use crate::{
-    TaskKind,
+    ModelArtifact, TaskKind,
     error::{Error, Result},
-    format::model::{ModelArtifactData, ModelConfig, ModelTensor, ModelTensorDType, write_model_artifact},
+    format::model::{
+        ModelArtifactData, ModelConfig, ModelTensor, ModelTensorDType, encode_model_artifact,
+        write_model_artifact,
+    },
 };
 
 const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
@@ -136,6 +139,22 @@ pub fn import_checkpoint(path: &Path, output: &Path) -> Result<crate::ModelArtif
             "checkpoint input and model output must be different files".into(),
         ));
     }
+    write_model_artifact(output, &model_data(path)?)
+}
+
+/// Convert a validated checkpoint into an executable model in memory, as
+/// [`import_checkpoint`] would write it, without writing a file.
+///
+/// # Errors
+///
+/// Returns [`Error::Checkpoint`] when the checkpoint is invalid and
+/// [`Error::Artifact`] when it is not an official model.
+pub(crate) fn model_from_checkpoint(path: &Path) -> Result<ModelArtifact> {
+    ModelArtifact::from_bytes(&encode_model_artifact(&model_data(path)?)?)
+}
+
+/// The portable model of a validated checkpoint.
+fn model_data(path: &Path) -> Result<ModelArtifactData> {
     let loaded = load_checkpoint(path)?;
     let source_sha256 = decode_sha256(&loaded.summary.source_sha256)?;
     let config = loaded
@@ -166,22 +185,19 @@ pub fn import_checkpoint(path: &Path, output: &Path) -> Result<crate::ModelArtif
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    write_model_artifact(
-        output,
-        &ModelArtifactData {
-            source_sha256,
-            config: ModelConfig {
-                max_classes: config.max_classes,
-                num_quantiles: config.num_quantiles,
-                embed_dim: config.embed_dim,
-                column_blocks: config.column_blocks,
-                row_blocks: config.row_blocks,
-                row_cls_tokens: config.row_cls_tokens,
-                icl_blocks: config.icl_blocks,
-            },
-            tensors,
+    Ok(ModelArtifactData {
+        source_sha256,
+        config: ModelConfig {
+            max_classes: config.max_classes,
+            num_quantiles: config.num_quantiles,
+            embed_dim: config.embed_dim,
+            column_blocks: config.column_blocks,
+            row_blocks: config.row_blocks,
+            row_cls_tokens: config.row_cls_tokens,
+            icl_blocks: config.icl_blocks,
         },
-    )
+        tensors,
+    })
 }
 
 struct LoadedCheckpoint {

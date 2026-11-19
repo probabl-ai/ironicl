@@ -8,6 +8,7 @@ import time
 import unittest
 from datetime import timedelta
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
@@ -101,6 +102,18 @@ class CacheTest(unittest.TestCase):
         self.assertEqual(cache_info(directory).entries, ())
         uncached = TabICLClassifier(allow_auto_download=False).fit(x, (y > 0).astype(int))
         np.testing.assert_array_equal(model.predict_proba(x[:10]), uncached.predict_proba(x[:10]))
+
+    @unittest.skipUnless(POSIX_USER, "needs POSIX permissions")
+    def test_an_unwritable_model_cache_converts_the_checkpoint_in_memory(self):
+        copy = self.directory / "checkpoint.ckpt"  # A path this process has not loaded yet.
+        shutil.copyfile(checkpoint(TabICLClassifier), copy)
+        cache_home = self.read_only("cache-home")
+        x, y = data()
+        with mock.patch.dict(os.environ, {"XDG_CACHE_HOME": str(cache_home)}):
+            model = TabICLClassifier(model_path=copy, allow_auto_download=False).fit(x, (y > 0).astype(int))
+        self.assertEqual(list(cache_home.iterdir()), [])
+        cached = TabICLClassifier(allow_auto_download=False).fit(x, (y > 0).astype(int))
+        np.testing.assert_array_equal(model.predict_proba(x[:10]), cached.predict_proba(x[:10]))
 
     def read_only(self, name):
         directory = self.directory / name

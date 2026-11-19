@@ -378,7 +378,7 @@ pub(crate) fn write_model_artifact(path: &Path, model: &ModelArtifactData) -> Re
     write_result
 }
 
-fn encode_model_artifact(model: &ModelArtifactData) -> Result<Vec<u8>> {
+pub(crate) fn encode_model_artifact(model: &ModelArtifactData) -> Result<Vec<u8>> {
     model.config.validate()?;
     if model.source_sha256 == [0; 32] {
         return Err(Error::Artifact("source checkpoint hash is empty".into()));
