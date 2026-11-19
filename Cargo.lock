@@ -877,7 +877,9 @@ dependencies = [
  "objc2-metal-performance-shaders",
  "objc2-metal-performance-shaders-graph",
  "pyo3",
+ "rand_mt",
  "rayon",
+ "serde_json",
  "sha2 0.11.1",
  "tempfile",
  "windows-sys",
@@ -1404,6 +1406,12 @@ dependencies = [
  "num-traits",
  "rand",
 ]
+
+[[package]]
+name = "rand_mt"
+version = "6.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab79b42e3c44cf58883b476bbcfa5750130c28cb0c6a9bcbc76ad820aed05873"
 
 [[package]]
 name = "raw-cpuid"

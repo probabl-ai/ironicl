@@ -14,7 +14,11 @@ dependencies = [
     "scikit-learn>=1.7",
 ]
 license = "BSD-3-Clause"
-license-files = ["LICENSE", "LICENSES/TabICL-BSD-3-Clause.txt"]
+license-files = [
+    "LICENSE",
+    "LICENSES/Python-PSF-2.0.txt",
+    "LICENSES/TabICL-BSD-3-Clause.txt",
+]
 
 [project.optional-dependencies]
 # verbose=True shows a progress bar with tqdm, and plain lines without it.

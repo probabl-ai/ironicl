@@ -52,10 +52,14 @@ candle-core = "=0.11.1"
 libm = "0.2.16"
 memmap2 = "0.9.12"
 pyo3 = { version = "0.30.1", features = ["abi3-py312"], optional = true }
+rand_mt = { version = "6.1.0", default-features = false }
 rayon = "1.12.0"
 sha2 = "0.11.1"
 tempfile = "3.27.0"
 zip = { version = "9.3.0", default-features = false }
+
+[dev-dependencies]
+serde_json = "1.0.154"
 
 # Windows memory: the planner's probe (memory status, job limits, commit
 # charge) and prefetching mapped contexts.

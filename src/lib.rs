@@ -10,6 +10,7 @@ pub mod format;
 pub mod kernels;
 pub mod memory;
 pub mod models;
+pub mod preprocess;
 pub mod profile;
 pub mod progress;
 #[cfg(feature = "python")]
