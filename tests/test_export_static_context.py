@@ -1,7 +1,6 @@
 """Exporter container tests that run without torch or TabICL."""
 import importlib.util
 import hashlib
-import json
 import pathlib
 import struct
 import tempfile
@@ -40,35 +39,6 @@ class ExportFormatTest(unittest.TestCase):
     def test_context_identity_is_stable(self):
         x, y = np.array([[1.0], [2.0]]), np.array([0, 1])
         self.assertEqual(exporter.context_identity(x, y, {"a": 1}), exporter.context_identity(x, y, {"a": 1}))
-
-    def test_fixture_source_arrays_retain_raw_values_and_identity(self):
-        with tempfile.TemporaryDirectory() as directory:
-            fixture = pathlib.Path(directory) / "fixture.npz"
-            np.savez(
-                fixture,
-                x_context=np.array([[1.0], [2.0]], dtype=np.float32),
-                y_context=np.array([0, 1], dtype=np.int64),
-                x_query=np.array([[3.0]], dtype=np.float32),
-            )
-            fixture.with_suffix(".npz.json").write_text(
-                json.dumps(
-                    {
-                        "benchmark_contract": "raw_x_cached_serving_v1",
-                        "fixture_sha256": "fixture",
-                        "context_indices_sha256": "context-indices",
-                        "query_indices_sha256": "query-indices",
-                        "x_context_sha256": "x-context",
-                        "y_context_sha256": "y-context",
-                        "x_query_sha256": "x-query",
-                    }
-                )
-            )
-            args = type("Arguments", (), {"fixture": fixture, "dataset": None, "x_context": None, "y_context": None, "x_query": None})()
-            x_context, y_context, x_query, source = exporter.source_arrays(args)
-            self.assertEqual(x_context.dtype, np.float32)
-            self.assertEqual(y_context.dtype, np.int64)
-            self.assertEqual(x_query.dtype, np.float32)
-            self.assertEqual(source["fixture_sha256"], "fixture")
 
     def test_streamed_context_matches_in_memory_encoding(self):
         original = exporter.tensor_bytes

@@ -401,7 +401,6 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--metadata-output", type=Path)
     parser.add_argument("--raw-logits-output", type=Path)
     parser.add_argument("--tabicl-root", type=Path, default=root.parent / "tabicl" / "src")
-    parser.add_argument("--fixture", type=Path, help="Raw-X .npz fixture from prepare_cached_benchmark_fixture.py")
     parser.add_argument("--x-context", type=Path); parser.add_argument("--y-context", type=Path); parser.add_argument("--x-query", type=Path)
     parser.add_argument("--dataset", choices=("covertype",)); parser.add_argument("--data-home", type=Path)
     parser.add_argument("--context-rows", type=int, default=128); parser.add_argument("--query-rows", type=int, default=8)
@@ -412,24 +411,6 @@ def arguments() -> argparse.Namespace:
 
 
 def source_arrays(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, Any]]:
-    if args.fixture:
-        metadata_path = args.fixture.with_suffix(args.fixture.suffix + ".json")
-        metadata = json.loads(metadata_path.read_text())
-        if metadata.get("benchmark_contract") != "raw_x_cached_serving_v1":
-            raise ValueError("fixture does not use the raw-X cached-serving contract")
-        with np.load(args.fixture, allow_pickle=False) as fixture:
-            x_context = np.ascontiguousarray(fixture["x_context"])
-            y_context = np.ascontiguousarray(fixture["y_context"])
-            x_query = np.ascontiguousarray(fixture["x_query"])
-        return x_context, y_context, x_query, {
-            "dataset": "fixture",
-            "fixture_sha256": metadata["fixture_sha256"],
-            "context_indices_sha256": metadata["context_indices_sha256"],
-            "query_indices_sha256": metadata["query_indices_sha256"],
-            "x_context_sha256": metadata["x_context_sha256"],
-            "y_context_sha256": metadata["y_context_sha256"],
-            "x_query_sha256": metadata["x_query_sha256"],
-        }
     if args.dataset:
         from sklearn.datasets import fetch_covtype
         from sklearn.model_selection import train_test_split
@@ -437,7 +418,7 @@ def source_arrays(args: argparse.Namespace) -> tuple[np.ndarray, np.ndarray, np.
         train, query = train_test_split(np.arange(len(dataset.target)), train_size=args.context_rows, test_size=args.query_rows, random_state=args.seed, stratify=dataset.target)
         return np.asarray(dataset.data)[train], np.asarray(dataset.target)[train], np.asarray(dataset.data)[query], {"dataset": "covertype", "context_indices_sha256": hashlib.sha256(canonical_array(train, "<i8")).hexdigest(), "query_indices_sha256": hashlib.sha256(canonical_array(query, "<i8")).hexdigest()}
     if not all((args.x_context, args.y_context, args.x_query)):
-        raise ValueError("provide a fixture, three .npy arrays, or --dataset")
+        raise ValueError("provide three .npy arrays or --dataset")
     return np.load(args.x_context, allow_pickle=False), np.load(args.y_context, allow_pickle=False), np.load(args.x_query, allow_pickle=False), {"dataset": "explicit-npy"}
 
 

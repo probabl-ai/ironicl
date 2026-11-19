@@ -123,23 +123,6 @@ class correction, and probability aggregation. Compare it only with Ironicl
 `--probabilities` when both sides start at an equivalent query boundary. Use a
 separate prepared-query benchmark for kernel-only estimator-logit comparisons.
 
-## Raw-X Cached Serving
-
-`tools/benchmark_cached_end_to_end.py` is the required cross-engine latency
-contract. It keeps the training K/V cache resident but times, for every sample:
-
-- raw numeric query validation;
-- TabICL numerical encoding and ensemble variant generation;
-- cached model execution;
-- class correction, logit averaging, temperature softmax, and host FP32 output.
-
-It excludes model/context loading and cache construction. Run each engine in a
-separate process. Then use `tools/compare_cached_end_to_end.py` to reject
-results with different fixture, prepared-query, cache, model, output, or timing
-contract identities before reporting a ratio. The strict lane requires FP32 K/V
-and exact Ironicl GELU and softmax controls. AMP is a separate lane and must
-pass its own probability and label gates before it can be compared.
-
 On the Ryzen benchmark host, run all required CPU and CUDA FP32 points with:
 
 ```bash
