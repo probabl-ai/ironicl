@@ -992,11 +992,12 @@ impl StaticContextArtifact {
         Ok((head, length))
     }
 
-    /// Encode and write this context to `path` atomically: write a uniquely-named
-    /// temp file in the same directory, flush it, then rename it into place, so a
-    /// reader never observes a partial file and concurrent writers of the same
-    /// content do not clobber each other. The payload streams to the file
-    /// without a copy in memory.
+    /// Encode and write this context to `path` atomically: write a new temporary
+    /// file in the same directory, sync it, then rename it into place, so a
+    /// reader never observes a partial file and concurrent writers do not
+    /// clobber each other. The file is readable only by its owner on Unix,
+    /// because a context encodes its training data. The payload streams to the
+    /// file without a copy in memory.
     ///
     /// # Errors
     ///
@@ -1006,21 +1007,19 @@ impl StaticContextArtifact {
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_nanos());
-        let temp = directory.join(format!(".ironicl-{}-{nanos}.tmp", std::process::id()));
-        let result = (|| -> Result<()> {
-            let mut file = std::io::BufWriter::new(File::create(&temp).map_err(artifact_error)?);
-            self.encode(&mut file)?;
-            let file = file.into_inner().map_err(artifact_error)?;
-            file.sync_all().map_err(artifact_error)?;
-            std::fs::rename(&temp, path).map_err(artifact_error)
-        })();
-        if result.is_err() {
-            let _ = std::fs::remove_file(&temp);
-        }
-        result
+        // A new file with a random name, owner-only on Unix, that is deleted if
+        // it is dropped before `persist`, even on panic. `ironicl.clear_cache`
+        // removes `.ironicl-*.tmp` files a killed process leaves behind.
+        let mut file = tempfile::Builder::new()
+            .prefix(".ironicl-")
+            .suffix(".tmp")
+            .tempfile_in(directory)
+            .map_err(artifact_error)?;
+        let mut writer = std::io::BufWriter::new(&mut file);
+        self.encode(&mut writer)?;
+        writer.into_inner().map_err(artifact_error)?;
+        file.as_file().sync_all().map_err(artifact_error)?;
+        file.persist(path).map(drop).map_err(artifact_error)
     }
 
     /// Verified context metadata.
@@ -1429,5 +1428,54 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn temporary_files(directory: &Path) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(directory)
+            .expect("list directory")
+            .map(|entry| entry.expect("directory entry").path())
+            .filter(|path| path.extension().is_some_and(|extension| extension == "tmp"))
+            .collect()
+    }
+
+    #[test]
+    fn concurrent_writes_leave_one_private_context() {
+        let artifact = fixture();
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("context.irctx");
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| artifact.write(&path).expect("write context"));
+            }
+        });
+        assert_eq!(
+            StaticContextArtifact::read_mapped(&path).expect("read context"),
+            artifact
+        );
+        assert_eq!(
+            temporary_files(directory.path()),
+            Vec::<std::path::PathBuf>::new()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path).expect("metadata").permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    #[test]
+    fn failed_write_removes_its_temporary_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        // Renaming a file over a nonempty directory fails on every platform.
+        let path = directory.path().join("context.irctx");
+        std::fs::create_dir(&path).expect("create directory");
+        std::fs::write(path.join("kept"), b"kept").expect("write file");
+        assert!(fixture().write(&path).is_err());
+        assert_eq!(
+            temporary_files(directory.path()),
+            Vec::<std::path::PathBuf>::new()
+        );
+        assert_eq!(std::fs::read(path.join("kept")).expect("read file"), b"kept");
     }
 }
