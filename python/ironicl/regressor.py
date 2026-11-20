@@ -13,10 +13,9 @@ from pathlib import Path
 import numpy as np
 from sklearn.base import RegressorMixin
 from sklearn.exceptions import DataConversionWarning
-from sklearn.preprocessing import StandardScaler
 from sklearn.utils.validation import check_is_fitted
 
-from ironicl.base import TabICLBase
+from ironicl.base import TabICLBase, _array
 
 OUTPUT_TYPES = ("mean", "variance", "median", "quantiles", "raw_quantiles")
 DEFAULT_ALPHAS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
@@ -108,19 +107,11 @@ class TabICLRegressor(RegressorMixin, TabICLBase):
             y = y.ravel()
         if y.ndim != 1 or not np.isfinite(y).all():
             raise ValueError("y must be a one-dimensional array of finite numbers")
-        scaler = StandardScaler()
-        scaled = scaler.fit_transform(y.reshape(-1, 1)).ravel()
-        self._fit_context(
-            X,
-            y,
-            lambda _: scaled,
-            classification=False,
-        )
-        self.y_scaler_ = scaler
+        self._fit(X, np.ascontiguousarray(y))
         return self
 
-    def _expand_targets(self, preprocessor, targets):
-        return np.tile(targets, (preprocessor.n_estimators_, 1))
+    def _targets(self, y) -> dict:
+        return {"values": y}
 
     def predict(self, X, output_type: str | list[str] = "mean", alphas: list[float] | None = None):
         """Predict target statistics for each sample.
@@ -135,17 +126,12 @@ class TabICLRegressor(RegressorMixin, TabICLBase):
             raise ValueError("The provided input X is one-dimensional. Reshape your data.")
         types = [output_type] if isinstance(output_type, str) else list(output_type)
         alphas = DEFAULT_ALPHAS if alphas is None else list(alphas)
-        chunks = [
-            self.context_.predict_regression(rows, types, alphas, progress)
-            for rows, progress in self._query_chunks(X)
-        ]
-        mean, scale = self.y_scaler_.mean_[0], self.y_scaler_.scale_[0]
+        x = self._query(X)
+        with self._progress("Predicting", "row", len(x)) as progress:
+            results = self.fitted_.predict_regression(x, types, alphas, progress)
         final = {}
-        for name, *parts in zip(types, *chunks):
-            values = np.concatenate([np.frombuffer(values, dtype=np.float32).reshape(shape) for values, shape in parts])
-            # Standardized units back to the target's: locations by σ·v + μ,
-            # the variance, a squared spread, by σ².
-            values = values * scale**2 if name == "variance" else values * scale + mean
-            values = values.astype(np.float32)
+        for name, (values, shape) in zip(types, results):
+            # Rust returns the target's units, writable here like TabICL's output.
+            values = _array(values, shape).copy()
             final[name] = values.ravel() if name in ("mean", "variance", "median") else values
         return final[types[0]] if len(types) == 1 else final

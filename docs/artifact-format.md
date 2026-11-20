@@ -68,7 +68,12 @@ portable rather than kernel-packed. Automatic checkpoint caching uses this same
 format. A future packed format can use a new version without changing the cache
 CLI.
 
-## Fitted Preprocessing
+## Fitted Models
+
+A fitted model is three files, linked by the checkpoint's SHA-256: the weights
+(`IRMODEL`), the fitted preprocessing (`IRPREP`), and optionally the training
+context (`IRCNTXT`). Pickling and `save` store them as bytes, not as Python
+objects, and the planned server will load the same files.
 
 `IRPREP\0\0`, version 1 (`src/format/preprocessor.rs`), is little-endian and
 ends with a SHA-256 of everything before it. It holds the checkpoint's SHA-256
@@ -80,7 +85,15 @@ scale, range, outlier bounds, and for the power group its lambda and
 standardization. Decoding checks every length against the bytes left before it
 allocates, then the preprocessing's invariants.
 
-`IRPREP` is not signed yet: the digest detects corruption, not tampering.
+Loading refuses an `IRPREP` fitted with another checkpoint. With a context, it
+checks that the context matches the preprocessing: checkpoint, `B`, `H`, class
+count, and each member's permutations. Without one, it rebuilds the training
+rows from the raw training data and builds the context as fitting does, with the
+same rows, so the same context. `IRCNTXT`'s own context SHA-256 stays the
+context cache's file name.
+
+Neither `IRPREP` nor `IRCNTXT` is signed yet: the digests detect corruption,
+not tampering.
 
 ## Current Guarantees
 

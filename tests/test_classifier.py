@@ -14,7 +14,6 @@ import numpy as np
 
 from ironicl import TabICLClassifier
 from ironicl.cache import _cache_dir
-from tests.test_preprocessing import NamedArray
 
 
 class ValidateParamsTest(unittest.TestCase):
@@ -86,12 +85,24 @@ class CacheDirTest(unittest.TestCase):
             self.assertEqual(_cache_dir(TabICLClassifier(cache_dir=None).cache_dir), Path("/xdg/ironicl/contexts"))
 
 
+class NamedArray:
+    """Exercise the named-array contract without a pandas test dependency."""
+
+    def __init__(self, values, columns):
+        self.values = np.asarray(values)
+        self.columns = columns
+
+    def __array__(self, dtype=None, copy=None):
+        result = np.asarray(self.values, dtype=dtype)
+        return result.copy() if copy else result
+
+
 class FakeModel:
-    """Stands in for the Rust model, so fit runs without a checkpoint."""
+    """Stands in for the Rust model, so fit runs preprocessing without a checkpoint."""
 
     task = "classifier"
 
-    def build_context(self, *args, **kwargs):
+    def build(self, *args, **kwargs):
         return object()
 
 
@@ -106,6 +117,34 @@ class FittedAttributesTest(unittest.TestCase):
             model.fit(x[:, :2], y)
             self.assertFalse(hasattr(model, "feature_names_in_"))
             self.assertEqual(model.n_features_in_, 2)
+
+    def test_queries_must_match_the_fitted_features(self):
+        x = np.random.default_rng(0).normal(size=(40, 3))
+        y = np.array(["b", "a"])[np.arange(40) % 2]
+        with tempfile.NamedTemporaryFile() as checkpoint, mock.patch("ironicl.base._model", return_value=FakeModel()):
+            model = TabICLClassifier(model_path=checkpoint.name).fit(NamedArray(x, ["a", "b", "c"]), y)
+        self.assertEqual(list(model.classes_), ["a", "b"])
+        self.assertEqual(model._query(NamedArray(x[:2], ["a", "b", "c"])).shape, (2, 3))
+        for invalid, message in (
+            (x[:2], "feature names"),
+            (NamedArray(x[:2], ["c", "b", "a"]), "feature names"),
+            (x[:2, :2], "features"),
+        ):
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                model._query(invalid)
+        with self.assertRaises(TypeError):
+            model._query(np.full((2, 3), "word"))
+
+    def test_parameter_types_are_checked_before_rust(self):
+        for name, value in (
+            ("n_estimators", 1.5),
+            ("n_estimators", True),
+            ("random_state", 0.5),
+            ("random_state", True),
+            ("outlier_threshold", "four"),
+        ):
+            with self.subTest(name=name, value=value), self.assertRaises(ValueError):
+                TabICLClassifier(**{name: value})._validate_params()
 
 
 if __name__ == "__main__":

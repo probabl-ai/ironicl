@@ -41,6 +41,15 @@ the complete model checksum and embedded source hash before reuse.
 
 The serving process reads only the Ironicl artifact format.
 
+## Preprocessing and Fitted Models
+
+Preprocessing runs in Rust on request data, and the server will load fitted
+preprocessing (`IRPREP`) from outside, so `src/preprocess/` forbids `unsafe`.
+`IRPREP` decodes as untrusted input; see
+[artifact-format.md](artifact-format.md#fitted-models). Python pickles hold the
+fitted model in these formats rather than as Python objects, but unpickling an
+estimator still runs Python's pickle: load pickles only from trusted sources.
+
 ## Data Handling
 
 Static artifacts encode information derived from the complete training set and

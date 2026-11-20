@@ -88,21 +88,24 @@ Before copying upstream code:
 4. verify the model checkpoint license and deployment terms independently.
 
 The Rust engine contains a fresh implementation and references upstream behavior.
-`python/ironicl/preprocessing.py` adapts scaling, outlier handling, and ensemble
-algorithms from `src/tabicl/_sklearn/preprocessing.py` at TabICL commit
-`bd030d47ff7d9f987f0f33431d743a3003bfe0d3` (version 2.1.1). Changes include a
-numeric-only classifier interface, grouped FP32 output, deterministic group
-ordering, iterative Latin-square construction, and removal of retained training
-arrays. It uses public scikit-learn APIs rather than copying upstream's sklearn
-compatibility module. No forecast code is included.
+`src/models/tabicl_v2/preprocess.rs` and `src/preprocess/scale.rs` adapt the
+scaling, outlier handling, and ensemble algorithms from
+`src/tabicl/_sklearn/preprocessing.py` at TabICL commit
+`bd030d47ff7d9f987f0f33431d743a3003bfe0d3` (version 2.1.1), through Ironicl's
+earlier Python port. Changes include a numeric-only classifier interface, grouped
+FP32 output, deterministic group ordering, a closed-form Latin square, and
+removal of retained training arrays. Rust also ports SciPy's Yeo-Johnson fit
+and `fminbound`, scikit-learn's `PowerTransformer` and `StandardScaler`
+statistics, and CPython's `random` methods; their notices are in
+[`../LICENSES/`](../LICENSES/). No forecast code is included.
 
-The upstream BSD-3-Clause notice is retained in
+TabICL's BSD-3-Clause notice is retained in
 [`../LICENSES/TabICL-BSD-3-Clause.txt`](../LICENSES/TabICL-BSD-3-Clause.txt) and
-included in Python distributions. The checked-in preprocessing oracle records
-its upstream commit and dependency versions in
+included in Python distributions. The checked-in preprocessing fixture records
+its TabICL commit and dependency versions in
 `tests/fixtures/preprocessing.json`. It contains generated numeric data, not
 model weights or user data.
 
-Python source and wheel distributions include both the project license and the
-upstream notice. Dependencies and model checkpoints remain subject to their
+Python source and wheel distributions include both the project license and
+TabICL's notice. Dependencies and model checkpoints remain subject to their
 respective licenses.

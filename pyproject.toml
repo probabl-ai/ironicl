@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "TabICLv2 classifier inference without PyTorch"
 readme = "README.md"
 requires-python = ">=3.12"
-# Floors are the oldest releases that pass the frozen upstream oracle.
+# Floors are the oldest releases that pass the Python tests.
 dependencies = [
     "numpy>=2",
     "scikit-learn>=1.7",

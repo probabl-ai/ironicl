@@ -2,9 +2,11 @@
 
 The `ironicl` Python package replaces TabICL's `TabICLClassifier` and
 `TabICLRegressor`. It requires
-Python 3.12+, NumPy, scikit-learn, and SciPy. It does not depend on TabICL or
+Python 3.12+, NumPy, and scikit-learn. It does not depend on TabICL or
 PyTorch. Building it from source requires Rust, because maturin compiles the
-private `ironicl._core` extension module.
+private `ironicl._core` extension module, which preprocesses, builds the
+training context, and predicts. Python converts inputs and keeps
+scikit-learn's interface.
 
 ```bash
 python -m pip install .
@@ -38,7 +40,7 @@ parameter names and defaults. A live parity test checks this.
   non-default `offload_mode`/`disk_offload_dir`, and `kv_cache="repr"` raise
   `NotImplementedError`.
 - `fit` runs the training rows through the model once and keeps their attention
-  keys and values in memory, like upstream's `kv_cache=True`. `predict_proba`
+  keys and values in memory, like TabICL's `kv_cache=True`. `predict_proba`
   then runs only the query rows. The context takes about 49 KB per training row
   and estimator. A fitted estimator can be saved and pickled; see
   [Saving and pickling](#saving-and-pickling).
@@ -116,14 +118,19 @@ clf = TabICLClassifier.load("model.pkl", device=None)
   context from the training data, which takes as long as the build in `fit`;
   with `cache_dir` set, a context cached on this machine loads from the cache
   instead.
-- `save_training_data` keeps the preprocessed training rows, one copy per
-  normalization group (`fit` keeps them for this). Leaving out both the rows
-  and the context raises `ValueError`.
+- `save_training_data` keeps the training data, `X` and `y` as `fit` received
+  them (`fit` keeps a copy for this). Leaving out both the training data and
+  the context raises `ValueError`.
 - `save_model_weights` includes the checkpoint, so loading needs no checkpoint
   file or download. Without it, loading uses the saved checkpoint path if it
   exists, otherwise `model_path` or the default location, downloaded when
   `allow_auto_download` allows. An included checkpoint is written there when it
   is missing.
+
+The fitted model is saved in Rust's formats
+([artifact-format.md](artifact-format.md#fitted-models)): its preprocessing,
+and the context and the training data as the options say. Loading refuses a
+different checkpoint.
 
 A 2,000-row, 100-feature classifier with 8 estimators, on an M1 Max:
 
@@ -198,52 +205,36 @@ which is wrong unless the target is already standardized
 
 ## Preprocessing
 
-`ironicl.preprocessing.Preprocessor` exposes the preprocessing step
-on its own:
-
-```python
-from ironicl.preprocessing import Preprocessor
-
-preprocessor = Preprocessor(n_estimators=8, random_state=42)
-training_groups = preprocessor.fit_transform(X_train, y_train)
-training_labels = preprocessor.encode_labels(y_train)
-query_groups = preprocessor.transform(X_query)
-```
-
-Each returned group is one contiguous FP32 matrix `[rows, filtered_features]`.
-`group_names_` records normalization order. `ensemble_groups_` maps ensemble
-members to those matrices; `feature_permutations_` and `class_permutations_`
-provide their feature and encoded-label mappings. The API does not expand
-features or labels per ensemble. `n_estimators_` records the actual ensemble
-count, which can be smaller than requested.
+Preprocessing runs in Rust, at parity with TabICL's. There is no separate
+preprocessing class: `fit` keeps the fitted model as `fitted_`
+([native-preprocessing.md](native-preprocessing.md)). `fit` also sets
+scikit-learn's `n_features_in_`, `feature_names_in_` for named data, `classes_`
+and `n_classes_` for the classifier, `memory_plan_`, and `checkpoint_path_`. TabICL's other fitted
+attributes, such as `X_encoder_`, `ensemble_generator_`, and the regressor's
+`y_scaler_`, do not exist.
 
 ## Supported Inputs
 
-This initial implementation supports finite dense numeric inputs, 2–10 classes,
-and the default `none`/`power` transforms with Latin feature and cyclic class
+This initial implementation supports finite dense numeric inputs, 2–10 classes
+whose labels are all integers, all floats, all booleans, or all strings, and the
+default `none`/`power` transforms with Latin feature and cyclic class
 permutations. It removes constant features and rejects all-constant training
 data. Categorical inputs, missing values, and sparse matrices are not supported.
 Numeric DataFrames must have unique string column names in the same order at
-prediction time. Preprocessing is fitted on training data only, retains no
-training rows (the estimator keeps the preprocessed rows for
-[`save`](#saving-and-pickling)), and does not require `PYTHONHASHSEED`
-configuration. It preserves
-upstream's power-transform fallback, including its batch-wide clipping when a
-transform raises a domain error.
+prediction time. Preprocessing is fitted on training data only and does not
+require `PYTHONHASHSEED` configuration. It preserves TabICL's power-transform
+fallback, including its batch-wide clipping when a transform raises a domain
+error.
 
-`tools/prepare_real_dataset.py` uses this package without `--tabicl-root`; it
-expands ensembles only when writing the existing IRINPUT file format. Other
-upstream oracle and context-export tools still require TabICL/PyTorch.
+`tools/prepare_real_dataset.py` uses Rust preprocessing without `--tabicl-root`;
+it expands ensembles only when writing the existing IRINPUT file format. Other
+TabICL oracle and context-export tools still require TabICL/PyTorch.
 
 ## Version Requirements
 
-The package requires NumPy 2.0+ and scikit-learn 1.7+, which brings SciPy.
-These are the oldest releases that pass the frozen upstream oracle. Any SciPy
-that scikit-learn accepts works: TabICL and Ironicl share the power-transform
-fit, so they match on each SciPy. The frozen oracle's float32 case needs SciPy
-1.17+, because older SciPy fits float32 data differently; its test skips that
-case on older SciPy. There are no upper bounds; the CI parity job installs the
-latest releases.
+The package requires NumPy 2.0+ and scikit-learn 1.7+, the oldest releases that
+pass its tests. Preprocessing does not use the installed SciPy. There are no
+upper bounds; the CI parity job installs the latest releases.
 
 ## Tests
 
@@ -253,9 +244,10 @@ Run the Python checks after installation:
 python -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
-The checked-in preprocessing oracle runs without upstream dependencies. Run live
-comparisons separately, in an environment with both projects installed and an
-unmodified TabICL checkout at commit `bd030d47ff7d9f987f0f33431d743a3003bfe0d3`:
+Rust's tests (`cargo test`) check preprocessing against a frozen TabICL fixture
+without TabICL. Run live comparisons separately, in an environment with both
+projects installed and an unmodified TabICL checkout at commit
+`bd030d47ff7d9f987f0f33431d743a3003bfe0d3`:
 
 ```bash
 IRONICL_TABICL_SOURCE=/path/to/tabicl/src \
@@ -266,5 +258,5 @@ This dedicated suite compares independently fitted preprocessing chains, using
 synthetic inputs and bundled scikit-learn datasets. It also compares
 `TabICLClassifier` and `TabICLRegressor` signatures and predictions within `1e-4`,
 and downloads the released checkpoints for that. Missing prerequisites fail rather than skip. See
-[validation](validation.md#python-preprocessing-parity) for setup, coverage, and
+[validation](validation.md#preprocessing-parity) for setup, coverage, and
 numerical requirements.

@@ -1,7 +1,9 @@
 //! `ironicl._core`: the private Python extension module.
 //!
-//! Python owns validation and preprocessing. This module loads the model,
-//! builds the training context, and predicts against it.
+//! Python owns scikit-learn's interface, input conversion, and the checkpoint
+//! download. This module preprocesses, builds the training context, and
+//! predicts ([`FittedModel`]). `Model.build_context` and `Context` remain for
+//! tests that drive the engine with their own rows.
 
 #![expect(
     clippy::needless_pass_by_value,
@@ -22,9 +24,10 @@ use pyo3::{
 };
 
 use crate::{
-    ClassifierAggregation, Error, Executor, Optimize, QueryRequest, RegressionOutput, StaticExecutor,
-    TaskKind, load_checkpoint_model,
+    ClassifierAggregation, Error, Executor, Features, Labels, NormMethod, Optimize, PreprocessOptions,
+    QueryRequest, RegressionOutput, StaticExecutor, Targets, TaskKind, load_checkpoint_model,
     memory::{Builder, MemoryLimits, Verdict},
+    models::tabicl_v2::preprocess::flatten_orders,
     plan_context,
     progress::{self, Hook, Stage},
 };
@@ -153,6 +156,82 @@ impl Model {
         .map(Context)
     }
 
+    /// Build the context of `preprocess`'s result. `optimize`, `threads`, the memory
+    /// limits, `progress`, and `cache_dir` are as for `build_context`.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the Python call's parameters")]
+    #[pyo3(signature = (
+        preprocessed, optimize, threads, memory_limit=None, device_memory_limit=None, progress=None, cache_dir=None,
+    ))]
+    fn build(
+        &self,
+        py: Python<'_>,
+        preprocessed: &Preprocessed,
+        optimize: &str,
+        threads: Option<usize>,
+        memory_limit: Option<String>,
+        device_memory_limit: Option<String>,
+        progress: Option<Py<PyAny>>,
+        cache_dir: Option<PathBuf>,
+    ) -> PyResult<FittedModel> {
+        let optimize = optimize.parse::<Optimize>().map_err(py_error)?;
+        let limits = MemoryLimits::resolve(memory_limit.as_deref(), device_memory_limit.as_deref())
+            .map_err(py_error)?;
+        let preprocessed = Arc::clone(&preprocessed.0);
+        run(py, progress, || {
+            self.0
+                .build_fitted(preprocessed, optimize, threads, limits, cache_dir.as_deref())
+        })
+        .map(FittedModel)
+    }
+
+    /// Load a fitted model from `FittedModel.preprocessor_bytes` (`IRPREP`),
+    /// with `context`, the bytes of `FittedModel.context_bytes`, or the raw
+    /// training rows `x` and their `labels` or `values`, as `preprocess` takes
+    /// them; without a context, it is built from the training rows, as `build`
+    /// builds it. The other arguments are as for `build`.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the Python call's parameters")]
+    #[pyo3(signature = (
+        preprocessor, optimize, threads, memory_limit=None, device_memory_limit=None, progress=None,
+        cache_dir=None, *, context=None, x=None, labels=None, values=None,
+    ))]
+    fn load_fitted(
+        &self,
+        py: Python<'_>,
+        preprocessor: &[u8],
+        optimize: &str,
+        threads: Option<usize>,
+        memory_limit: Option<String>,
+        device_memory_limit: Option<String>,
+        progress: Option<Py<PyAny>>,
+        cache_dir: Option<PathBuf>,
+        context: Option<&[u8]>,
+        x: Option<&Bound<'_, PyAny>>,
+        labels: Option<(String, Bound<'_, PyAny>)>,
+        values: Option<PyBuffer<f32>>,
+    ) -> PyResult<FittedModel> {
+        let optimize = optimize.parse::<Optimize>().map_err(py_error)?;
+        let limits = MemoryLimits::resolve(memory_limit.as_deref(), device_memory_limit.as_deref())
+            .map_err(py_error)?;
+        let training = match x {
+            Some(x) => Some((Matrix::read(py, x)?, read_targets(py, labels, values)?)),
+            None => None,
+        };
+        run(py, progress, || {
+            self.0.load_fitted(
+                preprocessor,
+                context,
+                training
+                    .as_ref()
+                    .map(|((x, columns), targets)| (x.features(), *columns, targets)),
+                optimize,
+                threads,
+                limits,
+                cache_dir.as_deref(),
+            )
+        })
+        .map(FittedModel)
+    }
+
     /// `"classifier"` or `"regressor"`.
     #[getter]
     fn task(&self) -> String {
@@ -271,22 +350,27 @@ impl Context {
         self.0.batch_rows()
     }
 
-    /// This context encoded as the context cache writes it, for pickling.
-    /// Encodes straight into the returned bytes, without another copy.
+    /// This context encoded as the context cache writes it (`IRCNTXT`).
     fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let length = self.0.context_encoded_len().map_err(py_error)?;
-        PyBytes::new_with(py, length, |mut buffer: &mut [u8]| {
-            py.detach(|| self.0.encode_context(&mut buffer))
-                .map_err(py_error)?;
-            if buffer.is_empty() {
-                Ok(())
-            } else {
-                Err(PyRuntimeError::new_err(
-                    "the encoded context is shorter than its length",
-                ))
-            }
-        })
+        context_bytes(py, &self.0)
     }
+}
+
+/// `context` encoded as the context cache writes it, straight into the
+/// returned bytes, without another copy.
+fn context_bytes<'py>(py: Python<'py>, context: &StaticExecutor) -> PyResult<Bound<'py, PyBytes>> {
+    let length = context.context_encoded_len().map_err(py_error)?;
+    PyBytes::new_with(py, length, |mut buffer: &mut [u8]| {
+        py.detach(|| context.encode_context(&mut buffer))
+            .map_err(py_error)?;
+        if buffer.is_empty() {
+            Ok(())
+        } else {
+            Err(PyRuntimeError::new_err(
+                "the encoded context is shorter than its length",
+            ))
+        }
+    })
 }
 
 /// Plan the memory to build a `task` context of `estimators x rows x features`
@@ -393,11 +477,300 @@ fn system_info(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     Ok(dict)
 }
 
+/// A C-ordered float32 or float64 matrix copied from a Python buffer.
+enum Matrix {
+    F32(Vec<f32>),
+    F64(Vec<f64>),
+}
+
+impl Matrix {
+    /// The values of a two-dimensional float64 or float32 buffer, and its column count.
+    fn read(py: Python<'_>, x: &Bound<'_, PyAny>) -> PyResult<(Self, usize)> {
+        let columns = |shape: &[usize]| match *shape {
+            [_, columns] => Ok(columns),
+            _ => Err(PyValueError::new_err("X must be two-dimensional")),
+        };
+        if let Ok(buffer) = PyBuffer::<f64>::get(x) {
+            return Ok((Self::F64(buffer.to_vec(py)?), columns(buffer.shape())?));
+        }
+        let buffer = PyBuffer::<f32>::get(x)?;
+        Ok((Self::F32(buffer.to_vec(py)?), columns(buffer.shape())?))
+    }
+
+    fn features(&self) -> Features<'_> {
+        match self {
+            Self::F32(values) => Features::F32(values),
+            Self::F64(values) => Features::F64(values),
+        }
+    }
+}
+
+/// Labels from Python as `(kind, values)`: `"int"`, `"float"`, or `"bool"` with
+/// an int64, float64, or uint8 buffer, or `"text"` with a list of str.
+fn read_labels(py: Python<'_>, (kind, values): (String, Bound<'_, PyAny>)) -> PyResult<Labels> {
+    Ok(match kind.as_str() {
+        "int" => Labels::Int(PyBuffer::<i64>::get(&values)?.to_vec(py)?),
+        "float" => Labels::Float(PyBuffer::<f64>::get(&values)?.to_vec(py)?),
+        "bool" => Labels::Bool(
+            PyBuffer::<u8>::get(&values)?
+                .to_vec(py)?
+                .into_iter()
+                .map(|value| value != 0)
+                .collect(),
+        ),
+        "text" => Labels::Text(values.extract()?),
+        _ => return Err(PyValueError::new_err(format!("unknown label kind {kind:?}"))),
+    })
+}
+
+/// A classifier's `labels` or a regressor's float32 `values`, exactly one of them.
+fn read_targets(
+    py: Python<'_>,
+    labels: Option<(String, Bound<'_, PyAny>)>,
+    values: Option<PyBuffer<f32>>,
+) -> PyResult<Targets> {
+    match (labels, values) {
+        (Some(labels), None) => Ok(Targets::Labels(read_labels(py, labels)?)),
+        (None, Some(values)) => Ok(Targets::Values(values.to_vec(py)?)),
+        _ => Err(PyValueError::new_err(
+            "pass labels for a classifier or values for a regressor",
+        )),
+    }
+}
+
+/// Index rows of equal length as little-endian uint64 bytes and their shape.
+fn index_rows<'py>(py: Python<'py>, rows: &[Vec<usize>]) -> (Bound<'py, PyBytes>, [usize; 2]) {
+    let values = flatten_orders(rows);
+    let width = rows.first().map_or(0, Vec::len);
+    (
+        PyBytes::new(py, bytemuck::cast_slice(&values)),
+        [rows.len(), width],
+    )
+}
+
+/// Little-endian bytes of `values`.
+fn f32_bytes<'py>(py: Python<'py>, values: &[f32]) -> Bound<'py, PyBytes> {
+    PyBytes::new(py, bytemuck::cast_slice(values))
+}
+
+/// Fit preprocessing on `x`, a float32 or float64 `[rows, columns]` array, for
+/// a classifier with `labels` (`(kind, values)`, as `read_labels` takes) or a
+/// regressor with float32 `values`. The result's `shape` plans the memory to
+/// build its context with `Model.build`.
+#[pyfunction]
+#[pyo3(signature = (x, *, labels=None, values=None, n_estimators, random_state, norm_methods, outlier_threshold))]
+#[expect(clippy::too_many_arguments, reason = "mirrors the Python call's parameters")]
+fn preprocess(
+    py: Python<'_>,
+    x: &Bound<'_, PyAny>,
+    labels: Option<(String, Bound<'_, PyAny>)>,
+    values: Option<PyBuffer<f32>>,
+    n_estimators: usize,
+    random_state: i128,
+    norm_methods: Vec<String>,
+    outlier_threshold: f64,
+) -> PyResult<Preprocessed> {
+    let (x, columns) = Matrix::read(py, x)?;
+    let targets = read_targets(py, labels, values)?;
+    let options = PreprocessOptions {
+        n_estimators,
+        random_state,
+        norm_methods: norm_methods
+            .iter()
+            .map(|name| NormMethod::from_name(name))
+            .collect::<crate::Result<_>>()
+            .map_err(py_error)?,
+        outlier_threshold,
+    };
+    py.detach(|| crate::Preprocessed::fit(&options, x.features(), columns, &targets))
+        .map(|preprocessed| Preprocessed(Arc::new(preprocessed)))
+        .map_err(py_error)
+}
+
+/// Fitted preprocessing and its training rows, before or within a `FittedModel`.
+#[pyclass(frozen)]
+struct Preprocessed(Arc<crate::Preprocessed>);
+
+#[pymethods]
+impl Preprocessed {
+    /// The context's `[B, N, H]` shape, or `None` without training rows.
+    #[getter]
+    fn shape(&self) -> Option<[usize; 3]> {
+        self.0.shape()
+    }
+
+    #[getter]
+    fn has_training(&self) -> bool {
+        self.0.has_training()
+    }
+
+    #[getter]
+    fn feature_mask(&self) -> Vec<bool> {
+        self.0.preprocessor().feature_mask().to_vec()
+    }
+
+    /// The normalization method of each group, in group order.
+    #[getter]
+    fn group_names(&self) -> Vec<&'static str> {
+        self.0
+            .preprocessor()
+            .group_methods()
+            .iter()
+            .map(|method| method.name())
+            .collect()
+    }
+
+    /// Each member's group.
+    #[getter]
+    fn member_groups(&self) -> Vec<usize> {
+        self.0.preprocessor().member_groups().to_vec()
+    }
+
+    /// Each member's feature order, as uint64 bytes, and their `[B, H]` shape.
+    #[getter]
+    fn feature_permutations<'py>(&self, py: Python<'py>) -> (Bound<'py, PyBytes>, [usize; 2]) {
+        index_rows(py, self.0.preprocessor().feature_permutations())
+    }
+
+    /// Each member's class order, as uint64 bytes, and their `[B, classes]` shape.
+    #[getter]
+    fn class_permutations<'py>(&self, py: Python<'py>) -> (Bound<'py, PyBytes>, [usize; 2]) {
+        index_rows(py, self.0.preprocessor().class_permutations())
+    }
+
+    /// What `Model.build_context` takes: FP32 `[B, N, H]` rows and `[B, N]`
+    /// targets, and uint64 class and feature orders, each as bytes and a shape.
+    #[expect(clippy::type_complexity, reason = "four arrays as bytes and shapes")]
+    fn training_inputs<'py>(
+        &self,
+        py: Python<'py>,
+    ) -> PyResult<(
+        (Bound<'py, PyBytes>, [usize; 3]),
+        (Bound<'py, PyBytes>, [usize; 2]),
+        (Bound<'py, PyBytes>, [usize; 2]),
+        (Bound<'py, PyBytes>, [usize; 2]),
+    )> {
+        let inputs = py.detach(|| self.0.training_inputs()).map_err(py_error)?;
+        let [members, rows, _] = inputs.shape;
+        let preprocessor = self.0.preprocessor();
+        Ok((
+            (f32_bytes(py, &inputs.rows), inputs.shape),
+            (f32_bytes(py, &inputs.targets), [members, rows]),
+            index_rows(py, preprocessor.class_permutations()),
+            index_rows(py, preprocessor.feature_permutations()),
+        ))
+    }
+
+    /// Each member's preprocessed rows of `x`, `[rows, columns]`, as FP32 bytes
+    /// and their `[B, rows, H]` shape.
+    fn query_rows<'py>(
+        &self,
+        py: Python<'py>,
+        x: &Bound<'py, PyAny>,
+    ) -> PyResult<(Bound<'py, PyBytes>, [usize; 3])> {
+        let (x, columns) = Matrix::read(py, x)?;
+        let (rows, shape) = py
+            .detach(|| self.0.query_rows(x.features(), columns))
+            .map_err(py_error)?;
+        Ok((f32_bytes(py, &rows), shape))
+    }
+}
+
+/// A fitted model: preprocessing and its training context. Predictions take
+/// raw features and return the caller's units.
+#[pyclass(frozen)]
+struct FittedModel(crate::FittedModel);
+
+#[pymethods]
+impl FittedModel {
+    /// Class probabilities for `x`, a float32 or float64 `[rows, columns]`
+    /// array, as FP32 bytes and their `[rows, classes]` shape. `progress`
+    /// receives `("predict", rows done, rows)`.
+    #[pyo3(signature = (x, softmax_temperature, average_logits, progress=None))]
+    fn predict_proba<'py>(
+        &self,
+        py: Python<'py>,
+        x: &Bound<'py, PyAny>,
+        softmax_temperature: f32,
+        average_logits: bool,
+        progress: Option<Py<PyAny>>,
+    ) -> PyResult<(Bound<'py, PyBytes>, [usize; 2])> {
+        let (x, columns) = Matrix::read(py, x)?;
+        let aggregation = ClassifierAggregation {
+            softmax_temperature,
+            average_logits,
+        };
+        let probabilities = run(py, progress, || {
+            self.0.predict_probabilities(x.features(), columns, aggregation)
+        })?;
+        Ok((f32_bytes(py, probabilities.values()), probabilities.shape()))
+    }
+
+    /// Each `output_types` entry for `x` in the target's units, as FP32 bytes
+    /// and its `[rows, columns]` shape. `alphas` are the levels for
+    /// `"quantiles"`; `progress` is as for `predict_proba`.
+    #[pyo3(signature = (x, output_types, alphas, progress=None))]
+    fn predict_regression<'py>(
+        &self,
+        py: Python<'py>,
+        x: &Bound<'py, PyAny>,
+        output_types: Vec<String>,
+        alphas: Vec<f32>,
+        progress: Option<Py<PyAny>>,
+    ) -> PyResult<Vec<(Bound<'py, PyBytes>, [usize; 2])>> {
+        let (x, columns) = Matrix::read(py, x)?;
+        let rows = x.features().len() / columns.max(1);
+        let outputs = output_types
+            .iter()
+            .map(|name| RegressionOutput::parse(name, &alphas))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(py_error)?;
+        let results = run(py, progress, || {
+            self.0.predict_regression(x.features(), columns, &outputs)
+        })?;
+        Ok(results
+            .into_iter()
+            .map(|(values, width)| (f32_bytes(py, &values), [rows, width]))
+            .collect())
+    }
+
+    #[getter]
+    fn preprocessed(&self) -> Preprocessed {
+        Preprocessed(Arc::clone(self.0.preprocessed()))
+    }
+
+    /// Where predictions run; see `Context.device`.
+    #[getter]
+    fn device(&self) -> &'static str {
+        self.0.device()
+    }
+
+    /// See `Context.batch_rows`.
+    #[getter]
+    fn batch_rows(&self) -> Option<usize> {
+        self.0.batch_rows()
+    }
+
+    /// The fitted preprocessing as `IRPREP` bytes, for `Model.load_fitted`.
+    fn preprocessor_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = self.0.preprocessor_bytes().map_err(py_error)?;
+        Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// The training context as `IRCNTXT` bytes, for `Model.load_fitted`.
+    fn context_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        context_bytes(py, &self.0.context)
+    }
+}
+
 #[pymodule]
 #[pyo3(name = "_core")]
 fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Model>()?;
     module.add_class::<Context>()?;
+    module.add_class::<Preprocessed>()?;
+    module.add_class::<FittedModel>()?;
+    module.add_function(wrap_pyfunction!(preprocess, module)?)?;
     module.add_function(wrap_pyfunction!(parse_size, module)?)?;
     module.add_function(wrap_pyfunction!(system_info, module)?)?;
     module.add_function(wrap_pyfunction!(plan_memory, module)?)

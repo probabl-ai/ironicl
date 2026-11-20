@@ -14,7 +14,7 @@ import numpy as np
 from sklearn.datasets import load_diabetes, make_regression
 from sklearn.exceptions import NotFittedError
 from sklearn.model_selection import train_test_split
-from test_tabicl_preprocessing import load_upstream
+from test_tabicl_preprocessing import load_tabicl, skewed
 
 from ironicl import TabICLRegressor
 
@@ -27,7 +27,7 @@ ALPHAS = [0.0005, 0.01, 0.1, 0.5, 0.9, 0.99, 0.9995]
 class TabICLRegressorParityTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        load_upstream()  # Verifies the pinned checkout and imports the tabicl package.
+        load_tabicl()  # Verifies the pinned checkout and imports the tabicl package.
         cls.tabicl = importlib.import_module("tabicl._sklearn.regressor").TabICLRegressor
         hub = importlib.import_module("huggingface_hub")
         cls.checkpoint = hub.hf_hub_download("jingang/TabICL", CHECKPOINT)
@@ -81,6 +81,23 @@ class TabICLRegressorParityTest(unittest.TestCase):
                     np.testing.assert_allclose(actual[name], expected[name], rtol=0, atol=1e-4 * unit, err_msg=name)
                 np.testing.assert_allclose(
                     ours.predict(x_test), theirs.predict(x_test), rtol=0, atol=1e-4 * scale
+                )
+
+    def test_float32_input_matches_tabicl_on_its_upcast(self):
+        x, y = load_diabetes(return_X_y=True)
+        x_skewed, q_skewed, _ = skewed(np.float32)
+        y_skewed = np.log(x_skewed[:, :3].astype(np.float64)).sum(axis=1)
+        cases = {
+            "diabetes": (x[:200].astype(np.float32), y[:200], x[200:300].astype(np.float32)),
+            "skewed": (x_skewed[:300], y_skewed[:300], q_skewed[:100]),
+        }
+        for name, (x_train, y_train, x_test) in cases.items():
+            with self.subTest(name):
+                ours = TabICLRegressor(model_path=self.checkpoint).fit(x_train, y_train)
+                theirs = self.tabicl(model_path=self.checkpoint, device="cpu").fit(x_train.astype(np.float64), y_train)
+                scale = theirs.y_scaler_.scale_[0]
+                np.testing.assert_allclose(
+                    ours.predict(x_test), theirs.predict(x_test.astype(np.float64)), rtol=0, atol=1e-4 * scale
                 )
 
     def test_optimize_levels_stay_within_their_bounds(self):

@@ -106,7 +106,8 @@ def encode_bundle(x: np.ndarray, y: np.ndarray) -> bytes:
 
 def main() -> None:
     args = parse_args()
-    from ironicl.preprocessing import Preprocessor
+    from ironicl import _core
+    from ironicl.base import _array, _features, _label_values, _labels
 
     x, labels, source = load_dataset(args.dataset)
     source_shape = [int(x.shape[0]), int(x.shape[1])]
@@ -115,26 +116,24 @@ def main() -> None:
     )
     x_train, x_test, selected_features = select_features(x_train, x_test, args.features)
 
-    preprocessor = Preprocessor(n_estimators=args.estimators, random_state=args.seed)
-    train_groups = preprocessor.fit_transform(x_train, y_train_raw)
-    test_groups = preprocessor.transform(x_test)
-    y_train = preprocessor.encode_labels(y_train_raw)
-    preprocessor.encode_labels(y_test_raw)  # Reject classes absent from training.
-
-    # IRINPUT still requires expanded [B,T,H] data. Keep that legacy allocation
-    # at the file-format boundary, not in the grouped Python preprocessing API.
-    transformed_x = np.empty(
-        (preprocessor.n_estimators_, len(x_train) + len(x_test), preprocessor.n_features_out_),
-        dtype=np.float32,
+    train_labels = _labels(y_train_raw)
+    classes = np.unique(train_labels)
+    if not np.isin(_labels(y_test_raw), classes).all():
+        raise ValueError("the test rows have classes the training rows do not")
+    preprocessed = _core.preprocess(
+        _features(x_train)[0],
+        labels=_label_values(train_labels),
+        n_estimators=args.estimators,
+        random_state=args.seed,
+        norm_methods=["none", "power"],
+        outlier_threshold=4.0,
     )
-    transformed_y = np.empty((preprocessor.n_estimators_, len(y_train)), dtype=np.float32)
-    for ensemble, group in enumerate(preprocessor.ensemble_groups_):
-        features = preprocessor.feature_permutations_[ensemble]
-        transformed_x[ensemble, :len(x_train)] = train_groups[group][:, features]
-        transformed_x[ensemble, len(x_train):] = test_groups[group][:, features]
-        transformed_y[ensemble] = preprocessor.class_permutations_[ensemble][y_train]
-    if not np.isfinite(transformed_x).all() or not np.isfinite(transformed_y).all():
-        raise ValueError("preprocessed tensors contain non-finite values")
+
+    # IRINPUT holds each member's training and test rows together, [B, T, H].
+    rows, targets, _, _ = preprocessed.training_inputs()
+    test_rows = preprocessed.query_rows(_features(x_test)[0])
+    transformed_x = np.concatenate([_array(*rows), _array(*test_rows)], axis=1)
+    transformed_y = _array(*targets)
 
     encoded = encode_bundle(transformed_x, transformed_y)
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -145,13 +144,13 @@ def main() -> None:
         "source": source,
         "source_shape": source_shape,
         "selected_source_features": selected_features,
-        "classes": [str(value) for value in preprocessor.classes_.tolist()],
+        "classes": [str(value) for value in classes.tolist()],
         "seed": args.seed,
         "requested_estimators": args.estimators,
         "shape": [int(value) for value in transformed_x.shape],
         "training_rows": int(transformed_y.shape[1]),
         "test_rows": args.test_rows,
-        "normalization_methods": list(preprocessor.group_names_),
+        "normalization_methods": list(preprocessed.group_names),
         "bundle_sha256": hashlib.sha256(encoded).hexdigest(),
     }
     metadata_path.parent.mkdir(parents=True, exist_ok=True)
