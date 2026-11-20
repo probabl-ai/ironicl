@@ -1,13 +1,13 @@
 //! Model-independent preprocessing: `CPython`'s random module, reproduced
-//! exactly, and `f64` column statistics that follow scikit-learn and `SciPy`. Models' own pipelines, such as `models::tabicl_v2::preprocess`,
+//! exactly; class labels; and `f64` column statistics that follow scikit-learn
+//! and `SciPy`. Models' own pipelines, such as `models::tabicl_v2::preprocess`,
 //! build on these pieces. This code handles untrusted input, so it may not use `unsafe`.
 #![forbid(unsafe_code)]
 
-#[allow(dead_code, reason = "TabICL preprocessing uses it in a following change")]
+#[allow(dead_code, reason = "the fitted model uses it in the following change")]
+pub mod labels;
 pub(crate) mod python_random;
-#[allow(dead_code, reason = "TabICL preprocessing uses it in a following change")]
 pub(crate) mod scale;
-#[allow(dead_code, reason = "TabICL preprocessing uses it in a following change")]
 pub(crate) mod yeo_johnson;
 
 /// A golden fixture from `tools/export_preprocess_fixtures.py`.

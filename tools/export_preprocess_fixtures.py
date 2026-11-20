@@ -3,7 +3,7 @@
 
 - tests/fixtures/python_random.json: draws from CPython's ``random.Random``,
   for src/preprocess/python_random.rs to reproduce exactly, and TabICL's
-  feature shuffles, for TabICL preprocessing to reproduce.
+  feature shuffles, for src/models/tabicl_v2/preprocess.rs.
 - tests/fixtures/yeo_johnson.json: SciPy's Yeo-Johnson log-likelihood and
   lambda, and scikit-learn's ``PowerTransformer``, on float64 data, for
   src/preprocess/yeo_johnson.rs.

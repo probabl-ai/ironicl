@@ -68,6 +68,20 @@ portable rather than kernel-packed. Automatic checkpoint caching uses this same
 format. A future packed format can use a new version without changing the cache
 CLI.
 
+## Fitted Preprocessing
+
+`IRPREP\0\0`, version 1 (`src/format/preprocessor.rs`), is little-endian and
+ends with a SHA-256 of everything before it. It holds the checkpoint's SHA-256
+(32 bytes, as `IRCNTXT` stores it), the feature mask, the
+normalization groups, each member's group and feature and class order, the class
+labels (integers, floats, booleans, or UTF-8 text) or the regressor's target
+mean and scale, and per group each kept feature's statistics as `f64`: mean,
+scale, range, outlier bounds, and for the power group its lambda and
+standardization. Decoding checks every length against the bytes left before it
+allocates, then the preprocessing's invariants.
+
+`IRPREP` is not signed yet: the digest detects corruption, not tampering.
+
 ## Current Guarantees
 
 - Little-endian, fixed-width scalar metadata.
