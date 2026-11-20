@@ -31,6 +31,7 @@ pub use format::model::{
     MODEL_ARTIFACT_MAGIC, MODEL_ARTIFACT_VERSION, ModelArtifact, ModelArtifactSummary, ModelConfig,
     ModelProfile, ModelTensorF32, inspect_model_artifact, load_model_artifact,
 };
+pub use format::preprocessor::{PREPROCESSOR_MAGIC, PREPROCESSOR_VERSION};
 pub use format::query_bundle::{STATIC_QUERY_BUNDLE_MAGIC, STATIC_QUERY_BUNDLE_VERSION, StaticQueryBundle};
 pub use format::static_context::{
     STATIC_CONTEXT_MAGIC, STATIC_CONTEXT_VERSION, StaticContextArtifact, StaticContextMetadata,
@@ -48,4 +49,6 @@ pub use models::tabicl_v2::cpu::{
     ClassifierAggregation, ClassifierProbabilities, DecoderOutputs, Executor, ForwardTrace, Optimize,
     SparseAttentionStatistics, StaticExecutor, TraceStage, plan_context,
 };
+pub use models::tabicl_v2::preprocess::{Features, NormMethod, PreprocessOptions, Preprocessor, Targets};
 pub use models::tabicl_v2::quantiles::RegressionOutput;
+pub use preprocess::labels::Labels;
