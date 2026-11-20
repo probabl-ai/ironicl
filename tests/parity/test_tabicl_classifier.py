@@ -14,7 +14,7 @@ import numpy as np
 from sklearn.datasets import load_breast_cancer, load_iris, load_wine
 from sklearn.exceptions import NotFittedError
 from sklearn.model_selection import train_test_split
-from test_tabicl_preprocessing import load_upstream
+from test_tabicl_preprocessing import load_tabicl, skewed
 
 from ironicl import TabICLClassifier
 
@@ -24,7 +24,7 @@ CHECKPOINT = "tabicl-classifier-v2-20260212.ckpt"
 class TabICLClassifierParityTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        load_upstream()  # Verifies the pinned checkout and imports the tabicl package.
+        load_tabicl()  # Verifies the pinned checkout and imports the tabicl package.
         cls.tabicl = importlib.import_module("tabicl._sklearn.classifier").TabICLClassifier
         hub = importlib.import_module("huggingface_hub")
         cls.checkpoint = hub.hf_hub_download("jingang/TabICL", CHECKPOINT)
@@ -71,6 +71,21 @@ class TabICLClassifierParityTest(unittest.TestCase):
                 )
                 np.testing.assert_array_equal(ours.predict(x_test), theirs.predict(x_test))
                 np.testing.assert_array_equal(ours.classes_, theirs.classes_)
+
+    def test_float32_input_matches_tabicl_on_its_upcast(self):
+        x, y = load_breast_cancer(return_X_y=True)
+        x_skewed, q_skewed, y_skewed = skewed(np.float32)
+        cases = {
+            "breast_cancer": (x[:300].astype(np.float32), y[:300], x[300:400].astype(np.float32)),
+            "skewed": (x_skewed[:300], y_skewed[:300], q_skewed[:100]),
+        }
+        for name, (x_train, y_train, x_test) in cases.items():
+            with self.subTest(name):
+                ours = TabICLClassifier(model_path=self.checkpoint).fit(x_train, y_train)
+                theirs = self.tabicl(model_path=self.checkpoint, device="cpu").fit(x_train.astype(np.float64), y_train)
+                np.testing.assert_allclose(
+                    ours.predict_proba(x_test), theirs.predict_proba(x_test.astype(np.float64)), rtol=0, atol=1e-4
+                )
 
     def test_failed_fit_is_not_fitted(self):
         clf = TabICLClassifier(model_path="/nonexistent/model.ckpt", allow_auto_download=False)

@@ -77,7 +77,7 @@ python -m pip install --editable .
 ```
 
 This environment does not need TabICL or PyTorch. Use a separate environment for
-live upstream comparisons.
+live TabICL comparisons.
 
 ## Local checks
 
@@ -87,7 +87,7 @@ live upstream comparisons.
 | `make lint-rust` | Formatting and Clippy for all feature configurations; warnings are errors. |
 | `make audit` | `Cargo.lock` against the RustSec advisory database; needs `cargo install cargo-audit`. |
 | `make lint-python` | Ruff pyflakes (`F`) checks for `python/ironicl` and `tools`; needs `pip install ruff` (or `uvx ruff`). |
-| `make test-python` | Standalone preprocessing and exporter tests, including the frozen upstream oracle. |
+| `make test-python` | Standalone Python tests: estimators, preprocessing bindings, and exporters. |
 | `make test-parity` | Direct comparisons with the pinned TabICL checkout; requires a separate environment. |
 
 The Python targets use `python3` from `PATH`. Override the interpreter when needed:
@@ -112,7 +112,7 @@ IRONICL_TABICL_SOURCE=/path/to/tabicl/src \
   make test-parity PYTHON=/path/to/parity/bin/python
 ```
 
-The suite verifies the upstream revision and imported source path. Missing
+The suite verifies the TabICL revision and imported source path. Missing
 prerequisites fail rather than skip. These tests compare preprocessing, not neural
 outputs or classifier predictions.
 
@@ -132,7 +132,7 @@ To run them, provide the fixtures and pass `--ignored`:
 - `IRONICL_CHECKPOINT_FIXTURES`: a directory containing both official v2 checkpoints
   and the imported classifier artifact `tabicl-classifier-v2.irmodel`.
 - `IRONICL_ORACLE_FIXTURES`: a directory containing `input.irinput` and
-  `logits.irlogits` from the upstream exporter.
+  `logits.irlogits` from the TabICL exporter.
 
 ```sh
 IRONICL_CHECKPOINT_FIXTURES=/path/to/checkpoints \
@@ -146,5 +146,5 @@ of skipping silently.
 See [the validation guide](docs/validation.md) for fixture generation and numerical
 requirements. CPU-feature-gated kernel tests run automatically where the CPU feature
 is present and no-op where it is not (a current harness limitation); benchmarks
-marked `#[ignore]` do not run by default. Green CI is not proof of upstream model
+marked `#[ignore]` do not run by default. Green CI is not proof of TabICL model
 parity or Zen 5 performance.

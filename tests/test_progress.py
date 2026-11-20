@@ -39,22 +39,22 @@ class ProgressTest(unittest.TestCase):
         checkpoint(TabICLClassifier)
         x, y = data()
         model = TabICLClassifier(cache_dir=False).fit(x, (y > 0).astype(int))
-        rows = next(model._query_chunks(np.tile(x, (20, 1))))[0]
+        rows = np.tile(x, (20, 1))
 
         def stop(*_):
             raise ValueError("stop")
 
         with self.assertRaisesRegex(ValueError, "stop"):
-            model.context_.predict_proba(rows, 0.9, False, stop)
+            model.fitted_.predict_proba(rows, 0.9, False, stop)
 
     def test_ctrl_c_stops_a_prediction_between_pieces(self):
         checkpoint(TabICLClassifier)
         x, y = data()
         model = TabICLClassifier(cache_dir=False).fit(x, (y > 0).astype(int))
-        # One Python chunk, so only Rust's pieces can notice the interrupt.
-        rows = next(model._query_chunks(np.tile(x, (27, 1))[:8000]))[0]
+        # Fewer rows than one preprocessing chunk, so only the engine's pieces can notice the interrupt.
+        rows = np.tile(x, (27, 1))[:8000]
         pieces = []
-        model.context_.predict_proba(rows, 0.9, False, lambda *report: pieces.append(report))
+        model.fitted_.predict_proba(rows, 0.9, False, lambda *report: pieces.append(report))
         if len(pieces) < 3:
             self.skipTest(f"this device predicts the rows in {len(pieces)} piece(s)")
 
@@ -73,7 +73,7 @@ class ProgressTest(unittest.TestCase):
         previous = signal.signal(signal.SIGINT, signal.default_int_handler)
         try:
             with self.assertRaises(KeyboardInterrupt):
-                model.context_.predict_proba(rows, 0.9, False, progress)
+                model.fitted_.predict_proba(rows, 0.9, False, progress)
         finally:
             signal.signal(signal.SIGINT, previous)
         self.assertLess(len(reports), len(pieces))

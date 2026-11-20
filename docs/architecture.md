@@ -9,13 +9,13 @@ converts tensors into an internal layer-major format. Serving must not depend on
 Python or PyTorch. The pure-Rust checkpoint front end uses Candle's pinned
 PyTorch pickle reader.
 
-### Preprocessing Bridge
+### Preprocessing
 
-The current Python exporter runs official fitted preprocessing and writes
-preprocessed query variants. A later native implementation can replace this
-only after parity tests cover category encoding, imputation, feature filtering,
-standardization, Yeo-Johnson power transforms, outlier handling, feature
-permutations, and class permutations.
+Rust fits and applies TabICL's preprocessing: feature filtering,
+standardization, Yeo-Johnson power transforms, outlier handling, and feature
+and class permutations, at parity with TabICL. The fitted model predicts from
+raw features ([native-preprocessing.md](native-preprocessing.md)). Category
+encoding and imputation come next.
 
 ### Context Builder
 

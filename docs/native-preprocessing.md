@@ -1,87 +1,85 @@
 # Native Preprocessing
 
-Preprocessing today is Python: `ironicl.preprocessing.Preprocessor`
-([python.md](python.md#preprocessing)) fits scaling, the power transform,
-outlier bounds, and the feature and class ensembles, then hands the Rust engine
-grouped FP32 matrices plus `uint64` permutation arrays. Native preprocessing
-moves that step into the Rust crate so a fitted classifier needs no scientific
-Python stack at runtime. It is the open [roadmap Phase 3](roadmap.md#phase-3-static-full-kv-context)
-item "fixed native preprocessing schema and implementation."
+Preprocessing runs in Rust. The fitted model, `models/tabicl_v2/fitted.rs`, holds
+the fitted preprocessing, with the class labels or the regressor's target scale,
+and the training context, so it predicts from raw features without Python. The
+Python estimators convert inputs and keep scikit-learn's interface; the planned
+prediction server uses the same fitted model, saved as `IRPREP` and `IRCNTXT`
+([artifact-format.md](artifact-format.md#fitted-models)).
 
-**Decision: Candidate, gated on dropping the runtime NumPy/scikit-learn/SciPy
-dependency.** The forward pass dominates fitting; preprocessing is not the
-bottleneck, so a native port buys no measurable speed. Its one payoff is a lean,
-pure-Rust wheel. Until that is a goal, Python preprocessing stays — it gets
-CPython's RNG and scikit-learn's power transform for free, which is exactly what
-the port must otherwise reproduce.
+| Part | Where |
+|---|---|
+| `CPython`'s `random.Random`: seeding, `choice`, `shuffle`, `sample` | `src/preprocess/python_random.rs`, on `rand_mt` |
+| Standardize and clip; two-pass outlier bounds; `StandardScaler` | `src/preprocess/scale.rs` |
+| Yeo-Johnson fit and transform | `src/preprocess/yeo_johnson.rs` |
+| Class labels | `src/preprocess/labels.rs` |
+| TabICL's pipeline: constant-feature mask, ensembles, groups | `src/models/tabicl_v2/preprocess.rs` |
+| Fitting, context building, chunked prediction, saving | `src/models/tabicl_v2/fitted.rs` |
+| Fitted preprocessing as `IRPREP` bytes | `src/format/preprocessor.rs` ([artifact-format.md](artifact-format.md#fitted-models)) |
+| Input conversion, label types, scikit-learn's interface | `python/ironicl/base.py` |
 
-## Parity contract to preserve
+`src/preprocess/` forbids `unsafe`: it handles request data and, in the server,
+fitted preprocessing from outside.
 
-The live parity test fits the real TabICL at the same `random_state` and requires
-`predict_proba` within `1e-4` and identical labels
-([validation.md](validation.md#python-preprocessing-parity)). Meeting that bound
-means reproducing TabICL's exact ensemble members, which rests on two
-deterministic Python behaviors. A native port must reproduce both, or the
-parity contract has to be relaxed to functional equivalence (same preprocessing
-math and ensemble size, statistically matching predictions) first — a separate
-product decision, not an implementation detail.
+## Parity Contract
 
-## Reproduction surface 1: the permutations
+Ironicl fits and transforms in float64. On float32 input it matches TabICL fed
+`X.astype(float64)`; TabICL's own float32 path loses precision when
+standardizing heavy-tailed columns before Yeo-Johnson. On a skewed synthetic
+set, TabICL's float32 probabilities differed from its float64 ones by up to
+0.23. Ironicl's results on float32 `X` are exactly its results on
+`X.astype(float64)`.
 
-Feature Latin-square shuffles and cyclic class permutations come from CPython's
-`random.Random(seed)` through `choice`, `shuffle`, and `sample`
-(`preprocessing.py`, `_feature_shuffles`). Only `random()` — the raw MT19937
-stream — is guaranteed stable across CPython versions and platforms. The
-selection methods are not promised, though they have been stable since Python
-3.2 because they route through `_randbelow`.
+Against TabICL 2.1.1 (commit `bd030d47ff7d9f987f0f33431d743a3003bfe0d3`), in the
+live suite and the frozen fixture `tests/fixtures/preprocessing.json`:
 
-This surface is largely solved by existing work, not a from-scratch port:
+- class order, encoded labels, feature masks, ensemble counts, group
+  membership, and feature and class permutations are exact;
+- preprocessed FP32 values are within `rtol=2e-6, atol=2e-6`;
+- predictions are within `1e-4`.
 
-- The [`mt19937` crate](https://docs.rs/mt19937/) reproduces `random.random()`
-  after seeding, and is the generator [RustPython](https://github.com/RustPython/mt19937)
-  uses to reimplement the whole `random` module, including `shuffle`, `sample`,
-  and `choice`.
-- Remaining work: adopt the crate, lift or verify the `_randbelow` consumption
-  layer, and confirm integer seeding (`init_by_array`, the one detail the crate
-  flags), then freeze golden permutation vectors generated from the pinned
-  TabICL commit as Rust fixtures.
+Values are not bit-exact: summation order and the platform's math library change
+the last bits of the float64 statistics.
 
-Because parity is against a pinned upstream commit
-(`bd030d47ff7d9f987f0f33431d743a3003bfe0d3`) on a pinned Python, the oracle is
-frozen, not moving. Golden vectors encode it; a future CPython change to the
-selection methods surfaces as a fixture mismatch, never a silent divergence.
+Fitting copies the kept features once, column by column, as float64, and fits
+each feature in parallel, keeping only its statistics. Transforming writes each
+group's FP32 rows directly from the input.
 
-## Reproduction surface 2: the power transform
+## The Ensemble
 
-`_Normalization` wraps scikit-learn's `PowerTransformer` (Yeo-Johnson): a
-per-feature lambda fitted by maximum likelihood, plus the out-of-domain clip
-fallback Ironicl preserves. There is no clean existing Rust crate for this, so it
-is the real lift of a native port. Within the `1e-4` exact-seed bound the lambda
-search must track scikit-learn closely; within functional parity a correct
-Yeo-Johnson suffices, since it is a smooth deterministic transform. This piece,
-not the RNG, decides the cost.
+TabICL draws its feature and class orders from `random.Random(random_state)`.
+`rand_mt` provides the Mersenne Twister with `CPython`'s seeding
+(`init_by_array` over the seed's 32-bit words); `python_random.rs` adds
+`_randbelow`, `choice`, `shuffle`, and `sample` from `Lib/random.py`. Golden
+draws from `CPython` 3.12, `tests/fixtures/python_random.json`, pin them.
+`rand_mt` reproduces `torch.Generator`'s CPU stream too, for Kumo later.
 
-## The mechanical remainder
+TabICL builds a Latin square by inserting each drawn feature into every row, in
+`O(H³)` time and `O(H²)` memory: 5 seconds at 4,000 features. The square has a
+closed form: its first row lists the features in the order they are drawn, and
+row `r` is that row rotated by `r`. Both shuffles draw only by the square's size,
+so Rust computes each member's order from two shuffled index lists, in `O(H)`.
+A test checks the closed form against the literal construction.
 
-Input validation, constant-feature masking, scale-and-clip, the two-pass outlier
-clamp, label encoding, and FP32 stacking are straightforward arithmetic and carry
-no parity risk. They are not the reason the port is deferred.
+## The Power Transform
 
-## Rejected: a partial port
+scikit-learn's `PowerTransformer` fits one Yeo-Johnson lambda per feature with
+`SciPy`'s `yeojohnson_normmax`: `fminbound` within bounds that keep the
+transformed values and their squares finite. A constant feature gets lambda 1.
+For one-signed data, `SciPy` computes the log-likelihood's variance in log space;
+Rust shifts the powers by their largest exponent instead, which avoids the same
+overflow and loss of precision. `tests/fixtures/yeo_johnson.json` pins the
+log-likelihood, the lambda, and the transformer.
 
-Generating permutations in Rust while leaving the power transform in Python is
-rejected. It splits the parity surface across the FFI boundary, keeps two places
-to maintain, and still ships scikit-learn — the worst of both. The port is
-all-or-nothing: either both surfaces move and the scientific-Python runtime
-dependency goes away, or preprocessing stays in Python.
+## Next
+
+- Missing values and categorical features: TabICL's `TransformToNumerical`,
+  mean imputation and ordinal codes.
+- Kumo's preprocessing, on the same pieces where it uses them.
 
 ## References
 
-- [python.md](python.md) — the current Python preprocessing package.
-- [roadmap.md](roadmap.md#phase-3-static-full-kv-context) — Phase 3, where this
-  lands.
-- [`mt19937` crate](https://docs.rs/mt19937/) and
-  [RustPython/mt19937](https://github.com/RustPython/mt19937) — CPython-compatible
-  RNG prior art.
-- CPython `random` "Notes on Reproducibility" — the `random()`-only stability
-  guarantee.
+- [python.md](python.md): the estimators and their fitted attributes.
+- [validation.md](validation.md#preprocessing-parity): the parity tests.
+- `CPython`'s "Notes on Reproducibility": only `random()` is promised across
+  versions, so golden draws pin the rest.

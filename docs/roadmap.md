@@ -48,7 +48,7 @@ classifier fixture passes at less than `1e-5` maximum absolute logit error.
 
 ## Phase 3: Static Full-KV Context
 
-Status: executable FP32 full-KV path complete; native preprocessing,
+Status: executable FP32 full-KV path and native preprocessing complete;
 representation-cache execution, mmap loading, and zero-allocation serving
 remain.
 
@@ -58,12 +58,12 @@ Completed:
 - full-KV artifact reader/writer and whole-file checksum;
 - one-row and microbatch cached inference;
 - online stable attention;
-- mmap-backed static-context loading.
+- mmap-backed static-context loading;
+- native preprocessing and a fitted-model format
+  (see [native-preprocessing.md](native-preprocessing.md)).
 
 Remaining:
 
-- fixed native preprocessing schema and implementation
-  (see [native-preprocessing.md](native-preprocessing.md));
 - representation-cache execution;
 - no steady-state allocations.
 

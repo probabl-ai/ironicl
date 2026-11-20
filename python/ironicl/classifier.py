@@ -13,7 +13,7 @@ import numpy as np
 from sklearn.base import ClassifierMixin
 from sklearn.utils.validation import check_is_fitted
 
-from ironicl.base import TabICLBase
+from ironicl.base import TabICLBase, _array, _label_values, _labels
 
 
 class TabICLClassifier(ClassifierMixin, TabICLBase):
@@ -140,34 +140,27 @@ class TabICLClassifier(ClassifierMixin, TabICLBase):
         """Fit preprocessing and build the training context in Rust."""
         if y is None:
             raise ValueError("This classifier requires y to be passed, but the target y is None.")
-        self._fit_context(
-            X,
-            y,
-            lambda preprocessor: preprocessor.encode_labels(y),
-            classification=True,
-        )
-        self.classes_ = self.preprocessor_.classes_
+        labels = _labels(y)
+        self._fit(X, labels)
+        self.classes_ = np.unique(labels)  # Rust sorts the classes as NumPy does.
         self.n_classes_ = len(self.classes_)
         return self
 
-    def _expand_targets(self, preprocessor, targets):
-        return preprocessor.class_permutations_[:, targets]
+    def _targets(self, y) -> dict:
+        return {"labels": _label_values(y)}
 
     def predict_proba(self, X) -> np.ndarray:
         """Return class probabilities with shape ``(n_samples, n_classes)``."""
         check_is_fitted(self)
-        chunks = []
-        for rows, progress in self._query_chunks(X):
-            values, shape = self.context_.predict_proba(
-                rows, self.softmax_temperature, self.average_logits, progress
-            )
-            chunks.append(np.frombuffer(values, dtype=np.float32).reshape(shape))
-        return np.concatenate(chunks)  # A writable copy, like TabICL's output.
+        x = self._query(X)
+        with self._progress("Predicting", "row", len(x)) as progress:
+            values, shape = self.fitted_.predict_proba(x, self.softmax_temperature, self.average_logits, progress)
+        return _array(values, shape).copy()  # Writable, like TabICL's.
 
     def predict(self, X) -> np.ndarray:
         """Return the most probable class label for each sample."""
         probabilities = self.predict_proba(X)  # Checks that the classifier is fitted.
-        return self.preprocessor_.decode_labels(np.argmax(probabilities, axis=1))
+        return self.classes_[np.argmax(probabilities, axis=1)]
 
     def _validate_params(self) -> None:
         super()._validate_params(

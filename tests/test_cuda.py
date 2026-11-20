@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 
 from ironicl import TabICLClassifier, TabICLRegressor
-from ironicl.base import _ensemble_rows, _model
+from ironicl.base import _array, _model
 from tests.test_pickle import checkpoint
 
 
@@ -30,7 +30,7 @@ import numpy as np
 from ironicl import TabICLClassifier
 data = np.load(sys.argv[1])
 model = TabICLClassifier(optimize="safe", cache_dir=False).fit(data["x_train"], data["y_train"])
-assert model.context_.device == "cpu", model.context_.device
+assert model.fitted_.device == "cpu", model.fitted_.device
 np.save(sys.argv[2], model.predict_proba(data["x_test"]))
 """
 
@@ -53,13 +53,13 @@ class CudaTest(unittest.TestCase):
     def fit(self, **params):
         params = {"optimize": "auto", **params}
         model = TabICLClassifier(cache_dir=False, **params).fit(self.x[:2000], self.y[:2000])
-        if not model.context_.device.startswith("cuda"):
+        if not model.fitted_.device.startswith("cuda"):
             self.skipTest("no CUDA GPU")
         return model
 
     def test_safe_runs_on_the_gpu_like_the_cpu(self):
         model = self.fit(optimize="safe")
-        self.assertEqual(model.context_.device, "cuda")
+        self.assertEqual(model.fitted_.device, "cuda")
         expected = cpu_proba(self.x[:2000], self.y[:2000], self.x[2000:])
         np.testing.assert_allclose(model.predict_proba(self.x[2000:]), expected, atol=1e-4)
 
@@ -70,29 +70,24 @@ class CudaTest(unittest.TestCase):
 
     def test_all_missing_training_rows_build_on_the_cpu(self):
         model = self.fit()
-        preprocessor = model.preprocessor_
-        rows = _ensemble_rows(preprocessor, model._training["groups"])
-        rows = np.ascontiguousarray(rows, dtype=np.float32)
+        preprocessed = model.fitted_.preprocessed
+        rows, targets, classes, features = (
+            _array(*pair, dtype)
+            for pair, dtype in zip(preprocessed.training_inputs(), (np.float32, np.float32, np.uint64, np.uint64))
+        )
+        rows = rows.copy()
         # Training rows whose every feature is the all-missing marker; only
         # the CPU build handles it.
         rows[:, [3, 70], :] = -100.0
-        targets = model._expand_targets(preprocessor, model._training["targets"])
-        arguments = (
-            rows,
-            np.ascontiguousarray(targets, dtype=np.float32),
-            np.ascontiguousarray(preprocessor.class_permutations_, dtype=np.uint64),
-            np.ascontiguousarray(preprocessor.feature_permutations_, dtype=np.uint64),
-        )
+        arguments = (rows, np.ascontiguousarray(targets), np.ascontiguousarray(classes), np.ascontiguousarray(features))
         cpu, gpu = (
             _model(model.checkpoint_path_).build_context(*arguments, optimize, None) for optimize in ("safe", "auto")
         )
         self.assertEqual(gpu.device, "cuda")
-        queries = _ensemble_rows(preprocessor, preprocessor.transform(self.x[2000:]))
-        queries = np.ascontiguousarray(queries, dtype=np.float32)
+        queries = _array(*preprocessed.query_rows(self.x[2000:]))
 
         def proba(context):
-            values, shape = context.predict_proba(queries, 0.9, True)
-            return np.frombuffer(values, dtype=np.float32).reshape(shape)
+            return _array(*context.predict_proba(queries, 0.9, True))
 
         np.testing.assert_allclose(proba(gpu), proba(cpu), atol=1e-3)
 
@@ -103,7 +98,7 @@ class CudaTest(unittest.TestCase):
             TabICLRegressor(optimize=optimize, cache_dir=False).fit(self.x[:2000], target[:2000])
             for optimize in ("safe", "auto")
         )
-        if not gpu.context_.device.startswith("cuda"):
+        if not gpu.fitted_.device.startswith("cuda"):
             self.skipTest("no CUDA GPU")
         np.testing.assert_allclose(gpu.predict(self.x[2000:]), cpu.predict(self.x[2000:]), atol=1e-3)
 
@@ -114,7 +109,7 @@ class CudaTest(unittest.TestCase):
             with self.subTest(optimize=optimize):
                 model = self.fit(optimize=optimize)
                 copy = pickle.loads(pickle.dumps(model))
-                self.assertEqual(copy.context_.device, "cuda")
+                self.assertEqual(copy.fitted_.device, "cuda")
                 np.testing.assert_allclose(
                     copy.predict_proba(self.x[2000:]), model.predict_proba(self.x[2000:]), atol=1e-6
                 )
@@ -133,16 +128,16 @@ class CudaTest(unittest.TestCase):
         for optimize, limits, tolerance in cases:
             with self.subTest(optimize=optimize):
                 resident = self.fit(optimize=optimize)
-                self.assertEqual(resident.context_.device, "cuda")
-                self.assertIsNone(resident.context_.batch_rows)
+                self.assertEqual(resident.fitted_.device, "cuda")
+                self.assertIsNone(resident.fitted_.batch_rows)
                 expected = resident.predict_proba(self.x[2000:])
                 streamed = 0
                 for limit in limits:
                     model = pickle.loads(pickle.dumps(resident.set_params(device_memory_limit=limit)))
-                    if model.context_.device != "cuda-streamed":
+                    if model.fitted_.device != "cuda-streamed":
                         continue
                     streamed += 1
-                    self.assertGreater(model.context_.batch_rows, 0)
+                    self.assertGreater(model.fitted_.batch_rows, 0)
                     actual = model.predict_proba(self.x[2000:])
                     np.testing.assert_allclose(actual, expected, atol=tolerance)
                     self.assertGreaterEqual(np.mean(actual.argmax(1) == expected.argmax(1)), 0.99)
@@ -150,18 +145,22 @@ class CudaTest(unittest.TestCase):
 
     def test_all_missing_rows_match_the_cpu_path(self):
         model = self.fit()
-        cpu = TabICLClassifier(optimize="safe", cache_dir=False).fit(self.x[:2000], self.y[:2000])
-        rows = _ensemble_rows(model.preprocessor_, model.preprocessor_.transform(self.x[2000:2100]))
-        rows = np.ascontiguousarray(rows, dtype=np.float32)
+        preprocessed = model.fitted_.preprocessed
+        training = [
+            np.ascontiguousarray(_array(*pair, dtype))
+            for pair, dtype in zip(preprocessed.training_inputs(), (np.float32, np.float32, np.uint64, np.uint64))
+        ]
+        # The contexts the fits with optimize="safe" and the default "auto" build.
+        cpu, gpu = (_model(model.checkpoint_path_).build_context(*training, optimize, None) for optimize in ("safe", "auto"))
+        rows = _array(*preprocessed.query_rows(self.x[2000:2100])).copy()
         # A row whose every feature is the all-missing marker; only the CPU
         # column stage handles it.
         rows[:, [3, 70], :] = -100.0
 
         def proba(context):
-            values, shape = context.predict_proba(rows, 0.9, True)
-            return np.frombuffer(values, dtype=np.float32).reshape(shape)
+            return _array(*context.predict_proba(rows, 0.9, True))
 
-        np.testing.assert_allclose(proba(model.context_), proba(cpu.context_), atol=1e-3)
+        np.testing.assert_allclose(proba(gpu), proba(cpu), atol=1e-3)
 
 
 if __name__ == "__main__":

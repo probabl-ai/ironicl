@@ -1,5 +1,9 @@
-"""What ``TabICLClassifier`` and ``TabICLRegressor`` share: the checkpoint, the
-fitted context and its disk cache, threads, ``optimize``, and memory planning."""
+"""What ``TabICLClassifier`` and ``TabICLRegressor`` share: input conversion, the
+checkpoint, fitting and its disk cache, threads, ``optimize``, and memory planning.
+
+Rust does the work: ``_core.preprocess`` fits preprocessing and ``Model.build``
+builds the context, which gives the fitted model (docs/native-preprocessing.md).
+Python converts inputs and keeps scikit-learn's interface."""
 
 from __future__ import annotations
 
@@ -10,23 +14,21 @@ import urllib.request
 import warnings
 from functools import cache
 from importlib.metadata import version
+from numbers import Integral, Real
 from pathlib import Path
 
 import numpy as np
 from sklearn.base import BaseEstimator
-from sklearn.utils import _safe_indexing
-from sklearn.utils.validation import _num_samples, check_is_fitted
+from sklearn.utils.multiclass import check_classification_targets
+from sklearn.utils.validation import check_array, check_is_fitted
 
+from ironicl import _core
 from ironicl._core import Model
 from ironicl.cache import _cache_dir
 from ironicl.memory import _enforce, _limit_text, _overflow_policy, _plan
-from ironicl.preprocessing import Preprocessor
 from ironicl.progress import Progress
 
 CHECKPOINT_URL = "https://huggingface.co/jingang/TabICL/resolve/main/{}"
-# Prediction preprocesses this many rows at a time, which bounds the [B, rows, H]
-# copies it makes. Rust splits each chunk further to fit its own buffers.
-PREDICT_CHUNK_ROWS = 8192
 
 
 def _version() -> str:
@@ -44,61 +46,86 @@ class TabICLBase(BaseEstimator):
     _task: str
     _checkpoint_version: str
 
-    def _fit_context(self, X, y, targets, classification: bool) -> Preprocessor:
-        """Fit preprocessing and build the Rust context from the per-row ``targets(preprocessor)``.
+    def _fit(self, X, y):
+        """Fit preprocessing in Rust on ``X`` and the checked targets ``y``, plan
+        the memory, then build the context.
 
         Fitted attributes are set only once the context exists, so a failed fit
         never looks fitted. The memory plan is checked after preprocessing, when
-        the context's shape is known, and before any model or build work.
+        the context's shape is known, and before any download or build work.
         """
         self._validate_params()
         optimize = self._optimize()
         policy = _overflow_policy(self.memory_overflow)
         limits = self._limits()
-        methods = self.norm_methods or ["none", "power"]
-        preprocessor = Preprocessor(
+        x, names = _features(X)
+        preprocessed = _core.preprocess(
+            x,
+            **self._targets(y),
             n_estimators=self.n_estimators,
             random_state=self.random_state,
-            norm_methods=(methods,) if isinstance(methods, str) else tuple(methods),
-            outlier_threshold=self.outlier_threshold,
-            classification=classification,
+            norm_methods=self._norm_methods(),
+            outlier_threshold=float(self.outlier_threshold),
         )
-        groups = tuple(group.astype(np.float32) for group in preprocessor.fit_transform(X, y))
-        rows, features = groups[0].shape
-        plan = _plan(self._task, preprocessor.n_estimators_, rows, features, optimize, *limits)
+        plan = _plan(self._task, *preprocessed.shape, optimize, *limits)
         _enforce(plan, policy, stacklevel=3)
         checkpoint = self._checkpoint()
-        training = {"groups": groups, "targets": targets(preprocessor)}
-        self.context_ = self._build(_model(checkpoint), optimize, limits, preprocessor, training)
-        self._training = training
+        self.fitted_ = self._build(checkpoint, preprocessed, optimize, limits)
+        self._training = (x.copy(), y.copy())  # Copies: the caller may change X and y.
         self.memory_plan_ = plan
-        self.preprocessor_ = preprocessor
         self.checkpoint_path_ = checkpoint
-        self.n_features_in_ = preprocessor.n_features_in_
-        if hasattr(preprocessor, "feature_names_in_"):
-            self.feature_names_in_ = preprocessor.feature_names_in_
+        self.n_features_in_ = x.shape[1]
+        if names is not None:
+            self.feature_names_in_ = np.asarray(names, dtype=object)
         elif hasattr(self, "feature_names_in_"):
             del self.feature_names_in_  # Left by an earlier fit on named data.
-        return preprocessor
 
-    def _build(self, model, optimize, limits, preprocessor, training):
-        """Build the context from ``training``: the grouped training rows and
-        the per-row targets."""
+    def _targets(self, y) -> dict:
+        """The checked targets ``y`` as ``_core.preprocess`` takes them."""
+        raise NotImplementedError
+
+    def _build(self, checkpoint: Path, preprocessed, optimize, limits):
+        """Build the context of ``preprocessed``, through ``cache_dir`` when set.
+        Rust checks and writes the cache; a bad entry is rebuilt and a failed
+        write is ignored."""
+        model = self._task_model(checkpoint)
+        with self._progress("Building context", "estimator") as progress:
+            arguments = (optimize, self._resolve_threads(), *limits)
+            return model.build(preprocessed, *arguments, progress=progress, cache_dir=_cache_dir(self.cache_dir))
+
+    def _load(self, checkpoint: Path, preprocessor: bytes, context: bytes | None, optimize, limits):
+        """Load the fitted model from its ``IRPREP`` and ``IRCNTXT`` bytes, or
+        without the context, build it from the training data as ``_build`` does."""
+        model = self._task_model(checkpoint)
+        x, y = getattr(self, "_training", (None, None))
+        training = {} if x is None else {"x": x, **self._targets(y)}
+        with self._progress("Building context", "estimator") as progress:
+            arguments = (optimize, self._resolve_threads(), *limits)
+            return model.load_fitted(
+                preprocessor,
+                *arguments,
+                progress=progress,
+                cache_dir=_cache_dir(self.cache_dir),
+                context=context,
+                **training,
+            )
+
+    def _task_model(self, checkpoint: Path) -> Model:
+        """The checkpoint's model, which must be for this estimator's task."""
+        model = _model(checkpoint)
         if model.task != self._task:
             raise ValueError(f"{self.checkpoint_version} is a {model.task} checkpoint, not a {self._task}")
-        return self._context(
-            model,
-            optimize,
-            limits,
-            _ensemble_rows(preprocessor, training["groups"]),
-            np.ascontiguousarray(self._expand_targets(preprocessor, training["targets"]), dtype=np.float32),
-            np.ascontiguousarray(preprocessor.class_permutations_, dtype=np.uint64),
-            np.ascontiguousarray(preprocessor.feature_permutations_, dtype=np.uint64),
-        )
+        return model
 
-    def _expand_targets(self, preprocessor: Preprocessor, targets: np.ndarray) -> np.ndarray:
-        """Each estimator's ``[B, N]`` targets from the per-row ``targets``."""
-        raise NotImplementedError
+    def _query(self, X) -> np.ndarray:
+        """``X`` as the float matrix Rust predicts from, checked against the training data."""
+        x, names = _features(X)
+        if x.shape[1] != self.n_features_in_:
+            raise ValueError(f"X has {x.shape[1]} features; expected {self.n_features_in_}")
+        expected = tuple(self.feature_names_in_) if hasattr(self, "feature_names_in_") else None
+        if names != expected:
+            raise ValueError("X must have the same feature names and order as the training data")
+        return x
 
     def save(
         self,
@@ -112,8 +139,9 @@ class TabICLBase(BaseEstimator):
         ``save_model_weights`` includes the checkpoint, so loading needs no
         file or download. ``save_kv_cache`` includes the fitted context; without
         it, loading rebuilds the context from the training data, through
-        ``cache_dir`` when set. ``save_training_data`` includes the preprocessed
-        training rows, which only a load without the context needs.
+        ``cache_dir`` when set. ``save_training_data`` includes the training
+        data, which only a load without the context needs. The fitted model is
+        saved in Rust's formats, not as Python objects.
         """
         check_is_fitted(self)
         if not (save_training_data or save_kv_cache):
@@ -143,20 +171,22 @@ class TabICLBase(BaseEstimator):
         return estimator
 
     def __getstate__(self):
-        """The pickled state: by default self-contained, with the context as bytes."""
+        """The pickled state: by default self-contained, with the fitted model as bytes."""
         state = dict(super().__getstate__())  # May be this estimator's own __dict__.
         weights, training, context = state.pop("_save_options", (False, True, True))
         state["_ironicl_version"] = _version()
-        if "context_" in state:
-            state["context_"] = state["context_"].to_bytes() if context else None
+        if "fitted_" in state:
+            state["fitted_"] = self.fitted_.preprocessor_bytes()
+            state["_context"] = self.fitted_.context_bytes() if context else None
             if not training:
-                del state["_training"]
+                state.pop("_training", None)
             if weights:
                 state["_checkpoint_bytes"] = Path(self.checkpoint_path_).read_bytes()
         return state
 
     def __setstate__(self, state):
-        """Load the context, or rebuild it, with this machine's threads and memory limits.
+        """Load the fitted model, building its context if it was saved without one,
+        with this machine's threads and memory limits.
 
         Loading plans its memory as ``fit`` does and follows ``memory_overflow``;
         ``memory_plan_`` becomes this machine's plan."""
@@ -169,21 +199,18 @@ class TabICLBase(BaseEstimator):
                 stacklevel=2,
             )
         checkpoint = state.pop("_checkpoint_bytes", None)
+        context = state.pop("_context", None)
         super().__setstate__(state)
-        if "context_" not in state:
+        if "fitted_" not in state:
             return  # Not fitted.
-        fitted, limits = self.memory_plan_, self._limits()
-        load = self.context_ is not None
-        plan = _plan(self._task, fitted.estimators, fitted.rows, fitted.features, fitted.optimize, *limits, load)
+        saved_plan, limits = self.memory_plan_, self._limits()
+        shape = (saved_plan.estimators, saved_plan.rows, saved_plan.features)
+        plan = _plan(self._task, *shape, saved_plan.optimize, *limits, context is not None)
         _enforce(plan, _overflow_policy(self.memory_overflow), stacklevel=2, action="load")
         self.memory_plan_ = plan
         if not Path(self.checkpoint_path_).exists():
             self.checkpoint_path_ = self._checkpoint(checkpoint)
-        model = _model(self.checkpoint_path_)
-        if load:
-            self.context_ = model.context_from_bytes(self.context_, plan.optimize, self._resolve_threads(), *limits)
-        else:
-            self.context_ = self._build(model, plan.optimize, limits, self.preprocessor_, self._training)
+        self.fitted_ = self._load(self.checkpoint_path_, self.fitted_, context, plan.optimize, limits)
 
     def _limits(self) -> tuple[str | None, str | None]:
         return (
@@ -191,23 +218,20 @@ class TabICLBase(BaseEstimator):
             _limit_text("device_memory_limit", self.device_memory_limit),
         )
 
-    def _query_chunks(self, X):
-        """Yield the preprocessed ``[B, rows, H]`` query rows of ``X`` a chunk at a time, each with
-        the progress callback for its prediction (``None`` unless ``verbose``). Chunks hold
-        ``PREDICT_CHUNK_ROWS``, or a whole pass when the context streams its cache to the GPU."""
-        rows = _num_samples(X)
-        step = self.context_.batch_rows or PREDICT_CHUNK_ROWS
-        with self._progress("Predicting", "row", rows) as progress:
-            for start in range(0, max(rows, 1), step):
-                chunk = _safe_indexing(X, slice(start, start + step))
-                report = progress and (lambda _stage, done, _total, start=start: progress.update(start + done))
-                yield _ensemble_rows(self.preprocessor_, self.preprocessor_.transform(chunk)), report
-                if progress:
-                    progress.update(min(start + step, rows))
+    def _norm_methods(self) -> list[str]:
+        """``norm_methods`` as a list, TabICL's default when unset or empty."""
+        methods = self.norm_methods or ["none", "power"]
+        return [methods] if isinstance(methods, str) else list(methods)
 
+    @contextlib.contextmanager
     def _progress(self, description: str, unit: str, total: int | None = None):
-        """A ``Progress`` for ``verbose=True``, else a context that yields ``None``."""
-        return Progress(description, unit, total) if self.verbose else contextlib.nullcontext()
+        """Yield the callback Rust reports ``(stage, done, total)`` to, which
+        drives a ``Progress`` for ``verbose=True``, else ``None``."""
+        if not self.verbose:
+            yield None
+            return
+        with Progress(description, unit, total) as progress:
+            yield lambda _stage, done, total: progress.update(done, total)
 
     def _validate_params(self, unsupported=(), noops=()) -> None:
         # Values that would change results or request an unimplemented feature raise.
@@ -227,14 +251,14 @@ class TabICLBase(BaseEstimator):
                 raise NotImplementedError(f"{name}={getattr(self, name)!r} is not supported")
         if self.random_state is None:
             raise NotImplementedError("random_state=None is not supported")
-        methods = self.norm_methods
-        if methods is not None:
-            methods = (methods,) if isinstance(methods, str) else methods
-            unsupported = sorted(set(methods) - {"none", "power"})
-            if unsupported:
-                raise NotImplementedError(
-                    f"norm_methods {unsupported} are not supported; only 'none' and 'power'"
-                )
+        # Rust checks the ranges; Python checks the types it would convert.
+        for name, kind in (("n_estimators", Integral), ("random_state", Integral), ("outlier_threshold", Real)):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, kind):
+                raise ValueError(f"{name} must be a{'n integer' if kind is Integral else ' number'}, not {value!r}")
+        unsupported = sorted(set(self._norm_methods()) - {"none", "power"})
+        if unsupported:
+            raise NotImplementedError(f"norm_methods {unsupported} are not supported; only 'none' and 'power'")
         # Genuine no-ops: warn when changed so the caller knows they are ignored.
         for name, default in (("batch_size", 8), *noops):
             if getattr(self, name) != default:
@@ -249,22 +273,6 @@ class TabICLBase(BaseEstimator):
         if self.n_jobs is None or self.n_jobs > 0:
             return self.n_jobs
         return max(1, (os.cpu_count() or 1) + 1 + self.n_jobs)
-
-    def _context(self, model, optimize, limits, train_rows, targets, class_perms, feature_perms):
-        """Build the Rust context, through ``cache_dir`` when set. Rust checks and
-        writes the cache; a bad entry is rebuilt and a failed write is ignored."""
-        with self._progress("Building context", "estimator") as progress:
-            return model.build_context(
-                train_rows,
-                targets,
-                class_perms,
-                feature_perms,
-                optimize,
-                self._resolve_threads(),
-                *limits,
-                progress=progress and (lambda _stage, done, total: progress.update(done, total)),
-                cache_dir=_cache_dir(self.cache_dir),
-            )
 
     def _optimize(self) -> str:
         optimize = self.optimize if self.optimize is not None else os.environ.get("IRONICL_OPTIMIZE", "safe")
@@ -294,10 +302,58 @@ class TabICLBase(BaseEstimator):
         return path
 
 
-def _ensemble_rows(preprocessor: Preprocessor, groups: tuple[np.ndarray, ...]) -> np.ndarray:
-    """Stack each estimator's feature-permuted group into ``[B, rows, H]``."""
-    rows = [
-        groups[group][:, preprocessor.feature_permutations_[e]]
-        for e, group in enumerate(preprocessor.ensemble_groups_)
-    ]
-    return np.stack(rows).astype(np.float32, copy=False)
+def _features(X) -> tuple[np.ndarray, tuple[str, ...] | None]:
+    """``X`` as a C-ordered float32 or float64 matrix, and its feature names if it has any."""
+    names = None
+    if hasattr(X, "columns"):
+        names = tuple(X.columns)
+        if not all(isinstance(name, str) for name in names) or len(set(names)) != len(names):
+            raise ValueError("DataFrame feature names must be unique strings")
+    if np.asarray(X).dtype.kind not in "biuf":
+        raise TypeError(
+            "X must contain dense, real numeric features; categorical and sparse inputs are unsupported"
+        )
+    return check_array(X, dtype=[np.float64, np.float32], order="C"), names
+
+
+def _array(values: bytes, shape, dtype=np.float32) -> np.ndarray:
+    """A read-only array over bytes Rust returned."""
+    return np.frombuffer(values, dtype=dtype).reshape(shape)
+
+
+def _labels(y) -> np.ndarray:
+    """``y`` as a one-dimensional array of class labels."""
+    labels = check_array(y, ensure_2d=False, dtype=None)
+    if labels.ndim != 1:
+        raise ValueError("y must be a one-dimensional array of class labels")
+    check_classification_targets(labels)
+    return labels
+
+
+def _label_values(labels: np.ndarray) -> tuple[str, object]:
+    """``labels`` as the ``(kind, values)`` pair Rust reads: int64, float64, or
+    uint8 arrays for integers, floats, and booleans, or a list of str."""
+    kind = labels.dtype.kind
+    if kind == "O":
+        items = labels.tolist()
+        if all(isinstance(item, str) for item in items):
+            return "text", items
+        if all(isinstance(item, (bool, np.bool_)) for item in items):
+            kind, labels = "b", np.asarray(items, dtype=bool)
+        elif all(isinstance(item, Integral) and not isinstance(item, (bool, np.bool_)) for item in items):
+            kind, labels = "i", np.asarray(items, dtype=np.int64)
+        elif all(isinstance(item, Real) and not isinstance(item, (bool, np.bool_)) for item in items):
+            kind, labels = "f", np.asarray(items, dtype=np.float64)
+        else:
+            raise TypeError("Class labels must be all strings, all booleans, or all numbers")
+    if kind == "U":
+        return "text", labels.tolist()
+    if kind == "b":
+        return "bool", np.ascontiguousarray(labels, dtype=np.uint8)
+    if kind in "iu":
+        if kind == "u" and labels.size and labels.max() > np.iinfo(np.int64).max:
+            raise ValueError("Integer class labels must fit in int64")
+        return "int", np.ascontiguousarray(labels, dtype=np.int64)
+    if kind == "f":
+        return "float", np.ascontiguousarray(labels, dtype=np.float64)
+    raise TypeError(f"Unsupported class label dtype {labels.dtype}")

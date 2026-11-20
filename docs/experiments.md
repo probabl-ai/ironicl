@@ -469,7 +469,7 @@ Each retained claim maps to a test or benchmark that would fail if it broke. The
 fixture-gated Rust tests run with `cargo test -- --ignored` once
 `IRONICL_CHECKPOINT_FIXTURES` and `IRONICL_ORACLE_FIXTURES` point at the official
 checkpoints (see [validation.md](validation.md)); the parity tests need the
-separate upstream environment.
+separate TabICL environment.
 
 | Claim | Backing check |
 |---|---|
@@ -478,8 +478,8 @@ separate upstream environment.
 | Grouped/budgeted GPU build matches a single-graph build | `gpu_build_groups.rs::grouped_gpu_build_matches_one_graph_run` (passes a 40 MiB memory limit) |
 | Large cached queries chunk to identical logits | `checkpoint_fixtures.rs::large_cached_query_runs_in_chunks` |
 | All-missing query rows fall back to CPU and still read the FP16 `auto` caches | `checkpoint_fixtures.rs::reduced_precision_context_predicts_all_missing_rows` |
-| Public `predict_proba` matches upstream TabICL within `atol=1e-4`, identical labels | `test_tabicl_classifier.py::test_predictions_match` (live parity CI job) |
-| Preprocessing matches upstream (frozen oracle and live) | `tests/test_preprocessing.py` (15 tests) and `tests/parity/test_tabicl_preprocessing.py` (11 tests) |
+| Public `predict_proba` matches TabICL within `atol=1e-4`, identical labels | `test_tabicl_classifier.py::test_predictions_match` (live parity CI job) |
+| Preprocessing matches TabICL (frozen fixture and live) | `cargo test` (`preprocess` and `tabicl_v2::preprocess`), `tests/test_preprocessing.py`, and `tests/parity/test_tabicl_preprocessing.py` |
 
 ## Next Work
 

@@ -33,7 +33,8 @@ In scope:
 - the checkpoint importer and its pickle and ZIP handling;
 - the model, static-context, input, and query artifact parsers;
 - memory safety in native kernels;
-- the Python preprocessing package.
+- preprocessing and the fitted-model and preprocessing-state parsers;
+- the Python package's input handling.
 
 Out of scope:
 

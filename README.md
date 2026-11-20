@@ -1,7 +1,7 @@
 # Ironicl
 
 [![Rust checks](https://github.com/probabl-ai/ironicl/actions/workflows/rust.yml/badge.svg)](https://github.com/probabl-ai/ironicl/actions/workflows/rust.yml)
-[![Python preprocessing](https://github.com/probabl-ai/ironicl/actions/workflows/python.yml/badge.svg)](https://github.com/probabl-ai/ironicl/actions/workflows/python.yml)
+[![Python](https://github.com/probabl-ai/ironicl/actions/workflows/python.yml/badge.svg)](https://github.com/probabl-ai/ironicl/actions/workflows/python.yml)
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
 
 Ironicl is an inference engine for [TabICLv2](https://github.com/soda-inria/tabicl),
@@ -22,8 +22,9 @@ training context once, stores it, and then answers new test rows against it.
 | Safe checkpoint import in pure Rust (no pickle execution) | Overlapping CPU and GPU work |
 | FP32 classifier and regressor inference on any CPU | More than 10 classes |
 | Static training context with AVX-512 kernels on Zen 5 | Categorical features and missing values |
-| Accelerate kernels and Metal prediction and context building on Apple Silicon | Pickling a fitted estimator |
+| Accelerate kernels and Metal prediction and context building on Apple Silicon | A prediction server |
 | Python `TabICLClassifier` and `TabICLRegressor`, drop-ins for TabICL's | Published packages on crates.io or PyPI |
+| TabICL's preprocessing in pure Rust, at parity with TabICL | |
 
 ## Quickstart
 
@@ -99,10 +100,12 @@ and prediction runs only the query rows against it. See
 
 ## License
 
-Ironicl is licensed under the [BSD 3-Clause License](LICENSE). The Python
+Ironicl is licensed under the [BSD 3-Clause License](LICENSE). Its Rust
 preprocessing adapts code from TabICL under its own
-[BSD 3-Clause notice](LICENSES/TabICL-BSD-3-Clause.txt). The TabICLv2
-checkpoints are published separately by their authors under BSD-3-Clause.
+[BSD 3-Clause notice](LICENSES/TabICL-BSD-3-Clause.txt), and ports parts of
+SciPy, scikit-learn, and CPython under theirs, in [LICENSES](LICENSES).
+The TabICLv2 checkpoints are published separately by their authors under
+BSD-3-Clause.
 
 If you use Ironicl, please cite the TabICL papers listed in
 [references](docs/references.md#papers).

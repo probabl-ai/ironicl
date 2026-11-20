@@ -11,6 +11,8 @@ their GPU targets.
   device: `models/tabicl_v2/{cpu.rs, metal.rs, cuda/}`.
 - Artifact formats live under `format/`. Shared infrastructure (configuration,
   errors, memory planning, progress) stays at the crate root.
+- Preprocessing that several models can share lives under `preprocess/`; each
+  model's own pipeline lives with the model.
 
 The split leaves room for specialized kernels per instruction set and per GPU
 architecture, and for more models.
@@ -53,14 +55,16 @@ src/
 │       ├── checkpoint.rs          checkpoint import
 │       ├── checkpoint_cache.rs    prepared checkpoints
 │       ├── quantiles.rs           regression outputs
-│       └── preprocess.rs          planned: TabICL's preprocessing pipeline
+│       ├── preprocess.rs          TabICL's preprocessing pipeline
+│       └── fitted.rs              the fitted model
 ├── format/
 │   ├── mod.rs                     container primitives
 │   ├── model.rs                   model artifacts
 │   ├── static_context.rs          static contexts
+│   ├── preprocessor.rs            fitted preprocessing (IRPREP)
 │   └── input_bundle.rs, query_bundle.rs
-├── preprocess/                    planned: pure-Rust fit + transform
-│                                  (power, scale, encode, random)
+├── preprocess/                    what must reproduce Python exactly; no `unsafe`:
+│                                  python_random, stats, scale, yeo_johnson, labels
 ├── server/                        planned: `server` feature, off by default
 └── bin/ironicl-server.rs          planned: [[bin]] with required-features = ["server"]
 ```
@@ -75,7 +79,7 @@ Each step is one pull request.
 | B | Consolidate: fold `platform.rs` and `backend.rs` into `kernels/cpu` (`Isa`); one `Device` enum for TabICLv2; separate the Metal graph builder's generic operations from the TabICLv2 stages. | Done |
 | C | Split the CUDA kernels: their device code moves into `kernels/cuda/ops/`, with TabICLv2's fused kernels in `ops/tabicl_v2.rs`. The `#[kernel]` entry points stay in `kernels.rs`, because cuda-oxide generates launchers only for kernels written inline in the `#[cuda_module]` block; it compiles every function reachable from a kernel, wherever it lives. The PTX is unchanged apart from symbol names. | Done |
 | C2 | Move the generic launchers (dense products, layer norm, ICL attention, FP8 encoding, copies) into `kernels/cuda`, with the types they take: `Precision`, the activation forms, the dense and norm weight layouts, and the kernel constants. The launchers of TabICLv2's fused kernels stay with the model. | Planned |
-| D | Rust preprocessing: `preprocess/` and `models/tabicl_v2/preprocess.rs`, fit and transform, at parity with TabICL. | Planned |
+| D | Rust preprocessing: `preprocess/` and `models/tabicl_v2/preprocess.rs`, fit and transform, at parity with TabICL, and `models/tabicl_v2/fitted.rs`, the fitted model. | Done |
 | E | Prediction server behind the `server` feature: `/health`, `/v1/models`, and `predict` and `predict_proba` per model, in JSON, for models loaded read-only at startup. Needs D, so it runs without Python. | Planned |
 
 ## CUDA build targets

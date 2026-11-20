@@ -1,15 +1,13 @@
-"""Standalone preprocessing tests; TabICL/PyTorch are not required.
+"""Rust preprocessing through ``_core.preprocess``; TabICL and PyTorch are not required.
 
-The checked-in oracle always runs without upstream dependencies. Explicit live
-comparisons belong in tests/parity; see docs/validation.md for setup.
+Rust's own tests check preprocessing against TabICL's frozen fixture. Explicit
+live comparisons belong in tests/parity; see docs/validation.md for setup.
 """
 
 from __future__ import annotations
 
 import importlib.util
 import json
-import os
-import pickle
 import struct
 import subprocess
 import sys
@@ -19,28 +17,17 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
-import scipy
-from numpy.testing import assert_allclose, assert_array_equal
-from sklearn.base import clone
-from sklearn.exceptions import NotFittedError
+from numpy.testing import assert_array_equal
 
-from ironicl.preprocessing import Preprocessor, _feature_shuffles
+from ironicl import _core
+from ironicl.base import _array, _features, _label_values, _labels
 
-SCIPY = tuple(int(part) for part in scipy.__version__.split(".")[:2])
-
-FIXTURE = Path(__file__).parent / "fixtures" / "preprocessing.json"
+DEFAULTS = {"n_estimators": 8, "random_state": 0, "norm_methods": ["none", "power"], "outlier_threshold": 4.0}
 
 
-class NamedArray:
-    """Exercise the named-array contract without a pandas test dependency."""
-
-    def __init__(self, values, columns):
-        self.values = np.asarray(values)
-        self.columns = columns
-
-    def __array__(self, dtype=None, copy=None):
-        result = np.asarray(self.values, dtype=dtype)
-        return result.copy() if copy else result
+def preprocess(x, y, **options):
+    """Fit preprocessing as a classifier's ``fit`` does, on converted inputs."""
+    return _core.preprocess(_features(x)[0], labels=_label_values(_labels(y)), **{**DEFAULTS, **options})
 
 
 class PreprocessingTest(unittest.TestCase):
@@ -52,268 +39,134 @@ class PreprocessingTest(unittest.TestCase):
         self.y = np.array(["zebra", "ant", "yak"])[np.arange(40) % 3]
         self.q = rng.normal(size=(9, 5))
 
-    def test_checked_in_upstream_oracle(self):
-        fixture = json.loads(FIXTURE.read_text())
-        self.assertEqual(fixture["upstream_commit"], "bd030d47ff7d9f987f0f33431d743a3003bfe0d3")
-        for case in fixture["cases"]:
-            with self.subTest(dtype=case["dtype"]):
-                if case["dtype"] == "float32" and SCIPY < (1, 17):
-                    # The fixture was made with SciPy 1.17+, whose float32 power-transform fit
-                    # differs; TabICL on older SciPy matches Ironicl (see tests/parity).
-                    self.skipTest("float32 fixture needs SciPy 1.17+")
-                x = np.asarray(fixture["training"], dtype=case["dtype"])
-                q = np.asarray(fixture["query"], dtype=case["dtype"])
-                preprocessor = Preprocessor(random_state=42).fit(x, fixture["labels"])
-                self.assertEqual(list(preprocessor.group_names_), case["group_names"])
-                for attribute in (
-                    "classes_",
-                    "feature_mask_",
-                    "ensemble_groups_",
-                    "feature_permutations_",
-                    "class_permutations_",
-                ):
-                    assert_array_equal(getattr(preprocessor, attribute), case[attribute])
-                assert_array_equal(preprocessor.encode_labels(fixture["labels"]), case["encoded_labels"])
-                for actual, expected in zip(preprocessor.transform(x), case["training_groups"], strict=True):
-                    assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
-                for actual, expected in zip(preprocessor.transform(q), case["query_groups"], strict=True):
-                    assert_allclose(actual, expected, rtol=2e-6, atol=2e-6)
+    def test_shapes_and_metadata(self):
+        preprocessed = preprocess(self.x, self.y)
+        self.assertEqual(preprocessed.shape, [8, 40, 4])
+        self.assertEqual(preprocessed.feature_mask, [True, False, True, True, True])
+        self.assertEqual(preprocessed.group_names, ["none", "power"])
+        self.assertEqual(_array(*preprocessed.query_rows(self.q)).shape, (8, 9, 4))
+        for permutations, width in ((preprocessed.feature_permutations, 4), (preprocessed.class_permutations, 3)):
+            orders = _array(*permutations, np.uint64)
+            assert_array_equal(np.sort(orders, axis=1), np.tile(np.arange(width), (8, 1)))
 
-    def test_grouped_layout_and_label_metadata(self):
-        preprocessor = Preprocessor().fit(self.x, self.y)
-        groups = preprocessor.transform(self.q)
-        self.assertEqual(preprocessor.n_features_in_, 5)
-        self.assertEqual(preprocessor.n_features_out_, 4)
-        self.assertEqual(preprocessor.n_estimators_, 8)
-        self.assertEqual(preprocessor.group_names_, ("none", "power"))
-        self.assertEqual(sum(group.nbytes for group in groups), 2 * 9 * 4 * 4)
-        for group in groups:
-            self.assertEqual(group.shape, (9, 4))
-            self.assertEqual(group.dtype, np.float32)
-            self.assertTrue(group.flags.c_contiguous)
-            self.assertFalse(np.shares_memory(group, self.q))
-        for permutations, width in (
-            (preprocessor.feature_permutations_, 4),
-            (preprocessor.class_permutations_, 3),
+    def test_label_types_keep_their_order(self):
+        for labels, expected in (
+            (np.array([3, -1, 3, 8] * 5), [1, 0, 1, 2]),
+            (np.array([2.0, -2.0, 2.0, 1e9] * 5), [1, 0, 1, 2]),
+            (np.array([True, False] * 10), [1, 0]),
+            (np.array(["é", "b", "a", "b"] * 5, dtype=object), [2, 1, 0, 1]),
         ):
-            self.assertEqual(permutations.shape, (8, width))
-            self.assertEqual(permutations.dtype, np.uint64)
-            self.assertFalse(permutations.flags.writeable)
-            assert_array_equal(np.sort(permutations, axis=1), np.tile(np.arange(width), (8, 1)))
-        encoded = preprocessor.encode_labels(self.y)
-        self.assertEqual(encoded.dtype, np.int64)
-        self.assertEqual(encoded.shape, (len(self.y),))
-        assert_array_equal(preprocessor.decode_labels(encoded), self.y)
-        with self.assertRaises(ValueError):
-            preprocessor.encode_labels(["unknown"])
-        for invalid in ([0.5], [-1], [3], [[0]]):
-            with self.subTest(indices=invalid), self.assertRaises(ValueError):
-                preprocessor.decode_labels(invalid)
+            with self.subTest(dtype=labels.dtype):
+                x = np.random.default_rng(1).normal(size=(len(labels), 3))
+                # One member keeps the class order, so its targets are the class indices.
+                _, targets, _, _ = preprocess(x, labels, n_estimators=1).training_inputs()
+                assert_array_equal(_array(*targets)[0, : len(expected)], expected)
+        with self.assertRaises(TypeError):
+            _label_values(np.array(["a", 1] * 10, dtype=object))
 
     def test_requested_and_actual_ensemble_counts(self):
         x = np.arange(20).reshape(-1, 1)
         y = np.arange(20) % 2
-        preprocessor = Preprocessor(n_estimators=32).fit(x, y)
-        self.assertEqual(preprocessor.n_estimators, 32)
-        self.assertEqual(preprocessor.n_estimators_, 4)
-        self.assertEqual(len(preprocessor.transform(x)), 2)
-        single = Preprocessor(n_estimators=1).fit(self.x, self.y)
-        self.assertEqual(single.group_names_, ("none",))
-        assert_array_equal(single.feature_permutations_, [np.arange(4)])
-        assert_array_equal(single.class_permutations_, [np.arange(3)])
+        self.assertEqual(preprocess(x, y, n_estimators=32).shape, [4, 20, 1])
+        single = preprocess(self.x, self.y, n_estimators=1)
+        self.assertEqual(single.group_names, ["none"])
+        assert_array_equal(_array(*single.feature_permutations, np.uint64), [np.arange(4)])
+        assert_array_equal(_array(*single.class_permutations, np.uint64), [np.arange(3)])
 
-    def test_finite_numeric_dtypes_and_noncontiguous_inputs(self):
+    def test_dtypes_and_noncontiguous_inputs(self):
         for dtype in (np.float32, np.float64, np.int64):
             x = (self.x * 10).astype(dtype)
             with self.subTest(dtype=dtype):
-                preprocessor = Preprocessor().fit(x, self.y)
+                preprocessed = preprocess(x, self.y)
                 view = x[::2]
                 self.assertFalse(view.flags.c_contiguous)
-                for actual, expected in zip(
-                    preprocessor.transform(view), preprocessor.transform(view.copy()), strict=True
-                ):
-                    assert_array_equal(actual, expected)
+                expected = _array(*preprocessed.query_rows(_features(view.copy())[0]))
+                assert_array_equal(_array(*preprocessed.query_rows(_features(view)[0])), expected)
 
-    def test_training_only_statistics_and_batching(self):
-        preprocessor = Preprocessor().fit(self.x, self.y)
-        original_x, original_q = self.x.copy(), self.q.copy()
-        before = pickle.dumps(preprocessor)
-        batched = preprocessor.transform(self.q)
-        individual = [preprocessor.transform(row[None, :]) for row in self.q]
-        for index, group in enumerate(batched):
-            assert_allclose(group, np.concatenate([row[index] for row in individual]), rtol=2e-6, atol=2e-6)
-        preprocessor.transform(self.q * 1000)
-        self.assertEqual(pickle.dumps(preprocessor), before)
-        assert_array_equal(self.x, original_x)
-        assert_array_equal(self.q, original_q)
-        restored = pickle.loads(before)
-        for actual, expected in zip(restored.transform(self.q), batched, strict=True):
-            assert_array_equal(actual, expected)
-
-    def test_no_training_arrays_retained(self):
-        preprocessor = Preprocessor().fit(self.x, self.y)
-        self.assertFalse(hasattr(preprocessor, "X_"))
-        self.assertFalse(hasattr(preprocessor, "y_"))
-        for normalizer in preprocessor.normalizers_:
-            for value in vars(normalizer).values():
-                if isinstance(value, np.ndarray):
-                    self.assertEqual(value.shape, (4,))
-                    self.assertFalse(np.shares_memory(value, self.x))
-            if normalizer.power is not None:
-                self.assertFalse(hasattr(normalizer.power, "X_transformed_"))
-
-    def test_named_features_and_refitting(self):
-        names = ["a", "b", "c", "d", "e"]
-        preprocessor = Preprocessor().fit(NamedArray(self.x, names), self.y)
-        preprocessor.transform(NamedArray(self.q, names))
-        for invalid in (self.q, NamedArray(self.q, names[::-1])):
-            with self.assertRaisesRegex(ValueError, "feature names"):
-                preprocessor.transform(invalid)
-        for invalid_names in (["a"] * 5, list(range(5))):
-            with self.assertRaises(ValueError):
-                Preprocessor().fit(NamedArray(self.x, invalid_names), self.y)
-        preprocessor.fit(self.x, self.y)
-        self.assertFalse(hasattr(preprocessor, "feature_names_in_"))
-        preprocessor.transform(self.q)
-
-    def test_invalid_data_and_unfitted_use(self):
-        with self.assertRaises(NotFittedError):
-            Preprocessor().transform(self.q)
-        with self.assertRaises(NotFittedError):
-            Preprocessor().encode_labels(self.y)
-        invalid_x = (
-            np.ones((40, 5)),
-            self.x[:, 0],
-            self.x[:1],
-            np.empty((0, 5)),
-            np.empty((40, 0)),
-            self.x.astype(complex),
-            np.full((40, 5), "word"),
-            np.full((40, 5), np.nan),
-            np.full((40, 5), np.inf),
-        )
-        for x in invalid_x:
-            with self.subTest(shape=x.shape, dtype=x.dtype), self.assertRaises((ValueError, TypeError)):
-                Preprocessor().fit(x, self.y)
-        for y in (
-            self.y[:-1],
-            self.y[:, None],
-            np.zeros(40),
-            np.arange(40) % 11,
-            np.arange(40) * 0.1,
-            np.full(40, np.nan),
+    def test_float32_input_is_its_float64_upcast(self):
+        # Heavy tails, where computing in float32 would lose precision.
+        rng = np.random.default_rng(5)
+        x = np.exp(rng.normal(size=(60, 4)) * [0.5, 1.0, 2.0, 3.0]).astype(np.float32)
+        q = np.exp(rng.normal(size=(9, 4)) * 2).astype(np.float32)
+        y = np.arange(60) % 3
+        for name, fitted in (
+            ("labels", lambda x: preprocess(x, y)),
+            ("values", lambda x: _core.preprocess(x, values=np.arange(60, dtype=np.float32), **DEFAULTS)),
         ):
+            with self.subTest(name):
+                narrow, wide = fitted(x), fitted(x.astype(np.float64))
+                self.assertEqual(narrow.training_inputs(), wide.training_inputs())
+                for query in (q, q.astype(np.float64)):
+                    self.assertEqual(narrow.query_rows(query), wide.query_rows(q))
+
+    def test_rows_preprocess_alike_alone_and_in_batches(self):
+        preprocessed = preprocess(self.x, self.y)
+        batched = _array(*preprocessed.query_rows(self.q))
+        alone = np.concatenate([_array(*preprocessed.query_rows(row[None, :])) for row in self.q], axis=1)
+        assert_array_equal(batched, alone)
+        preprocessed.query_rows(self.q * 1000)  # Outside the training range, by the fallback.
+
+    def test_invalid_data(self):
+        for x in (self.x.astype(complex), np.full((40, 5), "word")):
+            with self.subTest(dtype=x.dtype), self.assertRaises(TypeError):
+                _features(x)
+        for x in (np.ones((40, 5)), self.x[:1], np.full((40, 5), np.nan), np.full((40, 5), np.inf), np.empty((0, 5))):
+            with self.subTest(shape=x.shape), self.assertRaises(ValueError):
+                preprocess(x, self.y[: len(x)])
+        for y in (self.y[:-1], np.zeros(40), np.arange(40) % 11, np.arange(40) * 0.1, np.full(40, np.nan)):
             with self.subTest(y=y), self.assertRaises(ValueError):
-                Preprocessor().fit(self.x, y)
-        preprocessor = Preprocessor().fit(self.x, self.y)
+                preprocess(self.x, y)
+        preprocessed = preprocess(self.x, self.y)
         with self.assertRaisesRegex(ValueError, "features"):
-            preprocessor.transform(self.q[:, :3])
-        for invalid in (np.full_like(self.q, np.nan), np.full_like(self.q, np.inf)):
-            with self.assertRaises(ValueError):
-                preprocessor.transform(invalid)
+            preprocessed.query_rows(self.q[:, :3])
+        with self.assertRaises(ValueError):
+            preprocessed.query_rows(np.full_like(self.q, np.nan))
 
     def test_sparse_inputs_are_rejected(self):
         from scipy.sparse import csr_matrix
 
         with self.assertRaises(TypeError):
-            Preprocessor().fit(csr_matrix(self.x), self.y)
+            _features(csr_matrix(self.x))
 
-    def test_parameter_validation_and_sklearn_clone(self):
-        invalid = (
+    def test_parameter_validation(self):
+        for options in (
             {"n_estimators": 0},
             {"n_estimators": 4097},
-            {"n_estimators": 1.5},
-            {"n_estimators": True},
-            {"random_state": None},
-            {"random_state": True},
-            {"random_state": 0.5},
-            {"norm_methods": ()},
-            {"norm_methods": "none"},
-            {"norm_methods": ("none", "none")},
-            {"norm_methods": ("quantile",)},
-            {"outlier_threshold": 0},
-            {"outlier_threshold": np.nan},
-            {"outlier_threshold": np.inf},
-            {"outlier_threshold": "four"},
-        )
-        for parameters in invalid:
-            with self.subTest(parameters=parameters), self.assertRaises(ValueError):
-                Preprocessor(**parameters).fit(self.x, self.y)
-        fitted = Preprocessor(n_estimators=3, norm_methods=("power",)).fit(self.x, self.y)
-        copied = clone(fitted)
-        self.assertEqual(copied.get_params(), fitted.get_params())
-        self.assertFalse(hasattr(copied, "normalizers_"))
+            {"norm_methods": []},
+            {"norm_methods": ["none", "none"]},
+            {"norm_methods": ["quantile"]},
+            {"outlier_threshold": 0.0},
+            {"outlier_threshold": float("nan")},
+            {"outlier_threshold": float("inf")},
+        ):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                preprocess(self.x, self.y, **options)
 
-    def test_failed_fit_preserves_previous_state(self):
-        preprocessor = Preprocessor().fit(self.x, self.y)
-        before = pickle.dumps(preprocessor)
-        with self.assertRaises(ValueError):
-            preprocessor.fit(np.ones_like(self.x), self.y)
-        self.assertEqual(pickle.dumps(preprocessor), before)
-
-    def test_iterative_latin_square_does_not_change_recursion_limit(self):
-        limit = sys.getrecursionlimit()
-        permutations = _feature_shuffles(limit + 1, 8, 0) if limit < 2000 else _feature_shuffles(1100, 8, 0)
-        self.assertEqual(sys.getrecursionlimit(), limit)
-        count = len(permutations)
-        self.assertEqual(len(permutations[0]), count)
-        assert_array_equal(np.sort(permutations, axis=0), np.tile(np.arange(count)[:, None], (1, count)))
-
-    def test_large_feature_shuffle_fallback(self):
-        permutations = _feature_shuffles(4001, 3, 0)
-        self.assertEqual(len(permutations), 3)
-        for permutation in permutations:
-            self.assertEqual(sorted(permutation), list(range(4001)))
-
-    def test_hash_seed_independence_and_no_torch_import(self):
+    def test_does_not_import_torch_or_tabicl(self):
         script = """
-import importlib.abc, json, sys
+import importlib.abc, sys
 class BlockImports(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
         if fullname.split(".")[0] in {"torch", "tabicl"}:
             raise AssertionError("Unexpected dependency: " + fullname)
 sys.meta_path.insert(0, BlockImports())
 import numpy as np
-from ironicl.preprocessing import Preprocessor
+from ironicl import _core
 x = np.arange(120, dtype=np.float64).reshape(40, 3)
-p = Preprocessor().fit(x, np.arange(40) % 3)
-print(json.dumps({"groups": p.group_names_, "indices": p.ensemble_groups_.tolist(),
-                  "features": p.feature_permutations_.tolist(), "classes": p.class_permutations_.tolist(),
-                  "data": [group.tolist() for group in p.transform(x[:2])]}))
-assert not any(name.split(".")[0] in {"torch", "tabicl"} for name in sys.modules)
+_core.preprocess(x, labels=("int", np.arange(40) % 3), n_estimators=8, random_state=0,
+                 norm_methods=["none", "power"], outlier_threshold=4.0).query_rows(x[:2])
 """
-        results = []
-        for seed in ("0", "1", "42"):
-            results.append(
-                subprocess.check_output(
-                    [sys.executable, "-B", "-c", script],
-                    text=True,
-                    env={**os.environ, "PYTHONHASHSEED": seed},
-                )
-            )
-        self.assertEqual(results[0], results[1])
-        self.assertEqual(results[1], results[2])
+        subprocess.run([sys.executable, "-B", "-c", script], check=True)
 
-    def test_real_dataset_export_uses_standalone_preprocessing(self):
+    def test_real_dataset_export_matches_rust_preprocessing(self):
         path = Path(__file__).parents[1] / "tools" / "prepare_real_dataset.py"
         spec = importlib.util.spec_from_file_location("prepare_real_dataset", path)
         exporter = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(exporter)
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "input.irinput"
-            argv = [
-                str(path),
-                "--dataset",
-                "covertype",
-                "--train-rows",
-                "25",
-                "--test-rows",
-                "9",
-                "--estimators",
-                "8",
-                "--output",
-                str(output),
-            ]
+            argv = [str(path), "--dataset", "covertype", "--train-rows", "25", "--test-rows", "9",
+                    "--estimators", "8", "--output", str(output)]  # fmt: skip
             with (
                 patch.object(sys, "argv", argv),
                 patch.object(exporter, "load_dataset", return_value=(self.x, self.y, "fixture")),
@@ -327,14 +180,13 @@ assert not any(name.split(".")[0] in {"torch", "tabicl"} for name in sys.modules
         header = struct.unpack_from("<8sIIQQQQQQQQ", encoded)
         self.assertEqual(header[:3], (b"IRINPUT\0", 1, 1))
         x_train, x_test, y_train, _ = exporter.stratified_rows(self.x, self.y, 25, 9, 42)
-        p = Preprocessor(random_state=42).fit(x_train, y_train)
-        train, query = p.transform(x_train), p.transform(x_test)
+        preprocessed = preprocess(x_train, y_train, random_state=42)
         x_values = np.frombuffer(encoded, dtype="<f4", count=header[7], offset=80).reshape(8, 34, 4)
         y_values = np.frombuffer(encoded, dtype="<f4", count=header[8], offset=80 + header[9]).reshape(8, 25)
-        for ensemble, group in enumerate(p.ensemble_groups_):
-            assert_array_equal(x_values[ensemble, :25], train[group][:, p.feature_permutations_[ensemble]])
-            assert_array_equal(x_values[ensemble, 25:], query[group][:, p.feature_permutations_[ensemble]])
-            assert_array_equal(y_values[ensemble], p.class_permutations_[ensemble][p.encode_labels(y_train)])
+        rows, targets, _, _ = preprocessed.training_inputs()
+        assert_array_equal(x_values[:, :25], _array(*rows))
+        assert_array_equal(x_values[:, 25:], _array(*preprocessed.query_rows(x_test)))
+        assert_array_equal(y_values, _array(*targets))
 
 
 if __name__ == "__main__":

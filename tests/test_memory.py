@@ -130,7 +130,7 @@ class FitPlansMemoryTest(unittest.TestCase):
             model = unfittable(estimator, memory_limit="1M", memory_overflow="error")
             with self.subTest(estimator=estimator.__name__), self.assertRaises(IroniclMemoryError):
                 model.fit(*data())
-            self.assertFalse(hasattr(model, "context_"))
+            self.assertFalse(hasattr(model, "fitted_"))
             self.assertFalse(hasattr(model, "memory_plan_"))
 
     def test_warn_continues_to_the_build(self):
