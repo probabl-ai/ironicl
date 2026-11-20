@@ -46,6 +46,18 @@ pub fn with_hook<T>(hook: Hook, work: impl FnOnce() -> T) -> T {
     work()
 }
 
+/// Run `work` with its reports counted from `offset` of `total`, as one piece
+/// of a larger task: `(stage, done, _)` reaches the hook as `(stage, offset + done, total)`.
+pub(crate) fn with_offset<T>(offset: usize, total: usize, work: impl FnOnce() -> T) -> T {
+    match HOOK.with(|current| current.borrow().clone()) {
+        Some(outer) => with_hook(
+            Rc::new(move |stage, done, _| outer(stage, offset + done, total)),
+            work,
+        ),
+        None => work(),
+    }
+}
+
 /// Report `done` of `total` for `stage` to this thread's hook, if any.
 ///
 /// # Errors
