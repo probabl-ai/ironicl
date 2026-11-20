@@ -178,6 +178,13 @@ pub struct ClassifierProbabilities {
 }
 
 impl ClassifierProbabilities {
+    pub(crate) fn from_rows(values: Vec<f32>, classes: usize) -> Self {
+        Self {
+            shape: [values.len() / classes.max(1), classes],
+            values,
+        }
+    }
+
     /// Output dimensions `[test_rows, C]`.
     #[must_use]
     pub fn shape(&self) -> [usize; 2] {
@@ -1708,6 +1715,11 @@ impl StaticExecutor {
     /// Returns [`Error::Artifact`] if encoding or the atomic write fails.
     pub fn save_context(&self, path: &std::path::Path) -> Result<()> {
         self.context.write(path)
+    }
+
+    /// The context's shape, permutations, and identities.
+    pub(crate) fn context_metadata(&self) -> &StaticContextMetadata {
+        self.context.metadata()
     }
 
     /// The length of [`Self::encode_context`]'s output.

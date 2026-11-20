@@ -4,7 +4,6 @@
 //! build on these pieces. This code handles untrusted input, so it may not use `unsafe`.
 #![forbid(unsafe_code)]
 
-#[allow(dead_code, reason = "the fitted model uses it in the following change")]
 pub mod labels;
 pub(crate) mod python_random;
 pub(crate) mod scale;

@@ -49,6 +49,7 @@ pub use models::tabicl_v2::cpu::{
     ClassifierAggregation, ClassifierProbabilities, DecoderOutputs, Executor, ForwardTrace, Optimize,
     SparseAttentionStatistics, StaticExecutor, TraceStage, plan_context,
 };
+pub use models::tabicl_v2::fitted::{FittedModel, Preprocessed, TrainingInputs};
 pub use models::tabicl_v2::preprocess::{Features, NormMethod, PreprocessOptions, Preprocessor, Targets};
 pub use models::tabicl_v2::quantiles::RegressionOutput;
 pub use preprocess::labels::Labels;

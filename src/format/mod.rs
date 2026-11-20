@@ -9,7 +9,6 @@
 
 pub mod input_bundle;
 pub mod model;
-#[allow(dead_code, reason = "the fitted model uses it in the following change")]
 pub mod preprocessor;
 pub mod query_bundle;
 pub mod static_context;
@@ -108,13 +107,11 @@ impl<'a> ByteReader<'a> {
     }
 
     /// A u64 count as a usize.
-    #[allow(dead_code, reason = "the fitted model uses it in the following change")]
     pub(crate) fn read_count(&mut self, name: &str) -> Result<usize> {
         u64_to_usize(self.read_u64()?, name)
     }
 
     /// `count` values of `width` bytes each, checked against the bytes left.
-    #[allow(dead_code, reason = "the fitted model uses it in the following change")]
     pub(crate) fn read_chunks(
         &mut self,
         count: usize,
@@ -126,7 +123,6 @@ impl<'a> ByteReader<'a> {
         Ok(self.read_bytes(length)?.chunks_exact(width))
     }
 
-    #[allow(dead_code, reason = "the fitted model uses it in the following change")]
     pub(crate) fn read_f64s(&mut self, count: usize) -> Result<Vec<f64>> {
         Ok(self
             .read_chunks(count, 8)?
