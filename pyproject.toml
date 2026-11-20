@@ -17,7 +17,9 @@ license = "BSD-3-Clause"
 license-files = [
     "LICENSE",
     "LICENSES/Python-PSF-2.0.txt",
+    "LICENSES/SciPy-BSD-3-Clause.txt",
     "LICENSES/TabICL-BSD-3-Clause.txt",
+    "LICENSES/scikit-learn-BSD-3-Clause.txt",
 ]
 
 [project.optional-dependencies]
