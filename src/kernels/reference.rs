@@ -57,25 +57,6 @@ fn qass_tanh(value: f32) -> f32 {
     value.tanh()
 }
 
-/// Deterministic scalar dot product used as an initial correctness oracle.
-///
-/// # Errors
-///
-/// Returns [`Error::InvalidArgument`] when the input lengths differ.
-pub fn dot_f32(left: &[f32], right: &[f32]) -> Result<f32> {
-    if left.len() != right.len() {
-        return Err(Error::InvalidArgument(format!(
-            "dot-product lengths differ: {} and {}",
-            left.len(),
-            right.len()
-        )));
-    }
-    Ok(left
-        .iter()
-        .zip(right)
-        .fold(0.0_f32, |sum, (left, right)| left.mul_add(*right, sum)))
-}
-
 /// Apply a `PyTorch` `Linear` layer to `rows` row-major input rows.
 ///
 /// `weight` has `PyTorch` layout `[output_dim, input_dim]`. `bias`, when present,
@@ -160,29 +141,6 @@ pub(crate) fn affine_input3_transposed_f32(
     Ok(())
 }
 
-/// Look up rows from a row-major embedding table, equivalent to one-hot linear projection.
-pub fn embedding_lookup_f32(
-    indices: &[usize],
-    embeddings: &[f32],
-    vocabulary: usize,
-    embedding_dim: usize,
-    output: &mut [f32],
-) -> Result<()> {
-    let table_len = checked_elements(vocabulary, embedding_dim, "embedding table")?;
-    let output_len = checked_elements(indices.len(), embedding_dim, "embedding output")?;
-    require_length(embeddings, table_len, "embedding table")?;
-    require_length(output, output_len, "embedding output")?;
-    for (&index, output_row) in indices.iter().zip(output.chunks_exact_mut(embedding_dim)) {
-        if index >= vocabulary {
-            return Err(Error::InvalidArgument(format!(
-                "embedding index {index} is outside vocabulary of {vocabulary}"
-            )));
-        }
-        output_row.copy_from_slice(&embeddings[index * embedding_dim..][..embedding_dim]);
-    }
-    Ok(())
-}
-
 /// Apply a one-hot input followed by a `PyTorch` `Linear` layer.
 ///
 /// `weight` has `[output_dim, classes]` layout. This differs from an embedding
@@ -261,66 +219,6 @@ pub fn gelu_f32(input: &[f32], output: &mut [f32]) -> Result<()> {
     }
     for (input, output) in input.iter().zip(output) {
         *output = gelu(*input);
-    }
-    Ok(())
-}
-
-/// Add equally sized FP32 tensors into a caller-owned output buffer.
-pub fn residual_add_f32(left: &[f32], right: &[f32], output: &mut [f32]) -> Result<()> {
-    require_length(right, left.len(), "residual right input")?;
-    require_length(output, left.len(), "residual output")?;
-    for ((left, right), output) in left.iter().zip(right).zip(output) {
-        *output = left + right;
-    }
-    Ok(())
-}
-
-/// Project input rows with packed `PyTorch` Q/K/V parameters and split the result.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "a kernel takes its buffers and their shape as plain arguments"
-)]
-pub fn packed_qkv_projection_f32(
-    input: &[f32],
-    rows: usize,
-    embed_dim: usize,
-    weight: &[f32],
-    bias: Option<&[f32]>,
-    packed_scratch: &mut [f32],
-    query: &mut [f32],
-    key: &mut [f32],
-    value: &mut [f32],
-) -> Result<()> {
-    let rows_embed = checked_elements(rows, embed_dim, "QKV output")?;
-    let packed_dim = embed_dim
-        .checked_mul(3)
-        .ok_or(Error::ArithmeticOverflow("QKV dimension"))?;
-    require_length(
-        weight,
-        checked_elements(packed_dim, embed_dim, "QKV weight")?,
-        "QKV weight",
-    )?;
-    if let Some(bias) = bias {
-        require_length(bias, packed_dim, "QKV bias")?;
-    }
-    require_length(query, rows_embed, "query output")?;
-    require_length(key, rows_embed, "key output")?;
-    require_length(value, rows_embed, "value output")?;
-    require_length(
-        packed_scratch,
-        checked_elements(rows, packed_dim, "packed QKV output")?,
-        "packed QKV scratch",
-    )?;
-    affine_f32(input, rows, embed_dim, weight, bias, packed_dim, packed_scratch)?;
-    for (packed_row, ((query_row, key_row), value_row)) in packed_scratch.chunks_exact(packed_dim).zip(
-        query
-            .chunks_exact_mut(embed_dim)
-            .zip(key.chunks_exact_mut(embed_dim))
-            .zip(value.chunks_exact_mut(embed_dim)),
-    ) {
-        query_row.copy_from_slice(&packed_row[..embed_dim]);
-        key_row.copy_from_slice(&packed_row[embed_dim..2 * embed_dim]);
-        value_row.copy_from_slice(&packed_row[2 * embed_dim..]);
     }
     Ok(())
 }
@@ -479,6 +377,7 @@ pub fn rope_non_interleaved_f32(
     clippy::too_many_arguments,
     reason = "a kernel takes its buffers and their shape as plain arguments"
 )]
+#[cfg(test)]
 pub fn scaled_dot_product_attention_f32(
     query: &[f32],
     query_rows: usize,
@@ -1210,59 +1109,13 @@ fn attention_score_maximum(backend: super::cpu::Isa, scores: &[f32]) -> Result<f
     Ok(maximum)
 }
 
-/// Convert `[rows, embed_dim]` tokens to `[heads, rows, head_dim]` storage.
-pub fn tokens_to_heads_f32(
-    input: &[f32],
-    rows: usize,
-    embed_dim: usize,
-    heads: usize,
-    output: &mut [f32],
-) -> Result<()> {
-    let elements = checked_elements(rows, embed_dim, "token-to-head layout")?;
-    if heads == 0 || !embed_dim.is_multiple_of(heads) {
-        return Err(Error::InvalidArgument(
-            "embed_dim must be divisible by a non-zero head count".into(),
-        ));
-    }
-    require_length(input, elements, "token input")?;
-    require_length(output, elements, "head output")?;
-    let head_dim = embed_dim / heads;
-    for row in 0..rows {
-        for head in 0..heads {
-            output[(head * rows + row) * head_dim..][..head_dim]
-                .copy_from_slice(&input[row * embed_dim + head * head_dim..][..head_dim]);
-        }
-    }
-    Ok(())
-}
-
-/// Convert `[heads, rows, head_dim]` storage back to `[rows, embed_dim]` tokens.
-pub fn heads_to_tokens_f32(
-    input: &[f32],
-    heads: usize,
-    rows: usize,
-    head_dim: usize,
-    output: &mut [f32],
-) -> Result<()> {
-    let embed_dim = checked_elements(heads, head_dim, "head merge width")?;
-    let elements = checked_elements(rows, embed_dim, "head-to-token layout")?;
-    require_length(input, elements, "head input")?;
-    require_length(output, elements, "token output")?;
-    for row in 0..rows {
-        for head in 0..heads {
-            output[row * embed_dim + head * head_dim..][..head_dim]
-                .copy_from_slice(&input[(head * rows + row) * head_dim..][..head_dim]);
-        }
-    }
-    Ok(())
-}
-
 /// Stable FP32 softmax. Optimized implementations must preserve this contract.
 ///
 /// # Errors
 ///
 /// Returns [`Error::InvalidArgument`] for empty input, NaN input, or a
 /// non-finite normalization result.
+#[cfg(test)]
 pub fn softmax_f32(values: &mut [f32]) -> Result<()> {
     if values.is_empty() {
         return Err(Error::InvalidArgument("softmax input must not be empty".into()));
@@ -1291,12 +1144,6 @@ pub fn softmax_f32(values: &mut [f32]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn dot_product_uses_matching_inputs() {
-        let result = dot_f32(&[1.0, 2.0, 3.0], &[4.0, 5.0, 6.0]).expect("valid dot product");
-        assert!((result - 32.0).abs() < f32::EPSILON);
-    }
 
     #[test]
     fn softmax_is_stable_for_large_logits() {
@@ -1344,15 +1191,6 @@ mod tests {
     }
 
     #[test]
-    fn embedding_lookup_copies_selected_table_rows() {
-        let table = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-        let mut output = [0.0; 4];
-        embedding_lookup_f32(&[2, 0], &table, 3, 2, &mut output).expect("valid lookup");
-        assert_eq!(output, [5.0, 6.0, 1.0, 2.0]);
-        assert!(embedding_lookup_f32(&[3], &table, 3, 2, &mut [0.0; 2]).is_err());
-    }
-
-    #[test]
     fn one_hot_linear_selects_weight_columns_and_adds_bias() {
         let mut output = [0.0; 4];
         one_hot_linear_f32(
@@ -1383,52 +1221,6 @@ mod tests {
         let mut output = [0.0; 3];
         gelu_f32(&[-1.0, 0.0, 1.0], &mut output).expect("valid GELU");
         assert_close(&output, &[-0.158_655_26, 0.0, 0.841_344_7]);
-    }
-
-    #[test]
-    fn residual_rejects_mismatched_lengths() {
-        let mut output = [0.0; 2];
-        residual_add_f32(&[1.0, 2.0], &[3.0, 4.0], &mut output).expect("valid residual");
-        assert_eq!(output, [4.0, 6.0]);
-        assert!(residual_add_f32(&[1.0], &[2.0, 3.0], &mut output).is_err());
-    }
-
-    #[test]
-    fn packed_qkv_splits_pytorch_packed_projection() {
-        let input = [2.0, 3.0];
-        let weight = [1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 2.0, 0.0, 0.0, 2.0, 1.0, -1.0];
-        let bias = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
-        let mut packed = [0.0; 6];
-        let mut query = [0.0; 2];
-        let mut key = [0.0; 2];
-        let mut value = [0.0; 2];
-        packed_qkv_projection_f32(
-            &input,
-            1,
-            2,
-            &weight,
-            Some(&bias),
-            &mut packed,
-            &mut query,
-            &mut key,
-            &mut value,
-        )
-        .expect("valid QKV");
-        assert_eq!(query, [2.0, 4.0]);
-        assert_eq!(key, [7.0, 7.0]);
-        assert_eq!(value, [10.0, 4.0]);
-    }
-
-    #[test]
-    fn head_layout_round_trip_preserves_tokens() {
-        let tokens = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let mut heads = [0.0; 8];
-        let mut output = [0.0; 8];
-        tokens_to_heads_f32(&tokens, 2, 4, 2, &mut heads).expect("valid layout");
-        assert_eq!(heads, [1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]);
-        heads_to_tokens_f32(&heads, 2, 2, 2, &mut output).expect("valid merge");
-        assert_eq!(output, tokens);
-        assert!(tokens_to_heads_f32(&tokens, 2, 4, 3, &mut heads).is_err());
     }
 
     #[test]

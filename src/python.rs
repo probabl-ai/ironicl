@@ -2,8 +2,7 @@
 //!
 //! Python owns scikit-learn's interface, input conversion, and the checkpoint
 //! download. This module preprocesses, builds the training context, and
-//! predicts ([`FittedModel`]). `Model.build_context` and `Context` remain for
-//! tests that drive the engine with their own rows.
+//! predicts ([`FittedModel`]).
 
 #![expect(
     clippy::needless_pass_by_value,
@@ -25,7 +24,7 @@ use pyo3::{
 
 use crate::{
     ClassifierAggregation, Error, Executor, Features, Labels, NormMethod, Optimize, PreprocessOptions,
-    QueryRequest, RegressionOutput, StaticExecutor, Targets, TaskKind, load_checkpoint_model,
+    RegressionOutput, StaticExecutor, Targets, TaskKind, load_checkpoint_model,
     memory::{Builder, MemoryLimits, Verdict},
     models::tabicl_v2::preprocess::flatten_orders,
     plan_context,
@@ -101,63 +100,12 @@ impl Model {
             .map_err(py_error)
     }
 
-    /// Run FP32 training rows `x[B, N, H]` with targets `y_train[B, N]` once and
-    /// keep their attention keys and values. Targets are class labels for the
-    /// classifier and standardized values for the regressor. Permutations are
-    /// `[B, C]` (empty for the regressor) and `[B, H]`; `optimize` is `"safe"`,
-    /// `"auto"`, or `"fast"`. The memory limits are sizes such as `"16G"`;
-    /// `None` reads `IRONICL_MEMORY_LIMIT` and `IRONICL_DEVICE_MEMORY_LIMIT`.
-    /// `progress` receives `("build", estimators built, estimators)`. With
-    /// `cache_dir`, a matching context there is loaded instead of built, and a
-    /// built one is written there when possible.
-    #[expect(clippy::too_many_arguments, reason = "mirrors the Python call's parameters")]
-    #[pyo3(signature = (
-        x, y_train, class_permutations, feature_permutations, optimize, threads,
-        memory_limit=None, device_memory_limit=None, progress=None, cache_dir=None,
-    ))]
-    fn build_context(
-        &self,
-        py: Python<'_>,
-        x: PyBuffer<f32>,
-        y_train: PyBuffer<f32>,
-        class_permutations: PyBuffer<u64>,
-        feature_permutations: PyBuffer<u64>,
-        optimize: &str,
-        threads: Option<usize>,
-        memory_limit: Option<String>,
-        device_memory_limit: Option<String>,
-        progress: Option<Py<PyAny>>,
-        cache_dir: Option<PathBuf>,
-    ) -> PyResult<Context> {
-        let optimize = optimize.parse::<Optimize>().map_err(py_error)?;
-        let limits = MemoryLimits::resolve(memory_limit.as_deref(), device_memory_limit.as_deref())
-            .map_err(py_error)?;
-        let &[ensembles, rows, features] = x.shape() else {
-            return Err(PyValueError::new_err("x must have shape [B, N, H]"));
-        };
-        let (x, y_train) = (x.to_vec(py)?, y_train.to_vec(py)?);
-        let (class_permutations, feature_permutations) =
-            (class_permutations.to_vec(py)?, feature_permutations.to_vec(py)?);
-        run(py, progress, || {
-            self.0.build_context(
-                ensembles,
-                rows,
-                features,
-                &x,
-                &y_train,
-                class_permutations,
-                feature_permutations,
-                optimize,
-                threads,
-                limits,
-                cache_dir.as_deref(),
-            )
-        })
-        .map(Context)
-    }
-
-    /// Build the context of `preprocess`'s result. `optimize`, `threads`, the memory
-    /// limits, `progress`, and `cache_dir` are as for `build_context`.
+    /// Build the context of `preprocess`'s result. `optimize` is `"safe"`, `"auto"`,
+    /// or `"fast"`. The memory limits are sizes such as `"16G"`; `None` reads
+    /// `IRONICL_MEMORY_LIMIT` and `IRONICL_DEVICE_MEMORY_LIMIT`. `progress`
+    /// receives `("build", estimators built, estimators)`. With `cache_dir`, a
+    /// matching context there is loaded instead of built, and a built one is
+    /// written there when possible.
     #[expect(clippy::too_many_arguments, reason = "mirrors the Python call's parameters")]
     #[pyo3(signature = (
         preprocessed, optimize, threads, memory_limit=None, device_memory_limit=None, progress=None, cache_dir=None,
@@ -237,123 +185,6 @@ impl Model {
     fn task(&self) -> String {
         self.0.task().to_string()
     }
-
-    /// The source-checkpoint SHA-256 that identifies this model.
-    #[getter]
-    fn source_sha256(&self) -> String {
-        self.0.source_sha256().to_owned()
-    }
-
-    /// Load a context from the bytes `Context.to_bytes` returned. `optimize`,
-    /// `threads`, and the memory limits mean what they mean for
-    /// `build_context`; `optimize` should be the level the context was built at.
-    #[pyo3(signature = (data, optimize, threads, memory_limit=None, device_memory_limit=None))]
-    fn context_from_bytes(
-        &self,
-        py: Python<'_>,
-        data: &[u8],
-        optimize: &str,
-        threads: Option<usize>,
-        memory_limit: Option<String>,
-        device_memory_limit: Option<String>,
-    ) -> PyResult<Context> {
-        let limits = MemoryLimits::resolve(memory_limit.as_deref(), device_memory_limit.as_deref())
-            .map_err(py_error)?;
-        let optimize = optimize.parse::<Optimize>().map_err(py_error)?;
-        py.detach(|| self.0.load_context_bytes(data, optimize, threads, limits))
-            .map(Context)
-            .map_err(py_error)
-    }
-}
-
-/// A fitted training context. Prediction runs only the query rows.
-#[pyclass(frozen)]
-struct Context(StaticExecutor);
-
-#[pymethods]
-impl Context {
-    /// Predict FP32 query rows `x[B, Q, H]`. Returns probabilities as FP32
-    /// bytes and their `[Q, C]` shape. `progress` receives `("predict", rows
-    /// done, rows)` when the query runs in pieces.
-    #[pyo3(signature = (x, softmax_temperature, average_logits, progress=None))]
-    fn predict_proba<'py>(
-        &self,
-        py: Python<'py>,
-        x: PyBuffer<f32>,
-        softmax_temperature: f32,
-        average_logits: bool,
-        progress: Option<Py<PyAny>>,
-    ) -> PyResult<(Bound<'py, PyBytes>, [usize; 2])> {
-        let &[ensembles, rows, features] = x.shape() else {
-            return Err(PyValueError::new_err("x must have shape [B, Q, H]"));
-        };
-        let x = x.to_vec(py)?;
-        let aggregation = ClassifierAggregation {
-            softmax_temperature,
-            average_logits,
-        };
-        let probabilities = run(py, progress, || {
-            let request = QueryRequest::new(ensembles, rows, features, &x)?;
-            self.0.predict_probabilities(request, aggregation)
-        })?;
-        Ok((
-            PyBytes::new(py, bytemuck::cast_slice(probabilities.values())),
-            probabilities.shape(),
-        ))
-    }
-
-    /// Predict FP32 query rows `x[B, Q, H]` against a regression context. Returns
-    /// each `output_types` entry as FP32 bytes and its `[Q, columns]` shape, in
-    /// standardized target units. `alphas` are the levels for `"quantiles"`.
-    /// `progress` is as for `predict_proba`.
-    #[pyo3(signature = (x, output_types, alphas, progress=None))]
-    fn predict_regression<'py>(
-        &self,
-        py: Python<'py>,
-        x: PyBuffer<f32>,
-        output_types: Vec<String>,
-        alphas: Vec<f32>,
-        progress: Option<Py<PyAny>>,
-    ) -> PyResult<Vec<(Bound<'py, PyBytes>, [usize; 2])>> {
-        let &[ensembles, rows, features] = x.shape() else {
-            return Err(PyValueError::new_err("x must have shape [B, Q, H]"));
-        };
-        let outputs = output_types
-            .iter()
-            .map(|name| RegressionOutput::parse(name, &alphas))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(py_error)?;
-        let x = x.to_vec(py)?;
-        let results = run(py, progress, || {
-            let request = QueryRequest::new(ensembles, rows, features, &x)?;
-            self.0.predict_regression(request, &outputs)
-        })?;
-        Ok(results
-            .into_iter()
-            .map(|(values, columns)| (PyBytes::new(py, bytemuck::cast_slice(&values)), [rows, columns]))
-            .collect())
-    }
-
-    /// Where predictions run: `"metal"`, `"cuda"` with the ICL cache on the
-    /// GPU, `"cuda-streamed"` with it streamed from host memory on every pass,
-    /// or `"cpu"`.
-    #[getter]
-    fn device(&self) -> &'static str {
-        self.0.device()
-    }
-
-    /// Query rows a prediction call should bring at once: one pass's when the
-    /// ICL cache streams, so each copy of it serves as many rows as fit,
-    /// else `None`.
-    #[getter]
-    fn batch_rows(&self) -> Option<usize> {
-        self.0.batch_rows()
-    }
-
-    /// This context encoded as the context cache writes it (`IRCNTXT`).
-    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        context_bytes(py, &self.0)
-    }
 }
 
 /// `context` encoded as the context cache writes it, straight into the
@@ -374,7 +205,7 @@ fn context_bytes<'py>(py: Python<'py>, context: &StaticExecutor) -> PyResult<Bou
 }
 
 /// Plan the memory to build a `task` context of `estimators x rows x features`
-/// with `optimize`, as `build_context` would on this machine. The memory limits
+/// with `optimize`, as `Model.build` would on this machine. The memory limits
 /// are sizes such as `"16G"`; `None` reads `IRONICL_MEMORY_LIMIT` and
 /// `IRONICL_DEVICE_MEMORY_LIMIT`. With `load`, plans loading the built context
 /// instead of building it. Returns the plan as a dict.
@@ -638,8 +469,8 @@ impl Preprocessed {
         index_rows(py, self.0.preprocessor().class_permutations())
     }
 
-    /// What `Model.build_context` takes: FP32 `[B, N, H]` rows and `[B, N]`
-    /// targets, and uint64 class and feature orders, each as bytes and a shape.
+    /// What the context build takes: FP32 `[B, N, H]` rows and `[B, N]` targets,
+    /// and uint64 class and feature orders, each as bytes and a shape.
     #[expect(clippy::type_complexity, reason = "four arrays as bytes and shapes")]
     fn training_inputs<'py>(
         &self,
@@ -739,13 +570,17 @@ impl FittedModel {
         Preprocessed(Arc::clone(self.0.preprocessed()))
     }
 
-    /// Where predictions run; see `Context.device`.
+    /// Where predictions run: `"metal"`, `"cuda"` with the ICL cache on the
+    /// GPU, `"cuda-streamed"` with it streamed from host memory on every pass,
+    /// or `"cpu"`.
     #[getter]
     fn device(&self) -> &'static str {
         self.0.device()
     }
 
-    /// See `Context.batch_rows`.
+    /// Query rows a prediction call should bring at once: one pass's when the
+    /// ICL cache streams, so each copy of it serves as many rows as fit,
+    /// else `None`.
     #[getter]
     fn batch_rows(&self) -> Option<usize> {
         self.0.batch_rows()
@@ -767,7 +602,6 @@ impl FittedModel {
 #[pyo3(name = "_core")]
 fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Model>()?;
-    module.add_class::<Context>()?;
     module.add_class::<Preprocessed>()?;
     module.add_class::<FittedModel>()?;
     module.add_function(wrap_pyfunction!(preprocess, module)?)?;
