@@ -1,13 +1,6 @@
 //! Uncached scalar FP32 execution for the official `TabICLv2` classifier.
 
-use std::{
-    cell::RefCell,
-    collections::BTreeMap,
-    sync::{
-        Arc, OnceLock,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::sync::{Arc, OnceLock};
 
 use rayon::{ThreadPool, ThreadPoolBuilder, prelude::*};
 use sha2::{Digest, Sha256};
@@ -17,18 +10,12 @@ use crate::{
     Error, ModelArtifact, QueryRequest, RegressionOutput, Request, Result, StaticContextArtifact,
     StaticContextMetadata, StaticContextTensor, StaticContextTensorData, TaskKind,
     format::static_context::{PageAlignedTensors, TensorStorage},
-    kernels::{
-        cpu::{
-            Bf16AffineCompensation, PackedBf16Affine, PackedF32Affine, packed_bf16_affine_supported,
-            packed_f32_affine_supported,
-        },
-        reference::{
-            OnlineAttentionScratch, QassMaxWeights, affine_f32, affine_input3_transposed_f32, gelu_f32,
-            layer_norm_f32, one_hot_linear_f32, qassmax_f32, rope_non_interleaved_f32,
-            source_major_online_attention_bf16_with_backend_f32,
-            source_major_online_attention_f32_key_bf16_value_with_backend_f32,
-            source_major_online_attention_with_backend_f32, tiled_online_scaled_dot_product_attention_f32,
-        },
+    kernels::reference::{
+        OnlineAttentionScratch, QassMaxWeights, affine_f32, affine_input3_transposed_f32, gelu_f32,
+        layer_norm_f32, one_hot_linear_f32, qassmax_f32, rope_non_interleaved_f32,
+        source_major_online_attention_bf16_with_backend_f32,
+        source_major_online_attention_f32_key_bf16_value_with_backend_f32,
+        source_major_online_attention_with_backend_f32, tiled_online_scaled_dot_product_attention_f32,
     },
     memory::{Builder, ContextShape, MemoryLimits, Plan, Pools, Storage},
     models::tabicl_v2::Device,
@@ -52,64 +39,7 @@ const MAX_ACTIVATION_ELEMENTS: usize = MAX_ACTIVATION_BYTES / std::mem::size_of:
 /// Cached prediction splits larger queries. The GPU keeps the buffers and
 /// compiled graph of every query bucket up to this size.
 pub(crate) const QUERY_CHUNK_ROWS: usize = 1024;
-const SPARSE_INDEX_TENSORS: [&str; 4] = [
-    "icl.index.centroids",
-    "icl.index.radii",
-    "icl.index.offsets",
-    "icl.index.members",
-];
 static EXECUTOR_THREADS: OnceLock<usize> = OnceLock::new();
-
-thread_local! {
-    static BF16_AFFINE_INPUT: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
-    static BF16_AFFINE_INPUT_RESIDUAL: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) };
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "one switch per layer of the bf16-dense experiment"
-)]
-struct Bf16DensePolicy {
-    column_q: bool,
-    column_out: bool,
-    column_ffn1: bool,
-    column_ffn2: bool,
-    icl_q: bool,
-    icl_out: bool,
-    icl_ffn1: bool,
-    icl_ffn2: bool,
-    qass: bool,
-    decoder: bool,
-}
-
-#[derive(Clone, Copy)]
-struct SparseIndex<'a> {
-    centroids: &'a [f32],
-    radii: &'a [f32],
-    offsets: &'a [f32],
-    members: &'a [f32],
-    clusters: usize,
-}
-
-impl Bf16DensePolicy {
-    /// Every dense stage in BF16. The `bf16-dense` feature enables this whole
-    /// policy; finer selection was a runtime-only tuning knob that is gone.
-    const fn full() -> Self {
-        Self {
-            column_q: true,
-            column_out: true,
-            column_ffn1: true,
-            column_ffn2: true,
-            icl_q: true,
-            icl_out: true,
-            icl_ffn1: true,
-            icl_ffn2: true,
-            qass: true,
-            decoder: true,
-        }
-    }
-}
 
 /// Owned classifier logits in row-major `[B, test_rows, C]` order.
 #[derive(Debug, Clone, PartialEq)]
@@ -257,54 +187,8 @@ pub struct StaticExecutor {
     affine_pool: Arc<WorkerPool>,
     column_input_weight: Arc<Vec<f32>>,
     qass_base_scales: Arc<Vec<Vec<f32>>>,
-    packed_f32_affines: Option<Arc<BTreeMap<String, PackedF32Affine>>>,
-    packed_f32_row: bool,
-    packed_bf16_affines: Option<Arc<BTreeMap<String, PackedBf16Affine>>>,
-    bf16_dense_compensation: Bf16AffineCompensation,
     isa: crate::kernels::cpu::Isa,
-    sparse_attention_stats: Arc<SparseAttentionStats>,
     device: Device,
-}
-
-/// Sparse ICL attention decisions since the last reset.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct SparseAttentionStatistics {
-    /// Calls that evaluated sparse candidates.
-    pub attempted: u64,
-    /// Calls whose candidate set passed the omitted-mass certificate.
-    pub accepted: u64,
-    /// Calls that fell back to dense attention.
-    pub fallback: u64,
-}
-
-#[derive(Debug, Default)]
-struct SparseAttentionStats {
-    attempted: AtomicU64,
-    accepted: AtomicU64,
-}
-
-impl SparseAttentionStats {
-    fn record(&self, accepted: bool) {
-        self.attempted.fetch_add(1, Ordering::Relaxed);
-        if accepted {
-            self.accepted.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    fn reset(&self) {
-        self.attempted.store(0, Ordering::Relaxed);
-        self.accepted.store(0, Ordering::Relaxed);
-    }
-
-    fn snapshot(&self) -> SparseAttentionStatistics {
-        let attempted = self.attempted.load(Ordering::Relaxed);
-        let accepted = self.accepted.load(Ordering::Relaxed);
-        SparseAttentionStatistics {
-            attempted,
-            accepted,
-            fallback: attempted.saturating_sub(accepted),
-        }
-    }
 }
 
 impl Executor {
@@ -1634,39 +1518,6 @@ impl StaticExecutor {
             }
         }
         let qass_base_scales = model.icl_base_scales(context.metadata().training_rows)?;
-        // The BF16/packed dense experiment is off unless built with the
-        // `bf16-dense` feature; it is never activated by a runtime flag.
-        let bf16_dense = cfg!(feature = "bf16-dense");
-        let packed_f32_row = bf16_dense && packed_f32_affine_supported();
-        let packed_f32_policy = bf16_dense.then(Bf16DensePolicy::full);
-        let packed_f32_affines = if packed_f32_affine_supported() {
-            let mut packed = BTreeMap::new();
-            if let Some(policy) = packed_f32_policy {
-                packed.extend(Self::build_packed_f32_affines(&model, policy)?);
-            }
-            if packed_f32_row {
-                packed.extend(Self::build_packed_f32_row_affines(&model)?);
-            }
-            (!packed.is_empty()).then(|| Arc::new(packed))
-        } else {
-            None
-        };
-        let bf16_dense_policy = bf16_dense.then(Bf16DensePolicy::full);
-        let bf16_dense_compensation = Bf16AffineCompensation::None;
-        let column_bf16_blocks = [bf16_dense; 3];
-        let icl_bf16_blocks = [bf16_dense; 12];
-        let packed_bf16_affines = if let Some(policy) = bf16_dense_policy
-            && packed_bf16_affine_supported()
-        {
-            Some(Arc::new(Self::build_packed_bf16_affines(
-                &model,
-                policy,
-                column_bf16_blocks,
-                icl_bf16_blocks,
-            )?))
-        } else {
-            None
-        };
         let affine_pool = WorkerPool::new(threads)?;
         Self {
             model,
@@ -1674,12 +1525,7 @@ impl StaticExecutor {
             affine_pool: Arc::new(affine_pool),
             column_input_weight: Arc::new(column_input_weight),
             qass_base_scales: Arc::new(qass_base_scales),
-            packed_f32_affines,
-            packed_f32_row,
-            packed_bf16_affines,
-            bf16_dense_compensation,
             isa: crate::kernels::cpu::Isa::detect(),
-            sparse_attention_stats: Arc::new(SparseAttentionStats::default()),
             device: Device::Cpu,
         }
         .with_gpu(limits)
@@ -1895,17 +1741,6 @@ impl StaticExecutor {
             output.copy_from_slice(&logits[..classes]);
         }
         Ok(true)
-    }
-
-    /// Reset sparse-attention decisions collected by this executor.
-    pub fn reset_sparse_attention_statistics(&self) {
-        self.sparse_attention_stats.reset();
-    }
-
-    /// Return sparse-attention decisions collected by this executor.
-    #[must_use]
-    pub fn sparse_attention_statistics(&self) -> SparseAttentionStatistics {
-        self.sparse_attention_stats.snapshot()
     }
 
     /// Execute query-only FP32 inference for preprocessed `[B, Q, H]` values.
@@ -2316,7 +2151,6 @@ impl StaticExecutor {
                 )?),
                 INDUCING,
                 16,
-                None,
                 workers,
             )?;
         }
@@ -2345,7 +2179,6 @@ impl StaticExecutor {
         block: usize,
         workers: usize,
     ) -> Result<Vec<f32>> {
-        let sparse_index = self.sparse_index(ensemble, block)?;
         self.cached_block(
             rows,
             q,
@@ -2357,7 +2190,6 @@ impl StaticExecutor {
             self.cache("icl", block, "value", ensemble)?,
             self.context.metadata().training_rows,
             64,
-            sparse_index,
             workers,
         )
     }
@@ -2373,8 +2205,7 @@ impl StaticExecutor {
             &mut normalized,
         )?;
         let mut hidden = vec![0.0; q * 1024];
-        self.parallel_affine_named(
-            "icl_predictor.decoder.0.weight",
+        self.parallel_affine(
             &normalized,
             q,
             ICL_DIM,
@@ -2418,13 +2249,11 @@ impl StaticExecutor {
         value: StaticContextTensorData<'_>,
         source_rows: usize,
         head_dim: usize,
-        sparse_index: Option<SparseIndex<'_>>,
         workers: usize,
     ) -> Result<Vec<f32>> {
         let weight = self.tensor(&format!("{attn_prefix}.in_proj_weight"))?;
         let bias = self.tensor(&format!("{attn_prefix}.in_proj_bias"))?;
         let mut q_proj = vec![0.0; q.len()];
-        let q_name = format!("{attn_prefix}.in_proj_weight.q");
         let mut q_norm = vec![0.0; q.len()];
         layer_norm_f32(
             q,
@@ -2434,8 +2263,7 @@ impl StaticExecutor {
             Some(self.tensor(&format!("{prefix}.norm1.bias"))?),
             &mut q_norm,
         )?;
-        self.parallel_affine_named(
-            &q_name,
+        self.parallel_affine(
             &q_norm,
             q_rows,
             dim,
@@ -2491,38 +2319,18 @@ impl StaticExecutor {
                     )?;
                 }
                 (StaticContextTensorData::Fp32(key), StaticContextTensorData::Bf16(value)) => {
-                    let used_sparse = if let Some(index) = sparse_index {
-                        sparse_cached_attention_f32_key_bf16_value(
-                            &q_heads,
-                            q_rows,
-                            key,
-                            value,
-                            source_rows,
-                            head_dim,
-                            self.context.has_packed_icl_keys(),
-                            index,
-                            &mut attended,
-                        )?
-                    } else {
-                        false
-                    };
-                    if sparse_index.is_some() {
-                        self.sparse_attention_stats.record(used_sparse);
-                    }
-                    if !used_sparse {
-                        parallel_cached_attention_f32_key_bf16_value(
-                            self.isa,
-                            &q_heads,
-                            q_rows,
-                            key,
-                            value,
-                            source_rows,
-                            head_dim,
-                            self.context.has_packed_icl_keys(),
-                            &mut attended,
-                            workers,
-                        )?;
-                    }
+                    parallel_cached_attention_f32_key_bf16_value(
+                        self.isa,
+                        &q_heads,
+                        q_rows,
+                        key,
+                        value,
+                        source_rows,
+                        head_dim,
+                        self.context.has_packed_icl_keys(),
+                        &mut attended,
+                        workers,
+                    )?;
                 }
                 // Only queries the GPU hands back reach this: widen the
                 // block's FP16 caches and run the FP32 kernel.
@@ -2613,8 +2421,7 @@ impl StaticExecutor {
         }
         let merged = heads_to_tokens(&attended, q_rows, dim, HEADS);
         let mut projected = vec![0.0; q.len()];
-        self.parallel_affine_named(
-            &format!("{attn_prefix}.out_proj.weight"),
+        self.parallel_affine(
             &merged,
             q_rows,
             dim,
@@ -2640,8 +2447,7 @@ impl StaticExecutor {
             Some(self.tensor(&format!("{prefix}.norm2.bias"))?),
             &mut ff_norm,
         )?;
-        self.parallel_affine_named(
-            &ff_name,
+        self.parallel_affine(
             &ff_norm,
             q_rows,
             dim,
@@ -2654,8 +2460,7 @@ impl StaticExecutor {
         let mut activated = vec![0.0; ff.len()];
         self.parallel_gelu(&ff, &mut activated, workers)?;
         let mut ff_out = vec![0.0; q.len()];
-        self.parallel_affine_named(
-            &format!("{prefix}.linear2.weight"),
+        self.parallel_affine(
             &activated,
             q_rows,
             dim * 2,
@@ -2669,164 +2474,6 @@ impl StaticExecutor {
             *value += addition;
         }
         Ok(residual)
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
-    )]
-    fn parallel_affine_named(
-        &self,
-        name: &str,
-        input: &[f32],
-        rows: usize,
-        input_dim: usize,
-        weight: &[f32],
-        bias: Option<&[f32]>,
-        output_dim: usize,
-        output: &mut [f32],
-        workers: usize,
-    ) -> Result<()> {
-        if let Some(packed) = self
-            .packed_bf16_affines
-            .as_deref()
-            .and_then(|affines| affines.get(name))
-        {
-            return self.parallel_packed_bf16_affine(
-                packed, input, rows, input_dim, weight, bias, output_dim, output, workers,
-            );
-        }
-        if let Some(packed) = self
-            .packed_f32_affines
-            .as_deref()
-            .and_then(|affines| affines.get(name))
-        {
-            return self.parallel_packed_f32_affine(
-                packed, input, rows, input_dim, weight, bias, output_dim, output, workers,
-            );
-        }
-        self.parallel_affine(input, rows, input_dim, weight, bias, output_dim, output, workers)
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
-    )]
-    fn parallel_packed_bf16_affine(
-        &self,
-        packed: &PackedBf16Affine,
-        input: &[f32],
-        rows: usize,
-        input_dim: usize,
-        weight: &[f32],
-        bias: Option<&[f32]>,
-        output_dim: usize,
-        output: &mut [f32],
-        workers: usize,
-    ) -> Result<()> {
-        let workers = workers.min(self.affine_pool.current_num_threads()).min(rows);
-        if workers <= 1 || rows < 16 {
-            if Self::run_packed_bf16_affine(packed, input, rows, bias, output, self.bf16_dense_compensation) {
-                return Ok(());
-            }
-            return affine_f32(input, rows, input_dim, weight, bias, output_dim, output);
-        }
-        let rows_per_job = rows.div_ceil(workers);
-        self.affine_pool.install(|| {
-            input
-                .par_chunks(input_dim * rows_per_job)
-                .zip(output.par_chunks_mut(output_dim * rows_per_job))
-                .try_for_each(|(input, output)| {
-                    let chunk_rows = input.len() / input_dim;
-                    if Self::run_packed_bf16_affine(
-                        packed,
-                        input,
-                        chunk_rows,
-                        bias,
-                        output,
-                        self.bf16_dense_compensation,
-                    ) {
-                        Ok(())
-                    } else {
-                        affine_f32(input, chunk_rows, input_dim, weight, bias, output_dim, output)
-                    }
-                })
-        })
-    }
-
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
-    )]
-    fn parallel_packed_f32_affine(
-        &self,
-        packed: &PackedF32Affine,
-        input: &[f32],
-        rows: usize,
-        input_dim: usize,
-        weight: &[f32],
-        bias: Option<&[f32]>,
-        output_dim: usize,
-        output: &mut [f32],
-        workers: usize,
-    ) -> Result<()> {
-        let workers = workers.min(self.affine_pool.current_num_threads()).min(rows);
-        if workers <= 1 || rows < 16 {
-            if packed.run(input, rows, bias, output) {
-                return Ok(());
-            }
-            return affine_f32(input, rows, input_dim, weight, bias, output_dim, output);
-        }
-        let rows_per_job = rows.div_ceil(workers);
-        self.affine_pool.install(|| {
-            input
-                .par_chunks(input_dim * rows_per_job)
-                .zip(output.par_chunks_mut(output_dim * rows_per_job))
-                .try_for_each(|(input, output)| {
-                    let chunk_rows = input.len() / input_dim;
-                    if packed.run(input, chunk_rows, bias, output) {
-                        Ok(())
-                    } else {
-                        affine_f32(input, chunk_rows, input_dim, weight, bias, output_dim, output)
-                    }
-                })
-        })
-    }
-
-    fn run_packed_bf16_affine(
-        packed: &PackedBf16Affine,
-        input: &[f32],
-        rows: usize,
-        bias: Option<&[f32]>,
-        output: &mut [f32],
-        compensation: Bf16AffineCompensation,
-    ) -> bool {
-        BF16_AFFINE_INPUT.with(|input_storage| {
-            let mut input_bf16 = input_storage.borrow_mut();
-            input_bf16.resize(input.len(), 0);
-            if compensation == Bf16AffineCompensation::None {
-                return packed.run_f32(input, rows, bias, output, &mut input_bf16);
-            }
-            if matches!(
-                compensation,
-                Bf16AffineCompensation::Input | Bf16AffineCompensation::FirstOrder
-            ) {
-                return BF16_AFFINE_INPUT_RESIDUAL.with(|residual_storage| {
-                    let mut input_residual_bf16 = residual_storage.borrow_mut();
-                    input_residual_bf16.resize(input.len(), 0);
-                    packed.run_f32_compensated(
-                        input,
-                        rows,
-                        bias,
-                        output,
-                        &mut input_bf16,
-                        &mut input_residual_bf16,
-                        compensation,
-                    )
-                });
-            }
-            packed.run_f32_compensated(input, rows, bias, output, &mut input_bf16, &mut [], compensation)
-        })
     }
 
     #[expect(
@@ -2980,9 +2627,6 @@ impl StaticExecutor {
         qass: bool,
         rope: bool,
     ) -> Result<Vec<f32>> {
-        if self.packed_f32_row && !qass && rope && dim == COLUMN_DIM {
-            return self.packed_row_block(q, source, q_rows, source_rows, prefix);
-        }
         self.model.block(
             q,
             source,
@@ -2994,168 +2638,6 @@ impl StaticExecutor {
             qass,
             rope.then_some(0),
         )
-    }
-
-    #[expect(clippy::too_many_lines, reason = "one transformer block, step by step")]
-    fn packed_row_block(
-        &self,
-        q: &[f32],
-        source: &[f32],
-        q_rows: usize,
-        source_rows: usize,
-        prefix: &str,
-    ) -> Result<Vec<f32>> {
-        let _profile = profile::scope(Category::Block);
-        let norm_weight = self.tensor(&format!("{prefix}.norm1.weight"))?;
-        let norm_bias = self.tensor(&format!("{prefix}.norm1.bias"))?;
-        let mut q_norm = vec![0.0; q.len()];
-        layer_norm_f32(q, q_rows, COLUMN_DIM, norm_weight, Some(norm_bias), &mut q_norm)?;
-        let mut source_norm = vec![0.0; source.len()];
-        layer_norm_f32(
-            source,
-            source_rows,
-            COLUMN_DIM,
-            norm_weight,
-            Some(norm_bias),
-            &mut source_norm,
-        )?;
-
-        let attention = format!("{prefix}.attn");
-        let projection_name = format!("{attention}.in_proj_weight");
-        let weight = self.tensor(&projection_name)?;
-        let bias = self.tensor(&format!("{attention}.in_proj_bias"))?;
-        let matrix_elements = COLUMN_DIM * COLUMN_DIM;
-        let mut q_projection = vec![0.0; q.len()];
-        self.parallel_affine_named(
-            &format!("{projection_name}.q"),
-            &q_norm,
-            q_rows,
-            COLUMN_DIM,
-            &weight[..matrix_elements],
-            Some(&bias[..COLUMN_DIM]),
-            COLUMN_DIM,
-            &mut q_projection,
-            1,
-        )?;
-        let mut k_projection = vec![0.0; source.len()];
-        self.parallel_affine_named(
-            &format!("{projection_name}.k"),
-            &source_norm,
-            source_rows,
-            COLUMN_DIM,
-            &weight[matrix_elements..2 * matrix_elements],
-            Some(&bias[COLUMN_DIM..2 * COLUMN_DIM]),
-            COLUMN_DIM,
-            &mut k_projection,
-            1,
-        )?;
-        let mut v_projection = vec![0.0; source.len()];
-        self.parallel_affine_named(
-            &format!("{projection_name}.v"),
-            &source_norm,
-            source_rows,
-            COLUMN_DIM,
-            &weight[2 * matrix_elements..],
-            Some(&bias[2 * COLUMN_DIM..]),
-            COLUMN_DIM,
-            &mut v_projection,
-            1,
-        )?;
-
-        let mut q_heads = tokens_to_heads(&q_projection, q_rows, COLUMN_DIM, HEADS);
-        let mut k_heads = tokens_to_heads(&k_projection, source_rows, COLUMN_DIM, HEADS);
-        let v_heads = tokens_to_heads(&v_projection, source_rows, COLUMN_DIM, HEADS);
-        let frequencies = self.tensor("row_interactor.tf_row.rope.freqs")?;
-        let mut rotated = vec![0.0; q_heads.len()];
-        rope_non_interleaved_f32(&q_heads, HEADS, q_rows, 16, frequencies, 0, &mut rotated)?;
-        q_heads = rotated;
-        let mut rotated = vec![0.0; k_heads.len()];
-        rope_non_interleaved_f32(&k_heads, HEADS, source_rows, 16, frequencies, 0, &mut rotated)?;
-        k_heads = rotated;
-
-        let scratch_rows = q_rows.min(ATTENTION_QUERY_BLOCK_ROWS);
-        let scratch_sources = source_rows.min(ATTENTION_KEY_TILE_ROWS);
-        let mut scores = vec![0.0; attention_scratch_scores(scratch_rows, scratch_sources)?];
-        let mut maximum = vec![0.0; attention_scratch_state(scratch_rows)?];
-        let mut denominator = vec![0.0; attention_scratch_state(scratch_rows)?];
-        let mut attended = vec![0.0; q_heads.len()];
-        tiled_online_scaled_dot_product_attention_f32(
-            &q_heads,
-            q_rows,
-            &k_heads,
-            &v_heads,
-            source_rows,
-            HEADS,
-            16,
-            ATTENTION_QUERY_BLOCK_ROWS,
-            ATTENTION_KEY_TILE_ROWS,
-            &mut OnlineAttentionScratch {
-                scores: &mut scores,
-                maximum: &mut maximum,
-                denominator: &mut denominator,
-            },
-            &mut attended,
-        )?;
-        let merged = heads_to_tokens(&attended, q_rows, COLUMN_DIM, HEADS);
-        let output_weight_name = format!("{attention}.out_proj.weight");
-        let mut projected = vec![0.0; q.len()];
-        self.parallel_affine_named(
-            &output_weight_name,
-            &merged,
-            q_rows,
-            COLUMN_DIM,
-            self.tensor(&output_weight_name)?,
-            Some(self.tensor(&format!("{attention}.out_proj.bias"))?),
-            COLUMN_DIM,
-            &mut projected,
-            1,
-        )?;
-        let mut residual = q
-            .iter()
-            .zip(projected)
-            .map(|(left, right)| left + right)
-            .collect::<Vec<_>>();
-        let mut ff_norm = vec![0.0; residual.len()];
-        layer_norm_f32(
-            &residual,
-            q_rows,
-            COLUMN_DIM,
-            self.tensor(&format!("{prefix}.norm2.weight"))?,
-            Some(self.tensor(&format!("{prefix}.norm2.bias"))?),
-            &mut ff_norm,
-        )?;
-        let first_weight_name = format!("{prefix}.linear1.weight");
-        let mut hidden = vec![0.0; q_rows * COLUMN_DIM * 2];
-        self.parallel_affine_named(
-            &first_weight_name,
-            &ff_norm,
-            q_rows,
-            COLUMN_DIM,
-            self.tensor(&first_weight_name)?,
-            Some(self.tensor(&format!("{prefix}.linear1.bias"))?),
-            COLUMN_DIM * 2,
-            &mut hidden,
-            1,
-        )?;
-        let mut activated = vec![0.0; hidden.len()];
-        self.parallel_gelu(&hidden, &mut activated, 1)?;
-        let second_weight_name = format!("{prefix}.linear2.weight");
-        let mut addition = vec![0.0; q.len()];
-        self.parallel_affine_named(
-            &second_weight_name,
-            &activated,
-            q_rows,
-            COLUMN_DIM * 2,
-            self.tensor(&second_weight_name)?,
-            Some(self.tensor(&format!("{prefix}.linear2.bias"))?),
-            COLUMN_DIM,
-            &mut addition,
-            1,
-        )?;
-        for (value, addition) in residual.iter_mut().zip(addition) {
-            *value += addition;
-        }
-        Ok(residual)
     }
 
     fn tensor(&self, name: &str) -> Result<&[f32]> {
@@ -3178,58 +2660,6 @@ impl StaticExecutor {
         Ok(tensor.data.slice(ensemble * per_ensemble, per_ensemble))
     }
 
-    fn sparse_index(&self, ensemble: usize, layer: usize) -> Result<Option<SparseIndex<'_>>> {
-        if !sparse_attention_enabled() {
-            return Ok(None);
-        }
-        let Some(centroids) = self.context.tensor("icl.index.centroids") else {
-            return Ok(None);
-        };
-        let radii = self
-            .context
-            .tensor("icl.index.radii")
-            .ok_or_else(|| Error::Artifact("static context sparse index is incomplete".into()))?;
-        let offsets = self
-            .context
-            .tensor("icl.index.offsets")
-            .ok_or_else(|| Error::Artifact("static context sparse index is incomplete".into()))?;
-        let members = self
-            .context
-            .tensor("icl.index.members")
-            .ok_or_else(|| Error::Artifact("static context sparse index is incomplete".into()))?;
-        let centroids = centroids
-            .fp32_values()
-            .ok_or_else(|| Error::Artifact("static context sparse index centroids must be FP32".into()))?;
-        let radii = radii
-            .fp32_values()
-            .ok_or_else(|| Error::Artifact("static context sparse index radii must be FP32".into()))?;
-        let offsets = offsets
-            .fp32_values()
-            .ok_or_else(|| Error::Artifact("static context sparse index offsets must be FP32".into()))?;
-        let members = members
-            .fp32_values()
-            .ok_or_else(|| Error::Artifact("static context sparse index members must be FP32".into()))?;
-        let clusters = usize::try_from(
-            self.context
-                .tensor("icl.index.centroids")
-                .expect("index exists")
-                .dimensions[3],
-        )
-        .map_err(|_| Error::Artifact("static context sparse index cluster count overflows usize".into()))?;
-        let group = ensemble * 12 + layer;
-        let head_centroids = HEADS * clusters * 64;
-        let head_radii = HEADS * clusters;
-        let head_offsets = HEADS * (clusters + 1);
-        let head_members = HEADS * self.context.metadata().training_rows;
-        Ok(Some(SparseIndex {
-            centroids: &centroids[group * head_centroids..][..head_centroids],
-            radii: &radii[group * head_radii..][..head_radii],
-            offsets: &offsets[group * head_offsets..][..head_offsets],
-            members: &members[group * head_members..][..head_members],
-            clusters,
-        }))
-    }
-
     fn column_cache(&self, layer: usize, kind: &str, ensemble: usize, stream: usize) -> Result<&[f32]> {
         let name = format!("column.{layer}.{kind}");
         let tensor = self
@@ -3245,342 +2675,6 @@ impl StaticExecutor {
         let ensemble_elements = (self.context.metadata().feature_count + RESERVED) * stream_elements;
         let offset = ensemble * ensemble_elements + stream * stream_elements;
         Ok(&values[offset..][..stream_elements])
-    }
-
-    fn build_packed_f32_row_affines(model: &Executor) -> Result<BTreeMap<String, PackedF32Affine>> {
-        let mut packed = BTreeMap::new();
-        for block in 0..COLUMN_BLOCKS {
-            let prefix = format!("row_interactor.tf_row.blocks.{block}");
-            let attention = format!("{prefix}.attn");
-            let projection_name = format!("{attention}.in_proj_weight");
-            let projection = model.tensor(&projection_name)?;
-            let matrix_elements = COLUMN_DIM * COLUMN_DIM;
-            for (part, name) in ["q", "k", "v"].into_iter().enumerate() {
-                let start = part * matrix_elements;
-                let weight = projection.get(start..start + matrix_elements).ok_or_else(|| {
-                    Error::Artifact(format!(
-                        "model tensor '{projection_name}' is too short for {name} projection"
-                    ))
-                })?;
-                Self::pack_f32_affine(
-                    &mut packed,
-                    format!("{projection_name}.{name}"),
-                    weight,
-                    COLUMN_DIM,
-                    COLUMN_DIM,
-                )?;
-            }
-            Self::pack_f32_model_affine(
-                &mut packed,
-                model,
-                &format!("{attention}.out_proj.weight"),
-                COLUMN_DIM,
-                COLUMN_DIM,
-            )?;
-            Self::pack_f32_model_affine(
-                &mut packed,
-                model,
-                &format!("{prefix}.linear1.weight"),
-                COLUMN_DIM,
-                COLUMN_DIM * 2,
-            )?;
-            Self::pack_f32_model_affine(
-                &mut packed,
-                model,
-                &format!("{prefix}.linear2.weight"),
-                COLUMN_DIM * 2,
-                COLUMN_DIM,
-            )?;
-        }
-        Ok(packed)
-    }
-
-    fn build_packed_f32_affines(
-        model: &Executor,
-        policy: Bf16DensePolicy,
-    ) -> Result<BTreeMap<String, PackedF32Affine>> {
-        let mut packed = BTreeMap::new();
-        if policy.column_q || policy.column_out || policy.column_ffn1 || policy.column_ffn2 {
-            for block in 0..COLUMN_BLOCKS {
-                let prefix = format!("col_embedder.tf_col.blocks.{block}.multihead_attn2");
-                Self::pack_f32_cached_block(
-                    &mut packed,
-                    model,
-                    &prefix,
-                    &format!("{prefix}.attn"),
-                    COLUMN_DIM,
-                    policy.column_q,
-                    policy.column_out,
-                    policy.column_ffn1,
-                    policy.column_ffn2,
-                )?;
-            }
-        }
-        for block in 0..ICL_BLOCKS {
-            let prefix = format!("icl_predictor.tf_icl.blocks.{block}");
-            let attention = format!("{prefix}.attn");
-            Self::pack_f32_cached_block(
-                &mut packed,
-                model,
-                &prefix,
-                &attention,
-                ICL_DIM,
-                policy.icl_q,
-                policy.icl_out,
-                policy.icl_ffn1,
-                policy.icl_ffn2,
-            )?;
-            if policy.qass {
-                Self::pack_f32_model_affine(
-                    &mut packed,
-                    model,
-                    &format!("{attention}.ssmax_layer.query_mlp.0.weight"),
-                    64,
-                    64,
-                )?;
-                Self::pack_f32_model_affine(
-                    &mut packed,
-                    model,
-                    &format!("{attention}.ssmax_layer.query_mlp.2.weight"),
-                    64,
-                    64,
-                )?;
-            }
-        }
-        if policy.decoder {
-            Self::pack_f32_model_affine(
-                &mut packed,
-                model,
-                "icl_predictor.decoder.0.weight",
-                ICL_DIM,
-                1024,
-            )?;
-        }
-        Ok(packed)
-    }
-
-    #[expect(
-        clippy::fn_params_excessive_bools,
-        reason = "one switch per layer of the bf16-dense experiment"
-    )]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
-    )]
-    fn pack_f32_cached_block(
-        packed: &mut BTreeMap<String, PackedF32Affine>,
-        model: &Executor,
-        prefix: &str,
-        attention: &str,
-        dim: usize,
-        pack_q: bool,
-        pack_out: bool,
-        pack_ffn1: bool,
-        pack_ffn2: bool,
-    ) -> Result<()> {
-        if pack_q {
-            let projection_name = format!("{attention}.in_proj_weight");
-            let projection = model.tensor(&projection_name)?;
-            let q_elements = dim
-                .checked_mul(dim)
-                .ok_or(Error::ArithmeticOverflow("packed FP32 Q projection"))?;
-            let q_weight = projection.get(..q_elements).ok_or_else(|| {
-                Error::Artifact(format!(
-                    "model tensor '{projection_name}' is too short for Q projection"
-                ))
-            })?;
-            Self::pack_f32_affine(packed, format!("{projection_name}.q"), q_weight, dim, dim)?;
-        }
-        if pack_out {
-            Self::pack_f32_model_affine(packed, model, &format!("{attention}.out_proj.weight"), dim, dim)?;
-        }
-        if pack_ffn1 {
-            Self::pack_f32_model_affine(packed, model, &format!("{prefix}.linear1.weight"), dim, dim * 2)?;
-        }
-        if pack_ffn2 {
-            Self::pack_f32_model_affine(packed, model, &format!("{prefix}.linear2.weight"), dim * 2, dim)?;
-        }
-        Ok(())
-    }
-
-    fn pack_f32_model_affine(
-        packed: &mut BTreeMap<String, PackedF32Affine>,
-        model: &Executor,
-        name: &str,
-        input_dim: usize,
-        output_dim: usize,
-    ) -> Result<()> {
-        Self::pack_f32_affine(
-            packed,
-            name.to_owned(),
-            model.tensor(name)?,
-            input_dim,
-            output_dim,
-        )
-    }
-
-    fn pack_f32_affine(
-        packed: &mut BTreeMap<String, PackedF32Affine>,
-        name: String,
-        weight: &[f32],
-        input_dim: usize,
-        output_dim: usize,
-    ) -> Result<()> {
-        let affine = PackedF32Affine::new(weight, input_dim, output_dim).ok_or_else(|| {
-            Error::Artifact(format!(
-                "model tensor '{name}' cannot be packed as FP32 [{output_dim}, {input_dim}]"
-            ))
-        })?;
-        packed.insert(name, affine);
-        Ok(())
-    }
-
-    fn build_packed_bf16_affines(
-        model: &Executor,
-        policy: Bf16DensePolicy,
-        column_blocks: [bool; 3],
-        icl_blocks: [bool; 12],
-    ) -> Result<BTreeMap<String, PackedBf16Affine>> {
-        let mut packed = BTreeMap::new();
-        if policy.column_q || policy.column_out || policy.column_ffn1 || policy.column_ffn2 {
-            for (block, enabled) in column_blocks.into_iter().enumerate() {
-                if !enabled {
-                    continue;
-                }
-                let prefix = format!("col_embedder.tf_col.blocks.{block}.multihead_attn2");
-                Self::pack_cached_block_affines(
-                    &mut packed,
-                    model,
-                    &prefix,
-                    &format!("{prefix}.attn"),
-                    COLUMN_DIM,
-                    policy.column_q,
-                    policy.column_out,
-                    policy.column_ffn1,
-                    policy.column_ffn2,
-                )?;
-            }
-        }
-        for (block, enabled) in icl_blocks.into_iter().enumerate() {
-            if !enabled {
-                continue;
-            }
-            let prefix = format!("icl_predictor.tf_icl.blocks.{block}");
-            let attention = format!("{prefix}.attn");
-            Self::pack_cached_block_affines(
-                &mut packed,
-                model,
-                &prefix,
-                &attention,
-                ICL_DIM,
-                policy.icl_q,
-                policy.icl_out,
-                policy.icl_ffn1,
-                policy.icl_ffn2,
-            )?;
-            if policy.qass {
-                Self::pack_model_affine(
-                    &mut packed,
-                    model,
-                    &format!("{attention}.ssmax_layer.query_mlp.0.weight"),
-                    64,
-                    64,
-                )?;
-                Self::pack_model_affine(
-                    &mut packed,
-                    model,
-                    &format!("{attention}.ssmax_layer.query_mlp.2.weight"),
-                    64,
-                    64,
-                )?;
-            }
-        }
-        if policy.decoder {
-            Self::pack_model_affine(
-                &mut packed,
-                model,
-                "icl_predictor.decoder.0.weight",
-                ICL_DIM,
-                1024,
-            )?;
-        }
-        Ok(packed)
-    }
-
-    #[expect(
-        clippy::fn_params_excessive_bools,
-        reason = "one switch per layer of the bf16-dense experiment"
-    )]
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
-    )]
-    fn pack_cached_block_affines(
-        packed: &mut BTreeMap<String, PackedBf16Affine>,
-        model: &Executor,
-        prefix: &str,
-        attention: &str,
-        dim: usize,
-        pack_q: bool,
-        pack_out: bool,
-        pack_ffn1: bool,
-        pack_ffn2: bool,
-    ) -> Result<()> {
-        if pack_q {
-            let projection_name = format!("{attention}.in_proj_weight");
-            let projection = model.tensor(&projection_name)?;
-            let q_elements = dim
-                .checked_mul(dim)
-                .ok_or(Error::ArithmeticOverflow("packed BF16 Q projection"))?;
-            let q_weight = projection.get(..q_elements).ok_or_else(|| {
-                Error::Artifact(format!(
-                    "model tensor '{projection_name}' is too short for Q projection"
-                ))
-            })?;
-            Self::pack_affine(packed, format!("{projection_name}.q"), q_weight, dim, dim)?;
-        }
-        if pack_out {
-            Self::pack_model_affine(packed, model, &format!("{attention}.out_proj.weight"), dim, dim)?;
-        }
-        if pack_ffn1 {
-            Self::pack_model_affine(packed, model, &format!("{prefix}.linear1.weight"), dim, dim * 2)?;
-        }
-        if pack_ffn2 {
-            Self::pack_model_affine(packed, model, &format!("{prefix}.linear2.weight"), dim * 2, dim)?;
-        }
-        Ok(())
-    }
-
-    fn pack_model_affine(
-        packed: &mut BTreeMap<String, PackedBf16Affine>,
-        model: &Executor,
-        name: &str,
-        input_dim: usize,
-        output_dim: usize,
-    ) -> Result<()> {
-        Self::pack_affine(
-            packed,
-            name.to_owned(),
-            model.tensor(name)?,
-            input_dim,
-            output_dim,
-        )
-    }
-
-    fn pack_affine(
-        packed: &mut BTreeMap<String, PackedBf16Affine>,
-        name: String,
-        weight: &[f32],
-        input_dim: usize,
-        output_dim: usize,
-    ) -> Result<()> {
-        let affine = PackedBf16Affine::new(weight, input_dim, output_dim).ok_or_else(|| {
-            Error::Artifact(format!(
-                "model tensor '{name}' cannot be packed as BF16 [{output_dim}, {input_dim}]"
-            ))
-        })?;
-        packed.insert(name, affine);
-        Ok(())
     }
 }
 
@@ -3637,8 +2731,7 @@ impl StaticExecutor {
         let query_second_bias = self.tensor(&name("query_mlp.2.bias"))?;
         let query_rows = heads * rows;
         let mut query_hidden = vec![0.0; query_rows * 64];
-        self.parallel_affine_named(
-            &query_first_name,
+        self.parallel_affine(
             input,
             query_rows,
             head_dim,
@@ -3650,8 +2743,7 @@ impl StaticExecutor {
         )?;
         let mut activated = vec![0.0; query_hidden.len()];
         self.parallel_gelu(&query_hidden, &mut activated, workers)?;
-        self.parallel_affine_named(
-            &query_second_name,
+        self.parallel_affine(
             &activated,
             query_rows,
             64,
@@ -3961,7 +3053,7 @@ fn validate_static_cache_contract(context: &StaticContextArtifact) -> Result<()>
             )));
         }
     }
-    validate_sparse_index_contract(context)
+    Ok(())
 }
 
 /// The executor's own worker pool, or none where the target cannot start
@@ -4107,151 +3199,8 @@ fn row_source_major_attention_enabled() -> bool {
     crate::kernels::cpu::Isa::detect() == crate::kernels::cpu::Isa::Avx512
 }
 
-const fn sparse_attention_enabled() -> bool {
-    cfg!(feature = "sparse-attention")
-}
-
 fn static_execution_plan(ensembles: usize, total_threads: usize) -> ExecutionPlan {
     ExecutionPlan::automatic(ensembles, total_threads, false)
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    clippy::cast_precision_loss,
-    reason = "a kernel takes its buffers and their shape as plain arguments; its counts are small"
-)]
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::too_many_lines,
-    reason = "sparse indices are whole non-negative f32 values, checked by validate_sparse_index_contract"
-)]
-fn sparse_cached_attention_f32_key_bf16_value(
-    query: &[f32],
-    query_rows: usize,
-    key: &[f32],
-    value: &[u16],
-    source_rows: usize,
-    head_dim: usize,
-    key_is_packed: bool,
-    index: SparseIndex<'_>,
-    output: &mut [f32],
-) -> Result<bool> {
-    const MAX_CANDIDATE_FRACTION: usize = 4;
-    if !key_is_packed
-        || head_dim != 64
-        || source_rows == 0
-        || !source_rows.is_multiple_of(ATTENTION_KEY_TILE_ROWS)
-    {
-        return Ok(false);
-    }
-    let expected = HEADS * query_rows * head_dim;
-    if query.len() != expected || key.len() != HEADS * source_rows * head_dim || value.len() != key.len() {
-        return Err(Error::InvalidArgument(
-            "sparse cached attention dimensions do not match".into(),
-        ));
-    }
-    let scale = (head_dim as f32).sqrt().recip();
-    for head in 0..HEADS {
-        let centroids = &index.centroids[head * index.clusters * head_dim..][..index.clusters * head_dim];
-        let radii = &index.radii[head * index.clusters..][..index.clusters];
-        let offsets =
-            &index.offsets[head * (index.clusters + 1)..=head * (index.clusters + 1) + index.clusters];
-        let members = &index.members[head * source_rows..][..source_rows];
-        for row in 0..query_rows {
-            let query_row = &query[(head * query_rows + row) * head_dim..][..head_dim];
-            let query_norm = query_row.iter().map(|value| value * value).sum::<f32>().sqrt();
-            if !query_norm.is_finite() {
-                return Ok(false);
-            }
-            let mut bounds = (0..index.clusters)
-                .map(|cluster| {
-                    let centroid = &centroids[cluster * head_dim..][..head_dim];
-                    let dot = query_row
-                        .iter()
-                        .zip(centroid)
-                        .fold(0.0_f32, |sum, (left, right)| left.mul_add(*right, sum));
-                    ((dot + query_norm * radii[cluster]) * scale, cluster)
-                })
-                .collect::<Vec<_>>();
-            if bounds.iter().any(|(bound, _)| !bound.is_finite()) {
-                return Ok(false);
-            }
-            bounds.sort_unstable_by(|left, right| right.0.total_cmp(&left.0));
-            let mut selected = vec![false; index.clusters];
-            let mut candidate_scores = Vec::new();
-            let mut accepted = false;
-            for (_, cluster) in bounds.iter().copied() {
-                selected[cluster] = true;
-                let start = offsets[cluster] as usize;
-                let end = offsets[cluster + 1] as usize;
-                for member in &members[start..end] {
-                    let source = *member as usize;
-                    let tile_start = source / ATTENTION_KEY_TILE_ROWS * ATTENTION_KEY_TILE_ROWS;
-                    let tile_rows = (source_rows - tile_start).min(ATTENTION_KEY_TILE_ROWS);
-                    let local_source = source - tile_start;
-                    let key_start = head * source_rows * head_dim + tile_start * head_dim;
-                    let score = query_row
-                        .iter()
-                        .enumerate()
-                        .fold(0.0_f32, |sum, (dimension, query)| {
-                            let key = key[key_start + dimension * tile_rows + local_source];
-                            query.mul_add(key, sum)
-                        })
-                        * scale;
-                    candidate_scores.push((source, score));
-                }
-                if candidate_scores.len() > source_rows / MAX_CANDIDATE_FRACTION {
-                    return Ok(false);
-                }
-                let maximum = candidate_scores
-                    .iter()
-                    .map(|(_, score)| *score)
-                    .fold(f32::NEG_INFINITY, f32::max);
-                let denominator = candidate_scores
-                    .iter()
-                    .map(|(_, score)| (*score - maximum).exp())
-                    .sum::<f32>();
-                let omitted = bounds.iter().filter(|(_, cluster)| !selected[*cluster]).try_fold(
-                    0.0_f32,
-                    |sum, (bound, cluster)| {
-                        let rows = offsets[*cluster + 1] - offsets[*cluster];
-                        let contribution = rows * (*bound - maximum).exp();
-                        (sum + contribution).is_finite().then_some(sum + contribution)
-                    },
-                );
-                let Some(omitted) = omitted else {
-                    return Ok(false);
-                };
-                if denominator.is_finite() && omitted <= denominator * sparse_max_omitted_mass() {
-                    // Dense fallback resets the complete buffer, so direct writes avoid a
-                    // temporary allocation even if a later head rejects sparse execution.
-                    let output_row = &mut output[(head * query_rows + row) * head_dim..][..head_dim];
-                    output_row.fill(0.0);
-                    for (source, score) in &candidate_scores {
-                        let weight = (*score - maximum).exp() / denominator;
-                        let value_row = &value[(head * source_rows + source) * head_dim..][..head_dim];
-                        for dimension in 0..head_dim {
-                            output_row[dimension] +=
-                                weight * f32::from_bits(u32::from(value_row[dimension]) << 16);
-                        }
-                    }
-                    accepted = true;
-                    break;
-                }
-            }
-            if !accepted {
-                return Ok(false);
-            }
-        }
-    }
-    Ok(true)
-}
-
-const fn sparse_max_omitted_mass() -> f32 {
-    // The sparse-attention experiment's omitted-mass certificate (see
-    // docs/experiments.md). Tune by editing this constant and rebuilding.
-    1e-5
 }
 
 #[expect(
@@ -4817,108 +3766,6 @@ fn tokens_to_heads_into(input: &[f32], rows: usize, dim: usize, heads: usize, ou
     }
 }
 
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "row counts are at most a few million, close enough in f32"
-)]
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::float_cmp,
-    reason = "checks that sparse indices are whole, in range, and exact"
-)]
-fn validate_sparse_index_contract(context: &StaticContextArtifact) -> Result<()> {
-    let present = SPARSE_INDEX_TENSORS.map(|name| context.tensor(name));
-    if present.iter().all(Option::is_none) {
-        return Ok(());
-    }
-    if present.iter().any(Option::is_none) {
-        return Err(Error::Artifact(
-            "static context sparse index must contain centroids, radii, offsets, and members".into(),
-        ));
-    }
-    let [Some(centroids), Some(radii), Some(offsets), Some(members)] = present else {
-        unreachable!("sparse index presence was checked")
-    };
-    let metadata = context.metadata();
-    let b = metadata.ensemble_count;
-    let n = metadata.training_rows;
-    let clusters = centroids
-        .dimensions
-        .get(3)
-        .copied()
-        .and_then(|value| usize::try_from(value).ok())
-        .filter(|clusters| (2..=n).contains(clusters))
-        .ok_or_else(|| Error::Artifact("static context sparse index has invalid cluster count".into()))?;
-    let expected_centroids = [b as u64, 12, 8, clusters as u64, 64];
-    let expected_radii = [b as u64, 12, 8, clusters as u64];
-    let expected_offsets = [b as u64, 12, 8, (clusters + 1) as u64];
-    let expected_members = [b as u64, 12, 8, n as u64];
-    if centroids.dimensions != expected_centroids
-        || radii.dimensions != expected_radii
-        || offsets.dimensions != expected_offsets
-        || members.dimensions != expected_members
-    {
-        return Err(Error::Artifact(
-            "static context sparse index tensor shapes are invalid".into(),
-        ));
-    }
-    let _centroids = centroids
-        .fp32_values()
-        .ok_or_else(|| Error::Artifact("static context sparse index centroids must be FP32".into()))?;
-    let radii = radii
-        .fp32_values()
-        .ok_or_else(|| Error::Artifact("static context sparse index radii must be FP32".into()))?;
-    let offsets = offsets
-        .fp32_values()
-        .ok_or_else(|| Error::Artifact("static context sparse index offsets must be FP32".into()))?;
-    let members = members
-        .fp32_values()
-        .ok_or_else(|| Error::Artifact("static context sparse index members must be FP32".into()))?;
-    if radii.iter().any(|value| *value < 0.0) {
-        return Err(Error::Artifact(
-            "static context sparse index radii must be non-negative".into(),
-        ));
-    }
-    for group in 0..b * 12 * 8 {
-        let offset = &offsets[group * (clusters + 1)..=group * (clusters + 1) + clusters];
-        if offset[0] != 0.0 || offset[clusters] != n as f32 {
-            return Err(Error::Artifact(
-                "static context sparse index offsets must span all source rows".into(),
-            ));
-        }
-        let mut previous = 0_usize;
-        for value in offset {
-            if !value.is_finite() || value.fract() != 0.0 || *value < 0.0 || *value > n as f32 {
-                return Err(Error::Artifact(
-                    "static context sparse index offsets must be source-row integers".into(),
-                ));
-            }
-            let current = *value as usize;
-            if current < previous {
-                return Err(Error::Artifact(
-                    "static context sparse index offsets must be monotonic".into(),
-                ));
-            }
-            previous = current;
-        }
-        let mut seen = vec![false; n];
-        for value in &members[group * n..][..n] {
-            if !value.is_finite() || value.fract() != 0.0 || *value < 0.0 || *value >= n as f32 {
-                return Err(Error::Artifact(
-                    "static context sparse index members must be source-row integers".into(),
-                ));
-            }
-            let member = *value as usize;
-            if std::mem::replace(&mut seen[member], true) {
-                return Err(Error::Artifact(
-                    "static context sparse index members must be unique".into(),
-                ));
-            }
-        }
-    }
-    Ok(())
-}
 fn heads_to_tokens(input: &[f32], rows: usize, dim: usize, heads: usize) -> Vec<f32> {
     let mut output = vec![0.0; input.len()];
     heads_to_tokens_into(input, rows, dim, heads, &mut output);
