@@ -21,8 +21,9 @@ encoding and imputation come next.
 
 The current Python exporter runs all training-dependent stages through official
 TabICL. It streams FP32 or BF16 K/V tensors into a temporary artifact and then
-atomically replaces the destination. Version 3 can pack ICL K for the source-lane
-score kernel during export.
+atomically replaces the destination. Its version 3 pre-packed ICL K and BF16 ICL
+K are no longer read (see
+[removed-experiments.md](removed-experiments.md#ircntxt-v3-pre-packed-keys)).
 
 ### Artifact Loader
 

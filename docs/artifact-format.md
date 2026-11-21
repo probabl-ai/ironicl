@@ -2,19 +2,23 @@
 
 ## Static Context Versions
 
-Static-context artifacts use the separate `IRCNTXT\0` format. Three versions
+Static-context artifacts use the separate `IRCNTXT\0` format. Versions 1 and 2
 are supported:
 
 | Version | Tensor storage | ICL K layout |
 |---|---|---|
 | 1 | FP32 only | logical row-major |
-| 2 | explicit FP32 or BF16 per tensor | logical row-major |
-| 3 | explicit FP32 or BF16 per tensor | source-tile, dimension-major |
+| 2 | explicit FP32, BF16, or FP16 per tensor | logical row-major |
+| 3 | removed; the reader rejects it | source-tile, dimension-major |
 
-Versions 2 and 3 keep column caches in FP32. The exporter can store ICL K/V in
-BF16 or retain FP32 K while storing V in BF16. Version 3 physically packs each
-ICL K tile for the source-lane score kernel. Tensor dimensions remain logical.
-Static-context artifacts do not contain model weights.
+Version 2 keeps column caches in FP32 and ICL keys in FP32 or FP16. The CPU
+stores ICL values in BF16 with FP32 keys under `optimize="fast"`; the GPUs store
+ICL keys and values in FP16 under `auto` and `fast`. A context with BF16 ICL keys is rejected when it
+is loaded. Only the removed Python exporter wrote version 3 and BF16 keys; see
+[removed-experiments.md](removed-experiments.md#ircntxt-v3-pre-packed-keys) and
+[removed-experiments.md](removed-experiments.md#bf16-attention-keys). Tensor
+dimensions remain logical. Static-context artifacts do not contain model
+weights.
 
 The fixed little-endian header contains the source-checkpoint SHA-256 identity
 stored inside the model artifact, the context export identity, `B`, `N`, `H`, class count, and the required
@@ -25,8 +29,8 @@ class `[B,C]` and feature `[B,H]` permutations, a sorted named tensor directory,
 A regression context stores class count 0 and no class permutations.
 
 Each tensor directory entry contains its UTF-8 name, rank, dimensions, payload
-offset, and byte length. Versions 2 and 3 also use the existing directory
-reserved field for an explicit FP32 or BF16 dtype. Tensor names are strictly sorted and unique. All
+offset, and byte length. Version 2 also uses the existing directory
+reserved field for an explicit FP32, BF16, or FP16 dtype. Tensor names are strictly sorted and unique. All
 dimensions and byte calculations are checked. Loaders reject non-finite FP32
 and BF16 values, invalid permutations, bad offsets, overlap, padding changes,
 unknown versions, malformed headers, and all resource-limit violations.
@@ -150,10 +154,13 @@ diagnostics but are not a compact serving contract.
 
 ## Layout Strategy
 
-Version 3 packs each ICL K source tile in dimension-major order. This lets one
-AVX-512 vector hold source lanes while a query dimension is broadcast. V remains
-source-major so one sequential V row updates all query accumulators. Model
-weights remain portable and unpacked.
+Contexts store ICL K row-major. The CPU attention kernels pack each K source
+tile in dimension-major order into scratch, so one AVX-512 vector holds source
+lanes while a query dimension is broadcast. Version 3, which stored K already
+packed, is removed; see
+[removed-experiments.md](removed-experiments.md#ircntxt-v3-pre-packed-keys). V
+remains source-major so one sequential V row updates all query accumulators.
+Model weights remain portable and unpacked.
 
 Ironicl no longer reads the optional `icl.index.*` sparse-attention tensors;
 a context that has them loads with them ignored. See
