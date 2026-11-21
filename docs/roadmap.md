@@ -103,8 +103,9 @@ their gates. See [experiments.md](experiments.md#apple-silicon-experiments).
 ## Phase 5: BF16 Storage
 
 Status: partially shipped. The default context stores BF16 ICL values with
-FP32 accumulation, and the executor has packed BF16 affine and dense paths; the
-full accuracy suite, artifact variants, and migration policy remain.
+FP32 accumulation. The packed BF16 affine experiment failed its gates and is
+removed (see [removed-experiments.md](removed-experiments.md#packed-fp32-and-bf16-dense-layers-bf16-dense));
+the full accuracy suite, artifact variants, and migration policy remain.
 
 - BF16 weight conversion and packed kernels;
 - BF16 column and ICL cache storage;
