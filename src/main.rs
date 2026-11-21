@@ -1,9 +1,7 @@
-use std::{env, process, time::Instant};
+use std::{env, process};
 
 use ironicl::{
-    BenchmarkArgs, BenchmarkStats, ClassifierAggregation, Command, CpuCapabilities, Executor, HelpTopic,
-    ImportArgs, InputBundle, InspectArgs, Isa, ModelSource, PlanArgs, RunArgs, StaticContextArtifact,
-    StaticExecutor, StaticQueryBundle, StorageDType,
+    Command, CpuCapabilities, HelpTopic, ImportArgs, InspectArgs, Isa, ModelSource, PlanArgs, StorageDType,
     error::{Error, Result},
     estimate_memory, memory,
     memory::ByteSize,
@@ -25,8 +23,6 @@ fn run() -> Result<()> {
         Command::Plan(args) => print_plan(args)?,
         Command::Inspect(args) => inspect(args)?,
         Command::Import(args) => import(&args)?,
-        Command::Run(args) => run_model(args)?,
-        Command::Benchmark(args) => benchmark(&args)?,
     }
     Ok(())
 }
@@ -194,257 +190,6 @@ fn import(args: &ImportArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_model(args: RunArgs) -> Result<()> {
-    let model_path = match args.source {
-        ModelSource::Checkpoint(path) => match ironicl::prepare_checkpoint(&path, &args.cache)? {
-            ironicl::PreparedCheckpoint::Direct { .. } => {
-                return Err(Error::InvalidArgument(
-                    "run cannot execute a direct checkpoint; remove --no-cache".into(),
-                ));
-            }
-            ironicl::PreparedCheckpoint::Cached { path: model, .. } => model,
-        },
-        ModelSource::Model(path) => path,
-    };
-    let model = ironicl::load_model_artifact(&model_path)?;
-    if let Some(context_path) = args.context {
-        let query = StaticQueryBundle::read(&args.input)?;
-        let context = StaticContextArtifact::read(&context_path)?;
-        let executor = StaticExecutor::new(model, context)?;
-        if args.probabilities {
-            print_probabilities(
-                &executor.predict_bundle_probabilities(&query, ClassifierAggregation::default())?,
-            );
-        } else {
-            print_logits(&executor.predict_bundle(&query)?);
-        }
-        return Ok(());
-    }
-    let input = InputBundle::read(&args.input)?;
-    let executor = Executor::new(model);
-    if args.trace_stages {
-        let trace = executor.predict_logits_with_trace(input.request())?;
-        print_trace_stage("column_embeddings", trace.column_embeddings());
-        print_trace_stage("row_representations", trace.row_representations());
-        print_trace_stage("decoder_logits", trace.decoder_logits());
-        print_logits(trace.logits());
-    } else {
-        print_logits(&executor.predict_logits(input.request())?);
-    }
-    Ok(())
-}
-
-fn benchmark(args: &BenchmarkArgs) -> Result<()> {
-    let input_start = Instant::now();
-    let cached = args.context.is_some();
-    let input = (!cached).then(|| InputBundle::read(&args.input)).transpose()?;
-    let query = cached.then(|| StaticQueryBundle::read(&args.input)).transpose()?;
-    let input_load_ms = input_start.elapsed().as_secs_f64() * 1_000.0;
-    let model_start = Instant::now();
-    let model = ironicl::load_model_artifact(&args.model)?;
-    let model_load_ms = model_start.elapsed().as_secs_f64() * 1_000.0;
-    let executor = (!cached).then(|| Executor::new(model.clone()));
-    let static_executor = args
-        .context
-        .as_ref()
-        .map(|path| StaticContextArtifact::read(path).and_then(|context| StaticExecutor::new(model, context)))
-        .transpose()?;
-
-    let mut durations = Vec::with_capacity(args.iterations as usize);
-    let mut shape = None;
-    let mut checksum = 0.0_f64;
-    for _ in 0..args.warmup {
-        let output = benchmark_prediction(
-            args.probabilities,
-            executor.as_ref(),
-            input.as_ref(),
-            static_executor.as_ref(),
-            query.as_ref(),
-        )?;
-        check_benchmark_prediction(&output, shape)?;
-        shape = Some(output.shape());
-    }
-    ironicl::profile::reset();
-    for _ in 0..args.iterations {
-        let start = Instant::now();
-        let output = benchmark_prediction(
-            args.probabilities,
-            executor.as_ref(),
-            input.as_ref(),
-            static_executor.as_ref(),
-            query.as_ref(),
-        )?;
-        durations.push(start.elapsed());
-        checksum = check_benchmark_prediction(&output, shape)?;
-        shape = Some(output.shape());
-    }
-    let shape = shape.expect("benchmark has at least one iteration");
-    let stats = BenchmarkStats::from_durations(&durations);
-    let elapsed_seconds = durations
-        .iter()
-        .map(std::time::Duration::as_secs_f64)
-        .sum::<f64>();
-    let inferences_per_second = f64::from(args.iterations) / elapsed_seconds;
-    let query_rows_per_second =
-        inferences_per_second * f64::from(u32::try_from(shape[1]).expect("input bundle query rows fit u32"));
-
-    println!("input: {}", args.input.display());
-    println!("model: {}", args.model.display());
-    if let Some(context) = &args.context {
-        println!("context: {}", context.display());
-    }
-    println!("input_load_ms: {input_load_ms:.6}");
-    println!("model_load_ms: {model_load_ms:.6}");
-    println!("warmup: {}", args.warmup);
-    println!("iterations: {}", args.iterations);
-    println!(
-        "output: {}",
-        if args.probabilities {
-            "probabilities"
-        } else {
-            "estimator_logits"
-        }
-    );
-    println!("shape: {} {} {}", shape[0], shape[1], shape[2]);
-    println!("min_ms: {:.6}", stats.min_ms);
-    println!("p50_ms: {:.6}", stats.p50_ms);
-    println!("p95_ms: {:.6}", stats.p95_ms);
-    println!("p99_ms: {:.6}", stats.p99_ms);
-    println!("max_ms: {:.6}", stats.max_ms);
-    println!("mean_ms: {:.6}", stats.mean_ms);
-    println!("inferences_per_second: {inferences_per_second:.6}");
-    println!("query_rows_per_second: {query_rows_per_second:.6}");
-    println!("output_checksum: {checksum:.9e}");
-    if !args.probabilities {
-        println!("logits_checksum: {checksum:.9e}");
-    }
-    let samples = durations
-        .iter()
-        .map(|duration| duration.as_nanos().to_string())
-        .collect::<Vec<_>>()
-        .join(",");
-    println!("samples_ns: {samples}");
-    ironicl::profile::report();
-    Ok(())
-}
-
-enum BenchmarkPrediction {
-    Logits(ironicl::DecoderOutputs),
-    Probabilities(ironicl::ClassifierProbabilities),
-}
-
-impl BenchmarkPrediction {
-    fn shape(&self) -> [usize; 3] {
-        match self {
-            Self::Logits(logits) => logits.shape(),
-            Self::Probabilities(probabilities) => {
-                let [rows, classes] = probabilities.shape();
-                [1, rows, classes]
-            }
-        }
-    }
-
-    fn values(&self) -> &[f32] {
-        match self {
-            Self::Logits(logits) => logits.values(),
-            Self::Probabilities(probabilities) => probabilities.values(),
-        }
-    }
-}
-
-fn benchmark_prediction(
-    probabilities: bool,
-    executor: Option<&Executor>,
-    input: Option<&InputBundle>,
-    static_executor: Option<&StaticExecutor>,
-    query: Option<&StaticQueryBundle>,
-) -> Result<BenchmarkPrediction> {
-    if probabilities {
-        return Ok(BenchmarkPrediction::Probabilities(
-            static_executor
-                .expect("cached executor")
-                .predict_bundle_probabilities(
-                    query.expect("cached query"),
-                    ClassifierAggregation::default(),
-                )?,
-        ));
-    }
-    let logits = if let (Some(executor), Some(input)) = (executor, input) {
-        executor.predict_logits(input.request())?
-    } else {
-        static_executor
-            .expect("cached executor")
-            .predict_bundle(query.expect("cached query"))?
-    };
-    Ok(BenchmarkPrediction::Logits(logits))
-}
-
-fn check_benchmark_prediction(
-    output: &BenchmarkPrediction,
-    expected_shape: Option<[usize; 3]>,
-) -> Result<f64> {
-    if expected_shape.is_some_and(|shape| shape != output.shape()) {
-        return Err(Error::InvalidArgument(
-            "benchmark output shape changed between inferences".into(),
-        ));
-    }
-    if output.values().iter().any(|value| !value.is_finite()) {
-        return Err(Error::InvalidArgument(
-            "benchmark output contains a non-finite value".into(),
-        ));
-    }
-    Ok(output.values().iter().map(|value| f64::from(*value)).sum())
-}
-
-fn print_trace_stage<const D: usize>(name: &str, stage: &ironicl::TraceStage<D>) {
-    let values = stage.values();
-    let min = values.iter().copied().fold(f32::INFINITY, f32::min);
-    let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let sum = values.iter().sum::<f32>();
-    let first = values
-        .iter()
-        .take(8)
-        .map(|value| format!("{value:.9e}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let shape = stage
-        .shape()
-        .iter()
-        .map(usize::to_string)
-        .collect::<Vec<_>>()
-        .join(" ");
-    println!("trace {name}: shape: {shape}; min: {min:.9e}; max: {max:.9e}; sum: {sum:.9e}; first8: {first}");
-}
-
-fn print_logits(logits: &ironicl::DecoderOutputs) {
-    let [ensembles, test_rows, classes] = logits.shape();
-    println!("shape: {ensembles} {test_rows} {classes}");
-    for ensemble in 0..ensembles {
-        for row in 0..test_rows {
-            let offset = (ensemble * test_rows + row) * classes;
-            let values = logits.values()[offset..][..classes]
-                .iter()
-                .map(|value| format!("{value:.9e}"))
-                .collect::<Vec<_>>()
-                .join(" ");
-            println!("logits[{ensemble},{row}]: {values}");
-        }
-    }
-}
-
-fn print_probabilities(probabilities: &ironicl::ClassifierProbabilities) {
-    let [rows, classes] = probabilities.shape();
-    println!("shape: {rows} {classes}");
-    for row in 0..rows {
-        let values = probabilities.values()[row * classes..][..classes]
-            .iter()
-            .map(|value| format!("{value:.9e}"))
-            .collect::<Vec<_>>()
-            .join(" ");
-        println!("probabilities[{row}]: {values}");
-    }
-}
-
 fn print_help(topic: Option<HelpTopic>) {
     let text = match topic {
         None => {
@@ -453,9 +198,7 @@ fn print_help(topic: Option<HelpTopic>) {
                ironicl platform\n\
                ironicl plan [options]\n\
                ironicl inspect (--checkpoint FILE | --model FILE)\n\
-               ironicl import --checkpoint FILE --output FILE\n\
-               ironicl run (--checkpoint FILE | --model FILE) --input FILE [options]\n\
-               ironicl benchmark --model FILE --input FILE [--context FILE] [--warmup N] [--iterations N]\n\n\
+               ironicl import --checkpoint FILE --output FILE\n\n\
              Use 'ironicl help COMMAND' for command-specific help."
         }
         Some(HelpTopic::Platform) => "Usage: ironicl platform",
@@ -466,32 +209,6 @@ fn print_help(topic: Option<HelpTopic>) {
         Some(HelpTopic::Import) => {
             "Usage: ironicl import --checkpoint FILE --output FILE\n\n\
              Convert a PyTorch checkpoint to a portable Ironicl model."
-        }
-        Some(HelpTopic::Run) => {
-            "Usage: ironicl run (--checkpoint FILE | --model FILE) --input FILE [--context FILE] [options]\n\n\
-              Input:\n\
-                 --input FILE    IRINPUT, or IRQUERY when --context is set\n\
-                 --context FILE  full-K/V static-context artifact\n\n\
-             Options for --checkpoint:\n\
-               --no-cache\n\
-               --rebuild-cache\n\
-               --cache-dir DIR\n\n\
-             --trace-stages   print retained coarse stage outputs; use small requests\n\n\
-             --probabilities  aggregate cached estimator logits into predict_proba output\n\n\
-              Checkpoints are imported to a content-addressed cache automatically.\n\
-              --no-cache is not available for execution because it does not create an artifact."
-        }
-        Some(HelpTopic::Benchmark) => {
-            "Usage: ironicl benchmark --model FILE --input FILE [--context FILE] [--probabilities] [--warmup N] [--iterations N]\n\n\
-             Benchmark resident model-only inference. Checkpoints are not accepted, so import and conversion remain outside comparable timing.\n\n\
-             Options:\n\
-               --model FILE      imported Ironicl model artifact\n\
-               --input FILE      IRINPUT, or IRQUERY when --context is set\n\
-                --context FILE    full-K/V static-context artifact\n\
-                --probabilities   time final cached predict_proba output\n\
-                --warmup N        untimed inferences, 0..=1000 (default: 2)\n\
-               --iterations N    timed inferences, 1..=10000 (default: 10)\n\n\
-             Latency percentiles use nearest-rank: ceil(percentile * iterations)."
         }
         Some(HelpTopic::Plan) => {
             "Usage: ironicl plan [options]\n\n\
