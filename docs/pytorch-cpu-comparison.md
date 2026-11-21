@@ -199,9 +199,10 @@ performance optimization by itself.
   thresholds from `1e-5` through `1e-1`. Its best M=64 result, `195.00 ms`, was
   effectively tied with the `195.17 ms` indexed dense control.
 
-Sparse work is disabled by default. A different retrieval method must first
-show that it can safely skip meaningful work before a cluster-specific K/V
-layout is justified.
+The sparse index is now removed (see
+[removed-experiments.md](removed-experiments.md#sparse-icl-attention-sparse-attention)).
+A different retrieval method must first show that it can safely skip meaningful
+work before a cluster-specific K/V layout is justified.
 
 ### Dense Fusion and Reduced Precision
 

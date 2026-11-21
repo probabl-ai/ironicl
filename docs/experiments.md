@@ -255,11 +255,11 @@ scheduler rather than claiming it as an optimization.
 
 ### Sparse Index Quality
 
-The v3 sparse index remains opt-in through the `sparse-attention` cargo feature
-(build with `--features sparse-attention`; it is never enabled at runtime). It
-uses exact candidate scores and a maximum omitted-mass certificate of `1e-5`;
-it falls back to dense attention when the certificate fails. The checkpoint and
-dense K/V tensors remain unchanged.
+The v3 sparse index was opt-in, and it is now removed (see
+[removed-experiments.md](removed-experiments.md#sparse-icl-attention-sparse-attention)).
+It used exact candidate scores and a maximum omitted-mass certificate of `1e-5`;
+it fell back to dense attention when the certificate failed. The checkpoint and
+dense K/V tensors remained unchanged.
 
 Increasing the deterministic per-head K-means index from 16 to 64 clusters
 increased the artifact from 1,403,102,496 to 1,412,834,592 bytes. Before the
@@ -273,8 +273,8 @@ speedup, so do not enable it for serving yet.
 Executor-owned telemetry, reset after warmup, measured 1,920 M=64 sparse ICL
 calls over 20 timed requests: 0 accepted and 1,920 dense fallbacks under the
 default `1e-5` omitted-mass certificate. Candidate K/V layout is therefore not
-the current blocker. Raising the omitted-mass certificate (then a runtime knob,
-now the `1e-5` constant under the feature) to `1e-3`, `1e-2`, and `1e-1` also
+the current blocker. Raising the omitted-mass certificate (then a runtime knob)
+to `1e-3`, `1e-2`, and `1e-1` also
 accepted zero calls. The `1e-1` 50-sample run had
 `196.35 ms` p50 versus `195.17 ms` indexed dense, with bit-identical output.
 Threshold tuning is closed for this index. The next sparse work is stronger
@@ -301,7 +301,8 @@ cache at 50,000 rows or more in 16 GiB.
 The hybrid policy is the current large-context choice. Full BF16 reduces storage
 but does not improve latency and has substantially higher error.
 
-An opt-in profile (the `attention-stats` cargo feature) sampled the first query from all
+An opt-in profile (later the `attention-stats` cargo feature, now
+[removed](removed-experiments.md#attention-mass-profile-attention-stats)) sampled the first query from all
 96 ICL head/layer calls. Top-4096 mass ranged from 4.1% to 100%, with a 62.0%
 median. Top-16384 mass ranged from 16.4% to 100%, with an 89.2% median. A fixed
 small top-K policy is therefore not safe. Some heads are close to uniform and
