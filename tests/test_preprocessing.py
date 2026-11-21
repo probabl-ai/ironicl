@@ -6,15 +6,9 @@ live comparisons belong in tests/parity; see docs/validation.md for setup.
 
 from __future__ import annotations
 
-import importlib.util
-import json
-import struct
 import subprocess
 import sys
-import tempfile
 import unittest
-from pathlib import Path
-from unittest.mock import patch
 
 import numpy as np
 from numpy.testing import assert_array_equal
@@ -157,36 +151,6 @@ _core.preprocess(x, labels=("int", np.arange(40) % 3), n_estimators=8, random_st
                  norm_methods=["none", "power"], outlier_threshold=4.0).query_rows(x[:2])
 """
         subprocess.run([sys.executable, "-B", "-c", script], check=True)
-
-    def test_real_dataset_export_matches_rust_preprocessing(self):
-        path = Path(__file__).parents[1] / "tools" / "prepare_real_dataset.py"
-        spec = importlib.util.spec_from_file_location("prepare_real_dataset", path)
-        exporter = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(exporter)
-        with tempfile.TemporaryDirectory() as directory:
-            output = Path(directory) / "input.irinput"
-            argv = [str(path), "--dataset", "covertype", "--train-rows", "25", "--test-rows", "9",
-                    "--estimators", "8", "--output", str(output)]  # fmt: skip
-            with (
-                patch.object(sys, "argv", argv),
-                patch.object(exporter, "load_dataset", return_value=(self.x, self.y, "fixture")),
-                patch("builtins.print"),
-            ):
-                exporter.main()
-            metadata = json.loads(output.with_suffix(".json").read_text())
-            self.assertEqual(metadata["normalization_methods"], ["none", "power"])
-            self.assertEqual(metadata["shape"], [8, 34, 4])
-            encoded = output.read_bytes()
-        header = struct.unpack_from("<8sIIQQQQQQQQ", encoded)
-        self.assertEqual(header[:3], (b"IRINPUT\0", 1, 1))
-        x_train, x_test, y_train, _ = exporter.stratified_rows(self.x, self.y, 25, 9, 42)
-        preprocessed = preprocess(x_train, y_train, random_state=42)
-        x_values = np.frombuffer(encoded, dtype="<f4", count=header[7], offset=80).reshape(8, 34, 4)
-        y_values = np.frombuffer(encoded, dtype="<f4", count=header[8], offset=80 + header[9]).reshape(8, 25)
-        rows, targets, _, _ = preprocessed.training_inputs()
-        assert_array_equal(x_values[:, :25], _array(*rows))
-        assert_array_equal(x_values[:, 25:], _array(*preprocessed.query_rows(x_test)))
-        assert_array_equal(y_values, _array(*targets))
 
 
 if __name__ == "__main__":

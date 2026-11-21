@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::progress::Stage;
 use crate::{
     Error, ModelArtifact, QueryRequest, RegressionOutput, Request, Result, StaticContextArtifact,
-    StaticContextMetadata, StaticContextTensor, StaticContextTensorData, StaticQueryBundle, TaskKind,
+    StaticContextMetadata, StaticContextTensor, StaticContextTensorData, TaskKind,
     format::static_context::{PageAlignedTensors, TensorStorage},
     kernels::{
         cpu::{
@@ -198,65 +198,6 @@ impl ClassifierProbabilities {
     }
 }
 
-/// Owned FP32 values for a traced classifier stage in row-major order.
-#[derive(Debug, Clone, PartialEq)]
-pub struct TraceStage<const D: usize> {
-    shape: [usize; D],
-    values: Vec<f32>,
-}
-
-impl<const D: usize> TraceStage<D> {
-    /// Stage dimensions in row-major order.
-    #[must_use]
-    pub fn shape(&self) -> [usize; D] {
-        self.shape
-    }
-
-    /// Stage values in row-major order.
-    #[must_use]
-    pub fn values(&self) -> &[f32] {
-        &self.values
-    }
-}
-
-/// Coarse intermediate outputs from one classifier prediction.
-///
-/// This diagnostic result retains all requested ensemble stage outputs. Use it
-/// only for small requests because it increases the activation memory needed.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ForwardTrace {
-    column_embeddings: TraceStage<4>,
-    row_representations: TraceStage<3>,
-    decoder_logits: TraceStage<3>,
-    logits: DecoderOutputs,
-}
-
-impl ForwardTrace {
-    /// Column embeddings with shape `[B, T, H + 4, 128]`.
-    #[must_use]
-    pub fn column_embeddings(&self) -> &TraceStage<4> {
-        &self.column_embeddings
-    }
-
-    /// Row representations with shape `[B, T, 512]`, before ICL label injection.
-    #[must_use]
-    pub fn row_representations(&self) -> &TraceStage<3> {
-        &self.row_representations
-    }
-
-    /// Decoder outputs with shape `[B, T, width]`, before test-row and class slicing.
-    #[must_use]
-    pub fn decoder_logits(&self) -> &TraceStage<3> {
-        &self.decoder_logits
-    }
-
-    /// Final prediction logits with shape `[B, test_rows, classes]`.
-    #[must_use]
-    pub fn logits(&self) -> &DecoderOutputs {
-        &self.logits
-    }
-}
-
 impl DecoderOutputs {
     /// Wrap row-major `[B, rows, outputs]` values.
     ///
@@ -364,11 +305,6 @@ impl SparseAttentionStats {
             fallback: attempted.saturating_sub(accepted),
         }
     }
-}
-
-enum PredictionResult {
-    Logits(DecoderOutputs),
-    Trace(ForwardTrace),
 }
 
 impl Executor {
@@ -967,34 +903,11 @@ impl Executor {
     /// baseline activation memory or an
     /// unavailable validated model tensor. This uncached scalar executor is
     /// intended for small baseline runs, not 50K-row serving workloads.
-    pub fn predict_logits(&self, request: Request<'_>) -> Result<DecoderOutputs> {
-        match self.predict_logits_inner(request, false)? {
-            PredictionResult::Logits(logits) => Ok(logits),
-            PredictionResult::Trace(_) => unreachable!("normal prediction cannot produce a trace"),
-        }
-    }
-
-    /// Execute the classifier and retain coarse stage outputs for diagnostics.
-    ///
-    /// The trace is admitted with the same resource limit as normal execution,
-    /// but stores all ensemble outputs. Use only small requests.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same errors as [`Self::predict_logits`], including a resource
-    /// error when retained trace outputs exceed the activation limit.
-    pub fn predict_logits_with_trace(&self, request: Request<'_>) -> Result<ForwardTrace> {
-        match self.predict_logits_inner(request, true)? {
-            PredictionResult::Logits(_) => unreachable!("traced prediction must produce a trace"),
-            PredictionResult::Trace(trace) => Ok(trace),
-        }
-    }
-
     #[expect(
         clippy::many_single_char_names,
         reason = "b, q, h, n, c name the model's dimensions"
     )]
-    fn predict_logits_inner(&self, request: Request<'_>, trace: bool) -> Result<PredictionResult> {
+    pub fn predict_logits(&self, request: Request<'_>) -> Result<DecoderOutputs> {
         let (b, t, h, n) = (
             request.ensemble_count(),
             request.total_rows(),
@@ -1003,9 +916,6 @@ impl Executor {
         );
         let width = self.decoder_width()?;
         admit_request(b, t, h, n, width)?;
-        if trace {
-            admit_trace_request(b, t, h, width)?;
-        }
         // A regression fit keeps every decoded quantile.
         let classes = match self.validate_targets(request.y_train(), b, n)? {
             0 => width,
@@ -1014,54 +924,21 @@ impl Executor {
         let test = t.checked_sub(n).ok_or(Error::ArithmeticOverflow("test rows"))?;
         let output_len = checked_product(&[b, test, classes], "decoder output")?;
         let mut values = Vec::with_capacity(output_len);
-        let mut column_values = trace.then(Vec::new);
-        let mut row_values = trace.then(Vec::new);
-        let mut decoder_values = trace.then(Vec::new);
         for ensemble in 0..b {
             let x = &request.x()[checked_product(&[ensemble, t, h], "feature offset")?..]
                 [..checked_product(&[t, h], "feature rows")?];
             let labels = &request.y_train()[ensemble * n..][..n];
             let (columns, _) = self.column_embeddings(x, labels, t, h, n, false)?;
             let rows = self.row_embeddings(&columns, t, h + RESERVED)?;
-            if let Some(trace_values) = &mut column_values {
-                trace_values.extend_from_slice(&columns);
-            }
-            if let Some(trace_values) = &mut row_values {
-                trace_values.extend_from_slice(&rows);
-            }
             let logits = self.icl_logits(rows, labels, t, n)?;
-            if let Some(trace_values) = &mut decoder_values {
-                trace_values.extend_from_slice(&logits);
-            }
             for row in n..t {
                 values.extend_from_slice(&logits[row * width..][..classes]);
             }
         }
-        let logits = DecoderOutputs {
+        Ok(DecoderOutputs {
             shape: [b, test, classes],
             values,
-        };
-        match (column_values, row_values, decoder_values) {
-            (Some(column_embeddings), Some(row_representations), Some(decoder_logits)) => {
-                Ok(PredictionResult::Trace(ForwardTrace {
-                    column_embeddings: TraceStage {
-                        shape: [b, t, h + RESERVED, COLUMN_DIM],
-                        values: column_embeddings,
-                    },
-                    row_representations: TraceStage {
-                        shape: [b, t, ICL_DIM],
-                        values: row_representations,
-                    },
-                    decoder_logits: TraceStage {
-                        shape: [b, t, width],
-                        values: decoder_logits,
-                    },
-                    logits,
-                }))
-            }
-            (None, None, None) => Ok(PredictionResult::Logits(logits)),
-            _ => Err(Error::InvalidArgument("incomplete trace output".into())),
-        }
+        })
     }
 
     /// Embed every feature stream. With `capture`, also return each feature's
@@ -1691,23 +1568,6 @@ impl Executor {
 }
 
 impl StaticExecutor {
-    /// Pair an official classifier model with its matching exact full-K/V context.
-    ///
-    /// # Errors
-    ///
-    /// Returns an artifact error if the model identity, architecture, or required
-    /// cache tensor names and shapes do not match the serving contract, or when
-    /// `IRONICL_MEMORY_LIMIT` or `IRONICL_DEVICE_MEMORY_LIMIT` is invalid.
-    pub fn new(model: ModelArtifact, context: StaticContextArtifact) -> Result<Self> {
-        Self::with_executor(
-            Executor::new(model),
-            context,
-            Optimize::Safe,
-            None,
-            MemoryLimits::resolve(None, None)?,
-        )
-    }
-
     /// Write this context to `path` atomically, for reuse by [`Executor::load_context`].
     ///
     /// # Errors
@@ -2345,44 +2205,6 @@ impl StaticExecutor {
         }
         let logits = self.predict_logits(request)?;
         aggregate_classifier_probabilities(&logits, &self.context.metadata().class_permutations, aggregation)
-    }
-
-    /// Validate artifact identities and execute one owned query bundle.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the query references another model or static
-    /// context, or when normal query execution fails.
-    pub fn predict_bundle(&self, query: &StaticQueryBundle) -> Result<DecoderOutputs> {
-        if query.model_sha256() != &self.context.metadata().model_sha256
-            || query.context_sha256() != &self.context.metadata().context_sha256
-        {
-            return Err(Error::InvalidArgument(
-                "query bundle model or context identity does not match the static context".into(),
-            ));
-        }
-        self.predict_logits(query.request()?)
-    }
-
-    /// Validate artifact identities and return final aggregated probabilities.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the query references another model or static
-    /// context, or when normal query execution fails.
-    pub fn predict_bundle_probabilities(
-        &self,
-        query: &StaticQueryBundle,
-        aggregation: ClassifierAggregation,
-    ) -> Result<ClassifierProbabilities> {
-        if query.model_sha256() != &self.context.metadata().model_sha256
-            || query.context_sha256() != &self.context.metadata().context_sha256
-        {
-            return Err(Error::InvalidArgument(
-                "query bundle model or context identity does not match the static context".into(),
-            ));
-        }
-        self.predict_probabilities(query.request()?, aggregation)
     }
 
     fn cached_column_embeddings(
@@ -4930,29 +4752,6 @@ fn admit_static_request(
     if activation_peak > MAX_ACTIVATION_ELEMENTS {
         return Err(Error::InvalidArgument(format!(
             "query exceeds the cached FP32 activation limit of {MAX_ACTIVATION_BYTES} bytes"
-        )));
-    }
-    Ok(())
-}
-
-/// Trace buffers retain every ensemble's coarse stage output at once.
-fn admit_trace_request(b: usize, t: usize, h: usize, width: usize) -> Result<()> {
-    let streams = h
-        .checked_add(RESERVED)
-        .ok_or(Error::ArithmeticOverflow("column streams"))?;
-    let trace_elements = checked_sum(
-        &[
-            checked_product(&[b, t, streams, COLUMN_DIM], "trace column embeddings")?,
-            checked_product(&[b, t, ICL_DIM], "trace row representations")?,
-            checked_product(&[b, t, width], "trace decoder logits")?,
-        ],
-        "trace outputs",
-    )?;
-    // Reserve half the global limit for the normal forward graph, whose peak
-    // overlaps retained trace buffers while the final ensemble is executing.
-    if trace_elements > MAX_ACTIVATION_ELEMENTS / 2 {
-        return Err(Error::InvalidArgument(format!(
-            "trace outputs exceed half the uncached scalar activation limit of {MAX_ACTIVATION_BYTES} bytes"
         )));
     }
     Ok(())

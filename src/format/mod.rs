@@ -1,16 +1,14 @@
 //! Shared primitives for Ironicl's on-disk artifact containers.
 //!
-//! Every artifact format — the model artifact, the static context, the query
-//! bundle, and the input bundle — is a little-endian container: a fixed header,
-//! an optional 64-byte-aligned tensor payload, and a trailing SHA-256 digest
-//! over all preceding bytes. This module holds the byte-level primitives they
-//! all share. Each format still owns its own header layout, magic, version, and
-//! dtype numbering; only the mechanics live here.
+//! Every artifact format — the model artifact, the preprocessor, and the static
+//! context — is a little-endian container: a fixed header, an optional
+//! 64-byte-aligned tensor payload, and a trailing SHA-256 digest over all
+//! preceding bytes. This module holds the byte-level primitives they all share.
+//! Each format still owns its own header layout, magic, version, and dtype
+//! numbering; only the mechanics live here.
 
-pub mod input_bundle;
 pub mod model;
 pub mod preprocessor;
-pub mod query_bundle;
 pub mod static_context;
 
 use std::fmt;

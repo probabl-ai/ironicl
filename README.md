@@ -52,26 +52,28 @@ You need Rust (via [rustup](https://rustup.rs)) and Python 3.12 or newer.
      --output classifier.irmodel
    ```
 
-4. Prepare a small request from the Covertype dataset:
+4. Install the Python package:
 
    ```bash
    python3 -m venv .venv
    .venv/bin/python -m pip install .
-   .venv/bin/python tools/prepare_real_dataset.py \
-     --dataset covertype --train-rows 1024 --test-rows 8 \
-     --output covertype.irinput
    ```
 
-5. Run inference:
+5. Fit and predict on a small dataset:
 
-   ```bash
-   ./target/release/ironicl run --model classifier.irmodel --input covertype.irinput
+   ```python
+   from sklearn.datasets import load_iris
+   from ironicl import TabICLClassifier
+
+   X, y = load_iris(return_X_y=True)
+   clf = TabICLClassifier(model_path="tabicl-classifier-v2-20260212.ckpt").fit(X[::2], y[::2])
+   print(clf.predict_proba(X[1::2][:5]))
    ```
 
-   Ironicl prints one row of class logits for each test row.
+   Ironicl prints one row of class probabilities for each test row.
 
-See the [command-line reference](docs/cli.md) for `inspect`, `plan`, `platform`,
-and `benchmark`.
+See the [command-line reference](docs/cli.md) for `inspect`, `plan`, and
+`platform`.
 
 ## Python Package
 
