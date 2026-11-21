@@ -1,4 +1,8 @@
 //! Opt-in internal phase timing for kernel development.
+//!
+//! Timing runs only in a build with the `profile` feature and with `IRONICL_PROFILE` set when
+//! the first scope opens. [`report`] returns `(category, calls, total seconds)` for every
+//! category, accumulated since the start or the last [`reset`]; otherwise it returns nothing.
 
 #[derive(Clone, Copy)]
 #[repr(usize)]
@@ -105,25 +109,23 @@ mod implementation {
         }
     }
 
-    pub fn report() {
+    pub fn report() -> Vec<(&'static str, u64, f64)> {
         if !*ENABLED.get_or_init(|| std::env::var_os("IRONICL_PROFILE").is_some()) {
-            return;
+            return Vec::new();
         }
-        for category in Category::ALL {
-            let index = category as usize;
-            let nanos = NANOS[index].load(Ordering::Relaxed);
-            let calls = CALLS[index].load(Ordering::Relaxed);
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "a printed timing; nanoseconds below 2^53 are exact"
-            )]
-            let milliseconds = nanos as f64 / 1_000_000.0;
-            eprintln!(
-                "profile_{}_ms: {:.6} calls={calls}",
-                category.name(),
-                milliseconds
-            );
-        }
+        Category::ALL
+            .into_iter()
+            .map(|category| {
+                let index = category as usize;
+                let nanos = NANOS[index].load(Ordering::Relaxed);
+                #[expect(
+                    clippy::cast_precision_loss,
+                    reason = "a reported timing; nanoseconds below 2^53 are exact"
+                )]
+                let seconds = nanos as f64 / 1e9;
+                (category.name(), CALLS[index].load(Ordering::Relaxed), seconds)
+            })
+            .collect()
     }
 }
 
@@ -140,7 +142,11 @@ mod implementation {
     }
 
     pub const fn reset() {}
-    pub const fn report() {}
+
+    #[must_use]
+    pub const fn report() -> Vec<(&'static str, u64, f64)> {
+        Vec::new()
+    }
 }
 
 pub use implementation::{report, reset, scope};

@@ -598,6 +598,21 @@ impl FittedModel {
     }
 }
 
+/// The engine's phase timings since the start or the last `profile_reset`, as
+/// `(category, calls, total seconds)` tuples. Empty unless the extension is
+/// built with the `profile` feature and `IRONICL_PROFILE` is set before the
+/// first fit or prediction.
+#[pyfunction]
+fn profile_report() -> Vec<(&'static str, u64, f64)> {
+    crate::profile::report()
+}
+
+/// Zero the timings `profile_report` returns.
+#[pyfunction]
+fn profile_reset() {
+    crate::profile::reset();
+}
+
 #[pymodule]
 #[pyo3(name = "_core")]
 fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -607,5 +622,7 @@ fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(preprocess, module)?)?;
     module.add_function(wrap_pyfunction!(parse_size, module)?)?;
     module.add_function(wrap_pyfunction!(system_info, module)?)?;
+    module.add_function(wrap_pyfunction!(profile_report, module)?)?;
+    module.add_function(wrap_pyfunction!(profile_reset, module)?)?;
     module.add_function(wrap_pyfunction!(plan_memory, module)?)
 }

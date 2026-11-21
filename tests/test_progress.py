@@ -1,4 +1,4 @@
-"""verbose progress, Ctrl-C during prediction, and show_config."""
+"""verbose progress, Ctrl-C during prediction, show_config, and the profile timers."""
 
 import contextlib
 import io
@@ -9,7 +9,7 @@ from unittest import mock
 import numpy as np
 
 import ironicl.progress
-from ironicl import TabICLClassifier, show_config
+from ironicl import TabICLClassifier, _core, show_config
 from tests.test_pickle import checkpoint, data
 
 
@@ -23,6 +23,22 @@ class ProgressTest(unittest.TestCase):
         lines = stderr.getvalue().splitlines()
         self.assertEqual(len(lines), 11)
         self.assertEqual(lines[-1], "ironicl: Predicting: 100/100 rows")
+
+    def test_the_profile_report_times_a_fit_and_a_prediction(self):
+        # Empty unless built with the profile feature and run with IRONICL_PROFILE set.
+        checkpoint(TabICLClassifier)
+        x, y = data()
+        _core.profile_reset()
+        TabICLClassifier(cache_dir=False).fit(x, (y > 0).astype(int)).predict_proba(x)
+        report = _core.profile_report()
+        for name, calls, seconds in report:
+            self.assertIsInstance(name, str)
+            self.assertGreaterEqual(calls, 0)
+            self.assertGreaterEqual(seconds, 0.0)
+        if report:
+            self.assertGreater(sum(calls for _, calls, _ in report), 0)
+        _core.profile_reset()
+        self.assertTrue(all(calls == 0 for _, calls, _ in _core.profile_report()))
 
     def test_verbose_shows_the_build_and_the_prediction(self):
         checkpoint(TabICLClassifier)
