@@ -30,8 +30,9 @@ Python is used only to produce comparison fixtures from the official model. It
 is not part of checkpoint import, artifact creation, or runtime execution.
 
 Exit gate: all classifier tensors and configuration import exactly. Status:
-complete for the official classifier, including exact tensor manifests and
-deterministic Python oracle fixtures.
+complete for the official classifier, including exact tensor manifests. The
+Python oracle fixtures were superseded by the live parity suite and removed
+([removed-experiments.md](removed-experiments.md#external-pytorch-oracle-test)).
 
 ## Phase 2: Portable FP32 Model
 
@@ -48,15 +49,18 @@ classifier fixture passes at less than `1e-5` maximum absolute logit error.
 
 ## Phase 3: Static Full-KV Context
 
-Status: executable FP32 full-KV path and native preprocessing complete;
-representation-cache execution, mmap loading, and zero-allocation serving
-remain.
+Status: executable full-KV path and native preprocessing complete;
+representation-cache execution and zero-allocation serving remain.
 
 Completed:
 
-- Python full-KV context builder and preprocessed query exporter;
+- Python full-KV context builder and preprocessed query exporter: superseded by
+  the Rust context builder and removed
+  ([removed-experiments.md](removed-experiments.md#python-static-context-exporter-irquery-irlogits-and-irtrace));
+- Rust context builder on the CPU, Metal, and CUDA, with a content-addressed
+  context cache;
 - full-KV artifact reader/writer and whole-file checksum;
-- one-row and microbatch cached inference;
+- cached inference for one query row or many;
 - online stable attention;
 - mmap-backed static-context loading;
 - native preprocessing and a fitted-model format
@@ -102,8 +106,8 @@ their gates. See [experiments.md](experiments.md#apple-silicon-experiments).
 
 ## Phase 5: BF16 Storage
 
-Status: partially shipped. The default context stores BF16 ICL values with
-FP32 accumulation. The packed BF16 affine experiment failed its gates and is
+Status: partially shipped. Under `optimize="fast"`, a BF16-capable CPU stores
+ICL values in BF16 with FP32 accumulation. The packed BF16 affine experiment failed its gates and is
 removed (see [removed-experiments.md](removed-experiments.md#packed-fp32-and-bf16-dense-layers-bf16-dense));
 the full accuracy suite, artifact variants, and migration policy remain.
 
@@ -127,9 +131,40 @@ Exit gate: no default change without dataset-level accuracy approval.
 
 ## Phase 7: Regression and Packaging
 
+Status: regression and the Python API shipped; packaging remains.
+
 - 999-quantile decoder and postprocessing;
 - regressor parity and accuracy suite;
-- Python API bridge: delivered as the sklearn-compatible `TabICLClassifier`
-  (`python/ironicl/classifier.py`) over the PyO3 bindings;
+- Python API bridge: delivered as the sklearn-compatible `TabICLClassifier` and
+  `TabICLRegressor` over the PyO3 bindings;
 - reproducible release artifacts;
 - deployment and operations documentation.
+
+The next three phases run in this order.
+
+## Phase 8: Profiling
+
+- a cross-engine benchmark that starts every engine from the same raw rows:
+  Ironicl, TabICL, and Kumo-Tabular as baselines;
+- per-phase timings from the `profile` feature through `_core.profile_report()`
+  ([benchmarking.md](benchmarking.md#phase-timings));
+- fit and predict latency, throughput, and peak memory per device and level.
+
+Exit gate: one harness reports every engine on the same datasets and hosts.
+
+## Phase 9: Raw-Row CLI
+
+- `ironicl` commands that fit and predict from raw rows, as the estimators do;
+- the fitted model's three files (`IRMODEL`, `IRPREP`, `IRCNTXT`) as their
+  inputs and outputs.
+
+Exit gate: CLI predictions match the Python estimators byte for byte.
+
+## Phase 10: Server
+
+Step E of [source-layout.md](source-layout.md#steps): a prediction server behind
+the `server` feature, with `/health`, `/v1/models`, and `predict` and
+`predict_proba` per model, in JSON, for fitted models loaded read-only at
+startup. It runs without Python.
+
+Exit gate: server predictions match the Python estimators.

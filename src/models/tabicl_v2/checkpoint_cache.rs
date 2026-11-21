@@ -102,7 +102,7 @@ fn cache_model_path(cache_root: &Path, source_sha256: &str) -> Result<PathBuf> {
     }
     Ok(cache_root
         .join("models")
-        .join(format!("v{}", crate::MODEL_ARTIFACT_VERSION))
+        .join(format!("v{}", crate::format::model::MODEL_ARTIFACT_VERSION))
         .join(format!("{source_sha256}.irmodel")))
 }
 

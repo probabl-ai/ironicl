@@ -26,7 +26,7 @@ rows and a SHA-256 trailer. The context and query hashes had to match before
 `StaticExecutor::predict_bundle` ran. `IRLOGITS` v1 had a 48-byte `<8sIIQQQQ>`
 header, FP32 `[B,Q,C]` logits, and a SHA-256 trailer. TabICL preprocessed the
 queries and applied the ensemble permutations in Python, so the Rust cached
-executor started from those variants ([static-context.md](static-context.md)).
+executor started from those variants.
 
 **What it showed.** It was the first end-to-end path for cached Rust execution:
 a context built by TabICL, served by Ironicl. The Ryzen benchmark commands in

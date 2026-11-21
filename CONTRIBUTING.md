@@ -87,7 +87,7 @@ live TabICL comparisons.
 | `make lint-rust` | Formatting and Clippy for all feature configurations; warnings are errors. |
 | `make audit` | `Cargo.lock` against the RustSec advisory database; needs `cargo install cargo-audit`. |
 | `make lint-python` | Ruff pyflakes (`F`) checks for `python/ironicl` and `tools`; needs `pip install ruff` (or `uvx ruff`). |
-| `make test-python` | Standalone Python tests: estimators, preprocessing bindings, and exporters. |
+| `make test-python` | Standalone Python tests: estimators, preprocessing bindings, pickling, progress, and memory planning. |
 | `make test-parity` | Direct comparisons with the pinned TabICL checkout; requires a separate environment. |
 
 The Python targets use `python3` from `PATH`. Override the interpreter when needed:
@@ -125,8 +125,9 @@ checkout used for local development. It runs standalone and live parity tests in
 separate Linux/Python 3.12 environments.
 
 Rust CI does not provision official model fixtures. The tests in
-`tests/checkpoint_fixtures.rs`, `tests/gpu_build_groups.rs`, and `tests/build_memory.rs` are marked
-`#[ignore]`, so a normal `make test-rust` reports them as *ignored*, not passed.
+`tests/checkpoint_fixtures.rs`, `tests/gpu_build_groups.rs`, `tests/gpu_all_missing.rs`, and
+`tests/build_memory.rs` are marked `#[ignore]`, so a normal `make test-rust` reports them as
+*ignored*, not passed.
 To run them, provide the fixtures and pass `--ignored`:
 
 - `IRONICL_CHECKPOINT_FIXTURES`: a directory containing both official v2 checkpoints

@@ -226,10 +226,6 @@ require `PYTHONHASHSEED` configuration. It preserves TabICL's power-transform
 fallback, including its batch-wide clipping when a transform raises a domain
 error.
 
-`tools/prepare_real_dataset.py` uses Rust preprocessing without `--tabicl-root`;
-it expands ensembles only when writing the existing IRINPUT file format. Other
-TabICL oracle and context-export tools still require TabICL/PyTorch.
-
 ## Version Requirements
 
 The package requires NumPy 2.0+ and scikit-learn 1.7+, the oldest releases that
