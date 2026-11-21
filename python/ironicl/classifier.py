@@ -149,6 +149,9 @@ class TabICLClassifier(ClassifierMixin, TabICLBase):
     def _targets(self, y) -> dict:
         return {"labels": _label_values(y)}
 
+    def _aggregation(self) -> dict:
+        return {"softmax_temperature": float(self.softmax_temperature), "average_logits": bool(self.average_logits)}
+
     def predict_proba(self, X) -> np.ndarray:
         """Return class probabilities with shape ``(n_samples, n_classes)``."""
         check_is_fitted(self)

@@ -5,7 +5,7 @@ Ironicl writes three binary formats:
 | Format | Magic | Holds | Source |
 |---|---|---|---|
 | model | `IRMODEL\0` v1 | checkpoint weights | `src/format/model.rs` |
-| preprocessor | `IRPREP\0\0` v1 | fitted preprocessing | `src/format/preprocessor.rs` |
+| preprocessor | `IRPREP\0\0` v2 | fitted preprocessing | `src/format/preprocessor.rs` |
 | static context | `IRCNTXT\0` v1 and v2 | the training rows' attention keys and values | `src/format/static_context.rs` |
 
 Every format is little-endian, uses fixed-width fields, and ends with a SHA-256 of all preceding
@@ -23,13 +23,14 @@ cache.
 
 A fitted model is three files, linked by the checkpoint's SHA-256: the weights (`IRMODEL`), the
 fitted preprocessing (`IRPREP`), and optionally the training context (`IRCNTXT`). Pickling and
-`save` store them as bytes, not as Python objects, and the planned server will load the same
-files.
+`save` store them as bytes, not as Python objects. `export` writes them as files, with the
+training data as `.npy`, for the server ([python.md](python.md#exporting-for-the-server)).
 
-`IRPREP` v1 holds the checkpoint's SHA-256 (32 bytes, as `IRCNTXT` stores it), the feature mask,
+`IRPREP` v2 holds the checkpoint's SHA-256 (32 bytes, as `IRCNTXT` stores it), the feature mask,
 the normalization groups, each member's group and feature and class order, the class labels
-(integers, floats, booleans, or UTF-8 text) or the regressor's target mean and scale, and per
-group each kept feature's statistics as `f64`: mean, scale, range, outlier bounds, and for the
+(integers, floats, booleans, or UTF-8 text) with the classifier's `softmax_temperature` and
+`average_logits`, or the regressor's target mean and scale, the feature names when the training
+data had them, and per group each kept feature's statistics as `f64`: mean, scale, range, outlier bounds, and for the
 power group its lambda and standardization. Decoding checks every length against the bytes left
 before it allocates, then the preprocessing's invariants.
 
@@ -97,7 +98,9 @@ The fixed header holds the source checkpoint's SHA-256, the context identity, `B
 class count, and the required TabICLv2 architecture values: 3 column layers, 12 ICL layers,
 8 heads, column head dimension 16, and ICL head dimension 64. Estimator-major class `[B,C]` and
 feature `[B,H]` permutations follow, then a sorted tensor directory, 64-byte-aligned payloads, and
-the trailing SHA-256. A regression context stores class count 0 and no class permutations.
+the trailing SHA-256. A regression context stores class count 0 and no class permutations. The
+header's last field records the `optimize` level the context was built at (1 `safe`, 2 `auto`,
+3 `fast`), or 0 in files that predate it.
 
 Each directory entry holds the tensor's UTF-8 name, rank, dimensions, payload offset, byte length,
 and, in version 2, its dtype. The executor requires exactly these tensors:

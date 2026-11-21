@@ -657,7 +657,7 @@ impl Executor {
         }
         // Bump the prefix when built contexts change within an Ironicl version.
         let mut context_sha256 = Sha256::new_with_prefix(b"ironicl-context-v2\0");
-        let optimize = match optimize {
+        let level = match optimize {
             Optimize::Safe => "safe",
             Optimize::Auto => "auto",
             Optimize::Fast => "fast",
@@ -665,7 +665,7 @@ impl Executor {
         for part in [
             env!("CARGO_PKG_VERSION"),
             &self.model.summary().source_sha256,
-            optimize,
+            level,
         ] {
             context_sha256.update(part.as_bytes());
             context_sha256.update([0]);
@@ -686,6 +686,7 @@ impl Executor {
             class_count,
             class_permutations,
             feature_permutations,
+            optimize: Some(optimize),
         })
     }
 
@@ -3744,6 +3745,7 @@ mod tests {
                 class_count: 2,
                 class_permutations: vec![0, 1],
                 feature_permutations: vec![0],
+                optimize: None,
             },
             tensors,
         )

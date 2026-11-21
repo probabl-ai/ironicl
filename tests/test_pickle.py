@@ -12,6 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ironicl import _core
 from ironicl import IroniclMemoryError, IroniclMemoryWarning, TabICLClassifier, TabICLRegressor
 
 CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "ironicl" / "checkpoints"
@@ -121,6 +122,33 @@ class PickleTest(unittest.TestCase):
         model = pickle.loads(pickle.dumps(TabICLClassifier(n_estimators=4)))
         self.assertEqual(model.n_estimators, 4)
         self.assertFalse(hasattr(model, "fitted_"))
+
+    def test_export_writes_a_directory_rust_loads(self):
+        for estimator in (TabICLClassifier, TabICLRegressor):
+            with self.subTest(estimator=estimator.__name__):
+                model = fitted(estimator)
+                path = self.directory / estimator.__name__
+                model.export(path)
+                x, y = model._training
+                np.testing.assert_array_equal(np.load(path / "train_x.npy"), x)
+                codes = np.load(path / "train_y.npy")
+                restored = model.classes_[codes] if estimator is TabICLClassifier else codes
+                np.testing.assert_array_equal(restored, y)
+                self.assertEqual((path / "model.irmodel").read_bytes()[:8], b"IRMODEL\0")
+                rust = _core.Model(Path(model.checkpoint_path_))
+                loaded = rust.load_fitted(
+                    (path / "prep.irprep").read_bytes(),
+                    "safe",
+                    None,
+                    context=(path / "context.ircntxt").read_bytes(),
+                )
+                self.assertEqual(loaded.preprocessor_bytes(), model.fitted_.preprocessor_bytes())
+
+    def test_export_needs_the_training_data(self):
+        saved = self.directory / "no-training.pkl"
+        fitted(TabICLClassifier).save(saved, save_training_data=False)
+        with self.assertRaisesRegex(ValueError, "save_training_data=True"):
+            TabICLClassifier.load(saved).export(self.directory / "no-training")
 
 
 if __name__ == "__main__":

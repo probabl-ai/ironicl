@@ -66,6 +66,8 @@ class TabICLBase(BaseEstimator):
             random_state=self.random_state,
             norm_methods=self._norm_methods(),
             outlier_threshold=float(self.outlier_threshold),
+            feature_names=None if names is None else list(names),
+            **self._aggregation(),
         )
         plan = _plan(self._task, *preprocessed.shape, optimize, *limits)
         _enforce(plan, policy, stacklevel=3)
@@ -83,6 +85,10 @@ class TabICLBase(BaseEstimator):
     def _targets(self, y) -> dict:
         """The checked targets ``y`` as ``_core.preprocess`` takes them."""
         raise NotImplementedError
+
+    def _aggregation(self) -> dict:
+        """The classifier's prediction settings, which a saved model keeps."""
+        return {}
 
     def _build(self, checkpoint: Path, preprocessed, optimize, limits):
         """Build the context of ``preprocessed``, through ``cache_dir`` when set.
@@ -156,6 +162,30 @@ class TabICLBase(BaseEstimator):
                 pickle.dump(self, file, protocol=5)
         finally:
             del self._save_options
+
+    def export(self, path: str | Path) -> None:
+        """Export the fitted model to the directory ``path`` for ``ironicl serve``.
+
+        It holds the model weights (``model.irmodel``), the fitted preprocessing
+        (``prep.irprep``), the KV cache built at this fit's ``optimize`` level
+        (``context.ircntxt``), and the training data (``train_x.npy``,
+        ``train_y.npy``), from which ``ironicl prepare`` rebuilds the cache for
+        another machine or level.
+        """
+        check_is_fitted(self)
+        if not hasattr(self, "_training"):
+            raise ValueError(
+                "export needs the training data, which this estimator was saved without; "
+                "save it with save_training_data=True"
+            )
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        _core.import_checkpoint(Path(self.checkpoint_path_), path / "model.irmodel")
+        (path / "prep.irprep").write_bytes(self.fitted_.preprocessor_bytes())
+        (path / "context.ircntxt").write_bytes(self.fitted_.context_bytes())
+        x, y = self._training
+        np.save(path / "train_x.npy", x)
+        np.save(path / "train_y.npy", np.searchsorted(self.classes_, y) if self._task == "classifier" else y)
 
     @classmethod
     def load(cls, path: str | Path, device: str | None = None):

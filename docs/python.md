@@ -157,6 +157,25 @@ probability. `device` accepts what the constructor does. Loading warns when
 the file was saved with another Ironicl version. Load only files you trust:
 like any pickle, loading can run code.
 
+### Exporting for the server
+
+`export` writes a fitted estimator as a directory that `ironicl serve`
+loads:
+
+```python
+clf.export("churn")
+```
+
+| File | Contents |
+|---|---|
+| `model.irmodel` | the model weights |
+| `prep.irprep` | the fitted preprocessing, labels or target scale, feature names, and the classifier's `softmax_temperature` and `average_logits` |
+| `context.ircntxt` | the KV cache, built at this fit's `optimize` level on this machine |
+| `train_x.npy`, `train_y.npy` | the training data: features as `fit` received them, and class indices or regression targets |
+
+`ironicl prepare` rebuilds the KV cache from the training data, for another
+machine or `optimize` level.
+
 ### Progress and interrupts
 
 With `verbose=True`, `fit` shows the estimators built, `predict` and

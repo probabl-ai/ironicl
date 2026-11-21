@@ -389,7 +389,10 @@ fn f32_bytes<'py>(py: Python<'py>, values: &[f32]) -> Bound<'py, PyBytes> {
 /// regressor with float32 `values`. The result's `shape` plans the memory to
 /// build its context with `Model.build`.
 #[pyfunction]
-#[pyo3(signature = (x, *, labels=None, values=None, n_estimators, random_state, norm_methods, outlier_threshold))]
+#[pyo3(signature = (
+    x, *, labels=None, values=None, n_estimators, random_state, norm_methods, outlier_threshold,
+    feature_names=None, softmax_temperature=0.9, average_logits=true,
+))]
 #[expect(clippy::too_many_arguments, reason = "mirrors the Python call's parameters")]
 fn preprocess(
     py: Python<'_>,
@@ -400,7 +403,15 @@ fn preprocess(
     random_state: i128,
     norm_methods: Vec<String>,
     outlier_threshold: f64,
+    feature_names: Option<Vec<String>>,
+    softmax_temperature: f32,
+    average_logits: bool,
 ) -> PyResult<Preprocessed> {
+    if !(softmax_temperature.is_finite() && softmax_temperature > 0.0) {
+        return Err(PyValueError::new_err(
+            "softmax_temperature must be positive and finite",
+        ));
+    }
     let (x, columns) = Matrix::read(py, x)?;
     let targets = read_targets(py, labels, values)?;
     let options = PreprocessOptions {
@@ -413,8 +424,26 @@ fn preprocess(
             .map_err(py_error)?,
         outlier_threshold,
     };
-    py.detach(|| crate::Preprocessed::fit(&options, x.features(), columns, &targets))
-        .map(|preprocessed| Preprocessed(Arc::new(preprocessed)))
+    let mut preprocessed = py
+        .detach(|| crate::Preprocessed::fit(&options, x.features(), columns, &targets))
+        .map_err(py_error)?;
+    // Saved for serving; Python passes its own settings to every prediction.
+    let preprocessor = &mut preprocessed.preprocessor;
+    preprocessor.feature_names = feature_names;
+    if let Some(aggregation) = &mut preprocessor.aggregation {
+        *aggregation = ClassifierAggregation {
+            softmax_temperature,
+            average_logits,
+        };
+    }
+    Ok(Preprocessed(Arc::new(preprocessed)))
+}
+
+/// Convert the checkpoint at `checkpoint` to an Ironicl model at `output`.
+#[pyfunction]
+fn import_checkpoint(py: Python<'_>, checkpoint: PathBuf, output: PathBuf) -> PyResult<()> {
+    py.detach(|| crate::import_checkpoint(&checkpoint, &output))
+        .map(|_| ())
         .map_err(py_error)
 }
 
@@ -620,6 +649,7 @@ fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Preprocessed>()?;
     module.add_class::<FittedModel>()?;
     module.add_function(wrap_pyfunction!(preprocess, module)?)?;
+    module.add_function(wrap_pyfunction!(import_checkpoint, module)?)?;
     module.add_function(wrap_pyfunction!(parse_size, module)?)?;
     module.add_function(wrap_pyfunction!(system_info, module)?)?;
     module.add_function(wrap_pyfunction!(profile_report, module)?)?;

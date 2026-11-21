@@ -582,6 +582,7 @@ mod tests {
             class_count: 3,
             class_permutations: inputs.class_permutations,
             feature_permutations: inputs.feature_permutations,
+            optimize: None,
         };
         assert!(check_context(&fitted, &SHA, &metadata).is_ok());
         assert!(check_context(&fitted, &[6; 32], &metadata).is_err());
