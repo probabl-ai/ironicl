@@ -24,8 +24,8 @@ Entries marked *planned* do not exist yet.
 ```text
 src/
 ├── lib.rs, main.rs, cli.rs        crate root and the `ironicl` CLI
-├── config.rs, error.rs            ExecutionConfig and friends; Error
-├── memory.rs                      memory planning and the context cache estimate
+├── config.rs, error.rs            TaskKind and StorageDType; Error
+├── memory.rs                      memory planning
 ├── progress.rs, profile.rs        progress and cancellation; `profile` timers
 ├── benchmark.rs                   benchmark statistics
 ├── python.rs                      PyO3 bindings (`python` feature)
