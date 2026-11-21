@@ -664,12 +664,8 @@ impl StaticContextArtifact {
                 }
                 StorageDType::Fp32
             } else {
-                match StorageDType::from_disk_tag(dtype_tag) {
-                    Ok(dtype @ (StorageDType::Fp32 | StorageDType::Bf16 | StorageDType::F16)) => dtype,
-                    _ => {
-                        return Err(artifact_error("static context tensor directory entry is invalid"));
-                    }
-                }
+                StorageDType::from_disk_tag(dtype_tag)
+                    .map_err(|_| artifact_error("static context tensor directory entry is invalid"))?
             };
             let offset = to_usize(directory.read_u64()?, "tensor payload offset")?;
             let byte_length = to_usize(directory.read_u64()?, "tensor byte length")?;
@@ -765,9 +761,6 @@ impl StaticContextArtifact {
                         byte_offset,
                         byte_length,
                     }
-                }
-                StorageDType::Int8 => {
-                    return Err(artifact_error("static context does not store int8 tensors"));
                 }
             };
             tensors.insert(name, StaticContextTensorRecord { dimensions, values });

@@ -1,16 +1,12 @@
-use std::{path::PathBuf, str::FromStr};
+use std::path::PathBuf;
 
-use crate::{
-    CacheMode, ExecutionConfig, IsaPreference, StorageDType, TabIclV2Model, TaskKind, Workload,
-    error::{Error, Result},
-};
+use crate::error::{Error, Result};
 
 /// A parsed Ironicl command.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Command {
     Help(Option<HelpTopic>),
     Platform,
-    Plan(PlanArgs),
     Inspect(InspectArgs),
     Import(ImportArgs),
 }
@@ -19,7 +15,6 @@ pub enum Command {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HelpTopic {
     Platform,
-    Plan,
     Inspect,
     Import,
 }
@@ -38,13 +33,6 @@ impl ModelSource {
             Self::Checkpoint(path) | Self::Model(path) => path,
         }
     }
-}
-
-/// Arguments for the memory and execution planner.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PlanArgs {
-    pub config: ExecutionConfig,
-    pub bandwidth_gbps: Option<f64>,
 }
 
 /// Arguments for model inspection.
@@ -74,7 +62,6 @@ pub fn parse_cli(args: &[String]) -> Result<Command> {
     match command.as_str() {
         "help" | "--help" | "-h" => parse_help(rest),
         "platform" => parse_no_args(rest, HelpTopic::Platform, Command::Platform),
-        "plan" => parse_plan(rest),
         "inspect" => parse_inspect(rest),
         "import" => parse_import(rest),
         _ => Err(Error::InvalidArgument(format!("unknown command '{command}'"))),
@@ -94,7 +81,6 @@ fn parse_help(args: &[String]) -> Result<Command> {
 fn parse_help_topic(value: &str) -> Result<HelpTopic> {
     match value {
         "platform" => Ok(HelpTopic::Platform),
-        "plan" => Ok(HelpTopic::Plan),
         "inspect" => Ok(HelpTopic::Inspect),
         "import" => Ok(HelpTopic::Import),
         _ => Err(Error::InvalidArgument(format!("unknown help topic '{value}'"))),
@@ -111,79 +97,6 @@ fn parse_no_args(args: &[String], topic: HelpTopic, command: Command) -> Result<
         )));
     }
     Ok(command)
-}
-
-fn parse_plan(args: &[String]) -> Result<Command> {
-    if is_help(args) {
-        return Ok(Command::Help(Some(HelpTopic::Plan)));
-    }
-
-    let mut task = None;
-    let mut training_rows = None;
-    let mut features = None;
-    let mut estimators = None;
-    let mut query_microbatch = None;
-    let mut cache_mode = None;
-    let mut weight_dtype = None;
-    let mut kv_dtype = None;
-    let mut isa = None;
-    let mut bandwidth_gbps = None;
-
-    let mut index = 0;
-    while index < args.len() {
-        let flag = &args[index];
-        let value = option_value(args, &mut index)?;
-        match flag.as_str() {
-            "--task" => set_once(&mut task, TaskKind::from_str(value)?, flag)?,
-            "--rows" => set_once(&mut training_rows, parse_u64(flag, value)?, flag)?,
-            "--features" => set_once(&mut features, parse_u64(flag, value)?, flag)?,
-            "--estimators" => set_once(&mut estimators, parse_u64(flag, value)?, flag)?,
-            "--microbatch" => set_once(&mut query_microbatch, parse_u32(flag, value)?, flag)?,
-            "--cache" => set_once(&mut cache_mode, CacheMode::from_str(value)?, flag)?,
-            "--weights" => set_once(&mut weight_dtype, StorageDType::from_str(value)?, flag)?,
-            "--kv-dtype" => set_once(&mut kv_dtype, StorageDType::from_str(value)?, flag)?,
-            "--isa" => set_once(&mut isa, IsaPreference::from_str(value)?, flag)?,
-            "--bandwidth-gbps" => {
-                let bandwidth = value
-                    .parse::<f64>()
-                    .map_err(|error| Error::InvalidArgument(format!("invalid value for {flag}: {error}")))?;
-                if !bandwidth.is_finite() || bandwidth <= 0.0 {
-                    return Err(Error::InvalidArgument(format!(
-                        "{flag} must be finite and greater than zero"
-                    )));
-                }
-                set_once(&mut bandwidth_gbps, bandwidth, flag)?;
-            }
-            _ => {
-                return Err(Error::InvalidArgument(format!(
-                    "unknown option '{flag}' for plan"
-                )));
-            }
-        }
-    }
-
-    let defaults = ExecutionConfig::default();
-    let workload_defaults = defaults.workload;
-    let task = task.unwrap_or(defaults.model.task);
-    let config = ExecutionConfig {
-        model: TabIclV2Model::new(task),
-        workload: Workload {
-            training_rows: training_rows.unwrap_or(workload_defaults.training_rows),
-            features: features.unwrap_or(workload_defaults.features),
-            estimators: estimators.unwrap_or(workload_defaults.estimators),
-            query_microbatch: query_microbatch.unwrap_or(workload_defaults.query_microbatch),
-        },
-        cache_mode: cache_mode.unwrap_or(defaults.cache_mode),
-        weight_dtype: weight_dtype.unwrap_or(defaults.weight_dtype),
-        kv_dtype: kv_dtype.unwrap_or(defaults.kv_dtype),
-        isa: isa.unwrap_or(defaults.isa),
-    };
-    config.validate()?;
-
-    Ok(Command::Plan(PlanArgs {
-        config,
-        bandwidth_gbps,
-    }))
 }
 
 fn parse_inspect(args: &[String]) -> Result<Command> {
@@ -288,18 +201,6 @@ fn required<T>(value: Option<T>, flag: &str, command: &str) -> Result<T> {
     value.ok_or_else(|| Error::InvalidArgument(format!("{command} requires {flag}")))
 }
 
-fn parse_u64(flag: &str, value: &str) -> Result<u64> {
-    value
-        .parse::<u64>()
-        .map_err(|error| Error::InvalidArgument(format!("invalid value for {flag}: {error}")))
-}
-
-fn parse_u32(flag: &str, value: &str) -> Result<u32> {
-    value
-        .parse::<u32>()
-        .map_err(|error| Error::InvalidArgument(format!("invalid value for {flag}: {error}")))
-}
-
 fn is_help(args: &[String]) -> bool {
     matches!(args, [value] if value == "--help" || value == "-h")
 }
@@ -354,8 +255,14 @@ mod tests {
 
     #[test]
     fn rejects_duplicate_options() {
-        let error = parse_cli(&args(&["plan", "--rows", "100", "--rows", "200"]))
-            .expect_err("duplicate option must fail");
+        let error = parse_cli(&args(&[
+            "inspect",
+            "--model",
+            "a.irmodel",
+            "--model",
+            "b.irmodel",
+        ]))
+        .expect_err("duplicate option must fail");
         assert!(error.to_string().contains("duplicate option"));
     }
 
