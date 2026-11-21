@@ -2,8 +2,8 @@
 //!
 //! The format is separate from model artifacts. It stores fixed context metadata,
 //! class and feature permutations, named little-endian cache tensors, and a
-//! trailing SHA-256 digest. Version 1 stores FP32. Version 2 adds explicit FP32
-//! and BF16 tensor dtypes. Version 3 adds source-tile, dimension-major ICL K.
+//! trailing SHA-256 digest. Version 1 stores FP32. Version 2 tags each tensor
+//! FP32, BF16, or FP16. Version 3, with pre-packed ICL keys, is rejected.
 
 use std::{collections::BTreeMap, fs::File, path::Path, sync::Arc};
 
@@ -23,11 +23,12 @@ use crate::{
 /// Magic bytes at the start of a static-context artifact.
 pub const STATIC_CONTEXT_MAGIC: [u8; 8] = *b"IRCNTXT\0";
 /// Latest supported static-context artifact format version.
-pub const STATIC_CONTEXT_VERSION: u32 = 3;
+pub const STATIC_CONTEXT_VERSION: u32 = 2;
 
 const STATIC_CONTEXT_KIND: u32 = 1;
 const STATIC_CONTEXT_FP32_VERSION: u32 = 1;
-const STATIC_CONTEXT_BF16_VERSION: u32 = 2;
+/// Pre-packed ICL keys, written only by the removed Python exporter.
+const STATIC_CONTEXT_PACKED_KEYS_VERSION: u32 = 3;
 const HEADER_BYTES: usize = 164;
 const MAX_ARTIFACT_BYTES: usize = byte_limit(48 << 30);
 const MAX_DIRECTORY_BYTES: usize = 4 * 1024 * 1024;
@@ -300,7 +301,6 @@ impl PageAlignedTensors {
 /// A verified static context backed by owned or read-only mapped tensor storage.
 #[derive(Debug, Clone)]
 pub struct StaticContextArtifact {
-    version: u32,
     metadata: StaticContextMetadata,
     tensors: BTreeMap<String, StaticContextTensorRecord>,
     storage: StaticContextStorage,
@@ -308,8 +308,7 @@ pub struct StaticContextArtifact {
 
 impl PartialEq for StaticContextArtifact {
     fn eq(&self, other: &Self) -> bool {
-        self.version == other.version
-            && self.metadata == other.metadata
+        self.metadata == other.metadata
             && self.tensors.keys().eq(other.tensors.keys())
             && self.tensors.keys().all(|name| {
                 let left = self.tensor(name).expect("existing left tensor");
@@ -365,7 +364,6 @@ impl StaticContextArtifact {
             ));
         }
         Ok(Self {
-            version: STATIC_CONTEXT_FP32_VERSION,
             metadata,
             tensors: named,
             storage: StaticContextStorage::Owned,
@@ -418,7 +416,6 @@ impl StaticContextArtifact {
             }
         }
         Ok(Self {
-            version: STATIC_CONTEXT_FP32_VERSION,
             metadata,
             tensors: named,
             storage: StaticContextStorage::PageAligned(Arc::new(
@@ -547,10 +544,12 @@ impl StaticContextArtifact {
             return Err(artifact_error("static context magic does not match"));
         }
         let version = header.read_u32()?;
-        if !matches!(
-            version,
-            STATIC_CONTEXT_FP32_VERSION | STATIC_CONTEXT_BF16_VERSION | STATIC_CONTEXT_VERSION
-        ) {
+        if version == STATIC_CONTEXT_PACKED_KEYS_VERSION {
+            return Err(artifact_error(
+                "static context version 3 (pre-packed ICL keys) is no longer supported; rebuild the context",
+            ));
+        }
+        if !matches!(version, STATIC_CONTEXT_FP32_VERSION | STATIC_CONTEXT_VERSION) {
             return Err(artifact_error(format!(
                 "static context version {version} is unsupported"
             )));
@@ -783,7 +782,6 @@ impl StaticContextArtifact {
             return Err(artifact_error("static context tensor payload ranges are invalid"));
         }
         Ok(Self {
-            version,
             metadata,
             tensors,
             storage: StaticContextStorage::Mapped(Arc::new(mapping)),
@@ -860,7 +858,7 @@ impl StaticContextArtifact {
         {
             STATIC_CONTEXT_FP32_VERSION
         } else {
-            STATIC_CONTEXT_BF16_VERSION
+            STATIC_CONTEXT_VERSION
         };
         let mut directory = Vec::new();
         let mut payload_length = 0_usize;
@@ -1014,12 +1012,6 @@ impl StaticContextArtifact {
     #[must_use]
     pub fn metadata(&self) -> &StaticContextMetadata {
         &self.metadata
-    }
-
-    /// Whether ICL K tensors use source-tile, dimension-major physical packing.
-    #[must_use]
-    pub const fn has_packed_icl_keys(&self) -> bool {
-        self.version >= STATIC_CONTEXT_VERSION
     }
 
     /// Get a named exact cache tensor.
@@ -1348,7 +1340,7 @@ mod tests {
         // A non-FP32 tensor forces a version-2 header.
         assert_eq!(
             u32::from_le_bytes(bytes[8..12].try_into().expect("version field")),
-            STATIC_CONTEXT_BF16_VERSION
+            STATIC_CONTEXT_VERSION
         );
 
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -1372,6 +1364,15 @@ mod tests {
         assert_eq!(decoded.to_bytes().expect("re-encode"), bytes);
         let from_bytes = StaticContextArtifact::from_bytes(&bytes).expect("decode bytes");
         assert_eq!(from_bytes.to_bytes().expect("re-encode bytes"), bytes);
+    }
+
+    #[test]
+    fn rejects_the_removed_packed_key_version() {
+        let mut bytes = fixture().to_bytes().expect("encode");
+        bytes[8..12].copy_from_slice(&STATIC_CONTEXT_PACKED_KEYS_VERSION.to_le_bytes());
+        resign(&mut bytes);
+        let error = StaticContextArtifact::from_bytes(&bytes).expect_err("version 3 is rejected");
+        assert!(error.to_string().contains("pre-packed ICL keys"), "{error}");
     }
 
     #[test]

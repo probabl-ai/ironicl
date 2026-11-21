@@ -350,3 +350,116 @@ attention stages.
 
 **Code.** [`Cargo.toml`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/Cargo.toml#L30-L36). To restore it, restore the
 features it lists first.
+
+## IRCNTXT v3 pre-packed keys
+
+**What it was.** Version 3 of the `IRCNTXT` static-context format, in which
+each ICL key tensor arrived already in the layout of the CPU score kernel. Only
+`tools/export_static_context.py --pack-keys` wrote it.
+
+**How it worked.** The logical shape of `icl.{0..11}.key` stayed `[B,8,N,64]`,
+but within each estimator and head the exporter stored every 128-row source
+tile dimension-major: dimension 0 of all its rows, then dimension 1, and so on.
+One AVX-512 vector then held one dimension of 16 source rows
+([artifact-format.md](artifact-format.md#layout-strategy)). On load,
+`has_packed_icl_keys()` reported version 3, and the cached ICL stage passed
+`key_is_packed` to the attention kernels. With it set, the kernels skipped
+their per-tile transpose and the Accelerate path, scored straight from the file
+with `attention_score_packed_key_tile_f32`, and used a scalar dimension-major
+fallback. The Metal and CUDA loaders kept v3 contexts on the CPU.
+
+**What it showed.** The Ryzen 7 9800X3D reference workload in
+[experiments.md](experiments.md#current-result) used packed FP32 ICL keys with
+BF16 values: `199.64 ms` p50 at `B=8,N=4096,Q=128` and `752.07 ms` at `Q=500`.
+The const-specialized packed score kernel took that workload from `231.72 ms`
+to `203.69 ms`. At `B=1,N=100000,Q=128`, the packed FP32-key/BF16-value
+context was 3.71 GB and ran in `1,005 ms`
+([experiments.md](experiments.md#large-context-result)). No recorded
+measurement compares keys packed in the file with keys packed per tile at run
+time.
+
+**Why it was removed.** The Rust context builder writes v1 and v2 contexts
+with row-major keys, and the kernels pack each key tile into scratch before
+scoring, so the packed score kernels still run for every context Ironicl
+builds. Only the removed Python exporter wrote v3, and the GPU backends never
+read it. The reader now rejects version 3 with "static context version 3
+(pre-packed ICL keys) is no longer supported; rebuild the context".
+
+**Code.**
+
+- Format: [the version constants](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/format/static_context.rs#L25-L30),
+  [the version check](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/format/static_context.rs#L571-L579), and
+  [`has_packed_icl_keys`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/format/static_context.rs#L1041-L1045)
+- GPU fallbacks: [`with_cuda`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/models/tabicl_v2/cpu.rs#L1862-L1864)
+  and [`with_gpu`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/models/tabicl_v2/cpu.rs#L1918-L1920)
+- Dispatch: [the cached ICL attention match](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/models/tabicl_v2/cpu.rs#L2641-L2728),
+  which passed `has_packed_icl_keys()` to [`parallel_cached_attention`, `parallel_cached_attention_bf16`, and `parallel_cached_attention_f32_key_bf16_value`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/models/tabicl_v2/cpu.rs#L4435-L4715)
+- Kernels: the `key_is_packed` branches in
+  [`source_major_online_attention_with_backend_f32`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/kernels/reference.rs#L785-L1024)
+  and [`source_major_online_attention_f32_key_bf16_value_with_backend_f32`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/kernels/reference.rs#L1234-L1487)
+- Test: [the pre-packed case](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/kernels/reference.rs#L1948-L1982)
+  of `tiled_online_attention_matches_materialized_across_tiles_and_scores`
+- Writer: [`--pack-keys` in `write_static_context`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/tools/export_static_context.py#L299-L308)
+  in the removed exporter
+- Restore: accept version 3 in the reader again, restore `has_packed_icl_keys`,
+  thread `key_is_packed` from the dispatch to the kernels, and have the
+  context builder write packed key tiles. Measure first against the per-tile
+  packing the kernels do now.
+
+## BF16 attention keys
+
+**What it was.** Contexts that stored the ICL keys in BF16, and the CPU
+attention kernels that scored from them. The exporter wrote them with
+`--kv-dtype bf16` (BF16 keys and values) or `--kv-dtype bf16-k` (BF16 keys, FP32
+values, which no kernel served).
+
+**How it worked.** For BF16 keys and values, `parallel_cached_attention_bf16`
+split heads across workers and ran
+`source_major_online_attention_bf16_with_backend_f32`. It scored each tile
+from BF16 keys with FP32 accumulation, widening each key by a 16-bit shift:
+`attention_score_packed_key_bf16_tile_f32` on a per-tile packed copy or a v3
+packed file, else `attention_score_tile_bf16_f32` on row-major keys. On x86_64
+both ran AVX-512F/BW kernels, with scalar fallbacks elsewhere. Softmax stayed
+FP32, and the values went through the retained
+`attention_value_tile_bf16_fma_f32`. The Metal loader also uploaded BF16 keys
+and values to the GPU graph.
+
+**What it showed.** At `B=1,N=100000,Q=128` on the CPU, packed BF16 keys and
+values took the context from 3.71 GB to 2.48 GB, but ran in
+`1,018 ms` against `1,005 ms` for FP32 keys with BF16 values. Maximum logit
+error rose from `4.43e-3` to `4.46e-2` and maximum probability error from
+`7.13e-4` to `6.15e-3`, over the `1e-3` probability gate; labels agreed 100%
+([experiments.md](experiments.md#large-context-result),
+[pytorch-cpu-comparison.md](pytorch-cpu-comparison.md#dense-fusion-and-reduced-precision)).
+On an M1 Max GPU, BF16 ICL keys and values were slower and less accurate than
+FP16 ([experiments.md](experiments.md#metal-rejected-experiments)).
+
+**Why it was removed.** BF16 keys failed the probability gate without saving
+time, which is why `optimize="fast"` keeps FP32 keys with BF16 values. The
+Rust builder never writes BF16 keys, so only the removed exporter produced
+them. Loading such a context now fails with "static context cache tensor
+'icl.N.key' stores BF16 keys, which are no longer supported; rebuild the
+context". The FP32-key/BF16-value kernel and `attention_value_tile_bf16_fma_f32`
+stay.
+
+**Code.**
+
+- Dispatch: [the BF16 key and value arm](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/models/tabicl_v2/cpu.rs#L2657-L2670)
+  and [`parallel_cached_attention_bf16`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/models/tabicl_v2/cpu.rs#L4527-L4620)
+- Kernel: [`source_major_online_attention_bf16_with_backend_f32`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/kernels/reference.rs#L1026-L1232)
+  and its test, [`bf16_source_major_attention_matches_dequantized_fp32`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/kernels/reference.rs#L1987-L2059)
+- Score wrappers: [`attention_score_tile_bf16_f32`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/kernels/cpu/ops/attention.rs#L105-L130),
+  [`attention_score_packed_key_bf16_tile_f32`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/kernels/cpu/ops/attention.rs#L188-L213),
+  and the portable stubs, [`attention_score_packed_key_bf16_tile_for_target`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/kernels/cpu/ops/attention.rs#L339-L355)
+  and [`attention_score_tile_bf16_for_target`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/kernels/cpu/ops/attention.rs#L394-L410)
+- AVX-512 kernels: [`attention_score_tile_bf16_for_target`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/kernels/cpu/arch/x86_64.rs#L358-L386),
+  [`attention_score_packed_key_bf16_tile_for_target`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/kernels/cpu/arch/x86_64.rs#L473-L512),
+  [`attention_score_tile_bf16_avx512`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/kernels/cpu/arch/x86_64.rs#L698-L747), and
+  [`attention_score_packed_key_bf16_tile_avx512`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/kernels/cpu/arch/x86_64.rs#L916-L973)
+- Metal: [the BF16 arm of the ICL cache upload](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/models/tabicl_v2/cpu.rs#L1949-L1951)
+- Writer: [`--kv-dtype` selection](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/tools/export_static_context.py#L260-L265)
+  in the removed exporter
+- Restore: restore the code above, drop the BF16-key check in
+  `validate_static_cache_contract`, and add a BF16-key storage choice to the
+  context builder. It would need a new error budget: at `N=100000` it was six
+  times over the probability gate.

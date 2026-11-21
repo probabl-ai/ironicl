@@ -13,7 +13,8 @@ artifacts, not original model representations.
 
 ```text
 large linear weights: BF16 storage
-K/V cache:            BF16 storage
+K cache:              FP32 storage (BF16 K failed its gate)
+V cache:              BF16 storage
 dot accumulation:     FP32
 residual stream:       FP32
 sensitive operations: FP32
@@ -77,7 +78,10 @@ Risks:
   every case without evidence.
 
 BF16 K/V must be validated separately from BF16 weights. Do not describe it as
-lossless or exact relative to FP32.
+lossless or exact relative to FP32. BF16 K failed that validation: at
+`N=100000` it raised the maximum probability error to `6.15e-3` without saving
+time, so BF16 K support is removed and only BF16 V ships (see
+[removed-experiments.md](removed-experiments.md#bf16-attention-keys)).
 
 ## INT8 Weights
 
@@ -104,7 +108,7 @@ INT8 K/V is an experiment:
 
 Required experiment order:
 
-1. BF16 K and BF16 V.
+1. BF16 K and BF16 V (failed the probability gate; see above).
 2. BF16 K and INT8 V.
 3. INT8 K and BF16 V.
 4. INT8 K and INT8 V.
