@@ -20,6 +20,14 @@ fn run() -> Result<()> {
         Command::Inspect(args) => inspect(args)?,
         Command::Import(args) => import(&args)?,
         Command::Prepare(args) => prepare(&args)?,
+        #[cfg(feature = "server")]
+        Command::Serve(args) => ironicl::server::serve(&args)?,
+        #[cfg(not(feature = "server"))]
+        Command::Serve(_) => {
+            return Err(ironicl::Error::NotImplemented(
+                "this build has no server; build with --features server".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -144,7 +152,8 @@ fn print_help(topic: Option<HelpTopic>) {
                ironicl platform\n\
                ironicl inspect (--checkpoint FILE | --model FILE)\n\
                ironicl import --checkpoint FILE --output FILE\n\
-               ironicl prepare DIR [--optimize safe|auto|fast]\n\n\
+               ironicl prepare DIR [--optimize safe|auto|fast]\n\
+               ironicl serve DIR [--bind ADDR] [--max-rows N] [--max-body SIZE]\n\n\
              Use 'ironicl help COMMAND' for command-specific help."
         }
         Some(HelpTopic::Platform) => "Usage: ironicl platform",
@@ -161,6 +170,12 @@ fn print_help(topic: Option<HelpTopic>) {
              Build the KV cache of a model exported with export(), on this machine's\n\
              device, from its training data. The level defaults to safe and is\n\
              recorded in DIR/context.ircntxt, which ironicl serve reads."
+        }
+        Some(HelpTopic::Serve) => {
+            "Usage: ironicl serve DIR [--bind ADDR] [--max-rows N] [--max-body SIZE]\n\n\
+             Serve a model exported with export() over HTTP, at the optimize level its\n\
+             KV cache was built at: POST /predict, GET /health. Defaults: --bind\n\
+             127.0.0.1:8080, --max-rows 10000, --max-body 16M."
         }
     };
     println!("{text}");

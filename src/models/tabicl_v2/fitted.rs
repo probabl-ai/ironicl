@@ -435,15 +435,7 @@ impl Executor {
         limits: MemoryLimits,
         cache_dir: Option<&Path>,
     ) -> Result<FittedModel> {
-        let (checkpoint_sha256, preprocessor) = preprocessor::decode(preprocessor)?;
-        let checkpoint = encode_sha256(&checkpoint_sha256);
-        if checkpoint != self.source_sha256() {
-            return Err(Error::Artifact(format!(
-                "this {} was fitted with checkpoint {checkpoint}, not {}",
-                preprocessor.task(),
-                self.source_sha256()
-            )));
-        }
+        let (checkpoint_sha256, preprocessor) = self.decode_preprocessor(preprocessor)?;
         let preprocessed = match training {
             Some((x, columns, targets)) => Preprocessed::with_training(preprocessor, x, columns, targets)?,
             None => Preprocessed {
@@ -461,6 +453,39 @@ impl Executor {
             preprocessed,
             context: Arc::new(context),
         })
+    }
+
+    /// Pair `IRPREP` bytes with their loaded `context`.
+    ///
+    /// # Errors
+    ///
+    /// When the bytes are invalid or were fitted with another checkpoint, or
+    /// the context does not match the preprocessing.
+    pub fn fitted_with_context(&self, preprocessor: &[u8], context: StaticExecutor) -> Result<FittedModel> {
+        let (checkpoint_sha256, preprocessor) = self.decode_preprocessor(preprocessor)?;
+        let preprocessed = Arc::new(Preprocessed {
+            preprocessor,
+            training: None,
+        });
+        check_context(&preprocessed, &checkpoint_sha256, context.context_metadata())?;
+        Ok(FittedModel {
+            preprocessed,
+            context: Arc::new(context),
+        })
+    }
+
+    /// `IRPREP` bytes as preprocessing fitted with this model's checkpoint.
+    fn decode_preprocessor(&self, bytes: &[u8]) -> Result<([u8; 32], Preprocessor)> {
+        let (checkpoint_sha256, preprocessor) = preprocessor::decode(bytes)?;
+        let checkpoint = encode_sha256(&checkpoint_sha256);
+        if checkpoint != self.source_sha256() {
+            return Err(Error::Artifact(format!(
+                "this {} was fitted with checkpoint {checkpoint}, not {}",
+                preprocessor.task(),
+                self.source_sha256()
+            )));
+        }
+        Ok((checkpoint_sha256, preprocessor))
     }
 }
 

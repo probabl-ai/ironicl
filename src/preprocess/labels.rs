@@ -8,6 +8,7 @@ use crate::{Error, Result};
 /// One label per row, all of one type. Text sorts by Unicode code point, as
 /// `NumPy` sorts strings.
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "server", derive(serde::Serialize), serde(untagged))]
 pub enum Labels {
     Int(Vec<i64>),
     Float(Vec<f64>),

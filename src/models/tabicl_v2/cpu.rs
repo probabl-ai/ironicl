@@ -233,7 +233,7 @@ impl Executor {
         limits: MemoryLimits,
     ) -> Result<StaticExecutor> {
         let context = StaticContextArtifact::read_mapped_prefault(path)?;
-        StaticExecutor::with_executor(self.clone(), context, optimize, threads, limits)
+        self.load_context_artifact(context, optimize, threads, limits)
     }
 
     /// Load a context from the bytes [`StaticExecutor::encode_context`] wrote,
@@ -251,6 +251,22 @@ impl Executor {
         limits: MemoryLimits,
     ) -> Result<StaticExecutor> {
         let context = StaticContextArtifact::from_bytes(bytes)?;
+        self.load_context_artifact(context, optimize, threads, limits)
+    }
+
+    /// Load a decoded context, as [`Self::load_context`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context does not match this model's serving
+    /// contract.
+    pub fn load_context_artifact(
+        &self,
+        context: StaticContextArtifact,
+        optimize: Optimize,
+        threads: Option<usize>,
+        limits: MemoryLimits,
+    ) -> Result<StaticExecutor> {
         StaticExecutor::with_executor(self.clone(), context, optimize, threads, limits)
     }
 

@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use super::preprocess::{Features, Targets, invalid};
 use crate::{
-    Error, Executor, FittedModel, Optimize, Result,
+    Error, Executor, FittedModel, Optimize, Result, StaticContextArtifact,
     format::{
         model::load_model_artifact,
         npy::{self, Npy},
@@ -81,4 +81,26 @@ pub fn prepare(dir: &Path, optimize: Optimize) -> Result<(FittedModel, PathBuf)>
     let path = dir.join(CONTEXT);
     fitted.context.save_context(&path)?;
     Ok((fitted, path))
+}
+
+/// Load the model saved in `dir` with its KV cache, at the level the cache
+/// was built at.
+///
+/// # Errors
+///
+/// When a file is missing or invalid, the cache records no level, or the
+/// files do not belong together.
+pub fn load(dir: &Path, threads: Option<usize>, limits: MemoryLimits) -> Result<FittedModel> {
+    let executor = executor(dir)?;
+    let path = dir.join(CONTEXT);
+    let context = StaticContextArtifact::read_mapped_prefault(&path)
+        .map_err(|error| Error::Artifact(format!("{}: {error}; run ironicl prepare", path.display())))?;
+    let optimize = context.metadata().optimize.ok_or_else(|| {
+        Error::Artifact(format!(
+            "{} records no optimize level; run ironicl prepare",
+            path.display()
+        ))
+    })?;
+    let context = executor.load_context_artifact(context, optimize, threads, limits)?;
+    executor.fitted_with_context(&read(&dir.join(PREPROCESSOR))?, context)
 }

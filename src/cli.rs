@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::{net::SocketAddr, path::PathBuf};
 
 use crate::{
     Optimize,
@@ -13,6 +13,7 @@ pub enum Command {
     Inspect(InspectArgs),
     Import(ImportArgs),
     Prepare(PrepareArgs),
+    Serve(ServeArgs),
 }
 
 /// Command-specific help pages.
@@ -22,6 +23,7 @@ pub enum HelpTopic {
     Inspect,
     Import,
     Prepare,
+    Serve,
 }
 
 /// A model source accepted by commands that can read checkpoints or artifacts.
@@ -60,6 +62,15 @@ pub struct PrepareArgs {
     pub optimize: Optimize,
 }
 
+/// Arguments for serving an exported model over HTTP.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServeArgs {
+    pub dir: PathBuf,
+    pub bind: SocketAddr,
+    pub max_rows: usize,
+    pub max_body: usize,
+}
+
 /// Parse command-line arguments excluding the executable name.
 ///
 /// # Errors
@@ -77,6 +88,7 @@ pub fn parse_cli(args: &[String]) -> Result<Command> {
         "inspect" => parse_inspect(rest),
         "import" => parse_import(rest),
         "prepare" => parse_prepare(rest),
+        "serve" => parse_serve(rest),
         _ => Err(Error::InvalidArgument(format!("unknown command '{command}'"))),
     }
 }
@@ -97,6 +109,7 @@ fn parse_help_topic(value: &str) -> Result<HelpTopic> {
         "inspect" => Ok(HelpTopic::Inspect),
         "import" => Ok(HelpTopic::Import),
         "prepare" => Ok(HelpTopic::Prepare),
+        "serve" => Ok(HelpTopic::Serve),
         _ => Err(Error::InvalidArgument(format!("unknown help topic '{value}'"))),
     }
 }
@@ -171,6 +184,37 @@ fn parse_prepare(args: &[String]) -> Result<Command> {
     Ok(Command::Prepare(PrepareArgs {
         dir,
         optimize: optimize.unwrap_or_default(),
+    }))
+}
+
+fn parse_serve(args: &[String]) -> Result<Command> {
+    if is_help(args) {
+        return Ok(Command::Help(Some(HelpTopic::Serve)));
+    }
+    let (dir, rest) = model_dir(args, "serve")?;
+    let (mut bind, mut max_rows, mut max_body) = (None, None, None);
+    let mut index = 0;
+    while index < rest.len() {
+        let flag = &rest[index];
+        let value = option_value(rest, &mut index)?;
+        let invalid = || Error::InvalidArgument(format!("invalid value '{value}' for {flag}"));
+        match flag.as_str() {
+            "--bind" => set_once(&mut bind, value.parse().map_err(|_| invalid())?, flag)?,
+            "--max-rows" => set_once(&mut max_rows, value.parse().map_err(|_| invalid())?, flag)?,
+            "--max-body" => set_once(&mut max_body, crate::memory::parse_bytes(value)?, flag)?,
+            _ => {
+                return Err(Error::InvalidArgument(format!(
+                    "unknown option '{flag}' for serve"
+                )));
+            }
+        }
+    }
+    Ok(Command::Serve(ServeArgs {
+        dir,
+        bind: bind.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 8080))),
+        max_rows: max_rows.unwrap_or(10_000),
+        max_body: usize::try_from(max_body.unwrap_or(16 << 20))
+            .map_err(|_| Error::InvalidArgument("--max-body is too large".into()))?,
     }))
 }
 

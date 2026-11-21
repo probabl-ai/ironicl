@@ -2,8 +2,8 @@
 
 ## Command Shape
 
-Ironicl ships one binary. File commands take named inputs; `prepare` takes an exported model's
-directory.
+Ironicl ships one binary. File commands take named inputs; `prepare` and `serve` take an exported
+model's directory.
 
 ```text
 ironicl help [COMMAND]
@@ -11,6 +11,7 @@ ironicl platform
 ironicl inspect (--checkpoint FILE | --model FILE)
 ironicl import --checkpoint FILE --output FILE
 ironicl prepare DIR [--optimize safe|auto|fast]
+ironicl serve DIR [--bind ADDR] [--max-rows N] [--max-body SIZE]
 ```
 
 Use `ironicl help COMMAND` or `ironicl COMMAND --help` for command-specific help.
@@ -78,6 +79,15 @@ data, on this machine's device, and writes it to `churn/context.ircntxt` atomica
 records its `optimize` level, `safe` by default. Run it on the machine that will serve the model
 when that machine or the level differs from the fit's. `IRONICL_MEMORY_LIMIT` and
 `IRONICL_DEVICE_MEMORY_LIMIT` limit the build as they do in Python.
+
+## Serve
+
+```bash
+ironicl serve churn
+```
+
+`serve` serves the exported model over HTTP; it needs the `server` feature. See
+[server.md](server.md).
 
 ## Stability
 

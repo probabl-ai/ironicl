@@ -162,9 +162,8 @@ Exit gate: CLI predictions match the Python estimators byte for byte.
 
 ## Phase 10: Server
 
-Step E of [source-layout.md](source-layout.md#steps): a prediction server behind
-the `server` feature, with `/health`, `/v1/models`, and `predict` and
-`predict_proba` per model, in JSON, for fitted models loaded read-only at
-startup. It runs without Python.
-
-Exit gate: server predictions match the Python estimators.
+Step E of [source-layout.md](source-layout.md#steps). Done: `export`,
+`ironicl prepare`, and `ironicl serve` with `POST /predict` and `GET /health`
+in JSON, for one exported model, without Python ([server.md](server.md)). Its
+predictions match the Python estimators. Next: batching concurrent requests,
+missing values and categorical features, and a binary or gRPC interface.
