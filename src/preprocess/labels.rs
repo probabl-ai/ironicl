@@ -53,6 +53,19 @@ impl Labels {
         self.len() == 0
     }
 
+    /// The labels at `indices`, each below [`Self::len`].
+    pub(crate) fn select(&self, indices: &[usize]) -> Self {
+        fn pick<T: Clone>(values: &[T], indices: &[usize]) -> Vec<T> {
+            indices.iter().map(|&index| values[index].clone()).collect()
+        }
+        match self {
+            Self::Int(values) => Self::Int(pick(values, indices)),
+            Self::Float(values) => Self::Float(pick(values, indices)),
+            Self::Bool(values) => Self::Bool(pick(values, indices)),
+            Self::Text(values) => Self::Text(pick(values, indices)),
+        }
+    }
+
     /// The sorted distinct labels.
     ///
     /// Port of <https://github.com/scikit-learn/scikit-learn/blob/1.9.1/sklearn/preprocessing/_label.py#L90-L105>.

@@ -1,8 +1,8 @@
-use std::{env, process};
+use std::{env, process, time::Instant};
 
 use ironicl::{
-    Command, CpuCapabilities, HelpTopic, ImportArgs, InspectArgs, Isa, ModelSource, error::Result,
-    memory::ByteSize, parse_cli,
+    Command, CpuCapabilities, HelpTopic, ImportArgs, InspectArgs, Isa, ModelSource, PrepareArgs,
+    error::Result, memory::ByteSize, models::tabicl_v2::saved, parse_cli,
 };
 
 fn main() {
@@ -19,6 +19,7 @@ fn run() -> Result<()> {
         Command::Platform => print_platform(),
         Command::Inspect(args) => inspect(args)?,
         Command::Import(args) => import(&args)?,
+        Command::Prepare(args) => prepare(&args)?,
     }
     Ok(())
 }
@@ -121,6 +122,20 @@ fn import(args: &ImportArgs) -> Result<()> {
     Ok(())
 }
 
+fn prepare(args: &PrepareArgs) -> Result<()> {
+    let start = Instant::now();
+    let (fitted, path) = saved::prepare(&args.dir, args.optimize)?;
+    let seconds = start.elapsed().as_secs_f64();
+    let bytes = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
+    println!("Prepared the KV cache");
+    println!("path:          {}", path.display());
+    println!("device:        {}", fitted.device());
+    println!("optimize:      {}", args.optimize);
+    println!("size:          {}", ByteSize(bytes));
+    println!("time:          {seconds:.2} s");
+    Ok(())
+}
+
 fn print_help(topic: Option<HelpTopic>) {
     let text = match topic {
         None => {
@@ -128,7 +143,8 @@ fn print_help(topic: Option<HelpTopic>) {
              Usage:\n\
                ironicl platform\n\
                ironicl inspect (--checkpoint FILE | --model FILE)\n\
-               ironicl import --checkpoint FILE --output FILE\n\n\
+               ironicl import --checkpoint FILE --output FILE\n\
+               ironicl prepare DIR [--optimize safe|auto|fast]\n\n\
              Use 'ironicl help COMMAND' for command-specific help."
         }
         Some(HelpTopic::Platform) => "Usage: ironicl platform",
@@ -139,6 +155,12 @@ fn print_help(topic: Option<HelpTopic>) {
         Some(HelpTopic::Import) => {
             "Usage: ironicl import --checkpoint FILE --output FILE\n\n\
              Convert a PyTorch checkpoint to a portable Ironicl model."
+        }
+        Some(HelpTopic::Prepare) => {
+            "Usage: ironicl prepare DIR [--optimize safe|auto|fast]\n\n\
+             Build the KV cache of a model exported with export(), on this machine's\n\
+             device, from its training data. The level defaults to safe and is\n\
+             recorded in DIR/context.ircntxt, which ironicl serve reads."
         }
     };
     println!("{text}");

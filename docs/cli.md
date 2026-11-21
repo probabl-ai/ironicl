@@ -2,20 +2,21 @@
 
 ## Command Shape
 
-Ironicl ships one binary with four commands. Model commands take named inputs, not positional file
-paths.
+Ironicl ships one binary. File commands take named inputs; `prepare` takes an exported model's
+directory.
 
 ```text
 ironicl help [COMMAND]
 ironicl platform
 ironicl inspect (--checkpoint FILE | --model FILE)
 ironicl import --checkpoint FILE --output FILE
+ironicl prepare DIR [--optimize safe|auto|fast]
 ```
 
 Use `ironicl help COMMAND` or `ironicl COMMAND --help` for command-specific help.
 
-The CLI does not fit or predict yet. Use the [Python estimators](python.md) for that. A CLI that
-takes raw rows, as the estimators do, is planned; see the [roadmap](roadmap.md).
+The CLI does not fit. Fit with the [Python estimators](python.md) and export the model with
+`export`.
 
 ## Source Flags
 
@@ -65,6 +66,18 @@ caches; see [artifact-format.md](artifact-format.md).
 
 The Python estimators import checkpoints themselves, through a content-addressed cache, so a
 manual import is only needed to inspect or ship a model artifact.
+
+## Prepare
+
+```bash
+ironicl prepare churn --optimize auto
+```
+
+`prepare` builds the KV cache of a model that `export` wrote to `churn/`, from its training
+data, on this machine's device, and writes it to `churn/context.ircntxt` atomically. The cache
+records its `optimize` level, `safe` by default. Run it on the machine that will serve the model
+when that machine or the level differs from the fit's. `IRONICL_MEMORY_LIMIT` and
+`IRONICL_DEVICE_MEMORY_LIMIT` limit the build as they do in Python.
 
 ## Stability
 

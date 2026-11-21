@@ -12,6 +12,7 @@ pub(crate) mod metal;
 pub mod preprocess;
 pub mod quantiles;
 pub mod request;
+pub mod saved;
 
 /// Where a context predicts.
 #[derive(Debug, Clone)]

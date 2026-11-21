@@ -68,6 +68,16 @@ pub enum Optimize {
     Fast,
 }
 
+impl std::fmt::Display for Optimize {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Safe => "safe",
+            Self::Auto => "auto",
+            Self::Fast => "fast",
+        })
+    }
+}
+
 impl std::str::FromStr for Optimize {
     type Err = Error;
 
@@ -657,15 +667,10 @@ impl Executor {
         }
         // Bump the prefix when built contexts change within an Ironicl version.
         let mut context_sha256 = Sha256::new_with_prefix(b"ironicl-context-v2\0");
-        let level = match optimize {
-            Optimize::Safe => "safe",
-            Optimize::Auto => "auto",
-            Optimize::Fast => "fast",
-        };
         for part in [
             env!("CARGO_PKG_VERSION"),
             &self.model.summary().source_sha256,
-            level,
+            &optimize.to_string(),
         ] {
             context_sha256.update(part.as_bytes());
             context_sha256.update([0]);

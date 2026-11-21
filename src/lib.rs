@@ -15,7 +15,7 @@ pub mod progress;
 #[cfg(feature = "python")]
 mod python;
 
-pub use cli::{Command, HelpTopic, ImportArgs, InspectArgs, ModelSource, parse_cli};
+pub use cli::{Command, HelpTopic, ImportArgs, InspectArgs, ModelSource, PrepareArgs, parse_cli};
 pub use config::{StorageDType, TaskKind};
 pub use error::{Error, Result};
 pub use format::model::{

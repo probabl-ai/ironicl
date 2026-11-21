@@ -8,6 +8,7 @@
 //! numbering; only the mechanics live here.
 
 pub mod model;
+pub mod npy;
 pub mod preprocessor;
 pub mod static_context;
 

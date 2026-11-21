@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
-use crate::error::{Error, Result};
+use crate::{
+    Optimize,
+    error::{Error, Result},
+};
 
 /// A parsed Ironicl command.
 #[derive(Debug, Clone, PartialEq)]
@@ -9,6 +12,7 @@ pub enum Command {
     Platform,
     Inspect(InspectArgs),
     Import(ImportArgs),
+    Prepare(PrepareArgs),
 }
 
 /// Command-specific help pages.
@@ -17,6 +21,7 @@ pub enum HelpTopic {
     Platform,
     Inspect,
     Import,
+    Prepare,
 }
 
 /// A model source accepted by commands that can read checkpoints or artifacts.
@@ -48,6 +53,13 @@ pub struct ImportArgs {
     pub output: PathBuf,
 }
 
+/// Arguments for building an exported model's KV cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrepareArgs {
+    pub dir: PathBuf,
+    pub optimize: Optimize,
+}
+
 /// Parse command-line arguments excluding the executable name.
 ///
 /// # Errors
@@ -64,6 +76,7 @@ pub fn parse_cli(args: &[String]) -> Result<Command> {
         "platform" => parse_no_args(rest, HelpTopic::Platform, Command::Platform),
         "inspect" => parse_inspect(rest),
         "import" => parse_import(rest),
+        "prepare" => parse_prepare(rest),
         _ => Err(Error::InvalidArgument(format!("unknown command '{command}'"))),
     }
 }
@@ -83,6 +96,7 @@ fn parse_help_topic(value: &str) -> Result<HelpTopic> {
         "platform" => Ok(HelpTopic::Platform),
         "inspect" => Ok(HelpTopic::Inspect),
         "import" => Ok(HelpTopic::Import),
+        "prepare" => Ok(HelpTopic::Prepare),
         _ => Err(Error::InvalidArgument(format!("unknown help topic '{value}'"))),
     }
 }
@@ -133,6 +147,41 @@ fn parse_import(args: &[String]) -> Result<Command> {
         checkpoint: required(checkpoint, "--checkpoint", "import")?,
         output: required(output, "--output", "import")?,
     }))
+}
+
+fn parse_prepare(args: &[String]) -> Result<Command> {
+    if is_help(args) {
+        return Ok(Command::Help(Some(HelpTopic::Prepare)));
+    }
+    let (dir, rest) = model_dir(args, "prepare")?;
+    let mut optimize = None;
+    let mut index = 0;
+    while index < rest.len() {
+        let flag = &rest[index];
+        let value = option_value(rest, &mut index)?;
+        match flag.as_str() {
+            "--optimize" => set_once(&mut optimize, value.parse()?, flag)?,
+            _ => {
+                return Err(Error::InvalidArgument(format!(
+                    "unknown option '{flag}' for prepare"
+                )));
+            }
+        }
+    }
+    Ok(Command::Prepare(PrepareArgs {
+        dir,
+        optimize: optimize.unwrap_or_default(),
+    }))
+}
+
+/// The model directory that leads `args`, and the options after it.
+fn model_dir<'a>(args: &'a [String], command: &str) -> Result<(PathBuf, &'a [String])> {
+    match args.split_first() {
+        Some((dir, rest)) if !dir.starts_with("--") => Ok((PathBuf::from(dir), rest)),
+        _ => Err(Error::InvalidArgument(format!(
+            "{command} requires a model directory"
+        ))),
+    }
 }
 
 fn parse_model_source(args: &[String], command: &str) -> Result<ModelSource> {
@@ -264,6 +313,18 @@ mod tests {
         ]))
         .expect_err("duplicate option must fail");
         assert!(error.to_string().contains("duplicate option"));
+    }
+
+    #[test]
+    fn parses_prepare() {
+        assert_eq!(
+            parse_cli(&args(&["prepare", "churn", "--optimize", "auto"])),
+            Ok(Command::Prepare(PrepareArgs {
+                dir: PathBuf::from("churn"),
+                optimize: Optimize::Auto,
+            }))
+        );
+        assert!(parse_cli(&args(&["prepare", "--optimize", "auto"])).is_err());
     }
 
     #[test]
