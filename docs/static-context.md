@@ -26,10 +26,12 @@ A complete production context can precompute and persist:
 - quantization scales and zero-point metadata;
 - section hashes and whole-artifact checksums.
 
-The current executable artifact is narrower. It stores FP32 column caches and
-configurable FP32 or BF16 ICL K/V, estimator permutations, model/context
-identities, a checked tensor directory, and one trailing whole-file SHA-256.
-Version 3 can store ICL K in source-tile, dimension-major order. Representation caches,
+The current executable artifact is narrower. It stores FP32 column caches,
+ICL K in FP32 or FP16 and ICL V in FP32, BF16, or FP16, estimator permutations,
+model/context identities, a checked tensor directory, and one trailing
+whole-file SHA-256. BF16 ICL K and the version 3 pre-packed K layout are removed
+(see [removed-experiments.md](removed-experiments.md#bf16-attention-keys)).
+Representation caches,
 fitted preprocessing state, packed weights, RoPE tables, quantization metadata,
 and per-section checksums are not implemented.
 
@@ -60,7 +62,7 @@ The current static executor consumes:
 - column K/V tensors named `column.{0..2}.{key,value}` with shape
   `[B,H+4,8,128,16]`;
 - ICL K/V tensors named `icl.{0..11}.{key,value}` with logical shape
-  `[B,8,N,64]` and a supported FP32/BF16 policy;
+  `[B,8,N,64]`: FP32 K/V, FP32 K with BF16 V, or FP16 K/V;
 - one checked `IRQUERY` tensor with shape `[B,Q,H]` and matching model/context
   identities.
 
