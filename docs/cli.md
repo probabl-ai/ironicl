@@ -7,7 +7,6 @@ positional file paths.
 
 ```text
 ironicl platform
-ironicl plan [options]
 ironicl inspect (--checkpoint FILE | --model FILE)
 ironicl import --checkpoint FILE --output FILE
 ironicl run (--checkpoint FILE | --model FILE) --input FILE [cache options]

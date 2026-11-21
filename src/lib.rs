@@ -15,8 +15,8 @@ pub mod progress;
 #[cfg(feature = "python")]
 mod python;
 
-pub use cli::{Command, HelpTopic, ImportArgs, InspectArgs, ModelSource, PlanArgs, parse_cli};
-pub use config::{CacheMode, ExecutionConfig, StorageDType, TabIclV2Model, TaskKind, Workload};
+pub use cli::{Command, HelpTopic, ImportArgs, InspectArgs, ModelSource, parse_cli};
+pub use config::{StorageDType, TaskKind};
 pub use error::{Error, Result};
 pub use format::model::{
     MODEL_ARTIFACT_MAGIC, MODEL_ARTIFACT_VERSION, ModelArtifact, ModelArtifactSummary, ModelConfig,
@@ -27,8 +27,7 @@ pub use format::static_context::{
     STATIC_CONTEXT_MAGIC, STATIC_CONTEXT_VERSION, StaticContextArtifact, StaticContextMetadata,
     StaticContextTensor, StaticContextTensorData, StaticContextTensorRef,
 };
-pub use kernels::cpu::{CpuCapabilities, Isa, IsaPreference};
-pub use memory::{CacheEstimate, MemoryPlan, estimate_memory};
+pub use kernels::cpu::{CpuCapabilities, Isa};
 pub use models::tabicl_v2::checkpoint::{
     CheckpointProfile, CheckpointSummary, import_checkpoint, inspect_checkpoint,
 };

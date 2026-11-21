@@ -95,8 +95,8 @@ the limits that applied, and a verdict:
 When it does not fit, the plan lists the changes that would: at most this many
 training rows, fewer estimators, or a faster `optimize` level with smaller
 storage. Every suggestion is checked to fit. `ironicl::plan_context` plans with
-the storage, builder, and pools the build itself would use; `ironicl plan`
-prints the report.
+the storage, builder, and pools the build itself would use; `ironicl.plan_memory`
+and `memory_plan_` show the report in Python.
 
 ## Python API
 
@@ -195,7 +195,7 @@ changes which shapes run, so it can change results that much.
 
 | PR | Scope |
 |---|---|
-| A (#27) | Pools, platform probes, demand, plan, and the `ironicl plan` report. No behavior change |
+| A (#27) | Pools, platform probes, demand, plan, and the `ironicl plan` report (since removed). No behavior change |
 | B (#28) | The builds use the plan's group sizes by pool; memory limits; the Python API with warnings, errors, and the "cannot complete" verdict; a peak-memory fixture test against the plan |
 | D (#29) | GPU queries split into a fixed set of shapes that fits the device's share; Python predicts in row chunks |
 

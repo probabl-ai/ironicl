@@ -463,3 +463,67 @@ stay.
   `validate_static_cache_contract`, and add a BF16-key storage choice to the
   context builder. It would need a new error budget: at `N=100000` it was six
   times over the probability gate.
+
+## Legacy CLI planner
+
+**What it was.** The `ironicl plan` command and the configuration types behind
+it: `ExecutionConfig`, `TabIclV2Model`, `Workload` (with
+`query_microbatch`), `CacheMode` (`kv` or `repr`), `IsaPreference`,
+`Isa::resolve`, and `estimate_memory`, which returned a `MemoryPlan` with a
+`CacheEstimate`. `StorageDType` also had an `Int8` variant that only this
+planner could select.
+
+**How it worked.** `ironicl plan` took `--task`, `--rows`, `--features`,
+`--estimators`, `--microbatch`, `--cache kv|repr`, `--weights` and
+`--kv-dtype` (`fp32|bf16|int8`), `--isa auto|portable|neon|avx512`, and
+`--bandwidth-gbps`. The defaults were 50,000 rows, 100 features, 8 estimators,
+microbatch 1, full K/V, and BF16 weights and caches. `Isa::resolve` checked an
+explicit ISA against the host: AVX-512 needed `AVX512F`, plus `AVX512_BF16`
+for BF16 storage and `AVX512_VNNI` for INT8. `estimate_memory` applied the
+payload formulas in [memory-and-io.md](memory-and-io.md): column K/V
+`2 * s * B * 3 * (H + 4) * 128 * 128`, and either ICL K/V
+`2 * s * B * 12 * N * 512` or, for `repr`, row representations
+`s * B * N * 512`. It excluded quantization scales, alignment, and scratch
+memory. The command then printed the `memory::plan` report for a CPU build,
+and with a bandwidth it printed the ideal time to scan the cache once and that
+time divided by the microbatch size.
+
+**What it showed.** It reproduced the reference sizes in
+[memory-and-io.md](memory-and-io.md#reference-sizes): at 50,000 rows, 100
+features, 8 estimators, and BF16, a 9,993,977,856-byte cache, which at 80 GB/s
+is an ideal 124.9 ms scan ([memory-and-io.md](memory-and-io.md#bandwidth-lower-bound)).
+Its tests pinned that figure and the 24-fold smaller representation cache per
+context row. [Architecture](architecture.md) described it as the report of ISA
+and payload sizes; [memory-planner.md](memory-planner.md#phases) records that
+phase A (#27) added the `memory::plan` report to the command.
+
+**Why it was removed.** Nothing outside the command used it. Python plans with
+`plan_context`, which calls `memory::plan`, through `_core.plan_memory`; that
+backs `ironicl.plan_memory` and the fitted estimators' `memory_plan_`. The
+context builder sizes its CPU and GPU build groups with the same `memory`
+module. The kernels pick their ISA with
+`Isa::detect`, so `--isa` changed only the report. The representation cache
+and INT8 storage were never implemented, and the microbatch API went with the C
+ABI in `9e96273`. The CLI now has `help`, `platform`, `inspect`, and
+`import`. `StorageDType` tag `4` in the `IRCNTXT` tensor directory was
+`int8`; no context ever stored it, and it stays reserved so the number is not
+reused.
+
+**Code.**
+
+- Types: [`CacheMode`, `TabIclV2Model`, `Workload`, and `ExecutionConfig`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/config.rs#L131-L298)
+  and [`StorageDType` with `Int8`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/config.rs#L48-L129)
+- ISA choice: [`Isa::resolve`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/kernels/cpu/mod.rs#L86-L119),
+  [`IsaPreference`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/kernels/cpu/mod.rs#L122-L156), and
+  [their tests](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/kernels/cpu/mod.rs#L219-L259)
+- Estimate: [`CacheEstimate`, `MemoryPlan`, `cache_scan_seconds`, and `estimate_memory`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/memory.rs#L905-L1017)
+  and [their tests](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/memory.rs#L1451-L1498)
+- CLI: [`PlanArgs`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/cli.rs#L47-L52),
+  [`parse_plan`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/cli.rs#L154-L225),
+  [`print_plan`](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/main.rs#L40-L103), and
+  [its help](https://github.com/probabl-ai/ironicl/blob/e91a75d3995c52456b282a47138764fa064d81e1/src/main.rs#L496-L509)
+- Restore: for a memory report, add a `plan` command that prints
+  `memory::plan` for a shape, as `_core.plan_memory` does; that is the planner
+  the builds use. Restore `estimate_memory` and the configuration types only
+  to size a cache mode or storage type that the builder implements. Never give
+  tag `4` to a new dtype.

@@ -1,9 +1,6 @@
 use std::{fmt, str::FromStr};
 
-use crate::{
-    error::{Error, Result},
-    kernels::cpu::IsaPreference,
-};
+use crate::error::{Error, Result};
 
 /// The released `TabICLv2` task variants supported by the design.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,8 +44,8 @@ impl FromStr for TaskKind {
 
 /// Storage formats. Arithmetic policy is separate and remains FP32 by default.
 ///
-/// This is the one storage-dtype vocabulary shared by the config surface and the
-/// on-disk artifact directories. Model *import* dtypes are a separate concern
+/// This is the storage-dtype vocabulary of the on-disk artifact tensor
+/// directories. Model *import* dtypes are a separate concern
 /// (`format::model::ModelTensorDType`), since a checkpoint weight may be
 /// `i64`/`f64`/`u8` that a cache never stores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,7 +53,6 @@ pub enum StorageDType {
     Fp32,
     Bf16,
     F16,
-    Int8,
 }
 
 impl StorageDType {
@@ -65,13 +61,14 @@ impl StorageDType {
         match self {
             Self::Fp32 => 4,
             Self::Bf16 | Self::F16 => 2,
-            Self::Int8 => 1,
         }
     }
 
     /// Stable on-disk tag for an artifact tensor-directory entry. The numbers are
     /// a wire format shared by every artifact that stores these dtypes.
     ///
+    /// Reserved: tag `4` was `int8`, which no artifact ever stored; it was
+    /// removed with the legacy planner and must not be reused for another dtype.
     /// Reserved but unimplemented: tag `5` = `int4`. It is sub-byte, so it does
     /// not fit `bytes_per_element` and needs a packing convention decided before
     /// it becomes a variant.
@@ -81,7 +78,6 @@ impl StorageDType {
             Self::Fp32 => 1,
             Self::Bf16 => 2,
             Self::F16 => 3,
-            Self::Int8 => 4,
         }
     }
 
@@ -95,7 +91,6 @@ impl StorageDType {
             1 => Ok(Self::Fp32),
             2 => Ok(Self::Bf16),
             3 => Ok(Self::F16),
-            4 => Ok(Self::Int8),
             _ => Err(Error::Artifact(format!("unsupported tensor dtype tag {tag}"))),
         }
     }
@@ -107,192 +102,21 @@ impl fmt::Display for StorageDType {
             Self::Fp32 => f.write_str("fp32"),
             Self::Bf16 => f.write_str("bf16"),
             Self::F16 => f.write_str("f16"),
-            Self::Int8 => f.write_str("int8"),
         }
     }
 }
 
-impl FromStr for StorageDType {
-    type Err = Error;
+#[cfg(test)]
+mod tests {
+    use super::StorageDType;
 
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "fp32" | "f32" => Ok(Self::Fp32),
-            "bf16" => Ok(Self::Bf16),
-            "f16" | "fp16" => Ok(Self::F16),
-            "int8" | "i8" => Ok(Self::Int8),
-            _ => Err(Error::InvalidArgument(format!(
-                "unknown storage dtype '{value}'; expected fp32, bf16, f16, or int8"
-            ))),
+    #[test]
+    fn disk_tags_round_trip_and_reserved_tags_are_rejected() {
+        for dtype in [StorageDType::Fp32, StorageDType::Bf16, StorageDType::F16] {
+            assert_eq!(StorageDType::from_disk_tag(dtype.on_disk_tag()), Ok(dtype));
         }
-    }
-}
-
-/// Training-context cache strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CacheMode {
-    /// Cache K/V for every ICL layer. This is large but minimizes repeated work.
-    Kv,
-    /// Cache row representations and rerun the ICL stack for each request.
-    Representation,
-}
-
-impl fmt::Display for CacheMode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Kv => f.write_str("kv"),
-            Self::Representation => f.write_str("repr"),
+        for reserved in [0, 4, 5] {
+            assert!(StorageDType::from_disk_tag(reserved).is_err());
         }
-    }
-}
-
-impl FromStr for CacheMode {
-    type Err = Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "kv" | "full-kv" => Ok(Self::Kv),
-            "repr" | "representation" => Ok(Self::Representation),
-            _ => Err(Error::InvalidArgument(format!(
-                "unknown cache mode '{value}'; expected kv or repr"
-            ))),
-        }
-    }
-}
-
-/// Released `TabICLv2` architecture constants used by cache planning.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TabIclV2Model {
-    pub task: TaskKind,
-    pub embed_dim: u64,
-    pub column_blocks: u64,
-    pub column_inducing_points: u64,
-    pub row_cls_tokens: u64,
-    pub icl_blocks: u64,
-}
-
-impl TabIclV2Model {
-    #[must_use]
-    pub const fn classifier() -> Self {
-        Self::new(TaskKind::Classifier)
-    }
-
-    #[must_use]
-    pub const fn regressor() -> Self {
-        Self::new(TaskKind::Regressor)
-    }
-
-    #[must_use]
-    pub const fn new(task: TaskKind) -> Self {
-        Self {
-            task,
-            embed_dim: 128,
-            column_blocks: 3,
-            column_inducing_points: 128,
-            row_cls_tokens: 4,
-            icl_blocks: 12,
-        }
-    }
-
-    #[must_use]
-    pub const fn icl_dim(self) -> u64 {
-        self.embed_dim * self.row_cls_tokens
-    }
-
-    #[must_use]
-    pub const fn parameter_count(self) -> u64 {
-        self.task.parameter_count()
-    }
-}
-
-/// Data dimensions and request batching used to size a static context.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Workload {
-    pub training_rows: u64,
-    pub features: u64,
-    pub estimators: u64,
-    pub query_microbatch: u32,
-}
-
-impl Default for Workload {
-    fn default() -> Self {
-        Self {
-            training_rows: 50_000,
-            features: 100,
-            estimators: 8,
-            query_microbatch: 1,
-        }
-    }
-}
-
-impl Workload {
-    /// Validate non-zero workload dimensions.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidConfig`] when any dimension is zero.
-    pub fn validate(self) -> Result<()> {
-        if self.training_rows == 0 {
-            return Err(Error::InvalidConfig(
-                "training_rows must be greater than zero".into(),
-            ));
-        }
-        if self.features == 0 {
-            return Err(Error::InvalidConfig("features must be greater than zero".into()));
-        }
-        if self.estimators == 0 {
-            return Err(Error::InvalidConfig(
-                "estimators must be greater than zero".into(),
-            ));
-        }
-        if self.query_microbatch == 0 {
-            return Err(Error::InvalidConfig(
-                "query_microbatch must be greater than zero".into(),
-            ));
-        }
-        Ok(())
-    }
-}
-
-/// Top-level execution policy used to create an engine plan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExecutionConfig {
-    pub model: TabIclV2Model,
-    pub workload: Workload,
-    pub cache_mode: CacheMode,
-    pub weight_dtype: StorageDType,
-    pub kv_dtype: StorageDType,
-    pub isa: IsaPreference,
-}
-
-impl Default for ExecutionConfig {
-    fn default() -> Self {
-        Self {
-            model: TabIclV2Model::classifier(),
-            workload: Workload::default(),
-            cache_mode: CacheMode::Kv,
-            weight_dtype: StorageDType::Bf16,
-            kv_dtype: StorageDType::Bf16,
-            isa: IsaPreference::Auto,
-        }
-    }
-}
-
-impl ExecutionConfig {
-    /// Validate the workload and model-specific cache assumptions.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::InvalidConfig`] when the workload or model contract is
-    /// not supported.
-    pub fn validate(self) -> Result<()> {
-        self.workload.validate()?;
-
-        if self.model.task == TaskKind::Classifier && self.model.row_cls_tokens != 4 {
-            return Err(Error::InvalidConfig(
-                "the released classifier cache contract requires four row CLS tokens".into(),
-            ));
-        }
-        Ok(())
     }
 }

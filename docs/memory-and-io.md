@@ -34,7 +34,8 @@ total bytes  = s * B * [98,304 * (H + 4) + 512 * N]
 ```
 
 The row-dependent representation payload is 24 times smaller than ICL K/V, but
-the engine must rerun all 12 ICL blocks for each request.
+the engine must rerun all 12 ICL blocks for each request. Ironicl does not
+implement this cache; it is phase G of the [memory planner](memory-planner.md#phases).
 
 ## Reference Sizes
 
@@ -52,7 +53,7 @@ FP16 uses the same two bytes per element as BF16; it is the Apple Silicon GPU
 cache policy under `optimize=auto`/`fast`. The table assumes one storage type for the whole
 context; in practice only the ICL caches take the reduced type and the column
 caches stay FP32, which adds `0.31 GiB` at `H=100`, `B=8`. INT8 values exclude scale metadata and
-alignment. The planner currently reports payload bytes only.
+alignment; Ironicl does not store INT8 caches.
 
 ## RAM Budget
 
@@ -105,9 +106,9 @@ At 50K rows, BF16, 100 features, and eight estimators, the cache is
 latency prediction: it excludes computation, imperfect bandwidth, cache
 conflicts, synchronization, and other traffic.
 
-A microbatch can reuse one K/V stream for multiple queries. Divide the scan
-cost by microbatch size only as an ideal amortized floor; compute eventually
-becomes dominant.
+A batch of queries reads one K/V stream for all its rows, so the scan cost per
+query falls with batch size only as an ideal amortized floor; compute
+eventually becomes dominant.
 
 ## Gen5 NVMe
 

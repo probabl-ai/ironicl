@@ -31,12 +31,7 @@ mod ops {
 #[cfg(test)]
 mod tests;
 
-use std::{fmt, str::FromStr};
-
-use crate::{
-    config::{ExecutionConfig, StorageDType},
-    error::{Error, Result},
-};
+use std::fmt;
 
 #[cfg(target_arch = "aarch64")]
 pub(crate) use arch::aarch64::*;
@@ -80,77 +75,6 @@ impl Isa {
             Self::Avx512
         } else {
             Self::Portable
-        }
-    }
-
-    /// The instruction set `config` asks for on `host`, checked against the
-    /// host and the storage types: BF16 storage on AVX-512 needs
-    /// `AVX512_BF16`, and INT8 needs `AVX512_VNNI`.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the configuration is invalid or when an
-    /// explicitly chosen instruction set lacks a required CPU capability.
-    pub fn resolve(config: ExecutionConfig, host: &CpuCapabilities) -> Result<Self> {
-        config.validate()?;
-        match config.isa {
-            IsaPreference::Auto => Ok(Self::for_host(host)),
-            IsaPreference::Portable => Ok(Self::Portable),
-            IsaPreference::Neon if host.neon => Ok(Self::Neon),
-            IsaPreference::Neon => Err(Error::UnsupportedBackend("NEON needs an AArch64 CPU".into())),
-            IsaPreference::Avx512 => {
-                if !host.avx512f {
-                    return Err(Error::UnsupportedBackend("AVX-512 needs AVX512F".into()));
-                }
-                let uses = |dtype| config.weight_dtype == dtype || config.kv_dtype == dtype;
-                if uses(StorageDType::Bf16) && !host.avx512bf16 {
-                    return Err(Error::UnsupportedBackend(
-                        "BF16 storage on AVX-512 needs AVX512_BF16".into(),
-                    ));
-                }
-                if uses(StorageDType::Int8) && !host.avx512vnni {
-                    return Err(Error::UnsupportedBackend(
-                        "INT8 storage on AVX-512 needs AVX512_VNNI".into(),
-                    ));
-                }
-                Ok(Self::Avx512)
-            }
-        }
-    }
-}
-
-/// The instruction set a configuration asks for, before [`Isa::resolve`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IsaPreference {
-    Auto,
-    Portable,
-    Neon,
-    Avx512,
-}
-
-impl fmt::Display for IsaPreference {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Auto => "auto",
-            Self::Portable => "portable",
-            Self::Neon => "neon",
-            Self::Avx512 => "avx512",
-        })
-    }
-}
-
-impl FromStr for IsaPreference {
-    type Err = Error;
-
-    fn from_str(value: &str) -> Result<Self> {
-        match value {
-            "auto" => Ok(Self::Auto),
-            "portable" | "reference" => Ok(Self::Portable),
-            "neon" => Ok(Self::Neon),
-            "avx512" => Ok(Self::Avx512),
-            _ => Err(Error::InvalidArgument(format!(
-                "unknown ISA '{value}'; expected auto, portable, neon, or avx512"
-            ))),
         }
     }
 }
@@ -213,47 +137,5 @@ impl fmt::Display for CpuCapabilities {
         writeln!(f, "avx512vl:        {}", yes_no(self.avx512vl))?;
         writeln!(f, "avx512bf16:      {}", yes_no(self.avx512bf16))?;
         write!(f, "avx512vnni:      {}", yes_no(self.avx512vnni))
-    }
-}
-
-#[cfg(test)]
-mod isa_tests {
-    use super::{CpuCapabilities, Isa, IsaPreference};
-    use crate::config::ExecutionConfig;
-
-    fn avx512_host() -> CpuCapabilities {
-        CpuCapabilities {
-            architecture: "x86_64",
-            operating_system: "linux",
-            neon: false,
-            avx2: true,
-            avx512f: true,
-            avx512bw: true,
-            avx512vl: true,
-            avx512bf16: true,
-            avx512vnni: true,
-        }
-    }
-
-    #[test]
-    fn auto_picks_the_best_instruction_set() {
-        assert_eq!(
-            Isa::resolve(ExecutionConfig::default(), &avx512_host()),
-            Ok(Isa::Avx512)
-        );
-        let mut host = avx512_host();
-        host.avx512f = false;
-        assert_eq!(Isa::resolve(ExecutionConfig::default(), &host), Ok(Isa::Portable));
-    }
-
-    #[test]
-    fn avx512_needs_bf16_for_bf16_storage() {
-        let config = ExecutionConfig {
-            isa: IsaPreference::Avx512,
-            ..ExecutionConfig::default()
-        };
-        let mut host = avx512_host();
-        host.avx512bf16 = false;
-        assert!(Isa::resolve(config, &host).is_err());
     }
 }
