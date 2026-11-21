@@ -19,32 +19,29 @@ encoding and imputation come next.
 
 ### Context Builder
 
-The current Python exporter runs all training-dependent stages through official
-TabICL. It streams FP32 or BF16 K/V tensors into a temporary artifact and then
-atomically replaces the destination. Its version 3 pre-packed ICL K and BF16 ICL
-K are no longer read (see
-[removed-experiments.md](removed-experiments.md#ircntxt-v3-pre-packed-keys)).
+`Executor::build_context` runs the preprocessed training rows through the column, row, and ICL
+stages once, on the CPU, Metal, or CUDA, and keeps each stage's attention keys and values as a
+static context (`IRCNTXT`). `optimize` selects their storage precision. With a cache directory, it
+reuses a context with the same identity or writes the new one atomically
+([artifact-format.md](artifact-format.md#static-context)).
 
 ### Artifact Loader
 
-The loader validates format version, dimensions, identities, tensor names,
-dtypes, offsets, alignment, finite values, and the trailing whole-file checksum.
-It retains read-only mmap-backed FP32 or BF16 tensor views. Per-section checksums
-and prefault controls are not implemented.
+The loader validates format version, dimensions, identities, tensor names, dtypes, offsets,
+alignment, finite values, and the trailing whole-file checksum. It keeps read-only, memory-mapped
+tensor views and prefaults the mapping. Per-section checksums are not implemented.
 
 ### Portable Model Cache
 
-`run --checkpoint` hashes the source and resolves a versioned, content-addressed
-portable model. A cache miss performs the same checked conversion as explicit
-`import`; a hit verifies the model checksum and source hash without reparsing
-pickle. The portable cache is separate from dataset-specific static context.
+Loading a checkpoint hashes it and resolves a versioned, content-addressed portable model
+(`IRMODEL`). A cache miss performs the same checked conversion as `ironicl import`; a hit verifies
+the model checksum and source hash without reparsing pickle. The model cache is separate from the
+dataset-specific context cache.
 
 ### Command Interface
 
-The single `ironicl` binary exposes checkpoint inspection, artifact import,
-execution, and benchmarking. The parser is independent of the checkpoint
-dependency so builds can disable direct checkpoint support while retaining
-artifact execution.
+The single `ironicl` binary exposes platform reporting, checkpoint and model inspection, and
+checkpoint import ([cli.md](cli.md)). A CLI that fits and predicts from raw rows is planned.
 
 ### Planner
 
@@ -73,59 +70,56 @@ graph per estimator. Under `optimize=auto`/`fast` the GPU stores ICL caches and
 runs ICL attention in FP16. The CPU kernels run as `Isa::Neon`; the GPU path is
 selected at execution time rather than by the planner.
 
+### NVIDIA Backend
+
+Behind the `cuda` feature (Linux), kernels written with cuda-oxide build contexts and predict on
+NVIDIA GPUs. The ICL cache stays on the GPU, or streams from host memory when it does not fit.
+
 ### Request Executor
 
-Owns one persistent dense-work pool and request-local activation buffers. It
-executes preprocessed query variants against an immutable static context and
-returns per-estimator FP32 logits. When probabilities are requested, it also
-reverses each estimator's class permutation and aggregates the estimators.
+`StaticExecutor` owns one persistent dense-work pool and request-local activation buffers. It runs
+preprocessed query rows against an immutable static context, reverses each estimator's class
+permutation, and aggregates the estimators into probabilities, or summarizes the regressor's
+quantiles. `FittedModel` pairs it with the fitted preprocessing, so callers pass raw rows.
 
-## Offline Lifecycle
-
-The current exporter implements the temporary-file, file-sync, and atomic-rename
-steps. It does not reopen and validate the completed artifact before rename.
+## Fit Lifecycle
 
 ```text
-checkpoint + fitted preprocessing + X_train + y_train
-                         |
-                         v
-                  validate and hash
-                         |
-                         v
-                build and stream K/V
-                         |
-                         v
-              write immutable artifact.tmp
-                         |
-                         v
-              fsync, verify, atomic rename
+checkpoint -> content-addressed IRMODEL -> Executor
+                                             |
+raw X_train, y_train -> Rust preprocessing (IRPREP) -> transformed rows per estimator
+                                             |
+                                             v
+                      build_context (CPU, Metal, or CUDA) -> static context (IRCNTXT)
+                                             |
+                                             v
+                            optional atomic write to the context cache
 ```
 
-## Serving Lifecycle
+## Prediction Lifecycle
 
 ```text
-read model, context, and IRQUERY -> validate -> construct executor
-                                              |
-preprocessed variants -> column cache -> row transformer -> ICL K/V scan
-                                              |
-                                              v
-                              decoder -> per-estimator logits
+raw X_test -> fitted preprocessing -> transformed rows per estimator
+                                             |
+                                             v
+           column stage -> row transformer -> ICL attention over the cached keys and values
+                                             |
+                                             v
+           decoder -> class-order reversal and estimator aggregation -> probabilities or outputs
 ```
 
-Current Rust serving does not preprocess raw rows; that stays in the Python
-exporter. It does reverse class permutations and aggregate estimators when
-probabilities are requested (raw per-estimator logits otherwise). Static contexts
-are mmap-backed. Model mmap and explicit prefaulting remain future loading modes.
+The Python estimators drive both lifecycles today. A server that loads the same three files and
+predicts from raw rows is planned ([roadmap.md](roadmap.md)).
 
 ## Parallelism
 
-- One worker group owns a request or microbatch.
+- One worker group owns a request or query chunk.
 - Cached ICL attention partitions independent heads across scoped workers.
 - Cached ICL affine, exact GELU, decoder, and QASS row work uses one persistent
   executor-owned Rayon pool.
 - Column feature streams and query row interaction use scoped workers.
 - Do not submit nested Rayon jobs from attention workers.
-- Do not permit independent threads to reread the same K/V when a microbatch
+- Do not permit independent threads to reread the same K/V when a query chunk
   can share one streamed tile.
 - Pinning and NUMA placement are platform policies, not model semantics.
 - The 9800X3D is one CCD, so no cross-CCD policy is needed on the first target.
@@ -137,5 +131,6 @@ are mmap-backed. Model mmap and explicit prefaulting remain future loading modes
 - Each executor owns its dense-work pool. Request execution owns activation and
   online-attention scratch buffers.
 - No global mutable kernel state is permitted.
-- The model and query loaders own decoded values. Static-context tensor storage
-  is read-only mmap-backed. Request execution allocates intermediate activations.
+- The model loader owns decoded weights. Static-context tensor storage is read-only and
+  memory-mapped, or page-aligned memory a build produced. Request execution allocates
+  intermediate activations.

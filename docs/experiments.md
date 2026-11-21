@@ -1,5 +1,8 @@
 # Experiments and Tests Log
 
+> **Historical log.** Tools and formats this document mentions were removed; see
+> [removed-experiments.md](removed-experiments.md).
+
 This is the authoritative record of what Ironicl tried, what it kept, and what
 it rejected, together with the tests and gates that verify each retained claim.
 It covers two backends: the Ryzen 7 9800X3D CPU path and the Apple Silicon

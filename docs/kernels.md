@@ -16,8 +16,8 @@
 - classifier and regression decoders.
 - FP32 ensemble reduction.
 
-The initial scalar `dot_f32` and `softmax_f32` functions are contracts, not
-performance implementations.
+The scalar kernels in `kernels/reference.rs` are contracts, not performance
+implementations; the materialized attention and softmax there are test oracles only.
 
 The current affine kernel dispatches to custom NEON on AArch64 and AVX-512F on
 supported x86-64 hosts, with scalar fallback. On Apple Silicon, affine layers with

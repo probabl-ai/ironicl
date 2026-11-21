@@ -3,10 +3,8 @@
 ## Oracle Hierarchy
 
 1. Released TabICLv2 PyTorch FP32 CPU inference.
-2. Ironicl portable FP32 implementation.
-3. Ironicl optimized FP32 implementation.
-4. Ironicl mixed BF16-storage implementation.
-5. Experimental INT8 policies.
+2. Ironicl at `optimize="safe"`: FP32 on every device.
+3. Ironicl at `optimize="auto"` and `"fast"`: reduced precision, bounded against `"safe"`.
 
 Each level must pass before the next level is used for performance conclusions.
 
@@ -20,8 +18,9 @@ Each level must pass before the next level is used for performance conclusions.
 - rejection of unknown or missing tensors.
 
 Set `IRONICL_CHECKPOINT_FIXTURES` to a directory containing both official v2
-checkpoint files to enable the fixture-backed Rust integration tests. The local
-OpenCode fixture directory is detected automatically during development.
+checkpoint files and the imported classifier `tabicl-classifier-v2.irmodel` to
+enable the fixture-backed Rust integration tests; see
+[CONTRIBUTING.md](../CONTRIBUTING.md). They are ignored by default.
 
 ### Preprocessing Parity
 
@@ -54,7 +53,7 @@ env -u PYTHONPATH "$checks/standalone/bin/python" \
 ```
 
 `tests/test_preprocessing.py` covers validation, shapes, label types, batching,
-dependency isolation, and the dataset exporter, through the Rust extension.
+and dependency isolation, through the Rust extension.
 
 The `tabicl-parity` CI job downloads the wheel tested by `standalone` and installs
 it in a separate environment with CPU-only PyTorch and the pinned TabICL checkout.
@@ -125,58 +124,27 @@ These checks establish preprocessing parity only. They do not validate neural
 outputs, probabilities, predictions, native Python bindings, or Rust training-context
 construction; those require separate end-to-end tests.
 
-### External PyTorch Oracle
+### End-to-End Parity
 
-`tools/export_tabicl_oracle.py` runs the sibling TabICL checkout directly. It
-does not add a Python dependency to the Rust crate. The exporter accepts only
-the released classifier checkpoint with SHA-256
-`bdc7dbd5e4ff21f8f0456fcf90c6b7cdf72dbea960f2d05b19bec19f9b3d4ed0`.
+The live suite also compares the estimators with TabICL's, from the same raw rows and the same
+released checkpoints. `tests/parity/test_tabicl_classifier.py` and
+`tests/parity/test_tabicl_regressor.py` check that:
 
-From the Ironicl repository root, run the exporter with `uv` after placing the
-official checkpoint locally:
+- the public signatures match TabICL's;
+- at `optimize="safe"`, classifier probabilities match TabICL's within `atol=1e-4` on Iris, Wine,
+  and Breast Cancer, and labels match exactly; regressor outputs (mean, median, variance,
+  quantiles, and raw quantiles) match within `1e-4` of the target's standard deviation on
+  Diabetes and synthetic sets. Each suite includes a case large enough for the Metal ICL path;
+- float32 input matches TabICL on its float64 upcast;
+- `"auto"` and `"fast"` stay within their error bounds of `"safe"`, and labels differ only on
+  near-ties;
+- a checkpoint for the wrong task is rejected.
 
-```sh
-uv run --project ../tabicl python tools/export_tabicl_oracle.py \
-  --checkpoint /path/to/tabicl-classifier-v2-20260212.ckpt
-```
+Run it with the setup in [Preprocessing Parity](#preprocessing-parity).
 
-Use `--tabicl-root /path/to/tabicl/src` for a checkout outside the default
-`../tabicl/src`. The script uses CPU FP32, one PyTorch intra-op and inter-op
-thread, no AMP, no Flash Attention 3, evaluation mode, and `torch.no_grad()`.
-It writes a direct-neural fixture with `X` shape `[1, 5, 3]`, four training
-labels `[0, 1, 0, 1]`, and one test row. It does not use sklearn preprocessing.
-
-Add `--trace-output fixtures/tabicl-oracle.irtrace` to capture coarse parity
-traces. IRTRACE v1 contains named row-major FP32 tensors for `col_embedder`,
-`row_interactor`, the raw 10-wide decoder output, and returned logits. It uses
-little-endian lengths, dimensions, and values, followed by a SHA-256 trailer.
-The exporter also prints each trace tensor's shape, minimum, maximum, sum, and
-first eight values.
-
-Set `IRONICL_ORACLE_FIXTURES` to the directory that contains `input.irinput`
-and `logits.irlogits` to require the Rust end-to-end classifier parity test.
-The test loads the official artifact, validates both checked fixtures, and
-compares every logit at `rtol=1e-4`, `atol=1e-4`. Without this environment
-variable, the local OpenCode oracle fixture directory is used when available;
-the test skips when it is absent. For example:
-
-```sh
-IRONICL_ORACLE_FIXTURES=/path/to/oracle cargo test --test checkpoint_fixtures \
-  matches_python_classifier_oracle_when_fixtures_are_available -- --nocapture
-```
-
-The `.irinput` output is exact IRINPUT v1: `IRINPUT\0`, a 80-byte header with
-little-endian `u32` version and kind and eight little-endian `u64`
-dimension/count/byte fields, row-major FP32 `X`, FP32 `y_train`, and a SHA-256
-trailer over all preceding bytes. This is the format decoded by
-`src/format/input_bundle.rs`.
-
-The `.irlogits` output is IRLOGITS v1. It has a 48-byte header of `IRLOGITS`
-(8 bytes), little-endian `u32` version (1), little-endian `u32` kind (1), and
-little-endian `u64` values for `B`, test rows, classes, and FP32 element count.
-The header is followed by row-major little-endian FP32 logits with shape
-`[B, test_rows, classes]`, then a 32-byte SHA-256 trailer over the header and
-logits. The exporter prints each file hash, the logits shape, and values.
+An earlier oracle compared Rust logits with a direct PyTorch forward pass through exported
+fixture files. It was removed with its file formats; see
+[removed-experiments.md](removed-experiments.md#external-pytorch-oracle-test).
 
 ### Primitive Kernels
 
@@ -188,35 +156,29 @@ logits. The exporter prints each file hash, the logits shape, and values.
 - stable softmax with large, small, equal, and masked logits;
 - online attention against materialized attention.
 
-### Stage Parity
+### Cached Prediction
 
-Capture outputs after:
+The fixture-backed Rust tests in `tests/checkpoint_fixtures.rs` check the cached path against the
+model itself:
 
-- preprocessing;
-- input projection;
-- every column block;
-- every row block;
-- row representation;
-- target embedding;
-- every ICL block;
-- decoder;
-- ensemble aggregation.
+- `built_context_matches_the_uncached_forward_pass` builds a context from training rows and checks
+  that its predictions match one uncached forward pass over the training and query rows together,
+  with per-estimator class shifts;
+- `large_cached_query_runs_in_chunks` checks that a query larger than one pass matches the same
+  rows predicted piece by piece;
+- `reduced_precision_context_predicts_all_missing_rows` checks that query rows holding the
+  all-missing marker, which run on the CPU, read an `"auto"` context's FP16 caches and match
+  `"safe"`.
 
-Use deterministic small fixtures first, then real datasets.
+The GPU tests, also fixture-backed, check that grouped Metal builds match one-graph builds
+(`tests/gpu_build_groups.rs`), that rows with the all-missing marker match between `"safe"` and
+`"auto"` contexts on Metal or CUDA (`tests/gpu_all_missing.rs`), and that Metal builds and
+predictions stay within the memory plan (`tests/build_memory.rs`). `tests/test_cuda.py` checks
+CUDA predictions against the CPU, reduced levels against `"safe"`, and uploaded and streamed ICL
+caches against resident ones.
 
-### Cache Parity
-
-Compare:
-
-- uncached batch inference;
-- PyTorch full-KV inference;
-- Ironicl full-KV batch inference;
-- Ironicl one-row-at-a-time inference;
-- multiple query microbatch sizes.
-
-TabICL's cache tests use `rtol=1e-4` and `atol=1e-4` even for FP32 because
-the operation order changes. Treat this as context, not an automatic acceptance
-threshold for every Ironicl layer.
+TabICL's cache tests use `rtol=1e-4` and `atol=1e-4` even for FP32 because the operation order
+changes. Treat this as context, not an automatic acceptance threshold for every Ironicl layer.
 
 ## Numerical Metrics
 
@@ -238,13 +200,13 @@ Track at minimum:
 - per-dataset differences, not only aggregate mean;
 - confidence intervals across fixed seeds and ensemble policies.
 
-INT8 K/V is rejected as a default if it causes a material or concentrated
+A reduced-precision level is rejected as a default if it causes a material or concentrated
 regression, even when the global mean appears acceptable.
 
 ## Platform Matrix
 
 | Platform | Required validation |
 |---|---|
-| M1 Max macOS | portable FP32, artifact handling, test fixtures |
-| 9800X3D Arch Linux | portable FP32, optimized FP32, BF16, INT8 experiments |
+| M1 Max macOS | CPU and Metal at every level, artifact handling, test fixtures |
+| 9800X3D Arch Linux | CPU at every level, CUDA on the NVIDIA rig |
 | generic x86-64 CI | compilation and portable fallback |
