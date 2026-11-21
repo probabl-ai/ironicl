@@ -2,25 +2,39 @@
 //!
 //! `POST /predict` takes `{"rows": [[...], ...]}` and options named after
 //! `TabICL`'s predict arguments, and answers with one key per output.
-//! `GET /health` answers once the model is loaded. Predictions run one at a
-//! time. See `docs/server.md`.
+//! `GET /health` answers once the model is loaded. One worker thread owns the
+//! model and predicts the queued requests together, in batches of up to
+//! `--max-batch-rows` rows. A request that would wait longer than
+//! `--max-queue` is refused. See `docs/server.md`.
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        mpsc,
+    },
+    time::{Duration, Instant},
+};
 
 use axum::{
     Router,
     body::Bytes,
     extract::{DefaultBodyLimit, State, rejection::BytesRejection},
-    http::{StatusCode, header},
+    http::{HeaderName, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::oneshot;
 
 use crate::{
     ClassifierAggregation, Error, Features, FittedModel, Labels, RegressionOutput, Result, ServeArgs,
     TaskKind, memory::MemoryLimits, models::tabicl_v2::saved,
 };
+
+/// Default `--max-batch-rows` on a GPU and on the CPU.
+const GPU_BATCH_ROWS: usize = 1024;
+const CPU_BATCH_ROWS: usize = 32;
 
 /// `TabICLRegressor.predict`'s default quantile levels.
 const DEFAULT_ALPHAS: [f64; 9] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
@@ -160,6 +174,7 @@ struct Quantiles<'a> {
 }
 
 /// An error response: `{"error": {"code": ..., "message": ...}}`.
+#[derive(Clone)]
 struct ApiError {
     status: StatusCode,
     code: &'static str,
@@ -172,6 +187,14 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             code,
             message: message.into(),
+        }
+    }
+
+    fn worker_stopped() -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal",
+            message: "the prediction worker stopped".into(),
         }
     }
 }
@@ -196,34 +219,51 @@ impl IntoResponse for ApiError {
     }
 }
 
-/// The loaded model and what requests are checked against.
+/// What the handlers check requests against and hand them to the worker by.
 struct Server {
-    /// Locked for each prediction, so they run one at a time.
-    model: Mutex<FittedModel>,
     task: TaskKind,
     features: usize,
-    classes: Option<Labels>,
-    aggregation: ClassifierAggregation,
     max_rows: usize,
+    max_queue: Duration,
+    /// Rows waiting for a batch.
+    queued: Arc<AtomicUsize>,
+    /// Nanoseconds a row takes in a full batch, as the worker measures it.
+    row_cost: Arc<AtomicU64>,
+    jobs: mpsc::Sender<Job>,
 }
 
-impl Server {
-    fn respond(&self, body: &[u8]) -> std::result::Result<Vec<u8>, ApiError> {
-        let parse_error = |error: serde_json::Error| ApiError::invalid("invalid_request", error.to_string());
-        let json = match self.task {
-            TaskKind::Classifier => {
-                let request: ClassifierRequest = serde_json::from_slice(body).map_err(parse_error)?;
-                self.classify(&request)?
-            }
-            TaskKind::Regressor => {
-                let request: RegressorRequest = serde_json::from_slice(body).map_err(parse_error)?;
-                self.regress(&request)?
-            }
-        };
-        Ok(json)
-    }
+enum Request {
+    Classifier(ClassifierRequest),
+    Regressor(RegressorRequest),
+}
 
-    fn check(&self, rows: &Rows) -> std::result::Result<(), ApiError> {
+impl Request {
+    fn rows(&self) -> &Rows {
+        match self {
+            Self::Classifier(request) => &request.rows,
+            Self::Regressor(request) => &request.rows,
+        }
+    }
+}
+
+/// A checked request waiting for its batch, and where its answer goes.
+struct Job {
+    request: Request,
+    queued: Instant,
+    reply: oneshot::Sender<Reply>,
+}
+
+/// A response body and how long its request waited and its batch ran.
+type Reply = std::result::Result<(Vec<u8>, Duration, Duration), ApiError>;
+
+impl Server {
+    fn parse(&self, body: &[u8]) -> std::result::Result<Request, ApiError> {
+        let parse_error = |error: serde_json::Error| ApiError::invalid("invalid_request", error.to_string());
+        let request = match self.task {
+            TaskKind::Classifier => Request::Classifier(serde_json::from_slice(body).map_err(parse_error)?),
+            TaskKind::Regressor => Request::Regressor(serde_json::from_slice(body).map_err(parse_error)?),
+        };
+        let rows = request.rows();
         if rows.features != self.features {
             return Err(ApiError::invalid(
                 "wrong_feature_count",
@@ -239,97 +279,259 @@ impl Server {
                 format!("{} rows; the limit is {}", rows.count, self.max_rows),
             ));
         }
-        Ok(())
+        Ok(request)
     }
 
-    fn model(&self) -> std::sync::MutexGuard<'_, FittedModel> {
-        self.model.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Whether `rows` more can wait: the queued rows and theirs would take at
+    /// most `max_queue` to predict. An empty queue takes any request, so one
+    /// larger than the queue still runs.
+    fn fits(&self, queued: usize, rows: usize) -> bool {
+        let wait = (queued + rows) as u128 * u128::from(self.row_cost.load(Ordering::Relaxed));
+        queued == 0 || wait <= self.max_queue.as_nanos()
     }
 
-    fn classify(&self, request: &ClassifierRequest) -> std::result::Result<Vec<u8>, ApiError> {
-        let rows = &request.rows;
-        self.check(rows)?;
-        let outputs = request.output_type.as_ref().map_or(
-            &[ClassifierOutput::Labels, ClassifierOutput::Probabilities][..],
-            |outputs| &outputs.0,
-        );
-        let probabilities = self.model().predict_probabilities(
-            Features::F64(&rows.values),
-            rows.features,
-            self.aggregation,
-        )?;
-        let classes = self.classes.as_ref().expect("a classifier has classes");
-        let rows: Vec<&[f32]> = probabilities.values().chunks(classes.len()).collect();
-        let labels = outputs.contains(&ClassifierOutput::Labels).then(|| {
-            // The first most probable class, as NumPy's argmax picks it.
-            let best: Vec<usize> = rows
-                .iter()
-                .map(|row| (0..row.len()).fold(0, |best, i| if row[i] > row[best] { i } else { best }))
-                .collect();
-            classes.select(&best)
-        });
-        let probabilities =
-            outputs
-                .contains(&ClassifierOutput::Probabilities)
-                .then_some(ClassProbabilities {
-                    classes,
-                    probabilities: rows,
-                });
-        Ok(serde_json::to_vec(&ClassifierResponse {
-            labels,
-            probabilities,
-        })
-        .expect("the response serializes"))
-    }
-
-    fn regress(&self, request: &RegressorRequest) -> std::result::Result<Vec<u8>, ApiError> {
-        let rows = &request.rows;
-        self.check(rows)?;
-        let outputs = request
-            .output_type
-            .as_ref()
-            .map_or(&[RegressorOutput::Mean][..], |outputs| &outputs.0);
-        let alphas = request
-            .alphas
-            .as_ref()
-            .map_or(&DEFAULT_ALPHAS[..], |alphas| &alphas.0);
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "The model computes quantiles in FP32"
-        )]
-        let requested: Vec<RegressionOutput> = outputs
-            .iter()
-            .map(|output| match output {
-                RegressorOutput::Mean => RegressionOutput::Mean,
-                RegressorOutput::Median => RegressionOutput::Median,
-                RegressorOutput::Variance => RegressionOutput::Variance,
-                RegressorOutput::Quantiles => {
-                    RegressionOutput::Quantiles(alphas.iter().map(|&alpha| alpha as f32).collect())
-                }
-                RegressorOutput::RawQuantiles => RegressionOutput::RawQuantiles,
+    /// Count `rows` as waiting if they fit.
+    fn admit(&self, rows: usize) -> bool {
+        self.queued
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |queued| {
+                self.fits(queued, rows).then_some(queued + rows)
             })
-            .collect();
-        let results =
-            self.model()
-                .predict_regression(Features::F64(&rows.values), rows.features, &requested)?;
-        let mut response = RegressorResponse::default();
-        for (output, (values, width)) in outputs.iter().zip(&results) {
-            let matrix = || values.chunks((*width).max(1)).collect();
-            match output {
-                RegressorOutput::Mean => response.mean = Some(values),
-                RegressorOutput::Median => response.median = Some(values),
-                RegressorOutput::Variance => response.variance = Some(values),
-                RegressorOutput::Quantiles => {
-                    response.quantiles = Some(Quantiles {
-                        alphas,
-                        quantiles: matrix(),
-                    });
-                }
-                RegressorOutput::RawQuantiles => response.raw_quantiles = Some(matrix()),
+            .is_ok()
+    }
+}
+
+/// The oldest job and the jobs queued after it that fit in `max_rows` with
+/// it, and the first that did not fit, which leads the next batch. It never
+/// waits for more jobs.
+fn next_batch<T>(
+    first: T,
+    rows: impl Fn(&T) -> usize,
+    mut queued: impl FnMut() -> Option<T>,
+    max_rows: usize,
+) -> (Vec<T>, Option<T>) {
+    let mut total = rows(&first);
+    let mut batch = vec![first];
+    while let Some(job) = queued() {
+        total += rows(&job);
+        if total > max_rows {
+            return (batch, Some(job));
+        }
+        batch.push(job);
+    }
+    (batch, None)
+}
+
+/// Owns the model and predicts each batch of queued requests at once.
+struct Worker {
+    model: FittedModel,
+    features: usize,
+    classes: Option<Labels>,
+    aggregation: ClassifierAggregation,
+    max_batch_rows: usize,
+    queued: Arc<AtomicUsize>,
+    row_cost: Arc<AtomicU64>,
+    jobs: mpsc::Receiver<Job>,
+}
+
+impl Worker {
+    fn run(self) {
+        let mut next = None;
+        while let Some(first) = next.take().or_else(|| self.jobs.recv().ok()) {
+            let (batch, rest) = next_batch(
+                first,
+                |job: &Job| job.request.rows().count,
+                || self.jobs.try_recv().ok(),
+                self.max_batch_rows,
+            );
+            next = rest;
+            let rows = batch.iter().map(|job| job.request.rows().count).sum();
+            self.queued.fetch_sub(rows, Ordering::SeqCst);
+            // Clients that hung up get no answer, so skip their rows.
+            let batch: Vec<Job> = batch.into_iter().filter(|job| !job.reply.is_closed()).collect();
+            if !batch.is_empty() {
+                self.answer(batch);
             }
         }
-        Ok(serde_json::to_vec(&response).expect("the response serializes"))
     }
+
+    fn answer(&self, batch: Vec<Job>) {
+        let start = Instant::now();
+        let bodies = self.predict(&batch);
+        let predict = start.elapsed();
+        let rows: usize = batch.iter().map(|job| job.request.rows().count).sum();
+        if 2 * rows >= self.max_batch_rows {
+            self.measure(rows, predict);
+        }
+        for (index, job) in batch.into_iter().enumerate() {
+            let body = match &bodies {
+                Ok(bodies) => Ok((bodies[index].clone(), start - job.queued, predict)),
+                Err(error) => Err(error.clone()),
+            };
+            let _ = job.reply.send(body);
+        }
+    }
+
+    /// Fold a batch of at least half `max_batch_rows` into the row cost, which
+    /// smaller batches overstate.
+    fn measure(&self, rows: usize, predict: Duration) {
+        let cost = u64::try_from(predict.as_nanos() / rows as u128).unwrap_or(u64::MAX);
+        let old = self.row_cost.load(Ordering::Relaxed);
+        let new = if old == 0 { cost } else { (3 * old + cost) / 4 };
+        self.row_cost.store(new, Ordering::Relaxed);
+    }
+
+    /// One response body per job, from one prediction over all their rows.
+    fn predict(&self, batch: &[Job]) -> std::result::Result<Vec<Vec<u8>>, ApiError> {
+        let values: Vec<f64> = batch
+            .iter()
+            .flat_map(|job| job.request.rows().values.iter().copied())
+            .collect();
+        let x = Features::F64(&values);
+        let counts = batch.iter().map(|job| job.request.rows().count);
+        if let Some(classes) = &self.classes {
+            let probabilities = self
+                .model
+                .predict_probabilities(x, self.features, self.aggregation)?;
+            let mut rows = probabilities.values().chunks(classes.len());
+            return Ok(batch
+                .iter()
+                .zip(counts)
+                .map(|(job, count)| {
+                    let Request::Classifier(request) = &job.request else {
+                        unreachable!("a classifier's requests")
+                    };
+                    classifier_response(request, classes, rows.by_ref().take(count).collect())
+                })
+                .collect());
+        }
+        // Every output any request asks for, each once.
+        let mut requested: Vec<RegressionOutput> = Vec::new();
+        let picks: Vec<Vec<usize>> = batch
+            .iter()
+            .map(|job| {
+                let Request::Regressor(request) = &job.request else {
+                    unreachable!("a regressor's requests")
+                };
+                regression_outputs(request)
+                    .into_iter()
+                    .map(|output| {
+                        requested
+                            .iter()
+                            .position(|seen| *seen == output)
+                            .unwrap_or_else(|| {
+                                requested.push(output);
+                                requested.len() - 1
+                            })
+                    })
+                    .collect()
+            })
+            .collect();
+        let results = self.model.predict_regression(x, self.features, &requested)?;
+        let mut start = 0;
+        Ok(batch
+            .iter()
+            .zip(counts)
+            .zip(&picks)
+            .map(|((job, count), picks)| {
+                let Request::Regressor(request) = &job.request else {
+                    unreachable!("a regressor's requests")
+                };
+                let parts = picks
+                    .iter()
+                    .map(|&pick| {
+                        let (values, width) = &results[pick];
+                        (&values[start * width..(start + count) * width], *width)
+                    })
+                    .collect();
+                start += count;
+                regressor_response(request, parts)
+            })
+            .collect())
+    }
+}
+
+fn classifier_outputs(request: &ClassifierRequest) -> &[ClassifierOutput] {
+    request.output_type.as_ref().map_or(
+        &[ClassifierOutput::Labels, ClassifierOutput::Probabilities][..],
+        |outputs| &outputs.0,
+    )
+}
+
+fn classifier_response(request: &ClassifierRequest, classes: &Labels, rows: Vec<&[f32]>) -> Vec<u8> {
+    let outputs = classifier_outputs(request);
+    let labels = outputs.contains(&ClassifierOutput::Labels).then(|| {
+        // The first most probable class, as NumPy's argmax picks it.
+        let best: Vec<usize> = rows
+            .iter()
+            .map(|row| (0..row.len()).fold(0, |best, i| if row[i] > row[best] { i } else { best }))
+            .collect();
+        classes.select(&best)
+    });
+    let probabilities = outputs
+        .contains(&ClassifierOutput::Probabilities)
+        .then_some(ClassProbabilities {
+            classes,
+            probabilities: rows,
+        });
+    serde_json::to_vec(&ClassifierResponse {
+        labels,
+        probabilities,
+    })
+    .expect("the response serializes")
+}
+
+fn regressor_outputs(request: &RegressorRequest) -> &[RegressorOutput] {
+    request
+        .output_type
+        .as_ref()
+        .map_or(&[RegressorOutput::Mean][..], |outputs| &outputs.0)
+}
+
+fn alphas(request: &RegressorRequest) -> &[f64] {
+    request
+        .alphas
+        .as_ref()
+        .map_or(&DEFAULT_ALPHAS[..], |alphas| &alphas.0)
+}
+
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "The model computes quantiles in FP32"
+)]
+fn regression_outputs(request: &RegressorRequest) -> Vec<RegressionOutput> {
+    regressor_outputs(request)
+        .iter()
+        .map(|output| match output {
+            RegressorOutput::Mean => RegressionOutput::Mean,
+            RegressorOutput::Median => RegressionOutput::Median,
+            RegressorOutput::Variance => RegressionOutput::Variance,
+            RegressorOutput::Quantiles => {
+                RegressionOutput::Quantiles(alphas(request).iter().map(|&alpha| alpha as f32).collect())
+            }
+            RegressorOutput::RawQuantiles => RegressionOutput::RawQuantiles,
+        })
+        .collect()
+}
+
+/// `parts`: each requested output's rows of this request, with their width.
+fn regressor_response(request: &RegressorRequest, parts: Vec<(&[f32], usize)>) -> Vec<u8> {
+    let mut response = RegressorResponse::default();
+    for (output, (values, width)) in regressor_outputs(request).iter().zip(parts) {
+        let matrix = || values.chunks(width.max(1)).collect();
+        match output {
+            RegressorOutput::Mean => response.mean = Some(values),
+            RegressorOutput::Median => response.median = Some(values),
+            RegressorOutput::Variance => response.variance = Some(values),
+            RegressorOutput::Quantiles => {
+                response.quantiles = Some(Quantiles {
+                    alphas: alphas(request),
+                    quantiles: matrix(),
+                });
+            }
+            RegressorOutput::RawQuantiles => response.raw_quantiles = Some(matrix()),
+        }
+    }
+    serde_json::to_vec(&response).expect("the response serializes")
 }
 
 async fn predict(
@@ -345,12 +547,52 @@ async fn predict(
         }
         Err(rejection) => return ApiError::invalid("invalid_request", rejection.body_text()).into_response(),
     };
-    match tokio::task::spawn_blocking(move || server.respond(&body)).await {
-        Ok(Ok(json)) => ([(header::CONTENT_TYPE, "application/json")], json).into_response(),
-        Ok(Err(error)) => error.into_response(),
-        Err(error) => {
-            ApiError::from(Error::InvalidConfig(format!("prediction failed: {error}"))).into_response()
+    let overloaded = || {
+        let error = ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "overloaded",
+            message: "the queue is full; retry later".into(),
+        };
+        ([(header::RETRY_AFTER, "1")], error).into_response()
+    };
+    // A full queue refuses the request before the work of parsing it.
+    if !server.fits(server.queued.load(Ordering::SeqCst), 0) {
+        return overloaded();
+    }
+    let request = match server.parse(&body) {
+        Ok(request) => request,
+        Err(error) => return error.into_response(),
+    };
+    if !server.admit(request.rows().count) {
+        return overloaded();
+    }
+    let (reply, answer) = oneshot::channel();
+    let job = Job {
+        request,
+        queued: Instant::now(),
+        reply,
+    };
+    if server.jobs.send(job).is_err() {
+        return ApiError::worker_stopped().into_response();
+    }
+    match answer.await {
+        Ok(Ok((json, queue, predict))) => {
+            let timing = format!(
+                "queue;dur={:.3}, predict;dur={:.3}",
+                queue.as_secs_f64() * 1e3,
+                predict.as_secs_f64() * 1e3
+            );
+            (
+                [
+                    (header::CONTENT_TYPE, "application/json".to_owned()),
+                    (HeaderName::from_static("server-timing"), timing),
+                ],
+                json,
+            )
+                .into_response()
         }
+        Ok(Err(error)) => error.into_response(),
+        Err(_) => ApiError::worker_stopped().into_response(),
     }
 }
 
@@ -368,19 +610,74 @@ async fn health() -> impl IntoResponse {
 pub fn serve(args: &ServeArgs) -> Result<()> {
     let model = saved::load(&args.dir, None, MemoryLimits::resolve(None, None)?)?;
     let preprocessor = model.preprocessed().preprocessor();
-    let server = Server {
-        task: model.task(),
-        features: preprocessor.n_features_in(),
+    let (task, features) = (model.task(), preprocessor.n_features_in());
+    let device = model.device();
+    let max_batch_rows = args.max_batch_rows.unwrap_or(if device == "cpu" {
+        CPU_BATCH_ROWS
+    } else {
+        GPU_BATCH_ROWS
+    });
+    let (jobs, receiver) = mpsc::channel();
+    let queued = Arc::new(AtomicUsize::new(0));
+    let row_cost = Arc::new(AtomicU64::new(0));
+    let worker = Worker {
         classes: preprocessor.classes().cloned(),
         aggregation: preprocessor.aggregation.unwrap_or_default(),
-        max_rows: args.max_rows,
-        model: Mutex::new(model),
+        model,
+        features,
+        max_batch_rows,
+        queued: Arc::clone(&queued),
+        row_cost: Arc::clone(&row_cost),
+        jobs: receiver,
     };
-    let warm_up = format!("{{\"rows\": [[{}]]}}", vec!["0"; server.features].join(","));
-    server
-        .respond(warm_up.as_bytes())
-        .map_err(|error| Error::InvalidConfig(format!("warm-up prediction failed: {}", error.message)))?;
-    let device = server.model().device();
+    let server = Server {
+        task,
+        features,
+        max_rows: args.max_rows,
+        max_queue: args.max_queue,
+        queued,
+        row_cost,
+        jobs,
+    };
+    // Predict a full batch twice: once to warm up, once to measure the row cost.
+    let rows = Rows {
+        values: vec![0.0; max_batch_rows * features],
+        count: max_batch_rows,
+        features,
+    };
+    let request = match task {
+        TaskKind::Classifier => Request::Classifier(ClassifierRequest {
+            rows,
+            output_type: None,
+        }),
+        TaskKind::Regressor => Request::Regressor(RegressorRequest {
+            rows,
+            output_type: None,
+            alphas: None,
+        }),
+    };
+    let warm_up = [Job {
+        request,
+        queued: Instant::now(),
+        reply: oneshot::channel().0,
+    }];
+    for measure in [false, true] {
+        let start = Instant::now();
+        worker
+            .predict(&warm_up)
+            .map_err(|error| Error::InvalidConfig(format!("warm-up prediction failed: {}", error.message)))?;
+        if measure {
+            worker.measure(max_batch_rows, start.elapsed());
+        }
+    }
+    // A worker that panicked can never answer, so end the process rather than
+    // keep answering /health; a supervisor restarts it.
+    std::thread::spawn(move || {
+        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.run())).is_err() {
+            eprintln!("the prediction worker panicked; exiting");
+            std::process::exit(1);
+        }
+    });
     let app = Router::new()
         .route("/predict", post(predict))
         .route("/health", get(health))
@@ -388,15 +685,17 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
         .with_state(Arc::new(server));
     let failed = |error: std::io::Error| Error::InvalidConfig(format!("server: {error}"));
     tokio::runtime::Builder::new_multi_thread()
-        .enable_io()
+        .enable_all()
         .build()
         .map_err(failed)?
         .block_on(async {
             let listener = tokio::net::TcpListener::bind(args.bind).await.map_err(failed)?;
             println!(
-                "Serving {} on http://{} ({device})",
+                "Serving {} on http://{} ({device}; batches of up to {max_batch_rows} rows, \
+                 waits of up to {} ms)",
                 args.dir.display(),
-                args.bind
+                args.bind,
+                args.max_queue.as_millis()
             );
             axum::serve(listener, app)
                 .with_graceful_shutdown(async {
@@ -409,7 +708,7 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClassifierRequest, RegressorRequest};
+    use super::{ClassifierRequest, RegressorRequest, next_batch};
 
     fn error<T: for<'de> serde::Deserialize<'de>>(json: &str) -> String {
         serde_json::from_str::<T>(json)
@@ -452,5 +751,19 @@ mod tests {
             error::<RegressorRequest>(r#"{"rows": [[1]], "alphas": [0.5, 1]}"#)
                 .contains("between 0 and 1, got 1")
         );
+    }
+
+    #[test]
+    fn a_batch_takes_the_queued_jobs_that_fit() {
+        // Jobs are row counts. The first job always runs, even alone over the limit.
+        let batch = |first, queued: &[usize], max| {
+            let mut queued = queued.iter().copied();
+            next_batch(first, |&rows| rows, || queued.next(), max)
+        };
+        assert_eq!(batch(1, &[], 64), (vec![1], None));
+        assert_eq!(batch(1, &[2, 3], 64), (vec![1, 2, 3], None));
+        assert_eq!(batch(30, &[30, 30, 1], 64), (vec![30, 30], Some(30)));
+        assert_eq!(batch(100, &[1], 64), (vec![100], Some(1)));
+        assert_eq!(batch(1, &[1], 1), (vec![1], Some(1)));
     }
 }

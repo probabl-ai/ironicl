@@ -153,7 +153,8 @@ fn print_help(topic: Option<HelpTopic>) {
                ironicl inspect (--checkpoint FILE | --model FILE)\n\
                ironicl import --checkpoint FILE --output FILE\n\
                ironicl prepare DIR [--optimize safe|auto|fast]\n\
-               ironicl serve DIR [--bind ADDR] [--max-rows N] [--max-body SIZE]\n\n\
+               ironicl serve DIR [--bind ADDR] [--max-rows N] [--max-body SIZE]\n\
+             \x20 [--max-batch-rows N] [--max-queue MS]\n\n\
              Use 'ironicl help COMMAND' for command-specific help."
         }
         Some(HelpTopic::Platform) => "Usage: ironicl platform",
@@ -172,10 +173,14 @@ fn print_help(topic: Option<HelpTopic>) {
              recorded in DIR/context.ircntxt, which ironicl serve reads."
         }
         Some(HelpTopic::Serve) => {
-            "Usage: ironicl serve DIR [--bind ADDR] [--max-rows N] [--max-body SIZE]\n\n\
+            "Usage: ironicl serve DIR [--bind ADDR] [--max-rows N] [--max-body SIZE]\n\
+             \x20      [--max-batch-rows N] [--max-queue MS]\n\n\
              Serve a model exported with export() over HTTP, at the optimize level its\n\
-             KV cache was built at: POST /predict, GET /health. Defaults: --bind\n\
-             127.0.0.1:8080, --max-rows 10000, --max-body 16M."
+             KV cache was built at: POST /predict, GET /health. Concurrent requests\n\
+             are predicted together, up to --max-batch-rows rows at once; a request\n\
+             that would wait longer than --max-queue is refused with 503. Defaults:\n\
+             --bind 127.0.0.1:8080, --max-rows 10000, --max-body 16M, --max-batch-rows\n\
+             1024 on a GPU and 32 on the CPU, --max-queue 1000."
         }
     };
     println!("{text}");

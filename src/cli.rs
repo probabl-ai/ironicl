@@ -69,6 +69,10 @@ pub struct ServeArgs {
     pub bind: SocketAddr,
     pub max_rows: usize,
     pub max_body: usize,
+    /// Rows predicted together at most; by default, by device.
+    pub max_batch_rows: Option<usize>,
+    /// How long a request may wait for its batch before it is refused.
+    pub max_queue: std::time::Duration,
 }
 
 /// Parse command-line arguments excluding the executable name.
@@ -193,6 +197,7 @@ fn parse_serve(args: &[String]) -> Result<Command> {
     }
     let (dir, rest) = model_dir(args, "serve")?;
     let (mut bind, mut max_rows, mut max_body) = (None, None, None);
+    let (mut max_batch_rows, mut max_queue) = (None, None);
     let mut index = 0;
     while index < rest.len() {
         let flag = &rest[index];
@@ -200,8 +205,17 @@ fn parse_serve(args: &[String]) -> Result<Command> {
         let invalid = || Error::InvalidArgument(format!("invalid value '{value}' for {flag}"));
         match flag.as_str() {
             "--bind" => set_once(&mut bind, value.parse().map_err(|_| invalid())?, flag)?,
-            "--max-rows" => set_once(&mut max_rows, value.parse().map_err(|_| invalid())?, flag)?,
+            "--max-rows" => set_once(&mut max_rows, positive(value).ok_or_else(invalid)?, flag)?,
             "--max-body" => set_once(&mut max_body, crate::memory::parse_bytes(value)?, flag)?,
+            "--max-batch-rows" => set_once(&mut max_batch_rows, positive(value).ok_or_else(invalid)?, flag)?,
+            "--max-queue" => {
+                let milliseconds = positive(value).ok_or_else(invalid)?;
+                set_once(
+                    &mut max_queue,
+                    std::time::Duration::from_millis(milliseconds as u64),
+                    flag,
+                )?;
+            }
             _ => {
                 return Err(Error::InvalidArgument(format!(
                     "unknown option '{flag}' for serve"
@@ -215,7 +229,13 @@ fn parse_serve(args: &[String]) -> Result<Command> {
         max_rows: max_rows.unwrap_or(10_000),
         max_body: usize::try_from(max_body.unwrap_or(16 << 20))
             .map_err(|_| Error::InvalidArgument("--max-body is too large".into()))?,
+        max_batch_rows,
+        max_queue: max_queue.unwrap_or(std::time::Duration::from_secs(1)),
     }))
+}
+
+fn positive(value: &str) -> Option<usize> {
+    value.parse().ok().filter(|&value| value > 0)
 }
 
 /// The model directory that leads `args`, and the options after it.
@@ -369,6 +389,55 @@ mod tests {
             }))
         );
         assert!(parse_cli(&args(&["prepare", "--optimize", "auto"])).is_err());
+    }
+
+    #[test]
+    fn parses_serve() {
+        let serve = |extra: &[&str]| parse_cli(&args(&[&["serve", "churn"], extra].concat()));
+        assert_eq!(
+            serve(&[]),
+            Ok(Command::Serve(ServeArgs {
+                dir: PathBuf::from("churn"),
+                bind: SocketAddr::from(([127, 0, 0, 1], 8080)),
+                max_rows: 10_000,
+                max_body: 16 << 20,
+                max_batch_rows: None,
+                max_queue: std::time::Duration::from_secs(1),
+            }))
+        );
+        assert_eq!(
+            serve(&[
+                "--bind",
+                "0.0.0.0:9000",
+                "--max-rows",
+                "5",
+                "--max-body",
+                "1M",
+                "--max-batch-rows",
+                "64",
+                "--max-queue",
+                "10",
+            ]),
+            Ok(Command::Serve(ServeArgs {
+                dir: PathBuf::from("churn"),
+                bind: SocketAddr::from(([0, 0, 0, 0], 9000)),
+                max_rows: 5,
+                max_body: 1 << 20,
+                max_batch_rows: Some(64),
+                max_queue: std::time::Duration::from_millis(10),
+            }))
+        );
+        for bad in [
+            &["--max-rows", "0"][..],
+            &["--max-batch-rows", "0"],
+            &["--max-queue", "0"],
+            &["--bind", "nowhere"],
+            &["--max-rows", "1", "--max-rows", "2"],
+            &["--port", "1"],
+        ] {
+            assert!(serve(bad).is_err(), "{bad:?}");
+        }
+        assert!(parse_cli(&args(&["serve", "--bind", "0.0.0.0:9000"])).is_err());
     }
 
     #[test]
