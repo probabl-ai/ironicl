@@ -463,39 +463,23 @@ impl StaticContextArtifact {
     /// and truncating it makes the next read fault (`SIGBUS`). Serving artifacts are written
     /// once and replaced atomically, never edited in place.
     ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Artifact`] when the file or mapped tensor layout is invalid.
-    pub fn read_mapped(path: &Path) -> Result<Self> {
-        let file = File::open(path).map_err(artifact_error)?;
-        let length = to_usize(
-            file.metadata().map_err(artifact_error)?.len(),
-            "static context length",
-        )?;
-        Self::read_mapped_file(&file, length, false)
-    }
-
-    /// Like [`Self::read_mapped`], but prefaults the mapping so prediction runs at
-    /// RAM speed from the first query instead of paying page-fault latency. The
-    /// hint is best-effort and ignored where the platform does not support it.
+    /// The mapping is prefaulted so prediction runs at RAM speed from the first query instead
+    /// of paying page-fault latency. The hint is best-effort and ignored where the platform
+    /// does not support it.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Artifact`] when the file or mapped tensor layout is invalid.
+    #[expect(
+        unsafe_code,
+        reason = "memory-maps the artifact file; see the SAFETY comments"
+    )]
     pub fn read_mapped_prefault(path: &Path) -> Result<Self> {
         let file = File::open(path).map_err(artifact_error)?;
         let length = to_usize(
             file.metadata().map_err(artifact_error)?.len(),
             "static context length",
         )?;
-        Self::read_mapped_file(&file, length, true)
-    }
-
-    #[expect(
-        unsafe_code,
-        reason = "memory-maps the artifact file; see the SAFETY comments"
-    )]
-    fn read_mapped_file(file: &File, length: usize, prefault: bool) -> Result<Self> {
         if !(HEADER_BYTES + CHECKSUM_BYTES..=MAX_ARTIFACT_BYTES).contains(&length) {
             return Err(artifact_error(
                 "static context length is outside the resource limit",
@@ -505,19 +489,13 @@ impl StaticContextArtifact {
         // mapped; this crate never writes it, and serving artifacts must stay immutable (an
         // outside writer breaks `&[u8]` immutability; truncation raises SIGBUS). The `Mmap` is
         // owned by the artifact (`Arc`), so every tensor borrow ends before it is unmapped.
-        let mapping = unsafe { MmapOptions::new().map(file) }.map_err(artifact_error)?;
+        let mapping = unsafe { MmapOptions::new().map(&file) }.map_err(artifact_error)?;
         // Start reading the pages in now so the first prediction runs at RAM
         // speed. Advisory only; elsewhere the checksum below reads every page anyway.
         #[cfg(unix)]
-        if prefault {
-            let _ = mapping.advise(Advice::WillNeed);
-        }
+        let _ = mapping.advise(Advice::WillNeed);
         #[cfg(windows)]
-        if prefault {
-            prefetch(&mapping);
-        }
-        #[cfg(not(any(unix, windows)))]
-        let _ = prefault;
+        prefetch(&mapping);
         Self::from_mapping(mapping)
     }
 
@@ -1283,7 +1261,7 @@ mod tests {
         let path = directory.path().join("context.irctx");
         std::fs::write(&path, &bytes).expect("write context");
         assert_eq!(
-            StaticContextArtifact::read_mapped(&path).expect("map context"),
+            StaticContextArtifact::read_mapped_prefault(&path).expect("map context"),
             artifact
         );
     }
@@ -1296,7 +1274,7 @@ mod tests {
         let path = directory.path().join("context.irctx");
         std::fs::write(&path, &bytes).expect("write context");
 
-        let mapped = StaticContextArtifact::read_mapped(&path).expect("map context");
+        let mapped = StaticContextArtifact::read_mapped_prefault(&path).expect("map context");
         assert_eq!(mapped, artifact);
         let clone = mapped.clone();
         drop(mapped);
@@ -1455,7 +1433,7 @@ mod tests {
             }
         });
         assert_eq!(
-            StaticContextArtifact::read_mapped(&path).expect("read context"),
+            StaticContextArtifact::read_mapped_prefault(&path).expect("read context"),
             artifact
         );
         assert_eq!(

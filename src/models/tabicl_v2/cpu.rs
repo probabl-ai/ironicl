@@ -8,8 +8,10 @@ use sha2::{Digest, Sha256};
 use crate::progress::Stage;
 use crate::{
     Error, ModelArtifact, QueryRequest, RegressionOutput, Request, Result, StaticContextArtifact,
-    StaticContextMetadata, StaticContextTensor, StaticContextTensorData, TaskKind,
-    format::static_context::{PageAlignedTensors, TensorStorage},
+    StaticContextMetadata, TaskKind,
+    format::static_context::{
+        PageAlignedTensors, StaticContextTensor, StaticContextTensorData, TensorStorage,
+    },
     kernels::reference::{
         OnlineAttentionScratch, QassMaxWeights, affine_f32, affine_input3_transposed_f32, gelu_f32,
         layer_norm_f32, one_hot_linear_f32, qassmax_f32, rope_non_interleaved_f32,
@@ -3729,7 +3731,7 @@ mod tests {
     use crate::kernels::reference::{
         OnlineAttentionScratch, affine_f32, tiled_online_scaled_dot_product_attention_f32,
     };
-    use crate::{StaticContextArtifact, StaticContextMetadata, StaticContextTensor};
+    use crate::{StaticContextArtifact, StaticContextMetadata, format::static_context::StaticContextTensor};
 
     fn context(tensors: Vec<StaticContextTensor>) -> StaticContextArtifact {
         StaticContextArtifact::new(

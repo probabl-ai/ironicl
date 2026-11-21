@@ -19,18 +19,11 @@ pub use cli::{Command, HelpTopic, ImportArgs, InspectArgs, ModelSource, parse_cl
 pub use config::{StorageDType, TaskKind};
 pub use error::{Error, Result};
 pub use format::model::{
-    MODEL_ARTIFACT_MAGIC, MODEL_ARTIFACT_VERSION, ModelArtifact, ModelArtifactSummary, ModelConfig,
-    ModelProfile, ModelTensorF32, inspect_model_artifact, load_model_artifact,
+    ModelArtifact, ModelArtifactSummary, ModelProfile, inspect_model_artifact, load_model_artifact,
 };
-pub use format::preprocessor::{PREPROCESSOR_MAGIC, PREPROCESSOR_VERSION};
-pub use format::static_context::{
-    STATIC_CONTEXT_MAGIC, STATIC_CONTEXT_VERSION, StaticContextArtifact, StaticContextMetadata,
-    StaticContextTensor, StaticContextTensorData, StaticContextTensorRef,
-};
+pub use format::static_context::{StaticContextArtifact, StaticContextMetadata};
 pub use kernels::cpu::{CpuCapabilities, Isa};
-pub use models::tabicl_v2::checkpoint::{
-    CheckpointProfile, CheckpointSummary, import_checkpoint, inspect_checkpoint,
-};
+pub use models::tabicl_v2::checkpoint::{CheckpointProfile, import_checkpoint, inspect_checkpoint};
 pub use models::tabicl_v2::checkpoint_cache::{
     CheckpointCacheOptions, PreparedCheckpoint, load_checkpoint_model, prepare_checkpoint,
 };

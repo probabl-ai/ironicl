@@ -1,7 +1,8 @@
-"""CUDA builds and predictions: the context built on the GPU, the ICL cache
-streamed from host memory, and rows only the CPU path predicts. Skipped
-without a CUDA GPU. Every level runs on the GPU, ``safe`` in FP32, so the
-CPU's results come from a process with ``IRONICL_NO_CUDA`` set."""
+"""CUDA builds and predictions: the context built on the GPU and the ICL cache
+streamed from host memory; tests/gpu_all_missing.rs covers rows only the CPU
+path predicts. Skipped without a CUDA GPU. Every level runs on the GPU,
+``safe`` in FP32, so the CPU's results come from a process with
+``IRONICL_NO_CUDA`` set."""
 
 import os
 import pickle
@@ -14,7 +15,6 @@ from pathlib import Path
 import numpy as np
 
 from ironicl import TabICLClassifier, TabICLRegressor
-from ironicl.base import _array, _model
 from tests.test_pickle import checkpoint
 
 
@@ -68,29 +68,6 @@ class CudaTest(unittest.TestCase):
         actual = self.fit().predict_proba(self.x[2000:])
         np.testing.assert_allclose(actual, expected, atol=1e-3)
 
-    def test_all_missing_training_rows_build_on_the_cpu(self):
-        model = self.fit()
-        preprocessed = model.fitted_.preprocessed
-        rows, targets, classes, features = (
-            _array(*pair, dtype)
-            for pair, dtype in zip(preprocessed.training_inputs(), (np.float32, np.float32, np.uint64, np.uint64))
-        )
-        rows = rows.copy()
-        # Training rows whose every feature is the all-missing marker; only
-        # the CPU build handles it.
-        rows[:, [3, 70], :] = -100.0
-        arguments = (rows, np.ascontiguousarray(targets), np.ascontiguousarray(classes), np.ascontiguousarray(features))
-        cpu, gpu = (
-            _model(model.checkpoint_path_).build_context(*arguments, optimize, None) for optimize in ("safe", "auto")
-        )
-        self.assertEqual(gpu.device, "cuda")
-        queries = _array(*preprocessed.query_rows(self.x[2000:]))
-
-        def proba(context):
-            return _array(*context.predict_proba(queries, 0.9, True))
-
-        np.testing.assert_allclose(proba(gpu), proba(cpu), atol=1e-3)
-
     def test_an_auto_regressor_predicts_like_a_safe_one(self):
         checkpoint(TabICLRegressor)
         target = self.x[:, 0] + 0.5 * self.x[:, 1]
@@ -142,25 +119,6 @@ class CudaTest(unittest.TestCase):
                     np.testing.assert_allclose(actual, expected, atol=tolerance)
                     self.assertGreaterEqual(np.mean(actual.argmax(1) == expected.argmax(1)), 0.99)
                 self.assertGreater(streamed, 0)
-
-    def test_all_missing_rows_match_the_cpu_path(self):
-        model = self.fit()
-        preprocessed = model.fitted_.preprocessed
-        training = [
-            np.ascontiguousarray(_array(*pair, dtype))
-            for pair, dtype in zip(preprocessed.training_inputs(), (np.float32, np.float32, np.uint64, np.uint64))
-        ]
-        # The contexts the fits with optimize="safe" and the default "auto" build.
-        cpu, gpu = (_model(model.checkpoint_path_).build_context(*training, optimize, None) for optimize in ("safe", "auto"))
-        rows = _array(*preprocessed.query_rows(self.x[2000:2100])).copy()
-        # A row whose every feature is the all-missing marker; only the CPU
-        # column stage handles it.
-        rows[:, [3, 70], :] = -100.0
-
-        def proba(context):
-            return _array(*context.predict_proba(rows, 0.9, True))
-
-        np.testing.assert_allclose(proba(gpu), proba(cpu), atol=1e-3)
 
 
 if __name__ == "__main__":
