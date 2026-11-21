@@ -27,10 +27,9 @@ src/
 ├── config.rs, error.rs            TaskKind and StorageDType; Error
 ├── memory.rs                      memory planning
 ├── progress.rs, profile.rs        progress and cancellation; `profile` timers
-├── benchmark.rs                   benchmark statistics
 ├── python.rs                      PyO3 bindings (`python` feature)
 ├── kernels/
-│   ├── reference.rs               portable reference kernels
+│   ├── reference.rs               portable reference kernels and test oracles
 │   ├── cpu/
 │   │   ├── mod.rs                 Isa (the instruction set), CpuCapabilities
 │   │   ├── ops/                   affine, attention, norm, pointwise
@@ -55,16 +54,16 @@ src/
 │       ├── checkpoint.rs          checkpoint import
 │       ├── checkpoint_cache.rs    prepared checkpoints
 │       ├── quantiles.rs           regression outputs
+│       ├── request.rs             QueryRequest and Request: rows for a prediction
 │       ├── preprocess.rs          TabICL's preprocessing pipeline
 │       └── fitted.rs              the fitted model
 ├── format/
 │   ├── mod.rs                     container primitives
-│   ├── model.rs                   model artifacts
-│   ├── static_context.rs          static contexts
-│   ├── preprocessor.rs            fitted preprocessing (IRPREP)
-│   └── input_bundle.rs, query_bundle.rs
+│   ├── model.rs                   model artifacts (IRMODEL)
+│   ├── static_context.rs          static contexts (IRCNTXT)
+│   └── preprocessor.rs            fitted preprocessing (IRPREP)
 ├── preprocess/                    what must reproduce Python exactly; no `unsafe`:
-│                                  python_random, stats, scale, yeo_johnson, labels
+│                                  python_random, scale, yeo_johnson, labels
 ├── server/                        planned: `server` feature, off by default
 └── bin/ironicl-server.rs          planned: [[bin]] with required-features = ["server"]
 ```

@@ -1,5 +1,8 @@
 # Ironicl vs. TabICL PyTorch CPU
 
+> **Historical log.** Tools and formats this document mentions were removed; see
+> [removed-experiments.md](removed-experiments.md).
+
 This document summarizes how Ironicl's static-context CPU serving path differs
 from the official TabICLv2 PyTorch implementation, what improved performance,
 and which optimization experiments failed.

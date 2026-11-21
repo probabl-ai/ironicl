@@ -1,5 +1,8 @@
 # Real-Dataset Scaling Benchmarks
 
+> **Historical log.** Tools and formats this document mentions were removed; see
+> [removed-experiments.md](removed-experiments.md).
+
 ## Hardware
 
 - CPU: AMD Ryzen 7 9800X3D, 8 physical cores.
