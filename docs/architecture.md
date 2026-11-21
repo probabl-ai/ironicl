@@ -48,12 +48,10 @@ artifact execution.
 
 ### Planner
 
-Reports the CPU instruction set (`Isa`: portable, NEON, or AVX-512) and
-model/cache payload sizes. With a bandwidth
-input, it also reports ideal full-cache scan floors. The Metal GPU path is
-chosen separately at execution time (feature-gated and runtime-togglable), not
-by this planner. Scratch-memory and detailed K/V traffic reports are not yet
-exposed.
+`memory::plan` sizes a context and its build against the host and device
+memory and says whether it fits ([memory-planner.md](memory-planner.md)).
+`ironicl platform` reports the CPU instruction set the kernels detect (`Isa`:
+portable, NEON, or AVX-512).
 
 ### Portable Backend
 

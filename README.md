@@ -72,8 +72,8 @@ You need Rust (via [rustup](https://rustup.rs)) and Python 3.12 or newer.
 
    Ironicl prints one row of class probabilities for each test row.
 
-See the [command-line reference](docs/cli.md) for `inspect`, `plan`, and
-`platform`.
+See the [command-line reference](docs/cli.md) for `platform`, `inspect`,
+and `import`.
 
 ## Python Package
 
