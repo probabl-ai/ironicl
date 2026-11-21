@@ -27,6 +27,7 @@ records what each has verified.
 | [experiments.md](experiments.md) | Authoritative experiments-and-tests log: retained and rejected work (CPU and Apple Silicon), acceptance gates, and claim-to-test mapping |
 | [real-dataset-benchmarks.md](real-dataset-benchmarks.md) | Raw real-dataset scaling measurements the experiments log cites |
 | [pytorch-cpu-comparison.md](pytorch-cpu-comparison.md) | Cross-engine PyTorch CPU comparison and failed optimization results |
+| [removed-experiments.md](removed-experiments.md) | Removed design work: what it was, what it showed, why it went, and pinned links to its code |
 | [memory-planner.md](memory-planner.md) | How Ironicl plans memory across host and device pools, and the planner's phases |
 | [security.md](security.md) | Artifact parsing and untrusted-input requirements |
 | [roadmap.md](roadmap.md) | Ordered implementation milestones |
