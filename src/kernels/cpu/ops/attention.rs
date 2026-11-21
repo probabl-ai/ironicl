@@ -102,33 +102,6 @@ pub(crate) fn attention_score_tile_f32(
     )
 }
 
-/// Compute one score tile directly from BF16 K storage with FP32 accumulation.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "a kernel takes its buffers and their shape as plain arguments"
-)]
-pub(crate) fn attention_score_tile_bf16_f32(
-    backend: Isa,
-    query: &[f32],
-    query_rows: usize,
-    key: &[u16],
-    source_rows: usize,
-    head_dim: usize,
-    scale: f32,
-    scores: &mut [f32],
-) -> bool {
-    attention_score_tile_bf16_for_target(
-        backend,
-        query,
-        query_rows,
-        key,
-        source_rows,
-        head_dim,
-        scale,
-        scores,
-    )
-}
-
 /// Compute scores from dimension-major packed K using SIMD lanes as source rows.
 #[expect(
     clippy::too_many_arguments,
@@ -179,33 +152,6 @@ pub(crate) fn attention_score_packed_key_padded_tile_f32(
         packed_key,
         source_rows,
         packed_source_rows,
-        head_dim,
-        scale,
-        scores,
-    )
-}
-
-/// Compute scores from dimension-major packed BF16 K with FP32 accumulation.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "a kernel takes its buffers and their shape as plain arguments"
-)]
-pub(crate) fn attention_score_packed_key_bf16_tile_f32(
-    backend: Isa,
-    query: &[f32],
-    query_rows: usize,
-    packed_key: &[u16],
-    source_rows: usize,
-    head_dim: usize,
-    scale: f32,
-    scores: &mut [f32],
-) -> bool {
-    attention_score_packed_key_bf16_tile_for_target(
-        backend,
-        query,
-        query_rows,
-        packed_key,
-        source_rows,
         head_dim,
         scale,
         scores,
@@ -269,24 +215,6 @@ pub(crate) fn softmax_exp_sum_f32(backend: Isa, scores: &mut [f32], maximum: f32
     clippy::too_many_arguments,
     reason = "a kernel takes its buffers and their shape as plain arguments"
 )]
-pub(crate) fn attention_score_packed_key_bf16_tile_for_target(
-    _backend: Isa,
-    _query: &[f32],
-    _query_rows: usize,
-    _packed_key: &[u16],
-    _source_rows: usize,
-    _head_dim: usize,
-    _scale: f32,
-    _scores: &mut [f32],
-) -> bool {
-    false
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "a kernel takes its buffers and their shape as plain arguments"
-)]
 pub(crate) fn attention_score_packed_key_tile_for_target(
     _backend: Isa,
     _query: &[f32],
@@ -312,24 +240,6 @@ pub(crate) fn attention_score_packed_key_padded_tile_for_target(
     _packed_key: &[f32],
     _source_rows: usize,
     _packed_source_rows: usize,
-    _head_dim: usize,
-    _scale: f32,
-    _scores: &mut [f32],
-) -> bool {
-    false
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "a kernel takes its buffers and their shape as plain arguments"
-)]
-pub(crate) fn attention_score_tile_bf16_for_target(
-    _backend: Isa,
-    _query: &[f32],
-    _query_rows: usize,
-    _key: &[u16],
-    _source_rows: usize,
     _head_dim: usize,
     _scale: f32,
     _scores: &mut [f32],

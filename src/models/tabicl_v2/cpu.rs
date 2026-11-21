@@ -13,7 +13,6 @@ use crate::{
     kernels::reference::{
         OnlineAttentionScratch, QassMaxWeights, affine_f32, affine_input3_transposed_f32, gelu_f32,
         layer_norm_f32, one_hot_linear_f32, qassmax_f32, rope_non_interleaved_f32,
-        source_major_online_attention_bf16_with_backend_f32,
         source_major_online_attention_f32_key_bf16_value_with_backend_f32,
         source_major_online_attention_with_backend_f32, tiled_online_scaled_dot_product_attention_f32,
     },
@@ -1280,7 +1279,6 @@ impl Executor {
                 head_dim,
                 query_block_rows,
                 ATTENTION_KEY_TILE_ROWS,
-                false,
                 crate::kernels::cpu::Isa::detect(),
                 &mut OnlineAttentionScratch {
                     scores: &mut scores,
@@ -1565,9 +1563,6 @@ impl StaticExecutor {
         built: Option<crate::models::tabicl_v2::cuda::BuiltCache>,
     ) -> Result<Self> {
         let precision = crate::models::tabicl_v2::cuda::Precision::for_optimize(optimize);
-        if self.context.has_packed_icl_keys() {
-            return Ok(self);
-        }
         let Some(weights) = self.model.cuda_weights()? else {
             return Ok(self);
         };
@@ -1617,13 +1612,10 @@ impl StaticExecutor {
 
     /// Build the context's GPU predict graph when Metal is available, with
     /// queries split to keep its buckets within the device's share of memory
-    /// under `limits`, as for builds. Packed contexts and contexts with mixed
-    /// ICL storage stay on the CPU.
+    /// under `limits`, as for builds. Contexts with mixed ICL storage stay on
+    /// the CPU.
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
     fn with_gpu(mut self, limits: MemoryLimits) -> Result<Self> {
-        if self.context.has_packed_icl_keys() {
-            return Ok(self);
-        }
         let model = &self.model;
         let weights = |name: &str| model.tensor(name);
         let Some(gpu_weights) = model.gpu_weights() else {
@@ -1638,7 +1630,8 @@ impl StaticExecutor {
                 })
                 .collect()
         };
-        // ICL caches in whatever type the context stores, as raw bytes.
+        // The ICL caches as raw bytes, in FP32 or FP16 as stored. A context
+        // with BF16 values (and FP32 keys) stays on the CPU.
         let icl = |kind: &str| -> Option<(Vec<&[u8]>, crate::format::static_context::TensorStorage)> {
             use crate::format::static_context::TensorStorage;
             let mut storage = None;
@@ -1652,9 +1645,7 @@ impl StaticExecutor {
                             StaticContextTensorData::F16(values) => {
                                 (bytemuck::cast_slice(values), TensorStorage::F16)
                             }
-                            StaticContextTensorData::Bf16(values) => {
-                                (bytemuck::cast_slice(values), TensorStorage::Bf16)
-                            }
+                            StaticContextTensorData::Bf16(_) => return None,
                         };
                     (*storage.get_or_insert(block_storage) == block_storage).then_some(bytes)
                 })
@@ -2299,21 +2290,6 @@ impl StaticExecutor {
                         value,
                         source_rows,
                         head_dim,
-                        self.context.has_packed_icl_keys(),
-                        &mut attended,
-                        workers,
-                    )?;
-                }
-                (StaticContextTensorData::Bf16(key), StaticContextTensorData::Bf16(value)) => {
-                    parallel_cached_attention_bf16(
-                        self.isa,
-                        &q_heads,
-                        q_rows,
-                        key,
-                        value,
-                        source_rows,
-                        head_dim,
-                        self.context.has_packed_icl_keys(),
                         &mut attended,
                         workers,
                     )?;
@@ -2327,7 +2303,6 @@ impl StaticExecutor {
                         value,
                         source_rows,
                         head_dim,
-                        self.context.has_packed_icl_keys(),
                         &mut attended,
                         workers,
                     )?;
@@ -2345,7 +2320,6 @@ impl StaticExecutor {
                         &widen(value),
                         source_rows,
                         head_dim,
-                        self.context.has_packed_icl_keys(),
                         &mut attended,
                         workers,
                     )?;
@@ -2380,7 +2354,6 @@ impl StaticExecutor {
                     head_dim,
                     query_block_rows,
                     ATTENTION_KEY_TILE_ROWS,
-                    false,
                     self.isa,
                     &mut OnlineAttentionScratch {
                         scores: &mut scores,
@@ -3052,6 +3025,16 @@ fn validate_static_cache_contract(context: &StaticContextArtifact) -> Result<()>
                 tensor.dimensions
             )));
         }
+        // Only the removed Python exporter wrote BF16 ICL keys.
+        if name.starts_with("icl.")
+            && name.rsplit('.').next() == Some("key")
+            && matches!(tensor.data, StaticContextTensorData::Bf16(_))
+        {
+            return Err(Error::Artifact(format!(
+                "static context cache tensor '{name}' stores BF16 keys, which are no longer supported; \
+                 rebuild the context"
+            )));
+        }
     }
     Ok(())
 }
@@ -3215,7 +3198,6 @@ fn parallel_cached_attention(
     value: &[f32],
     source_rows: usize,
     head_dim: usize,
-    key_is_packed: bool,
     output: &mut [f32],
     workers: usize,
 ) -> Result<()> {
@@ -3238,7 +3220,6 @@ fn parallel_cached_attention(
             head_dim,
             ATTENTION_QUERY_BLOCK_ROWS,
             ATTENTION_KEY_TILE_ROWS,
-            key_is_packed,
             backend,
             &mut OnlineAttentionScratch {
                 scores: &mut scores,
@@ -3277,7 +3258,6 @@ fn parallel_cached_attention(
                     head_dim,
                     ATTENTION_QUERY_BLOCK_ROWS,
                     ATTENTION_KEY_TILE_ROWS,
-                    key_is_packed,
                     backend,
                     &mut OnlineAttentionScratch {
                         scores: &mut scores,
@@ -3299,101 +3279,6 @@ fn parallel_cached_attention(
     clippy::too_many_arguments,
     reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
 )]
-fn parallel_cached_attention_bf16(
-    backend: crate::kernels::cpu::Isa,
-    query: &[f32],
-    query_rows: usize,
-    key: &[u16],
-    value: &[u16],
-    source_rows: usize,
-    head_dim: usize,
-    key_is_packed: bool,
-    output: &mut [f32],
-    workers: usize,
-) -> Result<()> {
-    let query_head_elements = checked_product(&[query_rows, head_dim], "cached query head")?;
-    let source_head_elements = checked_product(&[source_rows, head_dim], "cached source head")?;
-    let key_tile_rows = ATTENTION_KEY_TILE_ROWS;
-    let workers = workers.min(HEADS);
-    if workers == 1 {
-        let scratch_query_rows = query_rows.min(ATTENTION_QUERY_BLOCK_ROWS);
-        let scratch_source_rows = source_rows.min(key_tile_rows);
-        let mut scores = vec![0.0; scratch_query_rows * scratch_source_rows];
-        let mut maximum = vec![0.0; HEADS * query_rows];
-        let mut denominator = vec![0.0; HEADS * query_rows];
-        return source_major_online_attention_bf16_with_backend_f32(
-            query,
-            query_rows,
-            key,
-            value,
-            source_rows,
-            HEADS,
-            head_dim,
-            ATTENTION_QUERY_BLOCK_ROWS,
-            key_tile_rows,
-            key_is_packed,
-            backend,
-            &mut OnlineAttentionScratch {
-                scores: &mut scores,
-                maximum: &mut maximum,
-                denominator: &mut denominator,
-            },
-            output,
-        );
-    }
-    let heads_per_worker = HEADS.div_ceil(workers);
-    std::thread::scope(|scope| {
-        let mut remaining_output = output;
-        let mut handles = Vec::with_capacity(workers);
-        for start in (0..HEADS).step_by(heads_per_worker) {
-            let heads = heads_per_worker.min(HEADS - start);
-            let output_elements = heads * query_head_elements;
-            let (worker_output, rest) = remaining_output.split_at_mut(output_elements);
-            remaining_output = rest;
-            let query = &query[start * query_head_elements..][..output_elements];
-            let source_elements = heads * source_head_elements;
-            let key = &key[start * source_head_elements..][..source_elements];
-            let value = &value[start * source_head_elements..][..source_elements];
-            handles.push(scope.spawn(move || {
-                let scratch_query_rows = query_rows.min(ATTENTION_QUERY_BLOCK_ROWS);
-                let scratch_source_rows = source_rows.min(key_tile_rows);
-                let mut scores = vec![0.0; scratch_query_rows * scratch_source_rows];
-                let mut maximum = vec![0.0; heads * query_rows];
-                let mut denominator = vec![0.0; heads * query_rows];
-                source_major_online_attention_bf16_with_backend_f32(
-                    query,
-                    query_rows,
-                    key,
-                    value,
-                    source_rows,
-                    heads,
-                    head_dim,
-                    ATTENTION_QUERY_BLOCK_ROWS,
-                    key_tile_rows,
-                    key_is_packed,
-                    backend,
-                    &mut OnlineAttentionScratch {
-                        scores: &mut scores,
-                        maximum: &mut maximum,
-                        denominator: &mut denominator,
-                    },
-                    worker_output,
-                )
-            }));
-        }
-        for handle in handles {
-            handle
-                .join()
-                .expect("cached BF16 attention worker must not panic")?;
-        }
-        Ok(())
-    })
-}
-
-#[expect(
-    clippy::too_many_arguments,
-    reason = "a model stage takes its inputs, weights, caches, and shape as plain arguments"
-)]
 fn parallel_cached_attention_f32_key_bf16_value(
     backend: crate::kernels::cpu::Isa,
     query: &[f32],
@@ -3402,7 +3287,6 @@ fn parallel_cached_attention_f32_key_bf16_value(
     value: &[u16],
     source_rows: usize,
     head_dim: usize,
-    key_is_packed: bool,
     output: &mut [f32],
     workers: usize,
 ) -> Result<()> {
@@ -3426,7 +3310,6 @@ fn parallel_cached_attention_f32_key_bf16_value(
             head_dim,
             ATTENTION_QUERY_BLOCK_ROWS,
             key_tile_rows,
-            key_is_packed,
             backend,
             &mut OnlineAttentionScratch {
                 scores: &mut scores,
@@ -3465,7 +3348,6 @@ fn parallel_cached_attention_f32_key_bf16_value(
                     head_dim,
                     ATTENTION_QUERY_BLOCK_ROWS,
                     key_tile_rows,
-                    key_is_packed,
                     backend,
                     &mut OnlineAttentionScratch {
                         scores: &mut scores,
@@ -3841,7 +3723,7 @@ mod tests {
     use super::{
         ClassifierAggregation, DecoderOutputs, admit_request, admit_static_request,
         aggregate_classifier_probabilities, attention_scratch_scores, attention_scratch_state,
-        model_hash_matches, parallel_cached_attention_f32_key_bf16_value, tokens_to_heads,
+        model_hash_matches, page_aligned, parallel_cached_attention_f32_key_bf16_value, tokens_to_heads,
         validate_class_count, validate_labels, validate_static_cache_contract,
     };
     use crate::kernels::reference::{
@@ -3897,6 +3779,25 @@ mod tests {
         }
         let valid = context(tensors.clone());
         assert!(validate_static_cache_contract(&valid).is_ok());
+        // FP32 keys with BF16 values, as `fast` writes, pass; BF16 keys do not.
+        let icl = |kind: &'static str| {
+            move |name: &str| name.starts_with("icl.") && name.rsplit('.').next() == Some(kind)
+        };
+        let with_bf16 = |kind| {
+            StaticContextArtifact::from_page_aligned(
+                valid.metadata().clone(),
+                page_aligned(
+                    &tensors,
+                    icl(kind),
+                    crate::format::static_context::TensorStorage::Bf16,
+                )
+                .expect("page-aligned tensors"),
+            )
+            .expect("page-aligned context")
+        };
+        assert!(validate_static_cache_contract(&with_bf16("value")).is_ok());
+        let error = validate_static_cache_contract(&with_bf16("key")).expect_err("BF16 keys are rejected");
+        assert!(error.to_string().contains("BF16 keys"), "{error}");
         tensors[0].dimensions[1] = 4;
         tensors[0].values.truncate(4 * 8 * 128 * 16);
         assert!(validate_static_cache_contract(&context(tensors)).is_err());
@@ -4035,7 +3936,6 @@ mod tests {
             &value,
             source_rows,
             head_dim,
-            false,
             &mut serial,
             1,
         )
@@ -4048,7 +3948,6 @@ mod tests {
             &value,
             source_rows,
             head_dim,
-            false,
             &mut parallel,
             2,
         )

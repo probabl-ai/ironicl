@@ -83,36 +83,6 @@ pub(crate) fn attention_score_tile_for_target(
     clippy::too_many_arguments,
     reason = "a kernel takes its buffers and their shape as plain arguments"
 )]
-pub(crate) fn attention_score_tile_bf16_for_target(
-    backend: Isa,
-    query: &[f32],
-    query_rows: usize,
-    key: &[u16],
-    source_rows: usize,
-    head_dim: usize,
-    scale: f32,
-    scores: &mut [f32],
-) -> bool {
-    if avx512(backend)
-        && std::is_x86_feature_detected!("avx512bw")
-        && query_rows <= MAX_PACKED_ATTENTION_QUERY_ROWS
-        && matches!(head_dim, 16 | 64)
-    {
-        // SAFETY: as in `attention_score_tile_for_target`; avx512bw was detected here.
-        unsafe {
-            attention_score_tile_bf16_avx512(query, query_rows, key, source_rows, head_dim, scale, scores);
-        }
-        true
-    } else {
-        false
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "a kernel takes its buffers and their shape as plain arguments"
-)]
 pub(crate) fn attention_score_packed_key_tile_for_target(
     backend: Isa,
     query: &[f32],
@@ -182,47 +152,6 @@ pub(crate) fn attention_score_packed_key_padded_tile_for_target(
                 packed_key,
                 source_rows,
                 packed_source_rows,
-                head_dim,
-                scale,
-                scores,
-            );
-        }
-        true
-    } else {
-        false
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "a kernel takes its buffers and their shape as plain arguments"
-)]
-pub(crate) fn attention_score_packed_key_bf16_tile_for_target(
-    backend: Isa,
-    query: &[f32],
-    query_rows: usize,
-    packed_key: &[u16],
-    source_rows: usize,
-    head_dim: usize,
-    scale: f32,
-    scores: &mut [f32],
-) -> bool {
-    if avx512(backend)
-        && std::is_x86_feature_detected!("avx512bw")
-        && query_rows <= 8
-        && source_rows.is_multiple_of(16)
-        && matches!(head_dim, 16 | 64)
-    {
-        // SAFETY: avx512f via `avx512(backend)`, avx512bw detected here, and
-        // `source_rows % 16 == 0`. Callers pass `head_dim * source_rows` packed key and
-        // `query_rows * source_rows` scores (`source_major_online_attention_bf16_with_backend_f32`).
-        unsafe {
-            attention_score_packed_key_bf16_tile_avx512(
-                query,
-                query_rows,
-                packed_key,
-                source_rows,
                 head_dim,
                 scale,
                 scores,
@@ -418,57 +347,6 @@ pub(crate) unsafe fn attention_score_tile_avx512(
     }
 }
 
-/// Computes a row-major score tile from FP32 Q and row-major BF16 K.
-///
-/// # Safety
-///
-/// The CPU must support `avx512f` and `avx512bw`; `head_dim` is a multiple of 16;
-/// `query.len() >= query_rows * head_dim`; and `key.len() >= source_rows * head_dim`.
-/// (`query_rows > 16` panics on the accumulator index.)
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx512bw")]
-pub(crate) unsafe fn attention_score_tile_bf16_avx512(
-    query: &[f32],
-    query_rows: usize,
-    key: &[u16],
-    source_rows: usize,
-    head_dim: usize,
-    scale: f32,
-    scores: &mut [f32],
-) {
-    use core::arch::x86_64::{
-        __m256i, _mm256_loadu_si256, _mm512_castsi512_ps, _mm512_cvtepu16_epi32, _mm512_fmadd_ps,
-        _mm512_loadu_ps, _mm512_reduce_add_ps, _mm512_setzero_ps, _mm512_slli_epi32,
-    };
-    // SAFETY: the key load reads 16 `u16` at `source * head_dim + dimension` and the query load 16
-    // values at `row * head_dim + dimension`, with `dimension + 16 <= head_dim`, `source <
-    // source_rows`, and `row < query_rows`. The score write uses checked indexing.
-    unsafe {
-        for source in 0..source_rows {
-            let key = key.as_ptr().add(source * head_dim);
-            let mut accumulators = [_mm512_setzero_ps(); MAX_PACKED_ATTENTION_QUERY_ROWS];
-            for dimension in (0..head_dim).step_by(16) {
-                #[expect(
-                    clippy::cast_ptr_alignment,
-                    reason = "This intrinsic accepts unaligned pointers."
-                )]
-                let packed = _mm256_loadu_si256(key.add(dimension).cast::<__m256i>());
-                let key = _mm512_castsi512_ps(_mm512_slli_epi32::<16>(_mm512_cvtepu16_epi32(packed)));
-                for row in 0..query_rows {
-                    accumulators[row] = _mm512_fmadd_ps(
-                        _mm512_loadu_ps(query.as_ptr().add(row * head_dim + dimension)),
-                        key,
-                        accumulators[row],
-                    );
-                }
-            }
-            for row in 0..query_rows {
-                scores[row * source_rows + source] = _mm512_reduce_add_ps(accumulators[row]) * scale;
-            }
-        }
-    }
-}
-
 /// Computes a row-major score tile from dimension-major packed FP32 K (`[head_dim,
 /// source_rows]`), with SIMD lanes over source rows.
 ///
@@ -629,65 +507,6 @@ pub(crate) unsafe fn attention_score_packed_key_padded_tile_avx512(
                 _mm512_mask_storeu_ps(
                     scores.as_mut_ptr().add(row * source_rows + source),
                     mask,
-                    _mm512_mul_ps(accumulators[row], scale),
-                );
-            }
-        }
-    }
-}
-
-/// Computes a row-major score tile from dimension-major packed BF16 K.
-///
-/// # Safety
-///
-/// The CPU must support `avx512f` and `avx512bw`; `source_rows % 16 == 0`;
-/// `packed_key.len() >= head_dim * source_rows`; and `scores.len() >= query_rows *
-/// source_rows`. (`query_rows > 8` panics on the accumulator index.)
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,avx512bw")]
-pub(crate) unsafe fn attention_score_packed_key_bf16_tile_avx512(
-    query: &[f32],
-    query_rows: usize,
-    packed_key: &[u16],
-    source_rows: usize,
-    head_dim: usize,
-    scale: f32,
-    scores: &mut [f32],
-) {
-    use core::arch::x86_64::{
-        __m256i, _mm256_loadu_si256, _mm512_castsi512_ps, _mm512_cvtepu16_epi32, _mm512_fmadd_ps,
-        _mm512_mul_ps, _mm512_set1_ps, _mm512_setzero_ps, _mm512_slli_epi32, _mm512_storeu_ps,
-    };
-    // SAFETY: as in `attention_score_packed_key_tile_avx512`: the key load reads 16 `u16` at
-    // `dimension * source_rows + source` with `source + 16 <= source_rows`, and the store writes
-    // `scores[row * source_rows + source..][..16]` with `row < query_rows`.
-    unsafe {
-        let scale = _mm512_set1_ps(scale);
-        for source in (0..source_rows).step_by(16) {
-            let mut accumulators = [_mm512_setzero_ps(); 8];
-            for dimension in 0..head_dim {
-                #[expect(
-                    clippy::cast_ptr_alignment,
-                    reason = "This intrinsic accepts unaligned pointers."
-                )]
-                let packed = _mm256_loadu_si256(
-                    packed_key
-                        .as_ptr()
-                        .add(dimension * source_rows + source)
-                        .cast::<__m256i>(),
-                );
-                let key = _mm512_castsi512_ps(_mm512_slli_epi32::<16>(_mm512_cvtepu16_epi32(packed)));
-                for row in 0..query_rows {
-                    accumulators[row] = _mm512_fmadd_ps(
-                        key,
-                        _mm512_set1_ps(query[row * head_dim + dimension]),
-                        accumulators[row],
-                    );
-                }
-            }
-            for row in 0..query_rows {
-                _mm512_storeu_ps(
-                    scores.as_mut_ptr().add(row * source_rows + source),
                     _mm512_mul_ps(accumulators[row], scale),
                 );
             }
