@@ -459,28 +459,6 @@ impl StaticContextArtifact {
         Self::from_mapping(mapping.make_read_only().map_err(artifact_error)?)
     }
 
-    /// Read, decode, and verify an artifact from a bounded file.
-    ///
-    /// The file is memory-mapped, not copied: it must not change while the artifact lives.
-    /// Another process writing it makes the mapped tensors change underneath Rust references,
-    /// and truncating it makes the next read fault (`SIGBUS`). Serving artifacts are written
-    /// once and replaced atomically, never edited in place.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::Artifact`] when the file cannot be read or is invalid.
-    pub fn read(path: &Path) -> Result<Self> {
-        let file = File::open(path).map_err(artifact_error)?;
-        let length = to_usize(
-            file.metadata().map_err(artifact_error)?.len(),
-            "static context length",
-        )?;
-        if length > MAX_ARTIFACT_BYTES {
-            return Err(artifact_error("static context exceeds the resource limit"));
-        }
-        Self::read_mapped_file(&file, length, false)
-    }
-
     /// Map, verify, and borrow tensors directly from an immutable artifact.
     ///
     /// The file is memory-mapped, not copied: it must not change while the artifact lives.

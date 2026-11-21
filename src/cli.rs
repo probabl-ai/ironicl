@@ -13,8 +13,6 @@ pub enum Command {
     Plan(PlanArgs),
     Inspect(InspectArgs),
     Import(ImportArgs),
-    Run(RunArgs),
-    Benchmark(BenchmarkArgs),
 }
 
 /// Command-specific help pages.
@@ -24,8 +22,6 @@ pub enum HelpTopic {
     Plan,
     Inspect,
     Import,
-    Run,
-    Benchmark,
 }
 
 /// A model source accepted by commands that can read checkpoints or artifacts.
@@ -64,36 +60,6 @@ pub struct ImportArgs {
     pub output: PathBuf,
 }
 
-/// Arguments for direct development execution or optimized artifact execution.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RunArgs {
-    pub source: ModelSource,
-    pub input: PathBuf,
-    pub context: Option<PathBuf>,
-    pub cache: CheckpointCacheOptions,
-    pub trace_stages: bool,
-    pub probabilities: bool,
-}
-
-/// Arguments for a resident-model inference benchmark.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BenchmarkArgs {
-    pub model: PathBuf,
-    pub input: PathBuf,
-    pub context: Option<PathBuf>,
-    pub probabilities: bool,
-    pub warmup: u32,
-    pub iterations: u32,
-}
-
-/// Controls automatic checkpoint import for `run`.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct CheckpointCacheOptions {
-    pub no_cache: bool,
-    pub rebuild_cache: bool,
-    pub cache_dir: Option<PathBuf>,
-}
-
 /// Parse command-line arguments excluding the executable name.
 ///
 /// # Errors
@@ -111,8 +77,6 @@ pub fn parse_cli(args: &[String]) -> Result<Command> {
         "plan" => parse_plan(rest),
         "inspect" => parse_inspect(rest),
         "import" => parse_import(rest),
-        "run" => parse_run(rest),
-        "benchmark" => parse_benchmark(rest),
         _ => Err(Error::InvalidArgument(format!("unknown command '{command}'"))),
     }
 }
@@ -133,8 +97,6 @@ fn parse_help_topic(value: &str) -> Result<HelpTopic> {
         "plan" => Ok(HelpTopic::Plan),
         "inspect" => Ok(HelpTopic::Inspect),
         "import" => Ok(HelpTopic::Import),
-        "run" => Ok(HelpTopic::Run),
-        "benchmark" => Ok(HelpTopic::Benchmark),
         _ => Err(Error::InvalidArgument(format!("unknown help topic '{value}'"))),
     }
 }
@@ -260,146 +222,6 @@ fn parse_import(args: &[String]) -> Result<Command> {
     }))
 }
 
-fn parse_run(args: &[String]) -> Result<Command> {
-    if is_help(args) {
-        return Ok(Command::Help(Some(HelpTopic::Run)));
-    }
-    let mut checkpoint = None;
-    let mut model = None;
-    let mut input = None;
-    let mut context = None;
-    let mut no_cache = false;
-    let mut rebuild_cache = false;
-    let mut cache_dir = None;
-    let mut trace_stages = false;
-    let mut probabilities = false;
-    let mut index = 0;
-    while index < args.len() {
-        let flag = &args[index];
-        match flag.as_str() {
-            "--no-cache" => set_flag(&mut no_cache, flag, &mut index)?,
-            "--rebuild-cache" => set_flag(&mut rebuild_cache, flag, &mut index)?,
-            "--trace-stages" => set_flag(&mut trace_stages, flag, &mut index)?,
-            "--probabilities" => set_flag(&mut probabilities, flag, &mut index)?,
-            "--checkpoint" | "--model" | "--input" | "--context" | "--cache-dir" => {
-                let value = option_value(args, &mut index)?;
-                match flag.as_str() {
-                    "--checkpoint" => set_once(&mut checkpoint, PathBuf::from(value), flag)?,
-                    "--model" => set_once(&mut model, PathBuf::from(value), flag)?,
-                    "--input" => set_once(&mut input, PathBuf::from(value), flag)?,
-                    "--context" => set_once(&mut context, PathBuf::from(value), flag)?,
-                    "--cache-dir" => set_once(&mut cache_dir, PathBuf::from(value), flag)?,
-                    _ => unreachable!(),
-                }
-            }
-            _ => {
-                return Err(Error::InvalidArgument(format!("unknown option '{flag}' for run")));
-            }
-        }
-    }
-    let source = resolve_model_source(checkpoint, model, "run")?;
-    if no_cache && rebuild_cache {
-        return Err(Error::InvalidArgument(
-            "--no-cache and --rebuild-cache cannot be used together".into(),
-        ));
-    }
-    if no_cache && cache_dir.is_some() {
-        return Err(Error::InvalidArgument(
-            "--cache-dir cannot be used with --no-cache".into(),
-        ));
-    }
-    let input = required(input, "--input", "run")?;
-    if no_cache {
-        return Err(Error::InvalidArgument(
-            "run cannot use --no-cache with --input because execution requires an imported model artifact"
-                .into(),
-        ));
-    }
-    if matches!(source, ModelSource::Model(_)) && (no_cache || rebuild_cache || cache_dir.is_some()) {
-        return Err(Error::InvalidArgument(
-            "checkpoint cache options require --checkpoint".into(),
-        ));
-    }
-    if trace_stages && context.is_some() {
-        return Err(Error::InvalidArgument(
-            "--trace-stages is unavailable with --context".into(),
-        ));
-    }
-    if probabilities && context.is_none() {
-        return Err(Error::InvalidArgument(
-            "--probabilities requires --context".into(),
-        ));
-    }
-    Ok(Command::Run(RunArgs {
-        source,
-        input,
-        context,
-        cache: CheckpointCacheOptions {
-            no_cache,
-            rebuild_cache,
-            cache_dir,
-        },
-        trace_stages,
-        probabilities,
-    }))
-}
-
-fn parse_benchmark(args: &[String]) -> Result<Command> {
-    if is_help(args) {
-        return Ok(Command::Help(Some(HelpTopic::Benchmark)));
-    }
-    let mut model = None;
-    let mut input = None;
-    let mut context = None;
-    let mut probabilities = false;
-    let mut warmup = None;
-    let mut iterations = None;
-    let mut index = 0;
-    while index < args.len() {
-        let flag = &args[index];
-        match flag.as_str() {
-            "--probabilities" => set_flag(&mut probabilities, flag, &mut index)?,
-            "--model" | "--input" | "--context" | "--warmup" | "--iterations" => {
-                let value = option_value(args, &mut index)?;
-                match flag.as_str() {
-                    "--model" => set_once(&mut model, PathBuf::from(value), flag)?,
-                    "--input" => set_once(&mut input, PathBuf::from(value), flag)?,
-                    "--context" => set_once(&mut context, PathBuf::from(value), flag)?,
-                    "--warmup" => set_once(&mut warmup, parse_u32(flag, value)?, flag)?,
-                    "--iterations" => set_once(&mut iterations, parse_u32(flag, value)?, flag)?,
-                    _ => unreachable!(),
-                }
-            }
-            _ => {
-                return Err(Error::InvalidArgument(format!(
-                    "unknown option '{flag}' for benchmark"
-                )));
-            }
-        }
-    }
-    let warmup = warmup.unwrap_or(2);
-    if warmup > 1_000 {
-        return Err(Error::InvalidArgument("--warmup must be at most 1000".into()));
-    }
-    let iterations = iterations.unwrap_or(10);
-    if !(1..=10_000).contains(&iterations) {
-        return Err(Error::InvalidArgument("--iterations must be in 1..=10000".into()));
-    }
-    if probabilities && context.is_none() {
-        return Err(Error::InvalidArgument(
-            "benchmark --probabilities requires --context".into(),
-        ));
-    }
-    Ok(Command::Benchmark(BenchmarkArgs {
-        model: required(model, "--model", "benchmark")?,
-        input: required(input, "--input", "benchmark")?,
-        context,
-        probabilities,
-        warmup,
-        iterations,
-    }))
-}
-
 fn parse_model_source(args: &[String], command: &str) -> Result<ModelSource> {
     let mut checkpoint = None;
     let mut model = None;
@@ -436,15 +258,6 @@ fn resolve_model_source(
             "{command} accepts only one of --checkpoint or --model"
         ))),
     }
-}
-
-fn set_flag(slot: &mut bool, flag: &str, index: &mut usize) -> Result<()> {
-    if *slot {
-        return Err(Error::InvalidArgument(format!("duplicate option '{flag}'")));
-    }
-    *slot = true;
-    *index += 1;
-    Ok(())
 }
 
 fn option_value<'a>(args: &'a [String], index: &mut usize) -> Result<&'a str> {
@@ -527,53 +340,13 @@ mod tests {
     }
 
     #[test]
-    fn parses_both_run_sources() {
-        assert_eq!(
-            parse_cli(&args(&[
-                "run",
-                "--checkpoint",
-                "model.ckpt",
-                "--input",
-                "request.irinput"
-            ])),
-            Ok(Command::Run(RunArgs {
-                source: ModelSource::Checkpoint(PathBuf::from("model.ckpt")),
-                input: PathBuf::from("request.irinput"),
-                context: None,
-                cache: CheckpointCacheOptions::default(),
-                trace_stages: false,
-                probabilities: false,
-            }))
-        );
-        assert_eq!(
-            parse_cli(&args(&[
-                "run",
-                "--model",
-                "model.irmodel",
-                "--input",
-                "request.irinput"
-            ])),
-            Ok(Command::Run(RunArgs {
-                source: ModelSource::Model(PathBuf::from("model.irmodel")),
-                input: PathBuf::from("request.irinput"),
-                context: None,
-                cache: CheckpointCacheOptions::default(),
-                trace_stages: false,
-                probabilities: false,
-            }))
-        );
-    }
-
-    #[test]
-    fn rejects_ambiguous_run_source() {
+    fn rejects_ambiguous_model_source() {
         let error = parse_cli(&args(&[
-            "run",
+            "inspect",
             "--checkpoint",
             "model.ckpt",
             "--model",
             "model.irmodel",
-            "--input",
-            "request.irinput",
         ]))
         .expect_err("ambiguous source must fail");
         assert!(error.to_string().contains("only one"));
@@ -587,244 +360,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_checkpoint_cache_options() {
-        assert_eq!(
-            parse_cli(&args(&[
-                "run",
-                "--checkpoint",
-                "model.ckpt",
-                "--input",
-                "request.irinput",
-                "--rebuild-cache",
-                "--cache-dir",
-                "cache",
-            ])),
-            Ok(Command::Run(RunArgs {
-                source: ModelSource::Checkpoint(PathBuf::from("model.ckpt")),
-                input: PathBuf::from("request.irinput"),
-                context: None,
-                cache: CheckpointCacheOptions {
-                    no_cache: false,
-                    rebuild_cache: true,
-                    cache_dir: Some(PathBuf::from("cache")),
-                },
-                trace_stages: false,
-                probabilities: false,
-            }))
-        );
-        let error = parse_cli(&args(&[
-            "run",
-            "--checkpoint",
-            "model.ckpt",
-            "--input",
-            "request.irinput",
-            "--no-cache",
-        ]))
-        .expect_err("execution cannot use a direct checkpoint");
-        assert!(error.to_string().contains("cannot use --no-cache"));
-    }
-
-    #[test]
-    fn parses_trace_stages() {
-        assert_eq!(
-            parse_cli(&args(&[
-                "run",
-                "--model",
-                "model.irmodel",
-                "--input",
-                "request.irinput",
-                "--trace-stages",
-            ])),
-            Ok(Command::Run(RunArgs {
-                source: ModelSource::Model(PathBuf::from("model.irmodel")),
-                input: PathBuf::from("request.irinput"),
-                context: None,
-                cache: CheckpointCacheOptions::default(),
-                trace_stages: true,
-                probabilities: false,
-            }))
-        );
-    }
-
-    #[test]
-    fn parses_cached_probabilities() {
-        assert_eq!(
-            parse_cli(&args(&[
-                "run",
-                "--model",
-                "model.irmodel",
-                "--context",
-                "context.irctx",
-                "--input",
-                "request.irquery",
-                "--probabilities",
-            ])),
-            Ok(Command::Run(RunArgs {
-                source: ModelSource::Model(PathBuf::from("model.irmodel")),
-                input: PathBuf::from("request.irquery"),
-                context: Some(PathBuf::from("context.irctx")),
-                cache: CheckpointCacheOptions::default(),
-                trace_stages: false,
-                probabilities: true,
-            }))
-        );
-    }
-
-    #[test]
-    fn rejects_incompatible_cache_options() {
-        for values in [
-            &[
-                "run",
-                "--checkpoint",
-                "model.ckpt",
-                "--input",
-                "request.irinput",
-                "--no-cache",
-                "--rebuild-cache",
-            ][..],
-            &[
-                "run",
-                "--checkpoint",
-                "model.ckpt",
-                "--input",
-                "request.irinput",
-                "--no-cache",
-                "--cache-dir",
-                "cache",
-            ][..],
-            &[
-                "run",
-                "--model",
-                "model.irmodel",
-                "--input",
-                "request.irinput",
-                "--rebuild-cache",
-            ][..],
-        ] {
-            assert!(parse_cli(&args(values)).is_err());
-        }
-    }
-
-    #[test]
     fn parses_command_help() {
         assert_eq!(
             parse_cli(&args(&["inspect", "--help"])),
             Ok(Command::Help(Some(HelpTopic::Inspect)))
         );
         assert_eq!(
-            parse_cli(&args(&["help", "run"])),
-            Ok(Command::Help(Some(HelpTopic::Run)))
+            parse_cli(&args(&["help", "import"])),
+            Ok(Command::Help(Some(HelpTopic::Import)))
         );
-    }
-
-    #[test]
-    fn run_requires_input() {
-        let error =
-            parse_cli(&args(&["run", "--model", "model.irmodel"])).expect_err("input must be required");
-        assert!(error.to_string().contains("run requires --input"));
-    }
-
-    #[test]
-    fn parses_model_only_benchmark_defaults_and_options() {
-        assert_eq!(
-            parse_cli(&args(&[
-                "benchmark",
-                "--model",
-                "model.irmodel",
-                "--input",
-                "request.irinput"
-            ])),
-            Ok(Command::Benchmark(BenchmarkArgs {
-                model: PathBuf::from("model.irmodel"),
-                input: PathBuf::from("request.irinput"),
-                context: None,
-                probabilities: false,
-                warmup: 2,
-                iterations: 10,
-            }))
-        );
-        assert_eq!(
-            parse_cli(&args(&[
-                "benchmark",
-                "--model",
-                "model.irmodel",
-                "--input",
-                "request.irinput",
-                "--warmup",
-                "0",
-                "--iterations",
-                "10000",
-            ])),
-            Ok(Command::Benchmark(BenchmarkArgs {
-                model: PathBuf::from("model.irmodel"),
-                input: PathBuf::from("request.irinput"),
-                context: None,
-                probabilities: false,
-                warmup: 0,
-                iterations: 10_000,
-            }))
-        );
-        assert_eq!(
-            parse_cli(&args(&[
-                "benchmark",
-                "--model",
-                "model.irmodel",
-                "--input",
-                "request.irquery",
-                "--context",
-                "context.irctx",
-                "--probabilities",
-            ])),
-            Ok(Command::Benchmark(BenchmarkArgs {
-                model: PathBuf::from("model.irmodel"),
-                input: PathBuf::from("request.irquery"),
-                context: Some(PathBuf::from("context.irctx")),
-                probabilities: true,
-                warmup: 2,
-                iterations: 10,
-            }))
-        );
-    }
-
-    #[test]
-    fn benchmark_rejects_checkpoints_and_out_of_range_counts() {
-        for values in [
-            &[
-                "benchmark",
-                "--checkpoint",
-                "model.ckpt",
-                "--input",
-                "request.irinput",
-            ][..],
-            &[
-                "benchmark",
-                "--model",
-                "model.irmodel",
-                "--input",
-                "request.irinput",
-                "--warmup",
-                "1001",
-            ][..],
-            &[
-                "benchmark",
-                "--model",
-                "model.irmodel",
-                "--input",
-                "request.irinput",
-                "--iterations",
-                "0",
-            ][..],
-            &[
-                "benchmark",
-                "--model",
-                "model.irmodel",
-                "--input",
-                "request.irinput",
-                "--iterations",
-                "10001",
-            ][..],
-        ] {
-            assert!(parse_cli(&args(values)).is_err());
-        }
     }
 }

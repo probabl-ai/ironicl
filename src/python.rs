@@ -35,7 +35,7 @@ use crate::{
 fn py_error(error: Error) -> PyErr {
     let message = error.to_string();
     match error {
-        Error::InvalidArgument(_) | Error::InputBundle(_) => PyValueError::new_err(message),
+        Error::InvalidArgument(_) => PyValueError::new_err(message),
         Error::NotImplemented(_) => PyNotImplementedError::new_err(message),
         _ => PyRuntimeError::new_err(message),
     }

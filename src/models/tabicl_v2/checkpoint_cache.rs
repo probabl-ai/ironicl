@@ -4,48 +4,41 @@ use std::{
 };
 
 use crate::{
-    CheckpointCacheOptions, ModelArtifact, ModelArtifactSummary, ModelProfile,
+    ModelArtifact, ModelArtifactSummary,
     error::{Error, Result},
     import_checkpoint, inspect_model_artifact, load_model_artifact,
-    models::tabicl_v2::checkpoint::{checkpoint_sha256, inspect_checkpoint, model_from_checkpoint},
+    models::tabicl_v2::checkpoint::{checkpoint_sha256, model_from_checkpoint},
 };
 
-/// Result of preparing a checkpoint for execution.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PreparedCheckpoint {
-    Direct {
-        source_sha256: String,
-        profile: ModelProfile,
-    },
-    Cached {
-        path: PathBuf,
-        created: bool,
-        summary: ModelArtifactSummary,
-    },
+/// Controls where and whether [`prepare_checkpoint`] reuses an imported model.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CheckpointCacheOptions {
+    pub rebuild_cache: bool,
+    pub cache_dir: Option<PathBuf>,
 }
 
-/// Validate a checkpoint and optionally prepare its content-addressed model cache.
+/// A checkpoint's imported model in the content-addressed cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedCheckpoint {
+    pub path: PathBuf,
+    pub created: bool,
+    pub summary: ModelArtifactSummary,
+}
+
+/// Validate a checkpoint and prepare its content-addressed model cache.
 ///
 /// # Errors
 ///
 /// Returns an error when checkpoint validation, cache path resolution, import,
 /// or cached artifact verification fails.
 pub fn prepare_checkpoint(path: &Path, options: &CheckpointCacheOptions) -> Result<PreparedCheckpoint> {
-    if options.no_cache {
-        let checkpoint = inspect_checkpoint(path)?;
-        return Ok(PreparedCheckpoint::Direct {
-            source_sha256: checkpoint.source_sha256,
-            profile: checkpoint.profile.into(),
-        });
-    }
-
     let source_sha256 = checkpoint_sha256(path)?;
     let cache_root = options.cache_dir.clone().map_or_else(default_cache_dir, Ok)?;
     let cache_path = cache_model_path(&cache_root, &source_sha256)?;
     if !options.rebuild_cache {
         match inspect_model_artifact(&cache_path) {
             Ok(summary) if summary.source_sha256 == source_sha256 => {
-                return Ok(PreparedCheckpoint::Cached {
+                return Ok(PreparedCheckpoint {
                     path: cache_path,
                     created: false,
                     summary,
@@ -62,7 +55,7 @@ pub fn prepare_checkpoint(path: &Path, options: &CheckpointCacheOptions) -> Resu
             "imported model source hash does not match the checkpoint".into(),
         ));
     }
-    Ok(PreparedCheckpoint::Cached {
+    Ok(PreparedCheckpoint {
         path: cache_path,
         created: true,
         summary,
@@ -78,12 +71,8 @@ pub fn prepare_checkpoint(path: &Path, options: &CheckpointCacheOptions) -> Resu
 /// Returns [`Error::Checkpoint`] when the checkpoint is invalid and
 /// [`Error::Artifact`] when it is not an official model.
 pub fn load_checkpoint_model(path: &Path) -> Result<ModelArtifact> {
-    let cached = prepare_checkpoint(path, &CheckpointCacheOptions::default()).and_then(|prepared| {
-        let PreparedCheckpoint::Cached { path, .. } = prepared else {
-            unreachable!("the default options always use the cache");
-        };
-        load_model_artifact(&path)
-    });
+    let cached = prepare_checkpoint(path, &CheckpointCacheOptions::default())
+        .and_then(|prepared| load_model_artifact(&prepared.path));
     match cached {
         Err(Error::Checkpoint(message)) => Err(Error::Checkpoint(message)),
         Err(_) => model_from_checkpoint(path),
@@ -99,7 +88,7 @@ fn default_cache_dir() -> Result<PathBuf> {
         return Ok(PathBuf::from(path).join(".cache/ironicl"));
     }
     Err(Error::Cache(
-        "cannot resolve cache directory; set --cache-dir, XDG_CACHE_HOME, or HOME".into(),
+        "cannot resolve cache directory; set XDG_CACHE_HOME or HOME".into(),
     ))
 }
 
@@ -115,16 +104,6 @@ fn cache_model_path(cache_root: &Path, source_sha256: &str) -> Result<PathBuf> {
         .join("models")
         .join(format!("v{}", crate::MODEL_ARTIFACT_VERSION))
         .join(format!("{source_sha256}.irmodel")))
-}
-
-impl From<crate::CheckpointProfile> for ModelProfile {
-    fn from(profile: crate::CheckpointProfile) -> Self {
-        match profile {
-            crate::CheckpointProfile::TabIclV2Classifier => Self::TabIclV2Classifier,
-            crate::CheckpointProfile::TabIclV2Regressor => Self::TabIclV2Regressor,
-            crate::CheckpointProfile::Unknown => Self::Unknown,
-        }
-    }
 }
 
 #[cfg(test)]
