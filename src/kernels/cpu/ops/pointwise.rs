@@ -23,20 +23,11 @@ pub(crate) const fn bf16_storage_supported_for_target() -> bool {
     false
 }
 
-pub(crate) fn bf16_bits_to_f32(value: u16) -> f32 {
-    f32::from_bits(u32::from(value) << 16)
-}
-
 /// Apply the native GELU approximation when the host supports it.
 ///
 /// The caller validates that `input` and `output` have equal lengths.
 pub(crate) fn gelu_f32(input: &[f32], output: &mut [f32]) -> bool {
     gelu_for_target(input, output)
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-pub(crate) fn convert_f32_to_bf16(_input: &[f32], _output: &mut [u16]) -> bool {
-    false
 }
 
 #[inline]

@@ -82,7 +82,9 @@ FP16 ICL attention under `optimize=auto`/`fast` (see
 [experiments.md](experiments.md#apple-silicon-experiments)). The remaining
 planned x86 kernels are:
 
-- BF16 dot product with FP32 accumulation through `VDPBF16PS`.
+- BF16 dot product with FP32 accumulation through `VDPBF16PS`. The first
+  `VDPBF16PS` affine and attention-value kernels failed their gates and are
+  removed; see [removed-experiments.md](removed-experiments.md#dormant-experiment-features).
 - INT8 VNNI projection kernels with INT32 accumulation.
 - conversion and packing kernels at artifact-build boundaries.
 

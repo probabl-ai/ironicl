@@ -155,15 +155,9 @@ AVX-512 vector hold source lanes while a query dimension is broadcast. V remains
 source-major so one sequential V row updates all query accumulators. Model
 weights remain portable and unpacked.
 
-An optional sparse-attention index adds four FP32 tensors without changing the
-version-3 header: `icl.index.centroids`, `icl.index.radii`,
-`icl.index.offsets`, and `icl.index.members`. They are estimator-, layer-, and
-head-major. The index is all-or-nothing: a context with no index uses dense
-attention, while a malformed or incomplete index is rejected. Candidate
-retrieval must retain a dense fallback and cannot change the query bundle.
-Build with the `sparse-attention` cargo feature to enable candidate retrieval
-for an indexed context. The first implementation selects candidates only when its omitted-mass
-certificate is at most `1e-5`; otherwise it uses the dense kernel.
+Ironicl no longer reads the optional `icl.index.*` sparse-attention tensors;
+a context that has them loads with them ignored. See
+[removed-experiments.md](removed-experiments.md#sparse-icl-attention-sparse-attention).
 
 A future combined artifact can organize complete K/V sections so one sequential
 tile read supplies all query rows in a microbatch:

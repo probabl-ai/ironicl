@@ -43,7 +43,8 @@ there are manual measurements; no tracked harness exercises the Metal path yet.
 
 - CPUID verification for all AVX-512 subsets.
 - Zen 5 code generation and disassembly review.
-- BF16 `VDPBF16PS` kernel validation.
+- BF16 `VDPBF16PS` kernel validation, once such a kernel returns (the first ones
+  are [removed](removed-experiments.md#dormant-experiment-features)).
 - INT8 VNNI kernel validation.
 - 96 MiB L3 behavior.
 - dual-channel DDR5 bandwidth and scaling.

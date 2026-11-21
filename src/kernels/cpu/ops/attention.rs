@@ -1,4 +1,4 @@
-//! Attention: score and value tiles, softmax, and packed BF16 values.
+//! Attention: score and value tiles and softmax.
 
 use crate::kernels::cpu::*;
 
@@ -249,78 +249,6 @@ pub(crate) fn attention_value_tile_bf16_fma_f32(
     )
 }
 
-/// Pack source-major BF16 V as `[dimension_block, source_pair, dimension_lane, pair]`.
-pub(crate) fn pack_attention_value_bf16(
-    value: &[u16],
-    source_rows: usize,
-    head_dim: usize,
-    packed: &mut [u16],
-) -> bool {
-    if source_rows == 0
-        || !source_rows.is_multiple_of(2)
-        || head_dim == 0
-        || !head_dim.is_multiple_of(16)
-        || value.len() != source_rows.saturating_mul(head_dim)
-        || packed.len() != value.len()
-    {
-        return false;
-    }
-    let source_pairs = source_rows / 2;
-    let dimension_blocks = head_dim / 16;
-    for block in 0..dimension_blocks {
-        for pair in 0..source_pairs {
-            let destination = (block * source_pairs + pair) * 32;
-            for lane in 0..16 {
-                let dimension = block * 16 + lane;
-                packed[destination + lane * 2] = value[(pair * 2) * head_dim + dimension];
-                packed[destination + lane * 2 + 1] = value[(pair * 2 + 1) * head_dim + dimension];
-            }
-        }
-    }
-    true
-}
-
-/// Accumulate FP32 softmax weights times packed BF16 V through `VDPBF16PS`.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "a kernel takes its buffers and their shape as plain arguments"
-)]
-pub(crate) fn attention_value_packed_bf16_dot_f32(
-    backend: Isa,
-    weights: &[f32],
-    query_rows: usize,
-    packed_value: &[u16],
-    source_rows: usize,
-    head_dim: usize,
-    output: &mut [f32],
-    weights_bf16: &mut [u16],
-) -> bool {
-    if backend != Isa::Avx512
-        || query_rows == 0
-        || query_rows > 8
-        || !source_rows.is_multiple_of(2)
-        || !head_dim.is_multiple_of(16)
-        || weights.len() != query_rows.saturating_mul(source_rows)
-        || weights_bf16.len() != weights.len()
-        || packed_value.len() != source_rows.saturating_mul(head_dim)
-        || output.len() != query_rows.saturating_mul(head_dim)
-        || !packed_bf16_affine_supported_for_target()
-    {
-        return false;
-    }
-    if !convert_f32_to_bf16(weights, weights_bf16) {
-        return false;
-    }
-    attention_value_packed_bf16_dot_for_target(
-        weights_bf16,
-        query_rows,
-        packed_value,
-        source_rows,
-        head_dim,
-        output,
-    )
-}
-
 /// Find an attention score maximum and report whether any lane is NaN.
 pub(crate) fn attention_score_maximum_f32(backend: Isa, scores: &[f32]) -> Option<(f32, bool)> {
     attention_score_maximum_for_target(backend, scores)
@@ -462,18 +390,6 @@ pub(crate) fn attention_value_tile_fma_for_target(
     _weights: &[f32],
     _query_rows: usize,
     _value: &[f32],
-    _source_rows: usize,
-    _head_dim: usize,
-    _output: &mut [f32],
-) -> bool {
-    false
-}
-
-#[cfg(not(target_arch = "x86_64"))]
-pub(crate) fn attention_value_packed_bf16_dot_for_target(
-    _weights: &[u16],
-    _query_rows: usize,
-    _packed_value: &[u16],
     _source_rows: usize,
     _head_dim: usize,
     _output: &mut [f32],
