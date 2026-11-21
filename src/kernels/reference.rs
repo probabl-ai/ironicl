@@ -1298,11 +1298,6 @@ pub(crate) fn source_major_online_attention_f32_key_bf16_value_with_backend_f32(
     output.fill(0.0);
     let scale = (head_dim as f32).sqrt().recip();
     let mut packed_key = vec![0.0; tile_rows * head_dim];
-    let use_bf16_value_dot = bf16_attention_value_dot_enabled();
-    let mut packed_value = use_bf16_value_dot.then(|| vec![0_u16; tile_rows * head_dim]);
-    let mut weights_bf16 = use_bf16_value_dot.then(|| vec![0_u16; block_rows * tile_rows]);
-    let mut profile_scores =
-        (attention_stats_enabled() && source_rows >= 4096).then(|| vec![0.0; source_rows]);
     for source_start in (0..source_rows).step_by(key_tile_rows) {
         let sources = (source_rows - source_start).min(key_tile_rows);
         let tile_elements = sources * head_dim;
@@ -1310,14 +1305,6 @@ pub(crate) fn source_major_online_attention_f32_key_bf16_value_with_backend_f32(
             let source_tile_start = (head * source_rows + source_start) * head_dim;
             let key_tile = &key[source_tile_start..][..tile_elements];
             let value_tile = &value[source_tile_start..][..tile_elements];
-            let value_is_packed = packed_value.as_mut().is_some_and(|packed| {
-                super::cpu::pack_attention_value_bf16(
-                    value_tile,
-                    sources,
-                    head_dim,
-                    &mut packed[..tile_elements],
-                )
-            });
             if !key_is_packed {
                 for dimension in 0..head_dim {
                     for source in 0..sources {
@@ -1379,11 +1366,6 @@ pub(crate) fn source_major_online_attention_f32_key_bf16_value_with_backend_f32(
                         }
                     }
                 }
-                if query_start == 0
-                    && let Some(profile) = &mut profile_scores
-                {
-                    profile[source_start..][..sources].copy_from_slice(&score_tile[..sources]);
-                }
                 {
                     let _profile = profile::scope(Category::AttentionSoftmax);
                     for row in 0..rows {
@@ -1424,29 +1406,15 @@ pub(crate) fn source_major_online_attention_f32_key_bf16_value_with_backend_f32(
                 let output_tile = &mut output[output_tile_start..][..rows * head_dim];
                 {
                     let _profile = profile::scope(Category::AttentionValue);
-                    let used_bf16_dot = value_is_packed
-                        && super::cpu::attention_value_packed_bf16_dot_f32(
-                            backend,
-                            score_tile,
-                            rows,
-                            &packed_value.as_deref().expect("packed V scratch exists")[..tile_elements],
-                            sources,
-                            head_dim,
-                            output_tile,
-                            &mut weights_bf16.as_deref_mut().expect("BF16 weight scratch exists")
-                                [..rows * sources],
-                        );
-                    if !used_bf16_dot
-                        && !super::cpu::attention_value_tile_bf16_fma_f32(
-                            backend,
-                            score_tile,
-                            rows,
-                            value_tile,
-                            sources,
-                            head_dim,
-                            output_tile,
-                        )
-                    {
+                    if !super::cpu::attention_value_tile_bf16_fma_f32(
+                        backend,
+                        score_tile,
+                        rows,
+                        value_tile,
+                        sources,
+                        head_dim,
+                        output_tile,
+                    ) {
                         for row in 0..rows {
                             let output_row = &mut output_tile[row * head_dim..][..head_dim];
                             for source in 0..sources {
@@ -1480,9 +1448,6 @@ pub(crate) fn source_major_online_attention_f32_key_bf16_value_with_backend_f32(
             }
         }
     }
-    if let Some(scores) = profile_scores {
-        report_attention_stats(scores);
-    }
     Ok(())
 }
 
@@ -1501,39 +1466,6 @@ fn attention_score_maximum(backend: super::cpu::Isa, scores: &[f32]) -> Result<f
         maximum = maximum.max(*score);
     }
     Ok(maximum)
-}
-
-const fn bf16_attention_value_dot_enabled() -> bool {
-    cfg!(feature = "bf16-value-dot")
-}
-
-const fn attention_stats_enabled() -> bool {
-    cfg!(feature = "attention-stats")
-}
-
-fn report_attention_stats(mut scores: Vec<f32>) {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static CALL: AtomicUsize = AtomicUsize::new(0);
-    scores.sort_unstable_by(|left, right| right.total_cmp(left));
-    let maximum = scores[0];
-    let weights = scores
-        .iter()
-        .map(|score| (*score - maximum).exp())
-        .collect::<Vec<_>>();
-    let total = weights.iter().sum::<f32>();
-    let masses = [64_usize, 256, 1024, 4096, 16_384]
-        .map(|count| weights[..count.min(weights.len())].iter().sum::<f32>() / total);
-    eprintln!(
-        "attention_stats call={} rows={} top64={:.6} top256={:.6} top1024={:.6} top4096={:.6} top16384={:.6}",
-        CALL.fetch_add(1, Ordering::Relaxed),
-        scores.len(),
-        masses[0],
-        masses[1],
-        masses[2],
-        masses[3],
-        masses[4]
-    );
 }
 
 /// Convert `[rows, embed_dim]` tokens to `[heads, rows, head_dim]` storage.

@@ -36,8 +36,8 @@ pub use models::tabicl_v2::checkpoint_cache::{
     CheckpointCacheOptions, PreparedCheckpoint, load_checkpoint_model, prepare_checkpoint,
 };
 pub use models::tabicl_v2::cpu::{
-    ClassifierAggregation, ClassifierProbabilities, DecoderOutputs, Executor, Optimize,
-    SparseAttentionStatistics, StaticExecutor, plan_context,
+    ClassifierAggregation, ClassifierProbabilities, DecoderOutputs, Executor, Optimize, StaticExecutor,
+    plan_context,
 };
 pub use models::tabicl_v2::fitted::{FittedModel, Preprocessed, TrainingInputs};
 pub use models::tabicl_v2::preprocess::{Features, NormMethod, PreprocessOptions, Preprocessor, Targets};
