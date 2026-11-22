@@ -19,7 +19,9 @@ Use it in two ways:
 > The optimized paths target AMD Zen 5 (Ryzen 7 9800X3D) and Apple Silicon. Other
 > CPUs, including Intel Macs, use a slower portable path.
 
-## Python
+## Quick start
+
+### 1. Use it from Python
 
 Install the package; building it needs Rust ([rustup](https://rustup.rs)) and
 Python 3.12 or newer:
@@ -35,43 +37,45 @@ from sklearn.datasets import load_iris
 from ironicl import TabICLClassifier  # was: from tabicl import TabICLClassifier
 
 X, y = load_iris(return_X_y=True)
-clf = TabICLClassifier().fit(X[::2], y[::2])
-clf.predict_proba(X[1::2])
+clf = TabICLClassifier().fit(X, y)
+clf.predict_proba(X[:3])
 ```
 
 The first fit downloads the TabICLv2 checkpoint (110 MB). `TabICLRegressor`
 works the same way, with TabICL's `output_type` and `alphas`. See
 [Python package](docs/python.md) for options and supported inputs.
 
-## Server
-
-Export a fitted model from Python as a model directory:
+### 2. Export the fitted model
 
 ```python
 clf.export("my-model")
 ```
 
-Build the server and serve the model:
+This writes the directory `my-model/`: the fitted preprocessing, the training
+data, and the KV cache. The weights stay in a shared folder on this machine.
+
+### 3. Serve it
+
+Install the `ironicl` command with the server, then serve the directory:
 
 ```bash
-cargo build --release --features server   # add metal on Apple Silicon, cuda on NVIDIA
-./target/release/ironicl serve my-model
+cargo install --locked --git https://github.com/probabl-ai/ironicl.git \
+    --features server,metal   # drop metal off Apple Silicon
+ironicl serve my-model
 ```
-
-Predict:
 
 ```bash
 curl -s localhost:8080/v1/predict -d '{"rows": [[5.1, 3.5, 1.4, 0.2]]}'
 ```
 
 ```json
-{"labels": [0], "classes": [0, 1, 2], "probabilities": [[0.99999, 0.00001, 0.0]]}
+{"labels": [0], "classes": [0, 1, 2], "probabilities": [[0.9999957, 0.0000031, 0.0000012]]}
 ```
 
-On another machine, import the checkpoint there once (`ironicl import
-CHECKPOINT`); the server builds the KV cache for its device on first start, or
-ahead of time with `ironicl prepare my-model --optimize auto`. See
-[Server](docs/server.md) for the API, batching, and measured throughput.
+To serve on another machine, copy `my-model/` there and run `ironicl import` on
+the checkpoint once; the server builds the KV cache for that machine on first
+start. NVIDIA GPUs need a CUDA build ([CUDA build targets](docs/source-layout.md#cuda-build-targets)).
+See [Server](docs/server.md) for the API, batching, and measured throughput.
 
 ## Status
 
@@ -87,7 +91,7 @@ ahead of time with `ironicl prepare my-model --optimize auto`. See
 ## Documentation
 
 - [Documentation index](docs/README.md): design, formats, and validation.
-- [Command line](docs/cli.md): `platform`, `inspect`, `import`, `prepare`, and `serve`.
+- [Command line](docs/cli.md): `inspect`, `import`, `prepare`, and `serve`, model directories, and weights.
 - [Benchmarking](docs/benchmarking.md): how Ironicl measures latency.
 - [Contributing](CONTRIBUTING.md): development setup and checks.
 
