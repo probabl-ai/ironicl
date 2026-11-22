@@ -132,15 +132,14 @@ impl Model {
         .map(FittedModel)
     }
 
-    /// Load a fitted model from `FittedModel.preprocessor_bytes` (`IRPREP`),
-    /// with `context`, the bytes of `FittedModel.context_bytes`, or the raw
-    /// training rows `x` and their `labels` or `values`, as `preprocess` takes
-    /// them; without a context, it is built from the training rows, as `build`
+    /// Load a fitted model from `FittedModel.preprocessor_bytes` (`IRPREP`) and
+    /// `context`, the bytes of `FittedModel.context_bytes`; without a context,
+    /// it is built from the training rows in the `IRPREP` bytes, as `build`
     /// builds it. The other arguments are as for `build`.
     #[expect(clippy::too_many_arguments, reason = "mirrors the Python call's parameters")]
     #[pyo3(signature = (
         preprocessor, optimize, threads, memory_limit=None, device_memory_limit=None, progress=None,
-        cache_dir=None, *, context=None, x=None, labels=None, values=None,
+        cache_dir=None, *, context=None,
     ))]
     fn load_fitted(
         &self,
@@ -153,24 +152,14 @@ impl Model {
         progress: Option<Py<PyAny>>,
         cache_dir: Option<PathBuf>,
         context: Option<&[u8]>,
-        x: Option<&Bound<'_, PyAny>>,
-        labels: Option<(String, Bound<'_, PyAny>)>,
-        values: Option<PyBuffer<f32>>,
     ) -> PyResult<FittedModel> {
         let optimize = optimize.parse::<Optimize>().map_err(py_error)?;
         let limits = MemoryLimits::resolve(memory_limit.as_deref(), device_memory_limit.as_deref())
             .map_err(py_error)?;
-        let training = match x {
-            Some(x) => Some((Matrix::read(py, x)?, read_targets(py, labels, values)?)),
-            None => None,
-        };
         run(py, progress, || {
             self.0.load_fitted(
                 preprocessor,
                 context,
-                training
-                    .as_ref()
-                    .map(|((x, columns), targets)| (x.features(), *columns, targets)),
                 optimize,
                 threads,
                 limits,
@@ -439,14 +428,6 @@ fn preprocess(
     Ok(Preprocessed(Arc::new(preprocessed)))
 }
 
-/// Convert the checkpoint at `checkpoint` to an Ironicl model at `output`.
-#[pyfunction]
-fn import_checkpoint(py: Python<'_>, checkpoint: PathBuf, output: PathBuf) -> PyResult<()> {
-    py.detach(|| crate::import_checkpoint(&checkpoint, &output))
-        .map(|_| ())
-        .map_err(py_error)
-}
-
 /// Fitted preprocessing and its training rows, before or within a `FittedModel`.
 #[pyclass(frozen)]
 struct Preprocessed(Arc<crate::Preprocessed>);
@@ -615,10 +596,23 @@ impl FittedModel {
         self.0.batch_rows()
     }
 
-    /// The fitted preprocessing as `IRPREP` bytes, for `Model.load_fitted`.
-    fn preprocessor_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = self.0.preprocessor_bytes().map_err(py_error)?;
+    /// The fitted preprocessing as `IRPREP` bytes, for `Model.load_fitted`, with
+    /// the training rows when `training` is set and they were kept.
+    #[pyo3(signature = (training=true))]
+    fn preprocessor_bytes<'py>(&self, py: Python<'py>, training: bool) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = self.0.preprocessor_bytes(training).map_err(py_error)?;
         Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// Write the model directory `path` for `ironicl serve`, with the KV cache
+    /// when `kv_cache` is set, and import `checkpoint`, the model's, into the
+    /// shared weights folder when it is not there.
+    fn export(&self, py: Python<'_>, path: PathBuf, checkpoint: PathBuf, kv_cache: bool) -> PyResult<()> {
+        py.detach(|| {
+            crate::prepare_checkpoint(&checkpoint, &crate::CheckpointCacheOptions::default())?;
+            crate::models::tabicl_v2::directory::write(&path, &self.0, kv_cache)
+        })
+        .map_err(py_error)
     }
 
     /// The training context as `IRCNTXT` bytes, for `Model.load_fitted`.
@@ -649,7 +643,6 @@ fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Preprocessed>()?;
     module.add_class::<FittedModel>()?;
     module.add_function(wrap_pyfunction!(preprocess, module)?)?;
-    module.add_function(wrap_pyfunction!(import_checkpoint, module)?)?;
     module.add_function(wrap_pyfunction!(parse_size, module)?)?;
     module.add_function(wrap_pyfunction!(system_info, module)?)?;
     module.add_function(wrap_pyfunction!(profile_report, module)?)?;

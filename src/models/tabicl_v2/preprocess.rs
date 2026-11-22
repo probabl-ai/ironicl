@@ -872,8 +872,8 @@ mod tests {
             }
             let sha = [7; 32];
             assert_eq!(
-                decode(&encode(&preprocessor, &sha).unwrap()).unwrap(),
-                (sha, preprocessor),
+                decode(&encode(&preprocessor, None, &sha).unwrap()).unwrap(),
+                (sha, preprocessor, None),
                 "case {index}"
             );
         }

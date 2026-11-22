@@ -22,17 +22,21 @@ cache.
 ## Fitted Models
 
 A fitted model is three files, linked by the checkpoint's SHA-256: the weights (`IRMODEL`), the
-fitted preprocessing (`IRPREP`), and optionally the training context (`IRCNTXT`). Pickling and
-`save` store them as bytes, not as Python objects. `export` writes them as files, with the
-training data as `.npy`, for the server ([python.md](python.md#exporting-for-the-server)).
+fitted preprocessing with its training rows (`IRPREP`), and optionally the training context
+(`IRCNTXT`). Pickling and `save` store the last two as bytes, not as Python objects. `export`
+writes them as a model directory, with the weights in a shared folder
+([cli.md](cli.md#model-directories-and-weights)).
 
-`IRPREP` v2 holds the checkpoint's SHA-256 (32 bytes, as `IRCNTXT` stores it), the feature mask,
+`IRPREP` v1 holds the checkpoint's SHA-256 (32 bytes, as `IRCNTXT` stores it), the feature mask,
 the normalization groups, each member's group and feature and class order, the class labels
 (integers, floats, booleans, or UTF-8 text) with the classifier's `softmax_temperature` and
 `average_logits`, or the regressor's target mean and scale, the feature names when the training
-data had them, and per group each kept feature's statistics as `f64`: mean, scale, range, outlier bounds, and for the
-power group its lambda and standardization. Decoding checks every length against the bytes left
-before it allocates, then the preprocessing's invariants.
+data had them, per group each kept feature's statistics as `f64` (mean, scale, range, outlier
+bounds, and for the power group its lambda and standardization), and optionally the preprocessed
+training rows a context is built from: each group's `[rows, features]` matrix and each row's
+target (a class index or the standardized value), as `f32`. Decoding checks every length against
+the bytes left before it allocates, then the preprocessing's invariants, finite training values,
+and class indices in range.
 
 Loading refuses an `IRPREP` fitted with another checkpoint. With a context, it checks that the
 context matches the preprocessing: checkpoint, `B`, `H`, class count, and each member's

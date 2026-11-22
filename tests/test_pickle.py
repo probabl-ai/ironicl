@@ -124,36 +124,32 @@ class PickleTest(unittest.TestCase):
         self.assertEqual(model.n_estimators, 4)
         self.assertFalse(hasattr(model, "fitted_"))
 
-    def test_export_writes_a_directory_rust_loads(self):
+    def test_export_writes_a_model_directory(self):
         for estimator in (TabICLClassifier, TabICLRegressor):
             with self.subTest(estimator=estimator.__name__):
                 model = fitted(estimator)
                 path = self.directory / estimator.__name__
                 model.export(path)
-                x, y = model._training
-                np.testing.assert_array_equal(np.load(path / "train_x.npy"), x)
-                codes = np.load(path / "train_y.npy")
-                restored = model.classes_[codes] if estimator is TabICLClassifier else codes
-                np.testing.assert_array_equal(restored, y)
-                manifest = json.loads((path / "ironicl.json").read_text())
+                files = ["context.ircntxt", "ironicl.json", "preprocessing.irprep"]
+                self.assertEqual(sorted(file.name for file in path.iterdir()), files)
+                metadata = json.loads((path / "ironicl.json").read_text())
                 self.assertEqual(
-                    (manifest["format"], manifest["version"], manifest["task"], manifest["n_features"]),
-                    ("ironicl-export", 1, model._task, x.shape[1]),
+                    (metadata["format"], metadata["version"], metadata["task"], metadata["n_features"]),
+                    ("ironicl-model", 1, model._task, model.n_features_in_),
                 )
-                if os.name == "posix":  # The training data is private.
-                    for name in ("preprocessing.irprep", "context.ircntxt", "train_x.npy", "train_y.npy"):
+                if os.name == "posix":  # The preprocessing and the cache hold the training data.
+                    for name in files:
                         self.assertEqual((path / name).stat().st_mode & 0o777, 0o600, name)
-                model.export(path)  # Again, over the first export.
-                self.assertEqual([file.name for file in path.iterdir() if file.name.startswith(".")], [])
-                self.assertEqual((path / "model.irmodel").read_bytes()[:8], b"IRMODEL\0")
+                # Rust loads it, with the cache or, without it, from the training rows.
                 rust = _core.Model(Path(model.checkpoint_path_))
-                loaded = rust.load_fitted(
-                    (path / "preprocessing.irprep").read_bytes(),
-                    "safe",
-                    None,
-                    context=(path / "context.ircntxt").read_bytes(),
-                )
-                self.assertEqual(loaded.preprocessor_bytes(), model.fitted_.preprocessor_bytes())
+                preprocessor = (path / "preprocessing.irprep").read_bytes()
+                self.assertEqual(preprocessor, model.fitted_.preprocessor_bytes())
+                for context in ((path / "context.ircntxt").read_bytes(), None):
+                    loaded = rust.load_fitted(preprocessor, "safe", None, context=context)
+                    self.assertEqual(loaded.preprocessor_bytes(), preprocessor)
+                # Again, over the first export, without the cache.
+                model.export(path, kv_cache=False)
+                self.assertEqual(sorted(file.name for file in path.iterdir()), files[1:])
 
     def test_export_needs_the_training_data(self):
         saved = self.directory / "no-training.pkl"

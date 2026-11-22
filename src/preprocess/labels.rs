@@ -55,6 +55,7 @@ impl Labels {
     }
 
     /// The labels at `indices`, each below [`Self::len`].
+    #[cfg(feature = "server")]
     pub(crate) fn select(&self, indices: &[usize]) -> Self {
         fn pick<T: Clone>(values: &[T], indices: &[usize]) -> Vec<T> {
             indices.iter().map(|&index| values[index].clone()).collect()

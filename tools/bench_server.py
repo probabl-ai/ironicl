@@ -2,13 +2,13 @@
 """Measure the throughput and latency of `ironicl serve` with oha
 (https://github.com/hatoo/oha).
 
-For each optimize level, it rebuilds the exported model's KV cache with
-`ironicl prepare` (overwriting MODEL/context.ircntxt), then for each
+For each optimize level, it prepares the model directory's KV cache with
+`ironicl prepare` (replacing MODEL/context.ircntxt), then for each
 --max-batch-rows starts the server and runs oha for each request size at each
-client count, or with --rates, at each request rate. Request rows are the
-model's training rows, repeated as needed. Latencies are of successful
-requests. It prints a Markdown table and appends each result to --output as a
-JSON line.
+client count, or with --rates, at each request rate. Request rows are random
+normal values, as many per row as the model has features. Latencies are of
+successful requests. It prints a Markdown table and appends each result to
+--output as a JSON line.
 
     tools/bench_server.py MODEL --levels auto fast --batch-rows 256 1024 \\
         --request-rows 1 64 --clients 1 32 256 --duration 10s
@@ -30,7 +30,7 @@ import numpy as np
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("model", type=Path, help="A directory that export() wrote.")
+    parser.add_argument("model", type=Path, help="A model directory that export() wrote.")
     parser.add_argument("--ironicl", type=Path, default=Path("target/release/ironicl"))
     parser.add_argument("--levels", nargs="+", default=["safe"], choices=["safe", "auto", "fast"])
     parser.add_argument("--cpu", action="store_true", help="Serve on the CPU (IRONICL_NO_CUDA, IRONICL_NO_METAL).")
@@ -67,10 +67,12 @@ def oha(url: str, body: Path, duration: str, clients: int, rate: int | None) -> 
 def main() -> None:
     args = parse_args()
     env = dict(os.environ, IRONICL_NO_CUDA="1", IRONICL_NO_METAL="1") if args.cpu else os.environ
-    rows = np.load(args.model / "train_x.npy")
+    features = json.loads((args.model / "ironicl.json").read_text())["n_features"]
+    random = np.random.default_rng(0)
     bodies = Path(tempfile.mkdtemp())
     for count in args.request_rows:
-        (bodies / f"{count}.json").write_text(json.dumps({"rows": np.resize(rows, (count, rows.shape[1])).tolist()}))
+        rows = random.standard_normal((count, features)).round(4)
+        (bodies / f"{count}.json").write_text(json.dumps({"rows": rows.tolist()}))
     largest = max(path.stat().st_size for path in bodies.iterdir())
     url = f"http://127.0.0.1:{args.port}"
     loads = [("rate", rate) for rate in args.rates] if args.rates else [("clients", c) for c in args.clients]

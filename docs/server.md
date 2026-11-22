@@ -1,6 +1,6 @@
 # Prediction Server
 
-`ironicl serve` serves one exported model over HTTP, without Python. It is built with the `server`
+`ironicl serve` serves one model directory over HTTP, without Python. It is built with the `server`
 feature:
 
 ```bash
@@ -9,33 +9,38 @@ cargo build --release --features server          # add metal on Apple Silicon, c
 
 ## Workflow
 
-1. Fit in Python and export the model ([python.md](python.md#exporting-for-the-server)):
+1. Fit in Python and export the model directory
+   ([python.md](python.md#exporting-for-the-server)):
 
    ```python
    clf = TabICLClassifier().fit(X, y)
-   clf.export("churn")
+   clf.export("my-model")
    ```
 
-2. Optionally, rebuild the KV cache on the serving machine or at another `optimize` level
+2. On the serving machine, make sure the weights are in the weights folder (`export` already put
+   them there on its own machine) and, optionally, build the KV cache for this device and level
    ([cli.md](cli.md#prepare)):
 
    ```bash
-   ironicl prepare churn --optimize auto
+   ironicl import tabicl-classifier-v2-20260212.ckpt
+   ironicl prepare my-model --optimize auto
    ```
 
 3. Serve it:
 
    ```bash
-   ironicl serve churn --bind 127.0.0.1:8080
+   ironicl serve my-model --bind 127.0.0.1:8080
    ```
 
-The server loads the weights, the preprocessing, and the KV cache, checks that they belong
-together, and predicts once before it opens the port, so any answer means it is ready. It predicts
-at the level the cache records. It refuses a cache that is invalid or does not match the
-preprocessing, and says to run `ironicl prepare`.
+The server finds the model's weights by its checkpoint's SHA-256, loads the preprocessing, and
+prepares the KV cache as `ironicl prepare` does: it reuses `context.ircntxt` when it is exactly
+the cache this model builds at the level, and otherwise builds it and replaces the file. It then
+predicts a full batch before it opens the port, so any answer means it is ready.
 
 | Option | Default |
 |---|---|
+| `--weights DIR` | the shared weights folder ([cli.md](cli.md#model-directories-and-weights)) |
+| `--optimize safe\|auto\|fast` | the saved cache's level, else `safe` |
 | `--bind ADDR` | `127.0.0.1:8080` |
 | `--max-request-rows N` | `10000` rows per request |
 | `--max-body SIZE` | `16M` |
@@ -158,9 +163,7 @@ Errors are `{"error": {"code": ..., "message": ...}}`.
 
 | Status | `code` | When |
 |---|---|---|
-| 400 | `invalid_request` | Malformed JSON, a wrong type, an unknown field, an empty or ragged `rows`, an unknown or repeated output, or `alphas` outside (0, 1) or more than 999 of them. The message says which. |
-| 400 | `wrong_feature_count` | Rows of another length than the training data's. |
-| 400 | `too_many_rows` | More rows than `--max-request-rows`. |
+| 400 | `invalid_request` | Malformed JSON, a wrong type, or an unknown field; `rows` empty, ragged, of another length than the training data's, or longer than `--max-request-rows`; an output the model does not have, or one named twice; `alphas` for a classifier, outside (0, 1), or more than 999 of them. The message names the field. |
 | 413 | `body_too_large` | A body larger than `--max-body`. |
 | 503 | `overloaded` | The request would wait longer than `--max-queue`. Retry after the `Retry-After` seconds. |
 | 500 | `internal` | A failed prediction. It fails every request in the same batch. |

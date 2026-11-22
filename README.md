@@ -45,17 +45,17 @@ works the same way, with TabICL's `output_type` and `alphas`. See
 
 ## Server
 
-Export a fitted model from Python:
+Export a fitted model from Python as a model directory:
 
 ```python
-clf.export("iris")
+clf.export("my-model")
 ```
 
 Build the server and serve the model:
 
 ```bash
 cargo build --release --features server   # add metal on Apple Silicon, cuda on NVIDIA
-./target/release/ironicl serve iris
+./target/release/ironicl serve my-model
 ```
 
 Predict:
@@ -68,8 +68,9 @@ curl -s localhost:8080/v1/predict -d '{"rows": [[5.1, 3.5, 1.4, 0.2]]}'
 {"labels": [0], "classes": [0, 1, 2], "probabilities": [[0.99999, 0.00001, 0.0]]}
 ```
 
-To serve on another machine or at another `optimize` level, rebuild the model's
-KV cache there first with `ironicl prepare iris --optimize auto`. See
+On another machine, import the checkpoint there once (`ironicl import
+CHECKPOINT`); the server builds the KV cache for its device on first start, or
+ahead of time with `ironicl prepare my-model --optimize auto`. See
 [Server](docs/server.md) for the API, batching, and measured throughput.
 
 ## Status

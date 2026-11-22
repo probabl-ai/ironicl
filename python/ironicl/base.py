@@ -8,7 +8,6 @@ Python converts inputs and keeps scikit-learn's interface."""
 from __future__ import annotations
 
 import contextlib
-import json
 import os
 import pickle
 import urllib.request
@@ -74,7 +73,6 @@ class TabICLBase(BaseEstimator):
         _enforce(plan, policy, stacklevel=3)
         checkpoint = self._checkpoint()
         self.fitted_ = self._build(checkpoint, preprocessed, optimize, limits)
-        self._training = (x.copy(), y.copy())  # Copies: the caller may change X and y.
         self.memory_plan_ = plan
         self.checkpoint_path_ = checkpoint
         self.n_features_in_ = x.shape[1]
@@ -104,17 +102,10 @@ class TabICLBase(BaseEstimator):
         """Load the fitted model from its ``IRPREP`` and ``IRCNTXT`` bytes, or
         without the context, build it from the training data as ``_build`` does."""
         model = self._task_model(checkpoint)
-        x, y = getattr(self, "_training", (None, None))
-        training = {} if x is None else {"x": x, **self._targets(y)}
         with self._progress("Building context", "estimator") as progress:
             arguments = (optimize, self._resolve_threads(), *limits)
             return model.load_fitted(
-                preprocessor,
-                *arguments,
-                progress=progress,
-                cache_dir=_cache_dir(self.cache_dir),
-                context=context,
-                **training,
+                preprocessor, *arguments, progress=progress, cache_dir=_cache_dir(self.cache_dir), context=context
             )
 
     def _task_model(self, checkpoint: Path) -> Model:
@@ -164,48 +155,24 @@ class TabICLBase(BaseEstimator):
         finally:
             del self._save_options
 
-    def export(self, path: str | Path) -> None:
+    def export(self, path: str | Path, kv_cache: bool = True) -> None:
         """Export the fitted model to the directory ``path`` for ``ironicl serve``.
 
-        It holds the model weights (``model.irmodel``), the fitted preprocessing
+        It holds the fitted preprocessing with its training rows
         (``preprocessing.irprep``), the KV cache built at this fit's ``optimize``
-        level (``context.ircntxt``), the training data (``train_x.npy``,
-        ``train_y.npy``), from which ``ironicl prepare`` rebuilds the cache for
-        another machine or level, and last a manifest (``ironicl.json``) that
-        marks the directory complete and describes the model.
-
-        Each file replaces the old one whole, so a server that maps it keeps a
-        valid file. The data files are readable only by their owner on Unix,
-        since they hold the training data.
+        level when ``kv_cache`` is set (``context.ircntxt``), and last the
+        metadata (``ironicl.json``), which marks the directory complete. The
+        weights stay in the shared weights folder, into which this imports the
+        checkpoint when it is not there. Each file replaces the old one whole and
+        is readable only by its owner on Unix.
         """
         check_is_fitted(self)
-        if not hasattr(self, "_training"):
+        if not self.fitted_.preprocessed.has_training:
             raise ValueError(
                 "export needs the training data, which this estimator was saved without; "
                 "save it with save_training_data=True"
             )
-        path = Path(path)
-        path.mkdir(parents=True, exist_ok=True)
-        # Until the new manifest, the directory is incomplete.
-        (path / "ironicl.json").unlink(missing_ok=True)
-        _core.import_checkpoint(Path(self.checkpoint_path_), path / "model.irmodel")
-        _write_private(path / "preprocessing.irprep", lambda file: file.write(self.fitted_.preprocessor_bytes()))
-        _write_private(path / "context.ircntxt", lambda file: file.write(self.fitted_.context_bytes()))
-        x, y = self._training
-        codes = np.searchsorted(self.classes_, y) if self._task == "classifier" else y
-        _write_private(path / "train_x.npy", lambda file: np.save(file, x))
-        _write_private(path / "train_y.npy", lambda file: np.save(file, codes))
-        names = getattr(self, "feature_names_in_", None)
-        manifest = {
-            "format": "ironicl-export",
-            "version": 1,
-            "ironicl": _version(),
-            "task": self._task,
-            "n_features": int(self.n_features_in_),
-            "feature_names": None if names is None else [str(name) for name in names],
-            "classes": self.classes_.tolist() if self._task == "classifier" else None,
-        }
-        _write_private(path / "ironicl.json", lambda file: file.write((json.dumps(manifest, indent=2) + "\n").encode()))
+        self.fitted_.export(Path(path), Path(self.checkpoint_path_), kv_cache)
 
     @classmethod
     def load(cls, path: str | Path, device: str | None = None):
@@ -226,10 +193,8 @@ class TabICLBase(BaseEstimator):
         weights, training, context = state.pop("_save_options", (False, True, True))
         state["_ironicl_version"] = _version()
         if "fitted_" in state:
-            state["fitted_"] = self.fitted_.preprocessor_bytes()
+            state["fitted_"] = self.fitted_.preprocessor_bytes(training=training)
             state["_context"] = self.fitted_.context_bytes() if context else None
-            if not training:
-                state.pop("_training", None)
             if weights:
                 state["_checkpoint_bytes"] = Path(self.checkpoint_path_).read_bytes()
         return state
@@ -350,20 +315,6 @@ class TabICLBase(BaseEstimator):
             partial.write_bytes(data)
         partial.replace(path)
         return path
-
-
-def _write_private(path: Path, write) -> None:
-    """Write ``path`` through ``write(file)``, owner-only on Unix, to a temporary
-    file that then replaces ``path`` whole."""
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.unlink(missing_ok=True)  # One a failed export left, maybe with wider permissions.
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)  # No newline translation on Windows.
-    try:
-        with os.fdopen(os.open(temporary, flags, 0o600), "wb") as file:
-            write(file)
-        temporary.replace(path)
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def _features(X) -> tuple[np.ndarray, tuple[str, ...] | None]:

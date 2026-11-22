@@ -653,7 +653,7 @@ impl Executor {
     /// Validate a context's inputs and describe it: model and content hashes,
     /// shape, class count, and permutations. The content hash is the context's
     /// cache identity: it covers everything the stored tensors depend on.
-    fn context_metadata(
+    pub(crate) fn context_metadata(
         &self,
         (b, n, h): (usize, usize, usize),
         x: &[f32],

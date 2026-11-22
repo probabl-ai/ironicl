@@ -159,25 +159,27 @@ like any pickle, loading can run code.
 
 ### Exporting for the server
 
-`export` writes a fitted estimator as a directory that `ironicl serve`
-loads:
+`export` writes a fitted estimator as a model directory that `ironicl prepare`
+and `ironicl serve` read ([cli.md](cli.md#model-directories-and-weights)):
 
 ```python
-clf.export("churn")
+clf.export("my-model")                  # with the KV cache built during the fit
+clf.export("my-model", kv_cache=False)  # without it, for another machine
 ```
 
 | File | Contents |
 |---|---|
-| `model.irmodel` | the model weights |
-| `preprocessing.irprep` | the fitted preprocessing, labels or target scale, feature names, and the classifier's `softmax_temperature` and `average_logits` |
-| `context.ircntxt` | the KV cache, built at this fit's `optimize` level on this machine |
-| `train_x.npy`, `train_y.npy` | the training data: features as `fit` received them, and class indices or regression targets |
-| `ironicl.json` | the manifest, written last: `format` (`"ironicl-export"`) and `version` (1), which `prepare` and `serve` check, and for people and tools the Ironicl version, `task`, `n_features`, `feature_names`, and `classes` |
+| `ironicl.json` | the metadata, written last: `format` (`"ironicl-model"`) and `version` (1), which `prepare` and `serve` check, and for people and tools the Ironicl version, `task`, `n_features`, `feature_names`, `classes`, and the weights' SHA-256 |
+| `preprocessing.irprep` | the fitted preprocessing (labels or target scale, feature names, the classifier's `softmax_temperature` and `average_logits`) with the preprocessed training rows |
+| `context.ircntxt` | the KV cache at this fit's `optimize` level, unless `kv_cache=False` |
 
-`ironicl prepare` rebuilds the KV cache from the training data, for another
-machine or `optimize` level. Each file replaces the old one whole, so exporting
-again does not break a server that has the old files open, and the files that
-hold training data are readable only by their owner on Unix.
+The weights are not in it. `export` makes sure the shared weights folder has
+the estimator's checkpoint, importing it once when needed. A directory without
+`ironicl.json` is incomplete. Each file replaces the old one whole, so exporting
+again does not break a server that has the old files open, and every file is
+readable only by its owner on Unix, since the preprocessing and the cache hold
+the training data. An estimator saved with `save_training_data=False` cannot be
+exported.
 
 ### Progress and interrupts
 

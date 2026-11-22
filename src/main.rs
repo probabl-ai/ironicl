@@ -1,8 +1,13 @@
 use std::{env, process, time::Instant};
 
+use std::path::{Path, PathBuf};
+
 use ironicl::{
-    Command, CpuCapabilities, HelpTopic, ImportArgs, InspectArgs, Isa, ModelSource, PrepareArgs,
-    error::Result, memory::ByteSize, models::tabicl_v2::saved, parse_cli,
+    CheckpointCacheOptions, Command, CpuCapabilities, HelpTopic, ImportArgs, InspectArgs, Isa, PrepareArgs,
+    error::Result,
+    memory::{ByteSize, MemoryLimits},
+    models::tabicl_v2::directory,
+    parse_cli,
 };
 
 fn main() {
@@ -17,7 +22,7 @@ fn run() -> Result<()> {
     match parse_cli(&args)? {
         Command::Help(topic) => print_help(topic),
         Command::Platform => print_platform(),
-        Command::Inspect(args) => inspect(args)?,
+        Command::Inspect(args) => inspect(&args)?,
         Command::Import(args) => import(&args)?,
         Command::Prepare(args) => prepare(&args)?,
         #[cfg(feature = "server")]
@@ -38,14 +43,55 @@ fn print_platform() {
     println!("isa:             {}", Isa::for_host(&host));
 }
 
-fn inspect(args: InspectArgs) -> Result<()> {
-    match args.source {
-        ModelSource::Checkpoint(path) => inspect_checkpoint_file(&path),
-        ModelSource::Model(path) => inspect_model_file(&path),
+/// The weights folder `--weights` names, else the shared one.
+fn weights_dir(weights: Option<&PathBuf>) -> Result<PathBuf> {
+    weights.map_or_else(directory::default_weights_dir, |path| Ok(path.clone()))
+}
+
+/// Inspect a model directory, Ironicl weights, or a checkpoint, by what `path` is.
+fn inspect(args: &InspectArgs) -> Result<()> {
+    let path = &args.path;
+    if path.is_dir() {
+        return inspect_directory(path, &weights_dir(args.weights.as_ref())?);
+    }
+    let mut magic = [0; 8];
+    let is_model = std::fs::File::open(path)
+        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut magic))
+        .is_ok()
+        && magic == ironicl::format::model::MODEL_ARTIFACT_MAGIC;
+    if is_model {
+        inspect_model_file(path)
+    } else {
+        inspect_checkpoint_file(path)
     }
 }
 
-fn inspect_model_file(path: &std::path::Path) -> Result<()> {
+fn inspect_directory(dir: &Path, weights: &Path) -> Result<()> {
+    let summary = directory::inspect(dir, weights)?;
+    let metadata = &summary.metadata;
+    let field = |key: &str| match &metadata[key] {
+        serde_json::Value::Null => "none".to_owned(),
+        serde_json::Value::String(text) => text.clone(),
+        value => value.to_string(),
+    };
+    println!("Ironicl model directory");
+    println!("path:          {}", dir.display());
+    println!("task:          {}", field("task"));
+    println!("features:      {}", field("n_features"));
+    println!("feature names: {}", field("feature_names"));
+    println!("classes:       {}", field("classes"));
+    println!("exported by:   Ironicl {}", field("ironicl"));
+    let (path, found) = &summary.weights;
+    let found = if *found { "" } else { " (missing)" };
+    println!("weights:       {}{found}", path.display());
+    match summary.cache {
+        Some((optimize, bytes)) => println!("KV cache:      {optimize}, {}", ByteSize(bytes)),
+        None => println!("KV cache:      none; ironicl prepare builds it"),
+    }
+    Ok(())
+}
+
+fn inspect_model_file(path: &Path) -> Result<()> {
     let summary = ironicl::inspect_model_artifact(path)?;
     println!("Ironicl model inspection");
     println!("path:          {}", path.display());
@@ -81,7 +127,7 @@ fn inspect_model_file(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn inspect_checkpoint_file(path: &std::path::Path) -> Result<()> {
+fn inspect_checkpoint_file(path: &Path) -> Result<()> {
     let summary = ironicl::inspect_checkpoint(path)?;
     println!("Ironicl checkpoint inspection");
     println!("path:          {}", path.display());
@@ -118,10 +164,18 @@ fn optional_display<T: std::fmt::Display>(value: Option<T>) -> String {
 }
 
 fn import(args: &ImportArgs) -> Result<()> {
-    let summary = ironicl::import_checkpoint(&args.checkpoint, &args.output)?;
-    println!("Imported Ironicl model");
+    let (path, summary) = if let Some(output) = &args.output {
+        (
+            output.clone(),
+            ironicl::import_checkpoint(&args.checkpoint, output)?,
+        )
+    } else {
+        let prepared = ironicl::prepare_checkpoint(&args.checkpoint, &CheckpointCacheOptions::default())?;
+        (prepared.path, prepared.summary)
+    };
+    println!("Imported the weights");
     println!("checkpoint:    {}", args.checkpoint.display());
-    println!("model:         {}", args.output.display());
+    println!("weights:       {}", path.display());
     println!("source sha256: {}", summary.source_sha256);
     println!("profile:       {}", summary.profile);
     println!("tensors:       {}", summary.tensor_count);
@@ -132,15 +186,23 @@ fn import(args: &ImportArgs) -> Result<()> {
 
 fn prepare(args: &PrepareArgs) -> Result<()> {
     let start = Instant::now();
-    let (fitted, path) = saved::prepare(&args.dir, args.optimize)?;
-    let seconds = start.elapsed().as_secs_f64();
+    let weights = weights_dir(args.weights.as_ref())?;
+    let prepared = directory::prepare(
+        &args.dir,
+        &weights,
+        args.optimize,
+        None,
+        MemoryLimits::resolve(None, None)?,
+    )?;
+    let path = args.dir.join(directory::CONTEXT);
     let bytes = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
-    println!("Prepared the KV cache");
+    let action = if prepared.built { "Built" } else { "Reused" };
+    println!("{action} the KV cache");
     println!("path:          {}", path.display());
-    println!("device:        {}", fitted.device());
-    println!("optimize:      {}", args.optimize);
+    println!("device:        {}", prepared.model.device());
+    println!("optimize:      {}", prepared.optimize);
     println!("size:          {}", ByteSize(bytes));
-    println!("time:          {seconds:.2} s");
+    println!("time:          {:.2} s", start.elapsed().as_secs_f64());
     Ok(())
 }
 
@@ -150,37 +212,43 @@ fn print_help(topic: Option<HelpTopic>) {
             "Ironicl\n\n\
              Usage:\n\
                ironicl platform\n\
-               ironicl inspect (--checkpoint FILE | --model FILE)\n\
-               ironicl import --checkpoint FILE --output FILE\n\
-               ironicl prepare DIR [--optimize safe|auto|fast]\n\
-               ironicl serve DIR [--bind ADDR] [--max-request-rows N] [--max-body SIZE]\n\
-             \x20 [--max-batch-rows N] [--max-queue MS]\n\n\
+               ironicl inspect PATH [--weights DIR]\n\
+               ironicl import CHECKPOINT [-o FILE]\n\
+               ironicl prepare DIR [--weights DIR] [--optimize safe|auto|fast]\n\
+               ironicl serve DIR [--weights DIR] [--optimize safe|auto|fast] [--bind ADDR]\n\
+             \x20 [--max-request-rows N] [--max-body SIZE] [--max-batch-rows N] [--max-queue MS]\n\n\
              Use 'ironicl help COMMAND' for command-specific help."
         }
         Some(HelpTopic::Platform) => "Usage: ironicl platform",
         Some(HelpTopic::Inspect) => {
-            "Usage: ironicl inspect (--checkpoint FILE | --model FILE)\n\n\
-             Inspect a PyTorch checkpoint or an imported Ironicl model."
+            "Usage: ironicl inspect PATH [--weights DIR]\n\n\
+             Inspect a model directory, Ironicl weights (.irmodel), or a PyTorch\n\
+             checkpoint. For a model directory, --weights is the folder its weights\n\
+             are looked for in, by default the shared one."
         }
         Some(HelpTopic::Import) => {
-            "Usage: ironicl import --checkpoint FILE --output FILE\n\n\
-             Convert a PyTorch checkpoint to a portable Ironicl model."
+            "Usage: ironicl import CHECKPOINT [-o FILE]\n\n\
+             Convert a PyTorch checkpoint to Ironicl weights: by default into the\n\
+             shared weights folder (~/.cache/ironicl/models/v1, under\n\
+             XDG_CACHE_HOME when set), where prepare and serve look for them."
         }
         Some(HelpTopic::Prepare) => {
-            "Usage: ironicl prepare DIR [--optimize safe|auto|fast]\n\n\
-             Build the KV cache of a model exported with export(), on this machine's\n\
-             device, from its training data. The level defaults to safe and is\n\
-             recorded in DIR/context.ircntxt, which ironicl serve reads."
+            "Usage: ironicl prepare DIR [--weights DIR] [--optimize safe|auto|fast]\n\n\
+             Build the KV cache of a model directory on this machine's device and\n\
+             write it to DIR/context.ircntxt, unless the saved cache is already the\n\
+             one this model builds at the level. The level defaults to the saved\n\
+             cache's, else safe. --weights is the folder of weights, by default the\n\
+             shared one."
         }
         Some(HelpTopic::Serve) => {
-            "Usage: ironicl serve DIR [--bind ADDR] [--max-request-rows N] [--max-body SIZE]\n\
-             \x20      [--max-batch-rows N] [--max-queue MS]\n\n\
-             Serve a model exported with export() over HTTP, at the optimize level its\n\
-             KV cache was built at: POST /v1/predict, GET /v1/health. Concurrent requests\n\
+            "Usage: ironicl serve DIR [--weights DIR] [--optimize safe|auto|fast] [--bind ADDR]\n\
+             \x20      [--max-request-rows N] [--max-body SIZE] [--max-batch-rows N] [--max-queue MS]\n\n\
+             Serve a model directory over HTTP: POST /v1/predict, GET /v1/health. It\n\
+             first prepares the KV cache as ironicl prepare does. Concurrent requests\n\
              are predicted together, up to --max-batch-rows rows at once; a request\n\
              that would wait longer than --max-queue is refused with 503. Defaults:\n\
-             --bind 127.0.0.1:8080, --max-request-rows 10000, --max-body 16M, --max-batch-rows\n\
-             1024 on a GPU and 32 on the CPU, --max-queue 1000."
+             --bind 127.0.0.1:8080, --max-request-rows 10000, --max-body 16M,\n\
+             --max-batch-rows 1024 on a GPU and 32 on the CPU, --max-queue 1000."
         }
     };
     println!("{text}");

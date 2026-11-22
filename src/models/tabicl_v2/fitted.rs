@@ -4,9 +4,10 @@
 //!
 //! Fitting is [`Preprocessed::fit`], whose shape plans the memory, then
 //! [`Executor::build_fitted`]. A fitted model saves as `IRPREP`
-//! ([`FittedModel::preprocessor_bytes`]) and, optionally, its `IRCNTXT`
-//! context; [`Executor::load_fitted`] loads them, or rebuilds the context from
-//! the raw training rows.
+//! ([`FittedModel::preprocessor_bytes`]), with or without its preprocessed
+//! training rows, and optionally its `IRCNTXT` context;
+//! [`Executor::load_fitted`] loads them, or rebuilds the context from the
+//! training rows.
 
 use std::{path::Path, sync::Arc};
 
@@ -333,14 +334,16 @@ impl FittedModel {
         self.preprocessed.chunks(x, columns, step, predict)
     }
 
-    /// The preprocessing as `IRPREP` bytes, for [`Executor::load_fitted`].
+    /// The preprocessing as `IRPREP` bytes, for [`Executor::load_fitted`], with
+    /// the training rows when `training` is set and they were kept.
     ///
     /// # Errors
     ///
     /// When a text label is longer than 4 GiB.
-    pub fn preprocessor_bytes(&self) -> Result<Vec<u8>> {
+    pub fn preprocessor_bytes(&self, training: bool) -> Result<Vec<u8>> {
         preprocessor::encode(
             &self.preprocessed.preprocessor,
+            self.preprocessed.training.as_ref().filter(|_| training),
             &self.context.context_metadata().model_sha256,
         )
     }
@@ -415,34 +418,24 @@ impl Executor {
         })
     }
 
-    /// Load a fitted model from its `IRPREP` bytes, its `IRCNTXT` `context`
-    /// bytes, and its raw `training` rows, `[rows, columns]`, and targets. Either
-    /// may be absent, not both: without a context, one is built from the
-    /// training rows (through `cache_dir`) as fitting builds it.
+    /// Load a fitted model from its `IRPREP` bytes and its `IRCNTXT` `context`
+    /// bytes. Without a context, one is built from the training rows in the
+    /// `IRPREP` bytes (through `cache_dir`) as fitting builds it.
     ///
     /// # Errors
     ///
     /// When the bytes are invalid or were fitted with another checkpoint, the
     /// context does not match the preprocessing, or as [`Self::build_fitted`].
-    #[expect(clippy::too_many_arguments, reason = "the saved parts and the build options")]
     pub fn load_fitted(
         &self,
         preprocessor: &[u8],
         context: Option<&[u8]>,
-        training: Option<(Features<'_>, usize, &Targets)>,
         optimize: Optimize,
         threads: Option<usize>,
         limits: MemoryLimits,
         cache_dir: Option<&Path>,
     ) -> Result<FittedModel> {
-        let (checkpoint_sha256, preprocessor) = self.decode_preprocessor(preprocessor)?;
-        let preprocessed = match training {
-            Some((x, columns, targets)) => Preprocessed::with_training(preprocessor, x, columns, targets)?,
-            None => Preprocessed {
-                preprocessor,
-                training: None,
-            },
-        };
+        let (checkpoint_sha256, preprocessed) = self.decode_preprocessed(preprocessor)?;
         let preprocessed = Arc::new(preprocessed);
         let Some(context) = context else {
             return self.build_fitted(preprocessed, optimize, threads, limits, cache_dir);
@@ -455,28 +448,14 @@ impl Executor {
         })
     }
 
-    /// Pair `IRPREP` bytes with their loaded `context`.
+    /// `IRPREP` bytes as preprocessing fitted with this model's checkpoint,
+    /// and that checkpoint's SHA-256.
     ///
     /// # Errors
     ///
-    /// When the bytes are invalid or were fitted with another checkpoint, or
-    /// the context does not match the preprocessing.
-    pub fn fitted_with_context(&self, preprocessor: &[u8], context: StaticExecutor) -> Result<FittedModel> {
-        let (checkpoint_sha256, preprocessor) = self.decode_preprocessor(preprocessor)?;
-        let preprocessed = Arc::new(Preprocessed {
-            preprocessor,
-            training: None,
-        });
-        check_context(&preprocessed, &checkpoint_sha256, context.context_metadata())?;
-        Ok(FittedModel {
-            preprocessed,
-            context: Arc::new(context),
-        })
-    }
-
-    /// `IRPREP` bytes as preprocessing fitted with this model's checkpoint.
-    fn decode_preprocessor(&self, bytes: &[u8]) -> Result<([u8; 32], Preprocessor)> {
-        let (checkpoint_sha256, preprocessor) = preprocessor::decode(bytes)?;
+    /// When the bytes are invalid or were fitted with another checkpoint.
+    pub(crate) fn decode_preprocessed(&self, bytes: &[u8]) -> Result<([u8; 32], Preprocessed)> {
+        let (checkpoint_sha256, preprocessor, training) = preprocessor::decode(bytes)?;
         let checkpoint = encode_sha256(&checkpoint_sha256);
         if checkpoint != self.source_sha256() {
             return Err(Error::Artifact(format!(
@@ -485,7 +464,36 @@ impl Executor {
                 self.source_sha256()
             )));
         }
-        Ok((checkpoint_sha256, preprocessor))
+        Ok((
+            checkpoint_sha256,
+            Preprocessed {
+                preprocessor,
+                training,
+            },
+        ))
+    }
+
+    /// The metadata of the context that [`Self::build_fitted`] builds for
+    /// `preprocessed` at `optimize`, to tell whether a saved one is it.
+    ///
+    /// # Errors
+    ///
+    /// When the training rows were not kept, or as [`Self::build_context`].
+    pub(crate) fn fitted_context_metadata(
+        &self,
+        preprocessed: &Preprocessed,
+        optimize: Optimize,
+    ) -> Result<StaticContextMetadata> {
+        let inputs = preprocessed.training_inputs()?;
+        let [members, rows, features] = inputs.shape;
+        self.context_metadata(
+            (members, rows, features),
+            &inputs.rows,
+            &inputs.targets,
+            inputs.class_permutations,
+            inputs.feature_permutations,
+            optimize,
+        )
     }
 }
 
@@ -519,19 +527,27 @@ mod tests {
     }
 
     #[test]
-    fn saved_preprocessing_rebuilds_the_training_rows() {
+    fn saved_preprocessing_keeps_the_training_rows() {
         for targets in [
             Targets::Labels(Labels::Int((0..20).map(|i| i % 3).collect())),
             values(1.0, 0.0),
         ] {
             let fitted = fit(&targets);
-            let (sha, preprocessor) = decode(&encode(&fitted.preprocessor, &SHA).unwrap()).unwrap();
+            let bytes = encode(&fitted.preprocessor, fitted.training.as_ref(), &SHA).unwrap();
+            let (sha, preprocessor, training) = decode(&bytes).unwrap();
             assert_eq!(sha, SHA);
+            let saved = Preprocessed {
+                preprocessor: preprocessor.clone(),
+                training,
+            };
+            assert_eq!(saved, fitted);
+            // The saved rows are the ones the raw rows preprocess to.
             let rebuilt =
                 Preprocessed::with_training(preprocessor, Features::F64(&x()), 3, &targets).unwrap();
-            assert_eq!(rebuilt, fitted);
-            let inputs = rebuilt.training_inputs().unwrap();
-            assert_eq!(inputs.rows, fitted.training_inputs().unwrap().rows);
+            assert_eq!(
+                rebuilt.training_inputs().unwrap(),
+                saved.training_inputs().unwrap()
+            );
         }
     }
 
