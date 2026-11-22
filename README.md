@@ -23,11 +23,20 @@ Use it in two ways:
 
 ### 1. Use it from Python
 
-Install the package; building it needs Rust ([rustup](https://rustup.rs)) and
-Python 3.12 or newer:
+Install the package with Python 3.12 or newer, using one of these. It builds
+from source: with pip or uv, install Rust first ([rustup](https://rustup.rs));
+pixi gets it from conda-forge.
 
 ```bash
+# pip
 pip install git+https://github.com/probabl-ai/ironicl.git
+
+# uv
+uv add "ironicl @ git+https://github.com/probabl-ai/ironicl.git"
+
+# pixi
+pixi add "python>=3.12" rust
+pixi add --pypi "ironicl @ git+https://github.com/probabl-ai/ironicl.git"
 ```
 
 Then change only the import:
@@ -51,8 +60,15 @@ works the same way, with TabICL's `output_type` and `alphas`. See
 clf.export("my-model")
 ```
 
-This writes the directory `my-model/`: the fitted preprocessing, the training
-data, and the KV cache. The weights stay in a shared folder on this machine.
+```text
+my-model/
+├── ironicl.json           what the model is: task, features, classes
+├── preprocessing.irprep   the fitted preprocessing and training data
+└── context.ircntxt        the KV cache, ready to serve
+```
+
+The weights are not copied: every model directory uses the one copy in
+`~/.cache/ironicl`.
 
 ### 3. Serve it
 
