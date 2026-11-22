@@ -40,8 +40,8 @@ and class indices in range.
 
 Loading refuses an `IRPREP` fitted with another checkpoint. With a context, it checks that the
 context matches the preprocessing: checkpoint, `B`, `H`, class count, and each member's
-permutations. Without one, it rebuilds the training rows from the raw training data and builds the
-context as fitting does, with the same rows, so the same context.
+permutations. Without one, it builds the context from the training rows that `IRPREP` holds, as
+fitting does, so the same context.
 
 Neither `IRPREP` nor `IRCNTXT` is signed yet: the digests detect corruption, not tampering.
 

@@ -118,9 +118,9 @@ clf = TabICLClassifier.load("model.pkl", device=None)
   context from the training data, which takes as long as the build in `fit`;
   with `cache_dir` set, a context cached on this machine loads from the cache
   instead.
-- `save_training_data` keeps the training data, `X` and `y` as `fit` received
-  them (`fit` keeps a copy for this). Leaving out both the training data and
-  the context raises `ValueError`.
+- `save_training_data` keeps the training rows as preprocessing transformed
+  them, which a load without the context and `export` need. Leaving out both
+  the training data and the context raises `ValueError`.
 - `save_model_weights` includes the checkpoint, so loading needs no checkpoint
   file or download. Without it, loading uses the saved checkpoint path if it
   exists, otherwise `model_path` or the default location, downloaded when
@@ -129,7 +129,7 @@ clf = TabICLClassifier.load("model.pkl", device=None)
 
 The fitted model is saved in Rust's formats
 ([artifact-format.md](artifact-format.md#fitted-models)): its preprocessing,
-and the context and the training data as the options say. Loading refuses a
+with the training rows, and the context as the options say. Loading refuses a
 different checkpoint.
 
 A 2,000-row, 100-feature classifier with 8 estimators, on an M1 Max:
