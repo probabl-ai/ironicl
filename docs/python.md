@@ -169,9 +169,10 @@ clf.export("churn")
 | File | Contents |
 |---|---|
 | `model.irmodel` | the model weights |
-| `prep.irprep` | the fitted preprocessing, labels or target scale, feature names, and the classifier's `softmax_temperature` and `average_logits` |
+| `preprocessing.irprep` | the fitted preprocessing, labels or target scale, feature names, and the classifier's `softmax_temperature` and `average_logits` |
 | `context.ircntxt` | the KV cache, built at this fit's `optimize` level on this machine |
 | `train_x.npy`, `train_y.npy` | the training data: features as `fit` received them, and class indices or regression targets |
+| `ironicl.json` | the manifest, written last: `format` (`"ironicl-export"`) and `version` (1), which `prepare` and `serve` check, and for people and tools the Ironicl version, `task`, `n_features`, `feature_names`, and `classes` |
 
 `ironicl prepare` rebuilds the KV cache from the training data, for another
 machine or `optimize` level.

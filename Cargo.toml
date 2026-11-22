@@ -33,7 +33,7 @@ python = ["dep:pyo3"]
 # through cuda-oxide's codegen backend: see tools/cuda-env.sh.
 cuda = ["dep:cuda-core", "dep:cuda-device", "dep:cuda-host"]
 # `ironicl serve`: an HTTP server for an exported model.
-server = ["dep:axum", "dep:tokio", "dep:serde", "dep:serde_json"]
+server = ["dep:axum", "dep:tokio", "dep:serde"]
 
 [dependencies]
 # cuda-oxide: one revision for all three and for the codegen backend.
@@ -55,9 +55,6 @@ zip = { version = "9.3.0", default-features = false }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"], optional = true }
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "signal", "sync"], optional = true }
 serde = { version = "1.0.229", features = ["derive"], optional = true }
-serde_json = { version = "1.0.154", optional = true }
-
-[dev-dependencies]
 serde_json = "1.0.154"
 
 # Windows memory: the planner's probe (memory status, job limits, commit

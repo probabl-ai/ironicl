@@ -8,6 +8,7 @@ Python converts inputs and keeps scikit-learn's interface."""
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import pickle
 import urllib.request
@@ -167,10 +168,11 @@ class TabICLBase(BaseEstimator):
         """Export the fitted model to the directory ``path`` for ``ironicl serve``.
 
         It holds the model weights (``model.irmodel``), the fitted preprocessing
-        (``prep.irprep``), the KV cache built at this fit's ``optimize`` level
-        (``context.ircntxt``), and the training data (``train_x.npy``,
+        (``preprocessing.irprep``), the KV cache built at this fit's ``optimize``
+        level (``context.ircntxt``), the training data (``train_x.npy``,
         ``train_y.npy``), from which ``ironicl prepare`` rebuilds the cache for
-        another machine or level.
+        another machine or level, and last a manifest (``ironicl.json``) that
+        marks the directory complete and describes the model.
         """
         check_is_fitted(self)
         if not hasattr(self, "_training"):
@@ -181,11 +183,22 @@ class TabICLBase(BaseEstimator):
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
         _core.import_checkpoint(Path(self.checkpoint_path_), path / "model.irmodel")
-        (path / "prep.irprep").write_bytes(self.fitted_.preprocessor_bytes())
+        (path / "preprocessing.irprep").write_bytes(self.fitted_.preprocessor_bytes())
         (path / "context.ircntxt").write_bytes(self.fitted_.context_bytes())
         x, y = self._training
         np.save(path / "train_x.npy", x)
         np.save(path / "train_y.npy", np.searchsorted(self.classes_, y) if self._task == "classifier" else y)
+        names = getattr(self, "feature_names_in_", None)
+        manifest = {
+            "format": "ironicl-export",
+            "version": 1,
+            "ironicl": _version(),
+            "task": self._task,
+            "n_features": int(self.n_features_in_),
+            "feature_names": None if names is None else [str(name) for name in names],
+            "classes": self.classes_.tolist() if self._task == "classifier" else None,
+        }
+        (path / "ironicl.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
     @classmethod
     def load(cls, path: str | Path, device: str | None = None):

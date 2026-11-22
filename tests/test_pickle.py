@@ -3,6 +3,7 @@ default cache, which ``allow_auto_download`` fills; each estimator is skipped
 without its own."""
 
 import copy
+import json
 import os
 import pickle
 import shutil
@@ -134,10 +135,15 @@ class PickleTest(unittest.TestCase):
                 codes = np.load(path / "train_y.npy")
                 restored = model.classes_[codes] if estimator is TabICLClassifier else codes
                 np.testing.assert_array_equal(restored, y)
+                manifest = json.loads((path / "ironicl.json").read_text())
+                self.assertEqual(
+                    (manifest["format"], manifest["version"], manifest["task"], manifest["n_features"]),
+                    ("ironicl-export", 1, model._task, x.shape[1]),
+                )
                 self.assertEqual((path / "model.irmodel").read_bytes()[:8], b"IRMODEL\0")
                 rust = _core.Model(Path(model.checkpoint_path_))
                 loaded = rust.load_fitted(
-                    (path / "prep.irprep").read_bytes(),
+                    (path / "preprocessing.irprep").read_bytes(),
                     "safe",
                     None,
                     context=(path / "context.ircntxt").read_bytes(),
