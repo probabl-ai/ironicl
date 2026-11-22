@@ -82,17 +82,17 @@ def main() -> None:
         for batch_rows in args.batch_rows:
             command = [str(args.ironicl), "serve", str(args.model), "--bind", f"127.0.0.1:{args.port}"]
             command += ["--max-batch-rows", str(batch_rows)]
-            command += ["--max-rows", str(max(args.request_rows)), "--max-body", str(largest)]
+            command += ["--max-request-rows", str(max(args.request_rows)), "--max-body", str(largest)]
             if args.max_queue:
                 command += ["--max-queue", str(args.max_queue)]
             server = subprocess.Popen(command, env=env, stdout=subprocess.DEVNULL)
             try:
-                wait_until_ready(f"{url}/health", server)
+                wait_until_ready(f"{url}/v1/health", server)
                 for count in args.request_rows:
                     for kind, load in loads:
                         rate = load if kind == "rate" else None
                         clients = args.rate_clients if rate else load
-                        result = oha(f"{url}/predict", bodies / f"{count}.json", args.duration, clients, rate)
+                        result = oha(f"{url}/v1/predict", bodies / f"{count}.json", args.duration, clients, rate)
                         codes = result.get("statusCodeDistribution", {})
                         errors = sum(n for code, n in codes.items() if code != "200")
                         per_second = result["summary"]["requestsPerSec"] * codes.get("200", 0) / max(sum(codes.values()), 1)

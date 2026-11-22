@@ -11,7 +11,7 @@ ironicl platform
 ironicl inspect (--checkpoint FILE | --model FILE)
 ironicl import --checkpoint FILE --output FILE
 ironicl prepare DIR [--optimize safe|auto|fast]
-ironicl serve DIR [--bind ADDR] [--max-rows N] [--max-body SIZE]
+ironicl serve DIR [--bind ADDR] [--max-request-rows N] [--max-body SIZE]
               [--max-batch-rows N] [--max-queue MS]
 ```
 

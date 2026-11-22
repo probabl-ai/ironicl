@@ -1,8 +1,8 @@
 //! `ironicl serve`: an HTTP server for one exported model.
 //!
-//! `POST /predict` takes `{"rows": [[...], ...]}` and options named after
+//! `POST /v1/predict` takes `{"rows": [[...], ...]}` and options named after
 //! `TabICL`'s predict arguments, and answers with one key per output.
-//! `GET /health` answers once the model is loaded. One worker thread owns the
+//! `GET /v1/health` answers once the model is loaded. One worker thread owns the
 //! model and predicts the queued requests together, in batches of up to
 //! `--max-batch-rows` rows. A request that would wait longer than
 //! `--max-queue` is refused. See `docs/server.md`.
@@ -223,7 +223,7 @@ impl IntoResponse for ApiError {
 struct Server {
     task: TaskKind,
     features: usize,
-    max_rows: usize,
+    max_request_rows: usize,
     max_queue: Duration,
     /// Rows waiting for a batch.
     queued: Arc<AtomicUsize>,
@@ -273,10 +273,10 @@ impl Server {
                 ),
             ));
         }
-        if rows.count > self.max_rows {
+        if rows.count > self.max_request_rows {
             return Err(ApiError::invalid(
                 "too_many_rows",
-                format!("{} rows; the limit is {}", rows.count, self.max_rows),
+                format!("{} rows; the limit is {}", rows.count, self.max_request_rows),
             ));
         }
         Ok(request)
@@ -300,20 +300,20 @@ impl Server {
     }
 }
 
-/// The oldest job and the jobs queued after it that fit in `max_rows` with
+/// The oldest job and the jobs queued after it that fit in `max_batch_rows` with
 /// it, and the first that did not fit, which leads the next batch. It never
 /// waits for more jobs.
 fn next_batch<T>(
     first: T,
     rows: impl Fn(&T) -> usize,
     mut queued: impl FnMut() -> Option<T>,
-    max_rows: usize,
+    max_batch_rows: usize,
 ) -> (Vec<T>, Option<T>) {
     let mut total = rows(&first);
     let mut batch = vec![first];
     while let Some(job) = queued() {
         total += rows(&job);
-        if total > max_rows {
+        if total > max_batch_rows {
             return (batch, Some(job));
         }
         batch.push(job);
@@ -633,7 +633,7 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
     let server = Server {
         task,
         features,
-        max_rows: args.max_rows,
+        max_request_rows: args.max_request_rows,
         max_queue: args.max_queue,
         queued,
         row_cost,
@@ -671,7 +671,7 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
         }
     }
     // A worker that panicked can never answer, so end the process rather than
-    // keep answering /health; a supervisor restarts it.
+    // keep answering /v1/health; a supervisor restarts it.
     std::thread::spawn(move || {
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.run())).is_err() {
             eprintln!("the prediction worker panicked; exiting");
@@ -679,8 +679,8 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
         }
     });
     let app = Router::new()
-        .route("/predict", post(predict))
-        .route("/health", get(health))
+        .route("/v1/predict", post(predict))
+        .route("/v1/health", get(health))
         .layer(DefaultBodyLimit::max(args.max_body))
         .with_state(Arc::new(server));
     let failed = |error: std::io::Error| Error::InvalidConfig(format!("server: {error}"));

@@ -163,7 +163,7 @@ Exit gate: CLI predictions match the Python estimators byte for byte.
 ## Phase 10: Server
 
 Step E of [source-layout.md](source-layout.md#steps). Done: `export`,
-`ironicl prepare`, and `ironicl serve` with `POST /predict` and `GET /health`
+`ironicl prepare`, and `ironicl serve` with `POST /v1/predict` and `GET /v1/health`
 in JSON, for one exported model, without Python ([server.md](server.md)). Its
 predictions match the Python estimators. It batches concurrent requests and
 bounds their wait ([server.md](server.md#batching)). Next: missing values and

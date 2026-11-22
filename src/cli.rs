@@ -67,7 +67,7 @@ pub struct PrepareArgs {
 pub struct ServeArgs {
     pub dir: PathBuf,
     pub bind: SocketAddr,
-    pub max_rows: usize,
+    pub max_request_rows: usize,
     pub max_body: usize,
     /// Rows predicted together at most; by default, by device.
     pub max_batch_rows: Option<usize>,
@@ -196,7 +196,7 @@ fn parse_serve(args: &[String]) -> Result<Command> {
         return Ok(Command::Help(Some(HelpTopic::Serve)));
     }
     let (dir, rest) = model_dir(args, "serve")?;
-    let (mut bind, mut max_rows, mut max_body) = (None, None, None);
+    let (mut bind, mut max_request_rows, mut max_body) = (None, None, None);
     let (mut max_batch_rows, mut max_queue) = (None, None);
     let mut index = 0;
     while index < rest.len() {
@@ -205,7 +205,9 @@ fn parse_serve(args: &[String]) -> Result<Command> {
         let invalid = || Error::InvalidArgument(format!("invalid value '{value}' for {flag}"));
         match flag.as_str() {
             "--bind" => set_once(&mut bind, value.parse().map_err(|_| invalid())?, flag)?,
-            "--max-rows" => set_once(&mut max_rows, positive(value).ok_or_else(invalid)?, flag)?,
+            "--max-request-rows" => {
+                set_once(&mut max_request_rows, positive(value).ok_or_else(invalid)?, flag)?;
+            }
             "--max-body" => set_once(&mut max_body, crate::memory::parse_bytes(value)?, flag)?,
             "--max-batch-rows" => set_once(&mut max_batch_rows, positive(value).ok_or_else(invalid)?, flag)?,
             "--max-queue" => {
@@ -226,7 +228,7 @@ fn parse_serve(args: &[String]) -> Result<Command> {
     Ok(Command::Serve(ServeArgs {
         dir,
         bind: bind.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 8080))),
-        max_rows: max_rows.unwrap_or(10_000),
+        max_request_rows: max_request_rows.unwrap_or(10_000),
         max_body: usize::try_from(max_body.unwrap_or(16 << 20))
             .map_err(|_| Error::InvalidArgument("--max-body is too large".into()))?,
         max_batch_rows,
@@ -399,7 +401,7 @@ mod tests {
             Ok(Command::Serve(ServeArgs {
                 dir: PathBuf::from("churn"),
                 bind: SocketAddr::from(([127, 0, 0, 1], 8080)),
-                max_rows: 10_000,
+                max_request_rows: 10_000,
                 max_body: 16 << 20,
                 max_batch_rows: None,
                 max_queue: std::time::Duration::from_secs(1),
@@ -409,7 +411,7 @@ mod tests {
             serve(&[
                 "--bind",
                 "0.0.0.0:9000",
-                "--max-rows",
+                "--max-request-rows",
                 "5",
                 "--max-body",
                 "1M",
@@ -421,18 +423,19 @@ mod tests {
             Ok(Command::Serve(ServeArgs {
                 dir: PathBuf::from("churn"),
                 bind: SocketAddr::from(([0, 0, 0, 0], 9000)),
-                max_rows: 5,
+                max_request_rows: 5,
                 max_body: 1 << 20,
                 max_batch_rows: Some(64),
                 max_queue: std::time::Duration::from_millis(10),
             }))
         );
         for bad in [
-            &["--max-rows", "0"][..],
+            &["--max-request-rows", "0"][..],
             &["--max-batch-rows", "0"],
             &["--max-queue", "0"],
             &["--bind", "nowhere"],
-            &["--max-rows", "1", "--max-rows", "2"],
+            &["--max-request-rows", "1", "--max-request-rows", "2"],
+            &["--max-rows", "5"],
             &["--port", "1"],
         ] {
             assert!(serve(bad).is_err(), "{bad:?}");

@@ -61,7 +61,7 @@ cargo build --release --features server   # add metal on Apple Silicon, cuda on 
 Predict:
 
 ```bash
-curl -s localhost:8080/predict -d '{"rows": [[5.1, 3.5, 1.4, 0.2]]}'
+curl -s localhost:8080/v1/predict -d '{"rows": [[5.1, 3.5, 1.4, 0.2]]}'
 ```
 
 ```json

@@ -37,7 +37,7 @@ preprocessing, and says to run `ironicl prepare`.
 | Option | Default |
 |---|---|
 | `--bind ADDR` | `127.0.0.1:8080` |
-| `--max-rows N` | `10000` rows per request |
+| `--max-request-rows N` | `10000` rows per request |
 | `--max-body SIZE` | `16M` |
 | `--max-batch-rows N` | `1024` on a GPU, `32` on the CPU |
 | `--max-queue MS` | `1000` |
@@ -112,7 +112,7 @@ port, each with an `IRONICL_DEVICE_MEMORY_LIMIT` that covers its KV cache. Two s
 model above shared the RTX 5080 at 24,400 requests/s together, against 27,700 for one alone. On
 a machine with several GPUs, select one per process with `CUDA_VISIBLE_DEVICES`.
 
-## `POST /predict`
+## `POST /v1/predict`
 
 The body is JSON. Rows are arrays of numbers, each as long as the training data's feature count.
 Options are named after TabICL's predict arguments; the response has one key per output.
@@ -148,7 +148,7 @@ A classifier uses the `softmax_temperature` and `average_logits` it was fitted w
 
 Missing values (`null`) and categorical features (strings) are not supported yet and return 400.
 
-## `GET /health`
+## `GET /v1/health`
 
 `{"status": "ok"}`.
 
@@ -160,7 +160,7 @@ Errors are `{"error": {"code": ..., "message": ...}}`.
 |---|---|---|
 | 400 | `invalid_request` | Malformed JSON, a wrong type, an unknown field, an empty or ragged `rows`, an unknown or repeated output, or `alphas` outside (0, 1). The message says which. |
 | 400 | `wrong_feature_count` | Rows of another length than the training data's. |
-| 400 | `too_many_rows` | More rows than `--max-rows`. |
+| 400 | `too_many_rows` | More rows than `--max-request-rows`. |
 | 413 | `body_too_large` | A body larger than `--max-body`. |
 | 503 | `overloaded` | The request would wait longer than `--max-queue`. Retry after the `Retry-After` seconds. |
 | 500 | `internal` | A failed prediction. It fails every request in the same batch. |
