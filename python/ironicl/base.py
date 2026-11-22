@@ -173,6 +173,10 @@ class TabICLBase(BaseEstimator):
         ``train_y.npy``), from which ``ironicl prepare`` rebuilds the cache for
         another machine or level, and last a manifest (``ironicl.json``) that
         marks the directory complete and describes the model.
+
+        Each file replaces the old one whole, so a server that maps it keeps a
+        valid file. The data files are readable only by their owner on Unix,
+        since they hold the training data.
         """
         check_is_fitted(self)
         if not hasattr(self, "_training"):
@@ -182,12 +186,15 @@ class TabICLBase(BaseEstimator):
             )
         path = Path(path)
         path.mkdir(parents=True, exist_ok=True)
+        # Until the new manifest, the directory is incomplete.
+        (path / "ironicl.json").unlink(missing_ok=True)
         _core.import_checkpoint(Path(self.checkpoint_path_), path / "model.irmodel")
-        (path / "preprocessing.irprep").write_bytes(self.fitted_.preprocessor_bytes())
-        (path / "context.ircntxt").write_bytes(self.fitted_.context_bytes())
+        _write_private(path / "preprocessing.irprep", lambda file: file.write(self.fitted_.preprocessor_bytes()))
+        _write_private(path / "context.ircntxt", lambda file: file.write(self.fitted_.context_bytes()))
         x, y = self._training
-        np.save(path / "train_x.npy", x)
-        np.save(path / "train_y.npy", np.searchsorted(self.classes_, y) if self._task == "classifier" else y)
+        codes = np.searchsorted(self.classes_, y) if self._task == "classifier" else y
+        _write_private(path / "train_x.npy", lambda file: np.save(file, x))
+        _write_private(path / "train_y.npy", lambda file: np.save(file, codes))
         names = getattr(self, "feature_names_in_", None)
         manifest = {
             "format": "ironicl-export",
@@ -198,7 +205,7 @@ class TabICLBase(BaseEstimator):
             "feature_names": None if names is None else [str(name) for name in names],
             "classes": self.classes_.tolist() if self._task == "classifier" else None,
         }
-        (path / "ironicl.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        _write_private(path / "ironicl.json", lambda file: file.write((json.dumps(manifest, indent=2) + "\n").encode()))
 
     @classmethod
     def load(cls, path: str | Path, device: str | None = None):
@@ -343,6 +350,20 @@ class TabICLBase(BaseEstimator):
             partial.write_bytes(data)
         partial.replace(path)
         return path
+
+
+def _write_private(path: Path, write) -> None:
+    """Write ``path`` through ``write(file)``, owner-only on Unix, to a temporary
+    file that then replaces ``path`` whole."""
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.unlink(missing_ok=True)  # One a failed export left, maybe with wider permissions.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)  # No newline translation on Windows.
+    try:
+        with os.fdopen(os.open(temporary, flags, 0o600), "wb") as file:
+            write(file)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _features(X) -> tuple[np.ndarray, tuple[str, ...] | None]:

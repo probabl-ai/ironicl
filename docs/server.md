@@ -121,7 +121,7 @@ Options are named after TabICL's predict arguments; the response has one key per
 |---|---|---|
 | `rows` | `number[][]`, at least one row | required |
 | `output_type` | list of output names, none twice | classifier: `["labels", "probabilities"]`; regressor: `["mean"]` |
-| `alphas` | regressor only: quantile levels in (0, 1) | `[0.1, 0.2, …, 0.9]` |
+| `alphas` | regressor only: up to 999 quantile levels in (0, 1) | `[0.1, 0.2, …, 0.9]` |
 
 | Task | Output | Response keys |
 |---|---|---|
@@ -158,7 +158,7 @@ Errors are `{"error": {"code": ..., "message": ...}}`.
 
 | Status | `code` | When |
 |---|---|---|
-| 400 | `invalid_request` | Malformed JSON, a wrong type, an unknown field, an empty or ragged `rows`, an unknown or repeated output, or `alphas` outside (0, 1). The message says which. |
+| 400 | `invalid_request` | Malformed JSON, a wrong type, an unknown field, an empty or ragged `rows`, an unknown or repeated output, or `alphas` outside (0, 1) or more than 999 of them. The message says which. |
 | 400 | `wrong_feature_count` | Rows of another length than the training data's. |
 | 400 | `too_many_rows` | More rows than `--max-request-rows`. |
 | 413 | `body_too_large` | A body larger than `--max-body`. |

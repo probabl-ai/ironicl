@@ -175,7 +175,9 @@ clf.export("churn")
 | `ironicl.json` | the manifest, written last: `format` (`"ironicl-export"`) and `version` (1), which `prepare` and `serve` check, and for people and tools the Ironicl version, `task`, `n_features`, `feature_names`, and `classes` |
 
 `ironicl prepare` rebuilds the KV cache from the training data, for another
-machine or `optimize` level.
+machine or `optimize` level. Each file replaces the old one whole, so exporting
+again does not break a server that has the old files open, and the files that
+hold training data are readable only by their owner on Unix.
 
 ### Progress and interrupts
 

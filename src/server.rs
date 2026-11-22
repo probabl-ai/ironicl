@@ -8,6 +8,7 @@
 //! `--max-queue` is refused. See `docs/server.md`.
 
 use std::{
+    fmt,
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -24,7 +25,10 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde::{Deserialize, Serialize};
+use serde::{
+    Deserialize, Deserializer, Serialize,
+    de::{DeserializeSeed, Error as _, SeqAccess, Visitor},
+};
 use tokio::sync::oneshot;
 
 use crate::{
@@ -38,6 +42,9 @@ const CPU_BATCH_ROWS: usize = 32;
 
 /// `TabICLRegressor.predict`'s default quantile levels.
 const DEFAULT_ALPHAS: [f64; 9] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+/// The most quantile levels a request may ask for: as many as the model's raw
+/// quantiles. Each level costs a value per row of the whole batch.
+const MAX_ALPHAS: usize = 999;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,30 +79,74 @@ enum RegressorOutput {
 }
 
 /// At least one row, all of the same length, flattened in row order.
-#[derive(Deserialize)]
-#[serde(try_from = "Vec<Vec<f64>>")]
 struct Rows {
     values: Vec<f64>,
     count: usize,
     features: usize,
 }
 
-impl TryFrom<Vec<Vec<f64>>> for Rows {
-    type Error = String;
+/// Rows parse straight into one flat buffer, without an allocation per row,
+/// and a ragged row fails as soon as it ends.
+impl<'de> Deserialize<'de> for Rows {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        deserializer.deserialize_seq(RowsVisitor)
+    }
+}
 
-    fn try_from(rows: Vec<Vec<f64>>) -> std::result::Result<Self, String> {
-        let features = rows.first().ok_or("rows is empty")?.len();
-        if let Some(index) = rows.iter().position(|row| row.len() != features) {
-            return Err(format!(
-                "row {index} has {} values; row 0 has {features}",
-                rows[index].len()
-            ));
+struct RowsVisitor;
+
+impl<'de> Visitor<'de> for RowsVisitor {
+    type Value = Rows;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("an array of rows of numbers")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut rows: A) -> std::result::Result<Rows, A::Error> {
+        let mut values = Vec::new();
+        let (mut count, mut features) = (0, None);
+        while let Some(length) = rows.next_element_seed(Row(&mut values))? {
+            let features = *features.get_or_insert(length);
+            if length != features {
+                return Err(A::Error::custom(format!(
+                    "row {count} has {length} values; row 0 has {features}"
+                )));
+            }
+            count += 1;
         }
-        Ok(Self {
-            count: rows.len(),
-            values: rows.concat(),
+        let features = features.ok_or_else(|| A::Error::custom("rows is empty"))?;
+        Ok(Rows {
+            values,
+            count,
             features,
         })
+    }
+}
+
+/// Appends one row's values and returns how many there were.
+struct Row<'a>(&'a mut Vec<f64>);
+
+impl<'de> DeserializeSeed<'de> for Row<'_> {
+    type Value = usize;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> std::result::Result<usize, D::Error> {
+        deserializer.deserialize_seq(self)
+    }
+}
+
+impl<'de> Visitor<'de> for Row<'_> {
+    type Value = usize;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a row of numbers")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut row: A) -> std::result::Result<usize, A::Error> {
+        let start = self.0.len();
+        while let Some(value) = row.next_element()? {
+            self.0.push(value);
+        }
+        Ok(self.0.len() - start)
     }
 }
 
@@ -118,7 +169,7 @@ impl<T: PartialEq> TryFrom<Vec<T>> for Outputs<T> {
     }
 }
 
-/// Quantile levels, each strictly between 0 and 1.
+/// Quantile levels: at most [`MAX_ALPHAS`], each strictly between 0 and 1.
 #[derive(Deserialize)]
 #[serde(try_from = "Vec<f64>")]
 struct Alphas(Vec<f64>);
@@ -129,6 +180,12 @@ impl TryFrom<Vec<f64>> for Alphas {
     fn try_from(alphas: Vec<f64>) -> std::result::Result<Self, String> {
         if alphas.is_empty() {
             return Err("alphas is empty".into());
+        }
+        if alphas.len() > MAX_ALPHAS {
+            return Err(format!(
+                "alphas has {} levels; the limit is {MAX_ALPHAS}",
+                alphas.len()
+            ));
         }
         if let Some(alpha) = alphas.iter().find(|&&alpha| !(alpha > 0.0 && alpha < 1.0)) {
             return Err(format!("alphas must be between 0 and 1, got {alpha}"));
@@ -182,20 +239,24 @@ struct ApiError {
 }
 
 impl ApiError {
-    fn invalid(code: &'static str, message: impl Into<String>) -> Self {
+    fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
         Self {
-            status: StatusCode::BAD_REQUEST,
+            status,
             code,
             message: message.into(),
         }
     }
 
+    fn invalid(code: &'static str, message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, code, message)
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
+    }
+
     fn worker_stopped() -> Self {
-        Self {
-            status: StatusCode::INTERNAL_SERVER_ERROR,
-            code: "internal",
-            message: "the prediction worker stopped".into(),
-        }
+        Self::internal("the prediction worker stopped")
     }
 }
 
@@ -203,11 +264,7 @@ impl From<Error> for ApiError {
     fn from(error: Error) -> Self {
         match error {
             Error::InvalidArgument(message) => Self::invalid("invalid_request", message),
-            error => Self {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                code: "internal",
-                message: error.to_string(),
-            },
+            error => Self::internal(error.to_string()),
         }
     }
 }
@@ -244,17 +301,39 @@ impl Request {
             Self::Regressor(request) => &request.rows,
         }
     }
+
+    /// The request, which a classifier's server parsed as a classifier's.
+    fn classifier(&self) -> &ClassifierRequest {
+        let Self::Classifier(request) = self else {
+            unreachable!("a classifier's server parses classifier requests")
+        };
+        request
+    }
+
+    /// The request, which a regressor's server parsed as a regressor's.
+    fn regressor(&self) -> &RegressorRequest {
+        let Self::Regressor(request) = self else {
+            unreachable!("a regressor's server parses regressor requests")
+        };
+        request
+    }
 }
 
 /// A checked request waiting for its batch, and where its answer goes.
 struct Job {
     request: Request,
-    queued: Instant,
+    enqueued_at: Instant,
     reply: oneshot::Sender<Reply>,
 }
 
 /// A response body and how long its request waited and its batch ran.
-type Reply = std::result::Result<(Vec<u8>, Duration, Duration), ApiError>;
+struct Answer {
+    body: Vec<u8>,
+    queue: Duration,
+    predict: Duration,
+}
+
+type Reply = std::result::Result<Answer, ApiError>;
 
 impl Server {
     fn parse(&self, body: &[u8]) -> std::result::Result<Request, ApiError> {
@@ -362,12 +441,18 @@ impl Worker {
         if 2 * rows >= self.max_batch_rows {
             self.measure(rows, predict);
         }
-        for (index, job) in batch.into_iter().enumerate() {
-            let body = match &bodies {
-                Ok(bodies) => Ok((bodies[index].clone(), start - job.queued, predict)),
-                Err(error) => Err(error.clone()),
-            };
-            let _ = job.reply.send(body);
+        match bodies {
+            Ok(bodies) => {
+                for (job, body) in batch.into_iter().zip(bodies) {
+                    let queue = start - job.enqueued_at;
+                    let _ = job.reply.send(Ok(Answer { body, queue, predict }));
+                }
+            }
+            Err(error) => {
+                for job in batch {
+                    let _ = job.reply.send(Err(error.clone()));
+                }
+            }
         }
     }
 
@@ -387,7 +472,6 @@ impl Worker {
             .flat_map(|job| job.request.rows().values.iter().copied())
             .collect();
         let x = Features::F64(&values);
-        let counts = batch.iter().map(|job| job.request.rows().count);
         if let Some(classes) = &self.classes {
             let probabilities = self
                 .model
@@ -395,47 +479,22 @@ impl Worker {
             let mut rows = probabilities.values().chunks(classes.len());
             return Ok(batch
                 .iter()
-                .zip(counts)
-                .map(|(job, count)| {
-                    let Request::Classifier(request) = &job.request else {
-                        unreachable!("a classifier's requests")
-                    };
-                    classifier_response(request, classes, rows.by_ref().take(count).collect())
+                .map(|job| {
+                    let request = job.request.classifier();
+                    let rows = rows.by_ref().take(request.rows.count).collect();
+                    classifier_response(request, classes, rows)
                 })
                 .collect());
         }
-        // Every output any request asks for, each once.
-        let mut requested: Vec<RegressionOutput> = Vec::new();
-        let picks: Vec<Vec<usize>> = batch
-            .iter()
-            .map(|job| {
-                let Request::Regressor(request) = &job.request else {
-                    unreachable!("a regressor's requests")
-                };
-                regression_outputs(request)
-                    .into_iter()
-                    .map(|output| {
-                        requested
-                            .iter()
-                            .position(|seen| *seen == output)
-                            .unwrap_or_else(|| {
-                                requested.push(output);
-                                requested.len() - 1
-                            })
-                    })
-                    .collect()
-            })
-            .collect();
-        let results = self.model.predict_regression(x, self.features, &requested)?;
+        let requests: Vec<&RegressorRequest> = batch.iter().map(|job| job.request.regressor()).collect();
+        let (outputs, picks) = merge_outputs(requests.iter().map(|request| regression_outputs(request)));
+        let results = self.model.predict_regression(x, self.features, &outputs)?;
         let mut start = 0;
-        Ok(batch
+        Ok(requests
             .iter()
-            .zip(counts)
-            .zip(&picks)
-            .map(|((job, count), picks)| {
-                let Request::Regressor(request) = &job.request else {
-                    unreachable!("a regressor's requests")
-                };
+            .zip(picks)
+            .map(|(request, picks)| {
+                let count = request.rows.count;
                 let parts = picks
                     .iter()
                     .map(|&pick| {
@@ -448,6 +507,27 @@ impl Worker {
             })
             .collect())
     }
+}
+
+/// Every output that some request asks for, each once, and for each request
+/// where its outputs are in that list.
+fn merge_outputs(
+    requests: impl Iterator<Item = Vec<RegressionOutput>>,
+) -> (Vec<RegressionOutput>, Vec<Vec<usize>>) {
+    let mut merged: Vec<RegressionOutput> = Vec::new();
+    let mut picks = Vec::new();
+    for outputs in requests {
+        let mut pick = Vec::with_capacity(outputs.len());
+        for output in outputs {
+            let index = merged.iter().position(|seen| *seen == output).unwrap_or_else(|| {
+                merged.push(output);
+                merged.len() - 1
+            });
+            pick.push(index);
+        }
+        picks.push(pick);
+    }
+    (merged, picks)
 }
 
 fn classifier_outputs(request: &ClassifierRequest) -> &[ClassifierOutput] {
@@ -541,18 +621,21 @@ async fn predict(
     let body = match body {
         Ok(body) => body,
         Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
-            let mut error = ApiError::invalid("body_too_large", rejection.body_text());
-            error.status = StatusCode::PAYLOAD_TOO_LARGE;
-            return error.into_response();
+            return ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "body_too_large",
+                rejection.body_text(),
+            )
+            .into_response();
         }
         Err(rejection) => return ApiError::invalid("invalid_request", rejection.body_text()).into_response(),
     };
     let overloaded = || {
-        let error = ApiError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            code: "overloaded",
-            message: "the queue is full; retry later".into(),
-        };
+        let error = ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "overloaded",
+            "the queue is full; retry later",
+        );
         ([(header::RETRY_AFTER, "1")], error).into_response()
     };
     // A full queue refuses the request before the work of parsing it.
@@ -569,14 +652,14 @@ async fn predict(
     let (reply, answer) = oneshot::channel();
     let job = Job {
         request,
-        queued: Instant::now(),
+        enqueued_at: Instant::now(),
         reply,
     };
     if server.jobs.send(job).is_err() {
         return ApiError::worker_stopped().into_response();
     }
     match answer.await {
-        Ok(Ok((json, queue, predict))) => {
+        Ok(Ok(Answer { body, queue, predict })) => {
             let timing = format!(
                 "queue;dur={:.3}, predict;dur={:.3}",
                 queue.as_secs_f64() * 1e3,
@@ -587,7 +670,7 @@ async fn predict(
                     (header::CONTENT_TYPE, "application/json".to_owned()),
                     (HeaderName::from_static("server-timing"), timing),
                 ],
-                json,
+                body,
             )
                 .into_response()
         }
@@ -658,7 +741,7 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
     };
     let warm_up = [Job {
         request,
-        queued: Instant::now(),
+        enqueued_at: Instant::now(),
         reply: oneshot::channel().0,
     }];
     for measure in [false, true] {
@@ -708,7 +791,9 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClassifierRequest, RegressorRequest, next_batch};
+    use super::{
+        ClassifierRequest, MAX_ALPHAS, RegressionOutput, RegressorRequest, merge_outputs, next_batch,
+    };
 
     fn error<T: for<'de> serde::Deserialize<'de>>(json: &str) -> String {
         serde_json::from_str::<T>(json)
@@ -751,6 +836,38 @@ mod tests {
             error::<RegressorRequest>(r#"{"rows": [[1]], "alphas": [0.5, 1]}"#)
                 .contains("between 0 and 1, got 1")
         );
+        let alphas = vec!["0.5"; MAX_ALPHAS + 1].join(", ");
+        assert!(
+            error::<RegressorRequest>(&format!(r#"{{"rows": [[1]], "alphas": [{alphas}]}}"#))
+                .contains("the limit is 999")
+        );
+        for (json, message) in [
+            (r#"{"rows": [1]}"#, "expected a row of numbers"),
+            (r#"{"rows": {}}"#, "expected an array of rows"),
+            (r#"{"rows": [[1], [2, 3], "never read"]}"#, "row 1 has 2 values"),
+        ] {
+            assert!(
+                error::<ClassifierRequest>(json).contains(message),
+                "{json}: {}",
+                error::<ClassifierRequest>(json)
+            );
+        }
+    }
+
+    #[test]
+    fn a_batch_computes_each_requested_output_once() {
+        use RegressionOutput::{Mean, Median, Quantiles};
+        let (merged, picks) = merge_outputs(
+            [
+                vec![Mean],
+                vec![Quantiles(vec![0.5]), Mean],
+                vec![Median, Quantiles(vec![0.5])],
+                vec![Quantiles(vec![0.1])],
+            ]
+            .into_iter(),
+        );
+        assert_eq!(merged, [Mean, Quantiles(vec![0.5]), Median, Quantiles(vec![0.1])]);
+        assert_eq!(picks, [vec![0], vec![1, 0], vec![2, 1], vec![3]]);
     }
 
     #[test]

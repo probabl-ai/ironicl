@@ -140,6 +140,11 @@ class PickleTest(unittest.TestCase):
                     (manifest["format"], manifest["version"], manifest["task"], manifest["n_features"]),
                     ("ironicl-export", 1, model._task, x.shape[1]),
                 )
+                if os.name == "posix":  # The training data is private.
+                    for name in ("preprocessing.irprep", "context.ircntxt", "train_x.npy", "train_y.npy"):
+                        self.assertEqual((path / name).stat().st_mode & 0o777, 0o600, name)
+                model.export(path)  # Again, over the first export.
+                self.assertEqual([file.name for file in path.iterdir() if file.name.startswith(".")], [])
                 self.assertEqual((path / "model.irmodel").read_bytes()[:8], b"IRMODEL\0")
                 rust = _core.Model(Path(model.checkpoint_path_))
                 loaded = rust.load_fitted(
