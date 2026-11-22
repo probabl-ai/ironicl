@@ -707,7 +707,7 @@ impl Executor {
             class_count,
             class_permutations,
             feature_permutations,
-            optimize: Some(optimize),
+            optimize,
         })
     }
 
@@ -3753,7 +3753,9 @@ mod tests {
     use crate::kernels::reference::{
         OnlineAttentionScratch, affine_f32, tiled_online_scaled_dot_product_attention_f32,
     };
-    use crate::{StaticContextArtifact, StaticContextMetadata, format::static_context::StaticContextTensor};
+    use crate::{
+        Optimize, StaticContextArtifact, StaticContextMetadata, format::static_context::StaticContextTensor,
+    };
 
     fn context(tensors: Vec<StaticContextTensor>) -> StaticContextArtifact {
         StaticContextArtifact::new(
@@ -3766,7 +3768,7 @@ mod tests {
                 class_count: 2,
                 class_permutations: vec![0, 1],
                 feature_permutations: vec![0],
-                optimize: None,
+                optimize: Optimize::Safe,
             },
             tensors,
         )

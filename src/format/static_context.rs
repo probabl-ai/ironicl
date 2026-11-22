@@ -74,8 +74,8 @@ pub struct StaticContextMetadata {
     pub class_permutations: Vec<u64>,
     /// Estimator-major feature orders with shape `[B, H]`.
     pub feature_permutations: Vec<u64>,
-    /// The level the context was built at; `None` in files that predate it.
-    pub optimize: Option<Optimize>,
+    /// The level the context was built at.
+    pub optimize: Optimize,
 }
 
 /// An owned named FP32 tensor in logical row-major order.
@@ -562,12 +562,14 @@ impl StaticContextArtifact {
         let directory_length = to_usize(header.read_u64()?, "directory length")?;
         let payload_length = to_usize(header.read_u64()?, "payload length")?;
         let optimize = match header.read_u32()? {
-            0 => None,
-            1 => Some(Optimize::Safe),
-            2 => Some(Optimize::Auto),
-            3 => Some(Optimize::Fast),
+            1 => Optimize::Safe,
+            2 => Optimize::Auto,
+            3 => Optimize::Fast,
             _ => return Err(artifact_error("static context optimize level is invalid")),
         };
+        if !header.is_empty() {
+            return Err(artifact_error("static context header has trailing bytes"));
+        }
         if tensor_count == 0
             || tensor_count > MAX_TENSOR_COUNT
             || directory_length > MAX_DIRECTORY_BYTES
@@ -929,10 +931,9 @@ impl StaticContextArtifact {
         write_u32(
             &mut head,
             match self.metadata.optimize {
-                None => 0,
-                Some(Optimize::Safe) => 1,
-                Some(Optimize::Auto) => 2,
-                Some(Optimize::Fast) => 3,
+                Optimize::Safe => 1,
+                Optimize::Auto => 2,
+                Optimize::Fast => 3,
             },
         );
         debug_assert_eq!(head.len(), HEADER_BYTES);
@@ -1212,7 +1213,7 @@ mod tests {
                 class_count: 3,
                 class_permutations: vec![2, 0, 1, 1, 2, 0],
                 feature_permutations: vec![1, 0, 0, 1],
-                optimize: Some(Optimize::Auto),
+                optimize: Optimize::Auto,
             },
             fixture_tensors(),
         )

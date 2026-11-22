@@ -88,19 +88,13 @@ pub fn prepare(dir: &Path, optimize: Optimize) -> Result<(FittedModel, PathBuf)>
 ///
 /// # Errors
 ///
-/// When a file is missing or invalid, the cache records no level, or the
-/// files do not belong together.
+/// When a file is missing or invalid, or the files do not belong together.
 pub fn load(dir: &Path, threads: Option<usize>, limits: MemoryLimits) -> Result<FittedModel> {
     let executor = executor(dir)?;
     let path = dir.join(CONTEXT);
     let context = StaticContextArtifact::read_mapped_prefault(&path)
         .map_err(|error| Error::Artifact(format!("{}: {error}; run ironicl prepare", path.display())))?;
-    let optimize = context.metadata().optimize.ok_or_else(|| {
-        Error::Artifact(format!(
-            "{} records no optimize level; run ironicl prepare",
-            path.display()
-        ))
-    })?;
+    let optimize = context.metadata().optimize;
     let context = executor.load_context_artifact(context, optimize, threads, limits)?;
     executor.fitted_with_context(&read(&dir.join(PREPROCESSOR))?, context)
 }

@@ -493,7 +493,8 @@ impl Executor {
 mod tests {
     use super::{Preprocessed, check_context, unscale};
     use crate::{
-        Features, Labels, NormMethod, PreprocessOptions, RegressionOutput, StaticContextMetadata, Targets,
+        Features, Labels, NormMethod, Optimize, PreprocessOptions, RegressionOutput, StaticContextMetadata,
+        Targets,
         format::preprocessor::{decode, encode},
     };
 
@@ -607,7 +608,7 @@ mod tests {
             class_count: 3,
             class_permutations: inputs.class_permutations,
             feature_permutations: inputs.feature_permutations,
-            optimize: None,
+            optimize: Optimize::Safe,
         };
         assert!(check_context(&fitted, &SHA, &metadata).is_ok());
         assert!(check_context(&fitted, &[6; 32], &metadata).is_err());

@@ -31,8 +31,8 @@ cargo build --release --features server          # add metal on Apple Silicon, c
 
 The server loads the weights, the preprocessing, and the KV cache, checks that they belong
 together, and predicts once before it opens the port, so any answer means it is ready. It predicts
-at the level the cache records. It refuses a cache without a level, or one that does not match
-the preprocessing, and says to run `ironicl prepare`.
+at the level the cache records. It refuses a cache that is invalid or does not match the
+preprocessing, and says to run `ironicl prepare`.
 
 | Option | Default |
 |---|---|

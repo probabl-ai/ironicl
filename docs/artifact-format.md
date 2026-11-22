@@ -99,8 +99,8 @@ class count, and the required TabICLv2 architecture values: 3 column layers, 12 
 8 heads, column head dimension 16, and ICL head dimension 64. Estimator-major class `[B,C]` and
 feature `[B,H]` permutations follow, then a sorted tensor directory, 64-byte-aligned payloads, and
 the trailing SHA-256. A regression context stores class count 0 and no class permutations. The
-header's last field records the `optimize` level the context was built at (1 `safe`, 2 `auto`,
-3 `fast`), or 0 in files that predate it.
+header's last field records the `optimize` level the context was built at: 1 `safe`, 2 `auto`,
+or 3 `fast`.
 
 Each directory entry holds the tensor's UTF-8 name, rank, dimensions, payload offset, byte length,
 and, in version 2, its dtype. The executor requires exactly these tensors:
