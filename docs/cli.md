@@ -12,6 +12,7 @@ ironicl inspect (--checkpoint FILE | --model FILE)
 ironicl import --checkpoint FILE --output FILE
 ironicl prepare DIR [--optimize safe|auto|fast]
 ironicl serve DIR [--bind ADDR] [--max-rows N] [--max-body SIZE]
+              [--max-batch-rows N] [--max-queue MS]
 ```
 
 Use `ironicl help COMMAND` or `ironicl COMMAND --help` for command-specific help.
@@ -86,8 +87,9 @@ when that machine or the level differs from the fit's. `IRONICL_MEMORY_LIMIT` an
 ironicl serve churn
 ```
 
-`serve` serves the exported model over HTTP; it needs the `server` feature. See
-[server.md](server.md).
+`serve` serves the exported model over HTTP; it needs the `server` feature. It predicts
+concurrent requests together, up to `--max-batch-rows` rows at once, and refuses a request that
+would wait longer than `--max-queue` milliseconds. See [server.md](server.md).
 
 ## Stability
 

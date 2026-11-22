@@ -165,5 +165,9 @@ Exit gate: CLI predictions match the Python estimators byte for byte.
 Step E of [source-layout.md](source-layout.md#steps). Done: `export`,
 `ironicl prepare`, and `ironicl serve` with `POST /predict` and `GET /health`
 in JSON, for one exported model, without Python ([server.md](server.md)). Its
-predictions match the Python estimators. Next: batching concurrent requests,
-missing values and categorical features, and a binary or gRPC interface.
+predictions match the Python estimators. It batches concurrent requests and
+bounds their wait ([server.md](server.md#batching)). Next: missing values and
+categorical features; a memory planner that sizes batches from the KV cache and
+the GPU, so a cache streamed from host memory gets large batches; `/metrics` in
+Prometheus format (queue depth, batch size and time, refusals, GPU memory); and
+a binary or gRPC interface.

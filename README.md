@@ -70,7 +70,7 @@ curl -s localhost:8080/predict -d '{"rows": [[5.1, 3.5, 1.4, 0.2]]}'
 
 To serve on another machine or at another `optimize` level, rebuild the model's
 KV cache there first with `ironicl prepare iris --optimize auto`. See
-[Server](docs/server.md) for the API.
+[Server](docs/server.md) for the API, batching, and measured throughput.
 
 ## Status
 
@@ -78,9 +78,9 @@ KV cache there first with `ironicl prepare iris --optimize auto`. See
 |---|---|
 | Classifier and regressor, at parity with TabICL | Categorical features and missing values |
 | TabICL's preprocessing, in Rust | More than 10 classes |
-| CPU (AVX-512 on Zen 5, Accelerate on Apple Silicon), Metal, CUDA | Batching requests in the server |
-| Python drop-ins for TabICL's estimators | Packages on PyPI or crates.io |
-| A prediction server, without Python | |
+| CPU (AVX-512 on Zen 5, Accelerate on Apple Silicon), Metal, CUDA | Packages on PyPI or crates.io |
+| Python drop-ins for TabICL's estimators | |
+| A prediction server that batches requests, without Python | |
 | Checkpoint import without executing pickle code | |
 
 ## Documentation
