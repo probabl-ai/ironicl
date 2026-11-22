@@ -5,7 +5,7 @@ Ironicl writes three binary formats:
 | Format | Magic | Holds | Source |
 |---|---|---|---|
 | model | `IRMODEL\0` v1 | checkpoint weights | `src/format/model.rs` |
-| preprocessor | `IRPREP\0\0` v2 | fitted preprocessing | `src/format/preprocessor.rs` |
+| preprocessor | `IRPREP\0\0` v1 | fitted preprocessing | `src/format/preprocessor.rs` |
 | static context | `IRCNTXT\0` v1 and v2 | the training rows' attention keys and values | `src/format/static_context.rs` |
 
 Every format is little-endian, uses fixed-width fields, and ends with a SHA-256 of all preceding
