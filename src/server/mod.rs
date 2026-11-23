@@ -9,6 +9,9 @@
 //! `docs/server.md`.
 
 mod api;
+mod error;
+mod request;
+mod response;
 mod worker;
 
 use std::{
@@ -24,7 +27,8 @@ use axum::{
 use tokio::sync::oneshot;
 
 use self::{
-    api::{ApiError, Schema},
+    error::ApiError,
+    request::Schema,
     worker::{Answer, Job, Query, Queue, Worker},
 };
 use crate::{Error, Result, ServeArgs, memory::MemoryLimits, models::tabicl_v2::directory};
@@ -109,7 +113,7 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
     // Predict a full batch twice: once to warm up, once to measure the row cost.
     let failed =
         |error: ApiError| Error::InvalidConfig(format!("warm-up prediction failed: {}", error.message()));
-    let warm_up = api::missing_rows(task, categories, max_batch_rows).map_err(failed)?;
+    let warm_up = request::missing_rows(task, categories, max_batch_rows).map_err(failed)?;
     for measure in [false, true] {
         let start = Instant::now();
         worker.predict(&[&warm_up]).map_err(failed)?;

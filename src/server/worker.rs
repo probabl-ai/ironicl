@@ -13,7 +13,11 @@ use std::{
 
 use tokio::sync::oneshot;
 
-use super::api::{ApiError, Rows, classifier_response, regressor_response};
+use super::{
+    error::ApiError,
+    request::Rows,
+    response::{classifier_response, regressor_response},
+};
 use crate::{ClassifierAggregation, Features, FittedModel, Labels, RegressionOutput};
 
 /// A checked request: its rows and the outputs it asks for.
