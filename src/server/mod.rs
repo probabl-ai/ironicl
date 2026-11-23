@@ -73,6 +73,9 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
     let start = Instant::now();
     let limits = MemoryLimits::resolve(None, None)?;
     let prepared = directory::prepare(&args.dir, &weights, args.optimize, None, limits)?;
+    if let Some(warning) = &prepared.warning {
+        eprintln!("warning: {warning}");
+    }
     let cache = if prepared.built {
         format!("KV cache built in {:.1} s", start.elapsed().as_secs_f64())
     } else {

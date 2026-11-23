@@ -78,8 +78,9 @@ ironicl prepare my-model --optimize auto
 
 `prepare` makes sure that `my-model/context.ircntxt` is the KV cache this model builds at the
 level: it reuses a saved cache that is exactly that one, and otherwise builds it from the training
-rows on this machine's device and replaces the file atomically. The level defaults to the saved
-cache's, else `safe`. Running it twice does nothing the second time. Use it on the serving machine,
+rows on this machine's device and replaces the file atomically. A saved cache that cannot be read
+is rebuilt too, with a warning. The level defaults to the saved cache's, else `safe`. Running it
+twice does nothing the second time. Use it on the serving machine,
 for example in a container build, so that `serve` starts at once. `IRONICL_MEMORY_LIMIT` and
 `IRONICL_DEVICE_MEMORY_LIMIT` limit the build as they do in Python.
 

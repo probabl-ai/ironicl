@@ -69,23 +69,26 @@ fn inspect(args: &InspectArgs) -> Result<()> {
 fn inspect_directory(dir: &Path, weights: &Path) -> Result<()> {
     let summary = directory::inspect(dir, weights)?;
     let metadata = &summary.metadata;
-    let field = |key: &str| match &metadata[key] {
-        serde_json::Value::Null => "none".to_owned(),
-        serde_json::Value::String(text) => text.clone(),
-        value => value.to_string(),
-    };
+    let names = metadata
+        .feature_names
+        .as_ref()
+        .map_or("none".to_owned(), |names| names.join(", "));
+    let classes = metadata.classes.as_ref().map_or("none".to_owned(), |classes| {
+        serde_json::to_string(classes).unwrap_or_default()
+    });
     println!("Ironicl model directory");
     println!("path:          {}", dir.display());
-    println!("task:          {}", field("task"));
-    println!("features:      {}", field("n_features"));
-    println!("feature names: {}", field("feature_names"));
-    println!("classes:       {}", field("classes"));
-    println!("exported by:   Ironicl {}", field("ironicl"));
+    println!("task:          {}", metadata.task);
+    println!("features:      {}", metadata.n_features);
+    println!("feature names: {names}");
+    println!("classes:       {classes}");
+    println!("exported by:   Ironicl {}", metadata.ironicl);
     let (path, found) = &summary.weights;
     let found = if *found { "" } else { " (missing)" };
     println!("weights:       {}{found}", path.display());
     match summary.cache {
-        Some((optimize, bytes)) => println!("KV cache:      {optimize}, {}", ByteSize(bytes)),
+        Some(Ok((optimize, bytes))) => println!("KV cache:      {optimize}, {}", ByteSize(bytes)),
+        Some(Err(error)) => println!("KV cache:      unreadable ({error}); ironicl prepare rebuilds it"),
         None => println!("KV cache:      none; ironicl prepare builds it"),
     }
     Ok(())
@@ -196,6 +199,9 @@ fn prepare(args: &PrepareArgs) -> Result<()> {
     )?;
     let path = args.dir.join(directory::CONTEXT);
     let bytes = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
+    if let Some(warning) = &prepared.warning {
+        eprintln!("warning: {warning}");
+    }
     let action = if prepared.built { "Built" } else { "Reused" };
     println!("{action} the KV cache");
     println!("path:          {}", path.display());

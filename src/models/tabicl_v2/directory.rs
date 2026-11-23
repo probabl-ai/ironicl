@@ -18,8 +18,10 @@ use std::{
     sync::Arc,
 };
 
+use serde::{Deserialize, Serialize};
+
 use crate::{
-    Error, Executor, FittedModel, Labels, Optimize, Result, StaticContextArtifact,
+    Error, Executor, FittedModel, Labels, Optimize, Result, StaticContextArtifact, TaskKind,
     format::{encode_sha256, model::load_model_artifact, preprocessor},
     memory::MemoryLimits,
 };
@@ -85,26 +87,47 @@ pub fn write(dir: &Path, model: &FittedModel, kv_cache: bool) -> Result<()> {
     write_atomic(&dir.join(METADATA), &metadata(model)?)
 }
 
+/// `ironicl.json`: what the model is. It describes the model; the other files
+/// stay the source of truth.
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Metadata {
+    /// `"ironicl-model"`.
+    pub format: String,
+    /// The layout's version.
+    pub version: u64,
+    /// The Ironicl version that wrote the directory.
+    pub ironicl: String,
+    pub task: TaskKind,
+    pub n_features: usize,
+    /// The training data's column names, when it had them.
+    pub feature_names: Option<Vec<String>>,
+    /// A classifier's classes, in the order of its probabilities.
+    pub classes: Option<Labels>,
+    /// The SHA-256 of the checkpoint the weights come from, which names their
+    /// file in the weights folder.
+    pub weights: String,
+}
+
+impl Metadata {
+    fn of(model: &FittedModel) -> Self {
+        let preprocessor = model.preprocessed.preprocessor();
+        Self {
+            format: FORMAT.to_owned(),
+            version: VERSION,
+            ironicl: env!("CARGO_PKG_VERSION").to_owned(),
+            task: model.task(),
+            n_features: preprocessor.n_features_in(),
+            feature_names: preprocessor.feature_names.clone(),
+            classes: preprocessor.classes().cloned(),
+            weights: encode_sha256(&model.context.context_metadata().model_sha256),
+        }
+    }
+}
+
 fn metadata(model: &FittedModel) -> Result<Vec<u8>> {
-    let preprocessor = model.preprocessed.preprocessor();
-    let classes = preprocessor.classes().map(|labels| match labels {
-        Labels::Int(values) => serde_json::json!(values),
-        Labels::Float(values) => serde_json::json!(values),
-        Labels::Bool(values) => serde_json::json!(values),
-        Labels::Text(values) => serde_json::json!(values),
-    });
-    let metadata = serde_json::json!({
-        "format": FORMAT,
-        "version": VERSION,
-        "ironicl": env!("CARGO_PKG_VERSION"),
-        "task": model.task().to_string(),
-        "n_features": preprocessor.n_features_in(),
-        "feature_names": preprocessor.feature_names,
-        "classes": classes,
-        "weights": encode_sha256(&model.context.context_metadata().model_sha256),
-    });
-    let mut bytes =
-        serde_json::to_vec_pretty(&metadata).map_err(|error| Error::Artifact(error.to_string()))?;
+    let mut bytes = serde_json::to_vec_pretty(&Metadata::of(model))
+        .map_err(|error| Error::Artifact(error.to_string()))?;
     bytes.push(b'\n');
     Ok(bytes)
 }
@@ -115,7 +138,7 @@ fn metadata(model: &FittedModel) -> Result<Vec<u8>> {
 /// # Errors
 ///
 /// When the metadata is missing, invalid, or for another layout.
-pub fn read_metadata(dir: &Path) -> Result<serde_json::Value> {
+pub fn read_metadata(dir: &Path) -> Result<Metadata> {
     let path = dir.join(METADATA);
     let bytes = std::fs::read(&path).map_err(|error| {
         Error::Artifact(format!(
@@ -123,15 +146,14 @@ pub fn read_metadata(dir: &Path) -> Result<serde_json::Value> {
             dir.display()
         ))
     })?;
-    let metadata: serde_json::Value =
-        serde_json::from_slice(&bytes).map_err(|error| artifact_error(&path, error))?;
-    if metadata["format"] != FORMAT || metadata["version"] != VERSION {
-        return Err(Error::Artifact(format!(
+    match serde_json::from_slice::<Metadata>(&bytes) {
+        Ok(metadata) if metadata.format == FORMAT && metadata.version == VERSION => Ok(metadata),
+        Ok(_) => Err(Error::Artifact(format!(
             "{} is not an Ironicl model directory of version {VERSION}; export the model again",
             dir.display()
-        )));
+        ))),
+        Err(error) => Err(artifact_error(&path, error)),
     }
-    Ok(metadata)
 }
 
 /// The weights file in `weights` that the preprocessing `bytes` were fitted
@@ -162,6 +184,9 @@ pub struct Prepared {
     pub optimize: Optimize,
     /// Whether the KV cache was built, rather than loaded from `context.ircntxt`.
     pub built: bool,
+    /// A warning that a saved KV cache exists but could not be read, so was
+    /// rebuilt.
+    pub warning: Option<String>,
 }
 
 /// Load the model directory `dir` with the weights in `weights`, and its KV
@@ -189,8 +214,21 @@ pub fn prepare(
         .map_err(|error| artifact_error(&path, error))?;
     let preprocessed = Arc::new(preprocessed);
     let path = dir.join(CONTEXT);
-    // An unreadable or invalid cache is rebuilt like a mismatched one.
-    let saved = StaticContextArtifact::read_mapped_prefault(&path).ok();
+    // A missing, unreadable, or invalid cache is rebuilt like a mismatched
+    // one; one that exists but cannot be read is reported.
+    let mut warning = None;
+    let saved = match StaticContextArtifact::read_mapped_prefault(&path) {
+        Ok(context) => Some(context),
+        Err(error) => {
+            if path.exists() {
+                warning = Some(format!(
+                    "could not read the saved KV cache {}, so rebuilt it: {error}",
+                    path.display()
+                ));
+            }
+            None
+        }
+    };
     let optimize = optimize
         .or(saved.as_ref().map(|context| context.metadata().optimize))
         .unwrap_or_default();
@@ -206,6 +244,7 @@ pub fn prepare(
             model,
             optimize,
             built: false,
+            warning,
         });
     }
     let model = executor.build_fitted(preprocessed, optimize, threads, limits, None)?;
@@ -214,16 +253,18 @@ pub fn prepare(
         model,
         optimize,
         built: true,
+        warning,
     })
 }
 
 /// What `ironicl inspect` shows of a model directory.
 pub struct Summary {
-    pub metadata: serde_json::Value,
+    pub metadata: Metadata,
     /// The weights file the model needs, and whether it is there.
     pub weights: (PathBuf, bool),
-    /// The saved KV cache's level and size, when there is a valid one.
-    pub cache: Option<(Optimize, u64)>,
+    /// The saved KV cache's level and size, or why it cannot be read, when
+    /// there is one.
+    pub cache: Option<Result<(Optimize, u64)>>,
 }
 
 /// Describe the model directory `dir`, looking for its weights in `weights`.
@@ -238,14 +279,14 @@ pub fn inspect(dir: &Path, weights: &Path) -> Result<Summary> {
     let weights = weights_path(&bytes, weights)?;
     let found = weights.is_file();
     let path = dir.join(CONTEXT);
-    let cache = StaticContextArtifact::read_mapped_prefault(&path)
-        .ok()
-        .map(|context| {
+    let cache = path.exists().then(|| {
+        StaticContextArtifact::read_mapped_prefault(&path).map(|context| {
             (
                 context.metadata().optimize,
                 std::fs::metadata(&path).map_or(0, |file| file.len()),
             )
-        });
+        })
+    });
     Ok(Summary {
         metadata,
         weights: (weights, found),
@@ -255,7 +296,8 @@ pub fn inspect(dir: &Path, weights: &Path) -> Result<Summary> {
 
 #[cfg(test)]
 mod tests {
-    use super::{METADATA, read_metadata};
+    use super::{METADATA, Metadata, read_metadata};
+    use crate::{Labels, TaskKind};
 
     #[test]
     fn a_model_directory_needs_metadata_of_this_layout() {
@@ -265,17 +307,33 @@ mod tests {
             error.contains("not a complete Ironicl model directory"),
             "{error}"
         );
-        for (metadata, ok) in [
+        let metadata = Metadata {
+            format: "ironicl-model".into(),
+            version: 1,
+            ironicl: "0.1.0".into(),
+            task: TaskKind::Classifier,
+            n_features: 2,
+            feature_names: Some(vec!["a".into(), "b".into()]),
+            classes: Some(Labels::Text(vec!["no".into(), "yes".into()])),
+            weights: "00".repeat(32),
+        };
+        let json = serde_json::to_string(&metadata).unwrap();
+        assert!(json.contains(r#""task":"classifier","n_features":2"#), "{json}");
+        assert!(json.contains(r#""classes":["no","yes"]"#), "{json}");
+        std::fs::write(dir.path().join(METADATA), &json).unwrap();
+        assert_eq!(read_metadata(dir.path()).unwrap(), metadata);
+        for (bad, message) in [
+            (json.replace(r#""version":1"#, r#""version":2"#), "of version 1"),
+            (json.replace("ironicl-model", "other"), "of version 1"),
             (
-                r#"{"format": "ironicl-model", "version": 1, "task": "classifier"}"#,
-                true,
+                json.replace(r#""task":"classifier""#, r#""task":"ranker""#),
+                "unknown variant",
             ),
-            (r#"{"format": "ironicl-model", "version": 2}"#, false),
-            (r#"{"format": "other", "version": 1}"#, false),
-            ("not json", false),
+            ("not json".into(), "expected ident"),
         ] {
-            std::fs::write(dir.path().join(METADATA), metadata).unwrap();
-            assert_eq!(read_metadata(dir.path()).is_ok(), ok, "{metadata}");
+            std::fs::write(dir.path().join(METADATA), &bad).unwrap();
+            let error = read_metadata(dir.path()).unwrap_err().to_string();
+            assert!(error.contains(message), "{bad}: {error}");
         }
     }
 }
