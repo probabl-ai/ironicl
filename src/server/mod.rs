@@ -81,9 +81,10 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
     let model = prepared.model;
     let preprocessor = model.preprocessed().preprocessor();
     let (task, features) = (model.task(), preprocessor.n_features_in());
-    let (classes, aggregation) = (
+    let (classes, aggregation, feature_names) = (
         preprocessor.classes().cloned(),
         preprocessor.aggregation.unwrap_or_default(),
+        preprocessor.feature_names.clone(),
     );
     let device = model.device();
     let max_batch_rows = args.max_batch_rows.unwrap_or(if device == "cpu" {
@@ -100,20 +101,23 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
         max_batch_rows,
         queue: Arc::clone(&queue),
     };
+    let limits = Limits {
+        task,
+        features,
+        feature_names,
+        max_request_rows: args.max_request_rows,
+    };
     // Predict a full batch twice: once to warm up, once to measure the row cost.
-    let warm_up = api::zeros(task, max_batch_rows, features)
-        .and_then(|query| {
-            for measure in [false, true] {
-                let start = Instant::now();
-                worker.predict(&[&query])?;
-                if measure {
-                    queue.measure(max_batch_rows, start.elapsed());
-                }
-            }
-            Ok(())
-        })
-        .map_err(|error| Error::InvalidConfig(format!("warm-up prediction failed: {}", error.message())));
-    warm_up?;
+    let warm_up = api::zeros(&limits, max_batch_rows);
+    for measure in [false, true] {
+        let start = Instant::now();
+        worker.predict(&[&warm_up]).map_err(|error| {
+            Error::InvalidConfig(format!("warm-up prediction failed: {}", error.message()))
+        })?;
+        if measure {
+            queue.measure(max_batch_rows, start.elapsed());
+        }
+    }
     let (jobs, receiver) = mpsc::channel();
     // A worker that panicked can never answer, so end the process rather than
     // keep answering /v1/health; a supervisor restarts it.
@@ -123,15 +127,7 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
             std::process::exit(1);
         }
     });
-    let server = Server {
-        limits: Limits {
-            task,
-            features,
-            max_request_rows: args.max_request_rows,
-        },
-        queue,
-        jobs,
-    };
+    let server = Server { limits, queue, jobs };
     let app = Router::new()
         .route("/v1/predict", post(api::predict))
         .route("/v1/health", get(api::health))

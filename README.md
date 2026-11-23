@@ -81,7 +81,7 @@ ironicl serve my-model
 ```
 
 ```bash
-curl -s localhost:8080/v1/predict -d '{"rows": [[5.1, 3.5, 1.4, 0.2]]}'
+curl -s localhost:8080/v1/predict -d '{"data": [[5.1, 3.5, 1.4, 0.2]]}'
 ```
 
 ```json
@@ -91,7 +91,8 @@ curl -s localhost:8080/v1/predict -d '{"rows": [[5.1, 3.5, 1.4, 0.2]]}'
 To serve on another machine, copy `my-model/` there and run `ironicl import` on
 the checkpoint once; the server builds the KV cache for that machine on first
 start. NVIDIA GPUs need a CUDA build ([CUDA build targets](docs/source-layout.md#cuda-build-targets)).
-See [Server](docs/server.md) for the API, batching, and measured throughput.
+See [Server](docs/server.md) for the API, sending a pandas DataFrame, batching, and measured
+throughput.
 
 ## Status
 

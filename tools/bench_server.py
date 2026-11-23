@@ -72,7 +72,7 @@ def main() -> None:
     bodies = Path(tempfile.mkdtemp())
     for count in args.request_rows:
         rows = random.standard_normal((count, features)).round(4)
-        (bodies / f"{count}.json").write_text(json.dumps({"rows": rows.tolist()}))
+        (bodies / f"{count}.json").write_text(json.dumps({"data": rows.tolist()}))
     largest = max(path.stat().st_size for path in bodies.iterdir())
     url = f"http://127.0.0.1:{args.port}"
     loads = [("rate", rate) for rate in args.rates] if args.rates else [("clients", c) for c in args.clients]

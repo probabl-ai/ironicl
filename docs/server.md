@@ -119,12 +119,13 @@ a machine with several GPUs, select one per process with `CUDA_VISIBLE_DEVICES`.
 
 ## `POST /v1/predict`
 
-The body is JSON. Rows are arrays of numbers, each as long as the training data's feature count.
-Options are named after TabICL's predict arguments; the response has one key per output.
+The body is JSON: a table as pandas writes it with `orient="split"`, plus options named after
+TabICL's predict arguments. The response has one key per output.
 
 | Field | Type | Default |
 |---|---|---|
-| `rows` | `number[][]`, at least one row | required |
+| `data` | `number[][]`: at least one row, each with a value per training feature | required |
+| `columns` | the column names, in the order of each row's values | the training data's order |
 | `output_type` | list of output names, none twice | classifier: `["labels", "probabilities"]`; regressor: `["mean"]` |
 | `alphas` | regressor only: up to 999 quantile levels in (0, 1) | `[0.1, 0.2, …, 0.9]` |
 
@@ -136,18 +137,30 @@ Options are named after TabICL's predict arguments; the response has one key per
 | regressor | `quantiles` | `quantiles`: `[rows][alphas]`, and `alphas`, their order |
 | regressor | `raw_quantiles` | `raw_quantiles`: `[rows][999]`, TabICL's sorted model quantiles |
 
+With `columns`, the server puts the values in the training data's order. The names must be the
+training DataFrame's column names, each once; a model fit on an array has none, so leave `columns`
+out. A DataFrame becomes a body with:
+
+```python
+body = df.to_json(orient="split", index=False)
+body = {**df.to_dict(orient="split", index=False), "output_type": ["labels"]}  # with options
+```
+
+`to_json` writes NaN as `null`; `json.dumps`, which `to_dict` needs, writes it as invalid JSON.
+
 A classifier uses the `softmax_temperature` and `average_logits` it was fitted with.
 
 ```json
-→ {"rows": [[5.1, 3.5, 1.4, 0.2], [6.7, 3.0, 5.2, 2.3]]}
+→ {"columns": ["sepal length (cm)", "sepal width (cm)", "petal length (cm)", "petal width (cm)"],
+   "data": [[5.1, 3.5, 1.4, 0.2], [6.7, 3.0, 5.2, 2.3]]}
 ← {"labels": ["setosa", "virginica"],
    "classes": ["setosa", "versicolor", "virginica"],
    "probabilities": [[0.99999, 0.00001, 0.0], [0.00001, 0.00132, 0.99867]]}
 
-→ {"rows": [[5.1, 3.5, 1.4, 0.2]], "output_type": ["labels"]}
+→ {"data": [[5.1, 3.5, 1.4, 0.2]], "output_type": ["labels"]}
 ← {"labels": ["setosa"]}
 
-→ {"rows": [[0.03, 0.05, ...]], "output_type": ["mean", "quantiles"], "alphas": [0.1, 0.9]}
+→ {"data": [[0.03, 0.05, ...]], "output_type": ["mean", "quantiles"], "alphas": [0.1, 0.9]}
 ← {"mean": [195.58], "alphas": [0.1, 0.9], "quantiles": [[103.75, 285.18]]}
 ```
 
@@ -163,7 +176,7 @@ Errors are `{"error": {"code": ..., "message": ...}}`.
 
 | Status | `code` | When |
 |---|---|---|
-| 400 | `invalid_request` | Malformed JSON, a wrong type, or an unknown field; `rows` empty, ragged, of another length than the training data's, or longer than `--max-request-rows`; an output the model does not have, or one named twice; `alphas` for a classifier, outside (0, 1), or more than 999 of them. The message names the field. |
+| 400 | `invalid_request` | Malformed JSON, a wrong type, or an unknown field; `data` empty, with a row of another length than the training data's, or longer than `--max-request-rows`; `columns` that are not the training data's column names, each once; an output the model does not have, or one named twice; `alphas` for a classifier, outside (0, 1), or more than 999 of them. The message names the field. |
 | 413 | `body_too_large` | A body larger than `--max-body`. |
 | 503 | `overloaded` | The request would wait longer than `--max-queue`. Retry after the `Retry-After` seconds. |
 | 500 | `internal` | A failed prediction. It fails every request in the same batch. |

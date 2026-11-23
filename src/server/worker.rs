@@ -30,7 +30,7 @@ pub(super) enum Outputs {
     /// Each output once, and the quantile levels as the request gave them.
     Regressor {
         outputs: Vec<RegressionOutput>,
-        alphas: Vec<f64>,
+        alphas: Vec<f32>,
     },
 }
 
@@ -180,7 +180,7 @@ impl Worker {
                 })
                 .collect());
         }
-        let requested: Vec<(&[RegressionOutput], &[f64])> = queries
+        let requested: Vec<(&[RegressionOutput], &[f32])> = queries
             .iter()
             .map(|query| match &query.outputs {
                 Outputs::Regressor { outputs, alphas } => (&outputs[..], &alphas[..]),
