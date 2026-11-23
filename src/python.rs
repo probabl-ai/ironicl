@@ -19,7 +19,7 @@ use pyo3::{
     buffer::PyBuffer,
     exceptions::{PyNotImplementedError, PyRuntimeError, PyValueError},
     prelude::*,
-    types::{PyBytes, PyDict},
+    types::{PyBytes, PyDict, PyList},
 };
 
 use crate::{
@@ -28,6 +28,7 @@ use crate::{
     memory::{Builder, MemoryLimits, Verdict},
     models::tabicl_v2::preprocess::flatten_orders,
     plan_context,
+    preprocess::columns::{self, Column},
     progress::{self, Hook, Stage},
 };
 
@@ -325,6 +326,64 @@ impl Matrix {
     }
 }
 
+/// Features from Python: a matrix, or a list of columns, each a float64
+/// array or a categorical column's `(kind, categories, codes)`, with the
+/// categories as `read_labels` takes them and int64 codes, -1 when missing.
+enum Input {
+    Matrix(Matrix, usize),
+    Columns(Vec<Column>),
+}
+
+impl Input {
+    fn read(py: Python<'_>, x: &Bound<'_, PyAny>) -> PyResult<Self> {
+        let Ok(list) = x.cast::<PyList>() else {
+            let (matrix, columns) = Matrix::read(py, x)?;
+            return Ok(Self::Matrix(matrix, columns));
+        };
+        let columns = list
+            .iter()
+            .map(|column| {
+                if let Ok((kind, categories, codes)) =
+                    column.extract::<(String, Bound<'_, PyAny>, PyBuffer<i64>)>()
+                {
+                    Ok(Column::Categorical {
+                        categories: read_labels(py, (kind, categories))?,
+                        codes: codes.to_vec(py)?,
+                    })
+                } else {
+                    Ok(Column::Numeric(PyBuffer::<f64>::get(&column)?.to_vec(py)?))
+                }
+            })
+            .collect::<PyResult<_>>()?;
+        Ok(Self::Columns(columns))
+    }
+
+    /// The matrix to fit on, its column count, and its features' categories.
+    fn fit(self) -> crate::Result<(Matrix, usize, Vec<Option<Labels>>)> {
+        match self {
+            Self::Matrix(matrix, columns) => Ok((matrix, columns, vec![None; columns])),
+            Self::Columns(columns) => {
+                let categories = columns::categories(&columns)?;
+                Ok((
+                    Matrix::F64(columns::encode(&columns, &categories)?),
+                    columns.len(),
+                    categories,
+                ))
+            }
+        }
+    }
+
+    /// The matrix to predict from, with the fitted `categories`, and its column count.
+    fn encode(self, categories: &[Option<Labels>]) -> crate::Result<(Matrix, usize)> {
+        match self {
+            Self::Matrix(matrix, columns) => Ok((matrix, columns)),
+            Self::Columns(columns) => {
+                Ok((Matrix::F64(columns::encode(&columns, categories)?), columns.len()))
+            }
+        }
+    }
+}
+
 /// Labels from Python as `(kind, values)`: `"int"`, `"float"`, or `"bool"` with
 /// an int64, float64, or uint8 buffer, or `"text"` with a list of str.
 fn read_labels(py: Python<'_>, (kind, values): (String, Bound<'_, PyAny>)) -> PyResult<Labels> {
@@ -373,7 +432,8 @@ fn f32_bytes<'py>(py: Python<'py>, values: &[f32]) -> Bound<'py, PyBytes> {
     PyBytes::new(py, bytemuck::cast_slice(values))
 }
 
-/// Fit preprocessing on `x`, a float32 or float64 `[rows, columns]` array, for
+/// Fit preprocessing on `x`, a float32 or float64 `[rows, columns]` array or
+/// a list of columns as `Input` reads them, for
 /// a classifier with `labels` (`(kind, values)`, as `read_labels` takes) or a
 /// regressor with float32 `values`. The result's `shape` plans the memory to
 /// build its context with `Model.build`.
@@ -401,7 +461,7 @@ fn preprocess(
             "softmax_temperature must be positive and finite",
         ));
     }
-    let (x, columns) = Matrix::read(py, x)?;
+    let x = Input::read(py, x)?;
     let targets = read_targets(py, labels, values)?;
     let options = PreprocessOptions {
         n_estimators,
@@ -414,7 +474,10 @@ fn preprocess(
         outlier_threshold,
     };
     let mut preprocessed = py
-        .detach(|| crate::Preprocessed::fit(&options, x.features(), columns, &targets))
+        .detach(|| {
+            let (x, columns, categories) = x.fit()?;
+            crate::Preprocessed::fit(&options, x.features(), columns, categories, &targets)
+        })
         .map_err(py_error)?;
     // Saved for serving; Python passes its own settings to every prediction.
     let preprocessor = &mut preprocessed.preprocessor;
@@ -448,6 +511,17 @@ impl Preprocessed {
     #[getter]
     fn feature_mask(&self) -> Vec<bool> {
         self.0.preprocessor().feature_mask().to_vec()
+    }
+
+    /// Whether each input feature is categorical.
+    #[getter]
+    fn categorical(&self) -> Vec<bool> {
+        self.0
+            .preprocessor()
+            .categories()
+            .iter()
+            .map(Option::is_some)
+            .collect()
     }
 
     /// The normalization method of each group, in group order.
@@ -509,9 +583,12 @@ impl Preprocessed {
         py: Python<'py>,
         x: &Bound<'py, PyAny>,
     ) -> PyResult<(Bound<'py, PyBytes>, [usize; 3])> {
-        let (x, columns) = Matrix::read(py, x)?;
+        let x = Input::read(py, x)?;
         let (rows, shape) = py
-            .detach(|| self.0.query_rows(x.features(), columns))
+            .detach(|| {
+                let (x, columns) = x.encode(self.0.preprocessor().categories())?;
+                self.0.query_rows(x.features(), columns)
+            })
             .map_err(py_error)?;
         Ok((f32_bytes(py, &rows), shape))
     }
@@ -536,7 +613,8 @@ impl FittedModel {
         average_logits: bool,
         progress: Option<Py<PyAny>>,
     ) -> PyResult<(Bound<'py, PyBytes>, [usize; 2])> {
-        let (x, columns) = Matrix::read(py, x)?;
+        let categories = self.0.preprocessed().preprocessor().categories();
+        let (x, columns) = Input::read(py, x)?.encode(categories).map_err(py_error)?;
         let aggregation = ClassifierAggregation {
             softmax_temperature,
             average_logits,
@@ -559,7 +637,8 @@ impl FittedModel {
         alphas: Vec<f32>,
         progress: Option<Py<PyAny>>,
     ) -> PyResult<Vec<(Bound<'py, PyBytes>, [usize; 2])>> {
-        let (x, columns) = Matrix::read(py, x)?;
+        let categories = self.0.preprocessed().preprocessor().categories();
+        let (x, columns) = Input::read(py, x)?.encode(categories).map_err(py_error)?;
         let rows = x.features().len() / columns.max(1);
         let outputs = output_types
             .iter()

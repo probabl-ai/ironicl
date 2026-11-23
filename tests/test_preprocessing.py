@@ -16,6 +16,11 @@ from numpy.testing import assert_array_equal
 from ironicl import _core
 from ironicl.base import _array, _features, _label_values, _labels
 
+try:
+    import pandas as pd
+except ImportError:
+    pd = None
+
 DEFAULTS = {"n_estimators": 8, "random_state": 0, "norm_methods": ["none", "power"], "outlier_threshold": 4.0}
 
 
@@ -130,6 +135,74 @@ class PreprocessingTest(unittest.TestCase):
         self.assertEqual(preprocessed.query_rows(q), reference.query_rows(np.where(np.isnan(q), means, q)))
         alone = np.concatenate([_array(*preprocessed.query_rows(row[None, :])) for row in q], axis=1)
         assert_array_equal(_array(*preprocessed.query_rows(q)), alone)
+
+    @unittest.skipIf(pd is None, "needs pandas")
+    def test_categorical_columns_are_category_codes_first(self):
+        rng = np.random.default_rng(3)
+        n = 40
+        frame = pd.DataFrame({
+            "num": self.x[:, 0],
+            "color": pd.Series(rng.choice(["red", "green", "blue"], n), dtype=object),
+            "size": pd.Categorical(rng.choice([10, 2, 7], n), categories=[10, 2, 7, 99]),
+            "count": pd.array(rng.integers(0, 4, n), dtype="Int64"),
+            "flag": pd.array(rng.choice([True, False], n), dtype="boolean"),
+        })
+        frame.loc[::5, "color"] = None
+        frame.loc[1::7, "count"] = pd.NA
+        frame.loc[2, "flag"] = pd.NA
+        columns, names = _features(frame)
+        self.assertEqual(names, ("num", "color", "size", "count", "flag"))
+        self.assertEqual([isinstance(column, tuple) for column in columns], [False, True, True, False, True])
+        # The same rows as numbers: each category's sorted index, -1 when
+        # missing, categorical columns first, and missing numbers as NaN.
+        def codes(column, categories):
+            index = {category: code for code, category in enumerate(categories)}
+            return np.array([-1.0 if pd.isna(value) else index[value] for value in column])
+
+        numbers = np.column_stack([
+            codes(frame["color"], ["blue", "green", "red"]),
+            codes(frame["size"], [2, 7, 10]),
+            codes(frame["flag"], [False, True]),
+            frame["num"],
+            frame["count"].to_numpy(dtype=float, na_value=np.nan),
+        ])
+        preprocessed = preprocess(frame, self.y)
+        reference = preprocess(numbers, self.y)
+        self.assertEqual(preprocessed.categorical, [False, True, True, False, True])
+        self.assertEqual(preprocessed.feature_mask, reference.feature_mask)
+        self.assertEqual(preprocessed.training_inputs(), reference.training_inputs())
+        # Categories training never saw are missing.
+        query = frame.iloc[:3].copy()
+        query["color"] = ["purple", None, "red"]
+        query["size"] = pd.Categorical([99, 2, 2])
+        expected = numbers[:3].copy()
+        expected[:, 0] = [-1, -1, 2]
+        expected[:, 1] = [-1, 0, 0]
+        query_columns, _ = _features(query, preprocessed.categorical)
+        self.assertEqual(preprocessed.query_rows(query_columns), reference.query_rows(expected))
+
+    @unittest.skipIf(pd is None, "needs pandas")
+    def test_unsupported_columns_are_explicit_errors(self):
+        frame = pd.DataFrame({"num": np.arange(4.0)})
+        for column, error, message in (
+            (np.array([True, False] * 2), TypeError, "ignores"),
+            (pd.to_datetime(["2020-01-01"] * 4), TypeError, "unsupported"),
+            (pd.to_timedelta([1, 2, 3, 4], unit="D"), TypeError, "unsupported"),
+            (np.array([1j] * 4), TypeError, "unsupported"),
+            (pd.array(["a", None, "b", "a"], dtype="string"), ValueError, "nullable string"),
+            (pd.Series(["a", 1, "b", 2], dtype=object), TypeError, "categories must be all strings"),
+        ):
+            with self.subTest(dtype=str(getattr(column, "dtype", ""))), self.assertRaisesRegex(error, message):
+                _features(frame.assign(bad=column))
+        # A nullable string column without missing values fits; at predict
+        # time, a missing value is a category training never saw.
+        fitted = pd.DataFrame({"s": pd.array(["a", "b", "a", "b"], dtype="string")})
+        columns, _ = _features(fitted)
+        self.assertEqual(columns[0][:2], ("text", ["a", "b"]))
+        query, _ = _features(pd.DataFrame({"s": pd.array(["b", None], dtype="string")}), [True])
+        assert_array_equal(query[0][2], [0, -1])
+        with self.assertRaisesRegex(ValueError, "pandas DataFrame"):
+            _features(np.ones((2, 1)), [True])
 
     def test_sparse_inputs_are_rejected(self):
         from scipy.sparse import csr_matrix

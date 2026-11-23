@@ -104,7 +104,11 @@ class ServerTest(unittest.TestCase):
 
     def frame(self):
         x, y = data()
-        return pd.DataFrame(x, columns=[f"f{i}" for i in range(x.shape[1])]), y
+        frame = pd.DataFrame(x, columns=[f"f{i}" for i in range(x.shape[1])])
+        rng = np.random.default_rng(3)
+        frame["color"] = pd.Series(rng.choice(["red", "green", "blue"], len(frame)), dtype=object)
+        frame["size"] = pd.Categorical(rng.choice([1, 2, 3], len(frame)))
+        return frame, y
 
     def test_a_classifier_takes_a_dataframe_in_any_column_order(self):
         checkpoint(TabICLClassifier)
@@ -118,8 +122,9 @@ class ServerTest(unittest.TestCase):
         np.testing.assert_allclose(answer["probabilities"], model.predict_proba(test), atol=1e-4)
         reordered = test[test.columns[::-1]].to_json(orient="split", index=False)
         self.assertEqual(self.post(url, reordered), answer)
-        missing = test.iloc[:2].copy()
+        missing = test.iloc[:3].copy()
         missing.iloc[1, 0] = np.nan
+        missing["color"] = [None, "purple", "red"]  # Missing, and a category training never saw.
         answer = self.post(url, missing.to_json(orient="split", index=False))
         np.testing.assert_allclose(answer["probabilities"], model.predict_proba(missing), atol=1e-4)
 

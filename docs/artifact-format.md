@@ -28,6 +28,7 @@ writes them as a model directory, with the weights in a shared folder
 ([cli.md](cli.md#model-directories-and-weights)).
 
 `IRPREP` v1 holds the checkpoint's SHA-256 (32 bytes, as `IRCNTXT` stores it), the feature mask,
+each input feature's categories (none for a numeric feature),
 the normalization groups, each member's group and feature and class order, the class labels
 (integers, floats, booleans, or UTF-8 text) with the classifier's `softmax_temperature` and
 `average_logits`, or the regressor's target mean and scale, the feature names when the training

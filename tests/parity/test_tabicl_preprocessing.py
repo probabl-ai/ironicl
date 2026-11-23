@@ -42,7 +42,41 @@ def preprocess(x, y, classification=True, **options):
 
 def upcast(x):
     """What TabICL is fed: Ironicl computes in float64, so float32 input matches TabICL on its upcast."""
-    return x.astype(np.float64) if x.dtype == np.float32 else x
+    return x.astype(np.float64) if getattr(x, "dtype", None) == np.float32 else x
+
+
+def empty_columns(numerical, x):
+    """Whether each column of TabICL's encoded data, categorical columns first,
+    is missing in every training row, before TabICL 2.1.1's imputer drops it."""
+    if not hasattr(numerical.tfm_, "transformers_"):
+        return np.isnan(upcast(x)).all(axis=0)
+    positions = {name: columns for name, _, columns in numerical.tfm_.transformers_}
+    numeric = [x.iloc[:, column].isna().all() for column in positions["continuous"]]
+    return np.array([False] * len(positions["categorical"]) + numeric, dtype=bool)
+
+
+def frame(rows, seed):
+    """A DataFrame of every column type TabICL encodes, interleaved, with
+    missing values; its object column marks them with NaN, which TabICL treats
+    as missing (it makes None a category, and Ironicl does not)."""
+    import pandas as pd
+
+    rng = np.random.default_rng(seed)
+    data = pd.DataFrame({
+        "num": rng.normal(size=rows),
+        "word": pd.Series(rng.choice(["é", "b", "a", "B", "c"], rows), dtype=object),
+        "count": pd.array(rng.integers(0, 6, rows), dtype="Int64"),
+        "size": pd.Categorical(rng.choice([10, 2, 7], rows), categories=[10, 2, 7, 99]),
+        "flag": pd.array(rng.choice([True, False], rows), dtype="boolean"),
+        "empty": np.full(rows, np.nan),
+        "text": pd.array(rng.choice(["x", "y", "z"], rows), dtype="string"),
+        "skew": np.exp(rng.normal(size=rows) * 2),
+    })
+    data.loc[rng.random(rows) < 0.15, "num"] = np.nan
+    data.loc[rng.random(rows) < 0.15, "word"] = np.nan
+    data.loc[rng.random(rows) < 0.15, "count"] = pd.NA
+    data.loc[rng.random(rows) < 0.15, "flag"] = pd.NA
+    return data
 
 
 TABICL_COMMIT = "bd030d47ff7d9f987f0f33431d743a3003bfe0d3"
@@ -203,7 +237,7 @@ class TabICLPreprocessingParityTest(unittest.TestCase):
 
     def run_case(self, name, x, q, y, **parameters):
         options = {**DEFAULTS, **parameters}
-        self.case = f"case={name}, dtype={x.dtype}, options={options}"
+        self.case = f"case={name}, dtype={getattr(x, 'dtype', 'DataFrame')}, options={options}"
 
         # The oracle starts from raw data and its own label encoder. It never
         # uses Ironicl's fitted statistics, labels, masks, or permutations.
@@ -217,7 +251,7 @@ class TabICLPreprocessingParityTest(unittest.TestCase):
         self.assert_equal(np.unique(_labels(y)), encoder.classes_, "classes")
         # TabICL 2.1.1's imputer drops a feature missing in every row before its
         # filter sees it; Ironicl's mask drops it.
-        empty = np.isnan(upcast(x)).all(axis=0)
+        empty = empty_columns(numerical, x)
         mask = np.zeros(len(empty), dtype=bool)
         mask[~empty] = expected.unique_filter_.features_to_keep_
         self.assert_equal(preprocessed.feature_mask, mask, "feature mask")
@@ -238,9 +272,12 @@ class TabICLPreprocessingParityTest(unittest.TestCase):
         rows, targets, _, _ = preprocessed.training_inputs()
         expected_training = expected.transform(X=None, mode="train")
         self.compare_rows(preprocessed, _array(*rows), expected_training, "training", _array(*targets))
-        self.compare_rows(preprocessed, _array(*preprocessed.query_rows(_features(x)[0])), expected_training, "training transformed again")
+        categorical = preprocessed.categorical
+        training_again = _array(*preprocessed.query_rows(_features(x, categorical)[0]))
+        self.compare_rows(preprocessed, training_again, expected_training, "training transformed again")
         expected_queries = expected.transform(numerical.transform(upcast(q)), mode="test")
-        self.compare_rows(preprocessed, _array(*preprocessed.query_rows(_features(q)[0])), expected_queries, "queries")
+        queries = _array(*preprocessed.query_rows(_features(q, categorical)[0]))
+        self.compare_rows(preprocessed, queries, expected_queries, "queries")
         type(self).fit_cases += 1
         return preprocessed, encoder, numerical, expected
 
@@ -311,6 +348,21 @@ class TabICLPreprocessingParityTest(unittest.TestCase):
                 x[:, 3] = np.nan  # Missing in every training row.
                 q[:, 5] = np.nan  # Missing in every query row.
                 self.run_case("missing", x, q, y, random_state=5)
+
+    def test_dataframe_column_types(self):
+        import pandas as pd
+
+        for seed in (0, 7):
+            with self.subTest(seed=seed):
+                x, q = frame(120, seed), frame(17, seed + 100)
+                # Categories training never saw, and missing ones.
+                q.loc[0, "word"] = "never"
+                q.loc[1, "size"] = 99
+                q.loc[2, "text"] = pd.NA
+                q.loc[3, "flag"] = pd.NA
+                y = (np.arange(len(x)) % 3) * 7 - 11
+                preprocessed, *_ = self.run_case("dataframe", x, q, y, random_state=seed)
+                self.assertEqual(preprocessed.categorical, [False, True, False, True, True, False, True, False])
 
     def test_skewed_heavy_tails(self):
         for dtype in (np.float32, np.float64):

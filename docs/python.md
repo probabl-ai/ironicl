@@ -239,17 +239,31 @@ attributes, such as `X_encoder_`, `ensemble_generator_`, and the regressor's
 
 ## Supported Inputs
 
-This initial implementation supports dense numeric inputs, 2–10 classes
-whose labels are all integers, all floats, all booleans, or all strings, and the
-default `none`/`power` transforms with Latin feature and cyclic class
-permutations. It removes constant features and rejects all-constant training
-data. A missing value (NaN) becomes its feature's training mean, as TabICL's
-`SimpleImputer` does; infinity is rejected. Unlike TabICL, a feature that is
-missing in every row of one `predict` call is still imputed, not dropped for that
-call, so a row's prediction does not depend on the rows predicted with it.
-Categorical inputs and sparse matrices are not supported.
-Numeric DataFrames must have unique string column names in the same order at
-prediction time. Preprocessing is fitted on training data only and does not
+This initial implementation supports dense numeric arrays, pandas DataFrames
+with numeric and categorical columns, 2–10 classes whose labels are all
+integers, all floats, all booleans, or all strings, and the default
+`none`/`power` transforms with Latin feature and cyclic class permutations. It
+removes constant features and rejects all-constant training data. A missing
+value (NaN) becomes its feature's training mean, as TabICL's `SimpleImputer`
+does; infinity is rejected. Unlike TabICL, a feature that is missing in every
+row of one `predict` call is still imputed, not dropped for that call, so a
+row's prediction does not depend on the rows predicted with it.
+
+In a DataFrame, as in TabICL, `object`, string, `category`, and pandas'
+nullable `boolean` columns are categorical, and number columns, including
+pandas' nullable `Int64` and `Float64`, are numeric. A categorical value becomes
+its category's index among the sorted training categories, or -1 when it is
+missing or training never saw it, and categorical columns move ahead of numeric
+ones; see [native-preprocessing.md](native-preprocessing.md#categorical-features).
+Where TabICL silently drops a column or fails, Ironicl raises an error that
+names the column: NumPy `bool` and datetime columns, timedelta and other
+dtypes, and missing values in pandas' nullable `string` dtype when fitting.
+Unlike TabICL, `None` in an `object` column is missing, like NaN; TabICL makes it
+a category of its own.
+
+Sparse matrices are not supported. DataFrames must have unique string column
+names in the same order at prediction time, and a model fit on categorical
+columns predicts only from DataFrames. Preprocessing is fitted on training data only and does not
 require `PYTHONHASHSEED` configuration. It preserves TabICL's power-transform
 fallback, including its batch-wide clipping when a transform raises a domain
 error.

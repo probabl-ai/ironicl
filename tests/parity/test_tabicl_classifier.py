@@ -14,7 +14,7 @@ import numpy as np
 from sklearn.datasets import load_breast_cancer, load_iris, load_wine
 from sklearn.exceptions import NotFittedError
 from sklearn.model_selection import train_test_split
-from test_tabicl_preprocessing import load_tabicl, skewed
+from test_tabicl_preprocessing import frame, load_tabicl, skewed
 
 from ironicl import TabICLClassifier
 
@@ -71,6 +71,17 @@ class TabICLClassifierParityTest(unittest.TestCase):
                 )
                 np.testing.assert_array_equal(ours.predict(x_test), theirs.predict(x_test))
                 np.testing.assert_array_equal(ours.classes_, theirs.classes_)
+
+    def test_dataframes_with_categorical_columns_match(self):
+        # TabICL 2.1.1 cannot predict after fitting on a column missing in every
+        # row, so this case leaves that column out.
+        x_train, x_test = (frame(rows, seed).drop(columns="empty") for rows, seed in ((200, 3), (60, 4)))
+        x_test.loc[0, "word"] = "never"  # A category training never saw.
+        y_train = np.where(x_train["skew"] > 1, "high", "low")
+        ours = TabICLClassifier(model_path=self.checkpoint).fit(x_train, y_train)
+        theirs = self.tabicl(model_path=self.checkpoint, device="cpu").fit(x_train, y_train)
+        np.testing.assert_allclose(ours.predict_proba(x_test), theirs.predict_proba(x_test), rtol=0, atol=1e-4)
+        np.testing.assert_array_equal(ours.predict(x_test), theirs.predict(x_test))
 
     def test_float32_input_matches_tabicl_on_its_upcast(self):
         x, y = load_breast_cancer(return_X_y=True)
