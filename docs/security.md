@@ -43,7 +43,7 @@ The serving process reads only the Ironicl artifact format.
 
 ## Preprocessing and Fitted Models
 
-Preprocessing runs in Rust on request data, and the server will load fitted
+Preprocessing runs in Rust on request data, and the server loads fitted
 preprocessing (`IRPREP`) from outside, so `src/preprocess/` forbids `unsafe`.
 `IRPREP` decodes as untrusted input; see
 [artifact-format.md](artifact-format.md#fitted-models). Python pickles hold the
@@ -53,7 +53,10 @@ estimator still runs Python's pickle: load pickles only from trusted sources.
 ## Data Handling
 
 Static artifacts encode information derived from the complete training set and
-targets. They are sensitive data even if raw rows are omitted.
+targets. They are sensitive data even if raw rows are omitted. `IRPREP` with its
+training section holds the preprocessed training rows and targets themselves;
+`export` and the context writer create their files readable only by their owner
+on Unix.
 
 - Apply the same access controls as the training data.
 - Do not log K/V payloads or target embeddings.
@@ -65,7 +68,12 @@ targets. They are sensitive data even if raw rows are omitted.
 ## Denial of Service
 
 - Enforce configured limits on rows, features, estimators, and microbatch size.
+  The server bounds each request's body, rows, and quantile levels, and refuses
+  a request that would wait longer than `--max-queue`
+  ([server.md](server.md#batching)).
 - Calculate memory before allocation.
 - Reject non-finite request data after the defined missing-value transform.
 - Bound concurrent executors and scratch allocations.
-- Apply request timeouts outside the kernel layer.
+- Apply request timeouts outside the kernel layer. The server sets no
+  connection or read timeouts, so a slow client can hold a connection open:
+  expose it only behind a reverse proxy that times out idle and slow clients.

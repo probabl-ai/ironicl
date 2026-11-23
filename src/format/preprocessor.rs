@@ -1,6 +1,7 @@
-//! Fitted `TabICL` preprocessing as `IRPREP` bytes: what pickling an estimator
-//! saves beside its context, and what the server will load. The bytes may come
-//! from outside, so decoding checks the digest, checks every length against the
+//! Fitted `TabICL` preprocessing as `IRPREP` bytes, optionally with the
+//! preprocessed training rows a context is built from: what pickling an
+//! estimator saves and what a model directory holds. The bytes may come from
+//! outside, so decoding checks the digest, checks every length against the
 //! bytes left before it allocates, and then checks the preprocessing's
 //! invariants.
 //!
@@ -13,17 +14,27 @@
 //! - classes (u64) and their labels: a kind (u8: 0 none, 1 int, 2 float,
 //!   3 bool, 4 text), then i64, f64, u8, or u32-length UTF-8 values;
 //! - for a regressor (no labels), the target's mean and scale (f64 each);
+//!   for a classifier, its softmax temperature (f32) and whether it averages
+//!   logits (u8);
+//! - feature names (u64: 0, or one per input feature), each a u32-length UTF-8
+//!   string;
 //! - per group, f64 per kept feature: mean, scale, minimum, maximum, lower and
 //!   upper bounds, and for a power group its lambdas, mean, and scale;
+//! - training rows (u64, 0 when absent), then per group the preprocessed rows
+//!   (f32 per row and kept feature), then each row's target (f32: a class
+//!   index, or the standardized value);
 //! - the SHA-256 of everything before it.
 
 use super::{
     ByteReader, CHECKSUM_BYTES, artifact_error, sha256, u64_to_usize, usize_to_u32, usize_to_u64, write_u32,
     write_u64,
 };
-use crate::Result;
-use crate::models::tabicl_v2::preprocess::{MAX_MEMBERS, NormMethod, Normalization, Preprocessor};
+use crate::models::tabicl_v2::{
+    fitted::Training,
+    preprocess::{MAX_MEMBERS, NormMethod, Normalization, Preprocessor},
+};
 use crate::preprocess::labels::Labels;
+use crate::{ClassifierAggregation, Result};
 
 pub const PREPROCESSOR_MAGIC: [u8; 8] = *b"IRPREP\0\0";
 pub const PREPROCESSOR_VERSION: u32 = 1;
@@ -35,9 +46,13 @@ fn write_count(bytes: &mut Vec<u8>, count: usize) -> Result<()> {
     Ok(())
 }
 
-/// `preprocessor` as `IRPREP` bytes, for the checkpoint whose SHA-256 is
-/// `checkpoint_sha256`.
-pub(crate) fn encode(preprocessor: &Preprocessor, checkpoint_sha256: &[u8; 32]) -> Result<Vec<u8>> {
+/// `preprocessor` and, when given, its `training` rows as `IRPREP` bytes, for
+/// the checkpoint whose SHA-256 is `checkpoint_sha256`.
+pub(crate) fn encode(
+    preprocessor: &Preprocessor,
+    training: Option<&Training>,
+    checkpoint_sha256: &[u8; 32],
+) -> Result<Vec<u8>> {
     let mut bytes = PREPROCESSOR_MAGIC.to_vec();
     write_u32(&mut bytes, PREPROCESSOR_VERSION);
     bytes.extend(checkpoint_sha256);
@@ -87,24 +102,52 @@ pub(crate) fn encode(preprocessor: &Preprocessor, checkpoint_sha256: &[u8; 32]) 
         }
         Some(Labels::Text(values)) => {
             bytes.push(4);
-            for value in values {
-                write_u32(&mut bytes, usize_to_u32(value.len(), "a label's length")?);
-                bytes.extend(value.as_bytes());
-            }
+            write_strings(&mut bytes, values)?;
         }
     }
     if let Some((mean, scale)) = preprocessor.target_scale {
         bytes.extend(mean.to_le_bytes());
         bytes.extend(scale.to_le_bytes());
     }
+    if let Some(aggregation) = preprocessor.aggregation {
+        bytes.extend(aggregation.softmax_temperature.to_le_bytes());
+        bytes.push(u8::from(aggregation.average_logits));
+    }
+    let names = preprocessor.feature_names.as_deref().unwrap_or_default();
+    write_count(&mut bytes, names.len())?;
+    write_strings(&mut bytes, names)?;
     for normalization in &preprocessor.normalizations {
         for value in normalization.statistics().into_iter().flatten() {
+            bytes.extend(value.to_le_bytes());
+        }
+    }
+    write_count(&mut bytes, training.map_or(0, |training| training.targets.len()))?;
+    if let Some(training) = training {
+        for value in training.group_rows.iter().flatten().chain(&training.targets) {
             bytes.extend(value.to_le_bytes());
         }
     }
     let digest = sha256(&bytes);
     bytes.extend(digest);
     Ok(bytes)
+}
+
+fn write_strings(bytes: &mut Vec<u8>, values: &[String]) -> Result<()> {
+    for value in values {
+        write_u32(bytes, usize_to_u32(value.len(), "a string's length")?);
+        bytes.extend(value.as_bytes());
+    }
+    Ok(())
+}
+
+fn read_strings(reader: &mut ByteReader<'_>, count: usize) -> Result<Vec<String>> {
+    (0..count)
+        .map(|_| {
+            let length = reader.read_u32()? as usize;
+            String::from_utf8(reader.read_bytes(length)?.to_vec())
+                .map_err(|_| artifact_error("IRPREP has a string that is not UTF-8"))
+        })
+        .collect()
 }
 
 fn read_flags(reader: &mut ByteReader<'_>, count: usize) -> Result<Vec<bool>> {
@@ -116,6 +159,47 @@ fn read_flags(reader: &mut ByteReader<'_>, count: usize) -> Result<Vec<bool>> {
             _ => Err(artifact_error("IRPREP has an invalid flag")),
         })
         .collect()
+}
+
+fn read_f32s(reader: &mut ByteReader<'_>, count: usize) -> Result<Vec<f32>> {
+    let values: Vec<f32> = reader
+        .read_chunks(count, 4)?
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four bytes")))
+        .collect();
+    if !values.iter().all(|value| value.is_finite()) {
+        return Err(artifact_error("IRPREP has a training value that is not finite"));
+    }
+    Ok(values)
+}
+
+/// The training rows: each group's `[rows, features]` matrix and each row's
+/// target, a class index below `classes` for a classifier.
+fn read_training(
+    reader: &mut ByteReader<'_>,
+    groups: usize,
+    features: usize,
+    classes: usize,
+) -> Result<Option<Training>> {
+    let rows = reader.read_count("training rows")?;
+    if rows == 0 {
+        return Ok(None);
+    }
+    let values = rows
+        .checked_mul(features)
+        .ok_or_else(|| artifact_error("IRPREP length overflows usize"))?;
+    let group_rows = (0..groups)
+        .map(|_| read_f32s(reader, values))
+        .collect::<Result<_>>()?;
+    let targets = read_f32s(reader, rows)?;
+    #[expect(clippy::cast_precision_loss, reason = "Class counts are below ten")]
+    if classes > 0
+        && !targets
+            .iter()
+            .all(|&target| target.fract() == 0.0 && (0.0..classes as f32).contains(&target))
+    {
+        return Err(artifact_error("IRPREP has a training target that is not a class"));
+    }
+    Ok(Some(Training { group_rows, targets }))
 }
 
 fn read_orders(reader: &mut ByteReader<'_>, members: usize, length: usize) -> Result<Vec<Vec<usize>>> {
@@ -138,8 +222,20 @@ fn read_orders(reader: &mut ByteReader<'_>, members: usize, length: usize) -> Re
     })
 }
 
-/// The checkpoint's SHA-256 and the preprocessor that `encode` wrote.
-pub(crate) fn decode(bytes: &[u8]) -> Result<([u8; 32], Preprocessor)> {
+/// The SHA-256 of the checkpoint that the `IRPREP` `bytes` were fitted with,
+/// from their header alone: [`decode`] checks the rest.
+pub(crate) fn checkpoint_sha256(bytes: &[u8]) -> Result<[u8; 32]> {
+    let mut reader = ByteReader::new(bytes);
+    if reader.read_array::<8>()? != PREPROCESSOR_MAGIC {
+        return Err(artifact_error("not fitted preprocessing (IRPREP)"));
+    }
+    reader.read_u32()?;
+    reader.read_array()
+}
+
+/// The checkpoint's SHA-256, the preprocessor, and the training rows, when
+/// they were written, that `encode` wrote.
+pub(crate) fn decode(bytes: &[u8]) -> Result<([u8; 32], Preprocessor, Option<Training>)> {
     let header = PREPROCESSOR_MAGIC.len() + 4 + 32;
     if bytes.len() < header + CHECKSUM_BYTES {
         return Err(artifact_error("IRPREP is truncated"));
@@ -186,16 +282,28 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<([u8; 32], Preprocessor)> {
     }
     let class_permutations = read_orders(&mut reader, members, classes)?;
     let labels = read_labels(&mut reader, classes)?;
-    let target_scale = if labels.is_none() {
+    let (target_scale, aggregation) = if labels.is_none() {
         let values = reader.read_f64s(2)?;
-        Some((values[0], values[1]))
+        (Some((values[0], values[1])), None)
     } else {
-        None
+        let aggregation = ClassifierAggregation {
+            softmax_temperature: f32::from_le_bytes(reader.read_array()?),
+            average_logits: read_flags(&mut reader, 1)?[0],
+        };
+        (None, Some(aggregation))
     };
+    let names = reader.read_count("feature names")?;
+    if names != 0 && names != features_in {
+        return Err(artifact_error("IRPREP has a name for some features only"));
+    }
+    let feature_names = (names != 0)
+        .then(|| read_strings(&mut reader, names))
+        .transpose()?;
     let normalizations = groups
         .iter()
         .map(|&method| read_normalization(&mut reader, method, features))
         .collect::<Result<_>>()?;
+    let training = read_training(&mut reader, groups.len(), features, classes)?;
     if !reader.is_empty() {
         return Err(artifact_error("IRPREP has trailing bytes"));
     }
@@ -207,9 +315,11 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<([u8; 32], Preprocessor)> {
         class_permutations,
         classes: labels,
         target_scale,
+        feature_names,
+        aggregation,
     };
     preprocessor.validate()?;
-    Ok((checkpoint_sha256, preprocessor))
+    Ok((checkpoint_sha256, preprocessor, training))
 }
 
 fn read_labels(reader: &mut ByteReader<'_>, classes: usize) -> Result<Option<Labels>> {
@@ -223,15 +333,7 @@ fn read_labels(reader: &mut ByteReader<'_>, classes: usize) -> Result<Option<Lab
         )),
         2 => Some(Labels::Float(reader.read_f64s(classes)?)),
         3 => Some(Labels::Bool(read_flags(reader, classes)?)),
-        4 => Some(Labels::Text(
-            (0..classes)
-                .map(|_| {
-                    let length = reader.read_u32()? as usize;
-                    String::from_utf8(reader.read_bytes(length)?.to_vec())
-                        .map_err(|_| artifact_error("IRPREP has a label that is not UTF-8"))
-                })
-                .collect::<Result<_>>()?,
-        )),
+        4 => Some(Labels::Text(read_strings(reader, classes)?)),
         _ => return Err(artifact_error("IRPREP has an invalid label kind")),
     };
     if labels.as_ref().map_or(0, Labels::len) != classes {
@@ -258,9 +360,9 @@ fn read_normalization(
 #[cfg(test)]
 mod tests {
     use super::{decode, encode};
-    use crate::{Features, Labels, NormMethod, PreprocessOptions, Preprocessor, Targets};
+    use crate::{Features, Labels, NormMethod, PreprocessOptions, Preprocessed, Targets};
 
-    fn fit(targets: &Targets) -> Preprocessor {
+    fn fit(targets: &Targets) -> Preprocessed {
         let options = PreprocessOptions {
             n_estimators: 4,
             random_state: 3,
@@ -268,27 +370,42 @@ mod tests {
             outlier_threshold: 4.0,
         };
         let x: Vec<f64> = (0..60).map(|i| f64::from((i * 37 % 23) - 11) / 3.0).collect();
-        Preprocessor::fit(&options, Features::F64(&x), 3, targets).unwrap()
+        Preprocessed::fit(&options, Features::F64(&x), 3, targets).unwrap()
     }
 
     #[test]
     fn corrupt_or_inconsistent_bytes_are_rejected() {
         let sha = [9; 32];
         let regressor = fit(&Targets::Values((0..20_u8).map(f32::from).collect()));
-        let classifier = fit(&Targets::Labels(Labels::Int((0..20).map(|i| i % 3).collect())));
-        for preprocessor in [regressor, classifier.clone()] {
-            let bytes = encode(&preprocessor, &sha).unwrap();
-            assert_eq!(decode(&bytes).unwrap(), (sha, preprocessor));
-            for index in [0, 9, 20, bytes.len() / 2, bytes.len() - 1] {
-                let mut corrupt = bytes.clone();
-                corrupt[index] ^= 1;
-                assert!(decode(&corrupt).is_err(), "byte {index}");
+        let mut classifier = fit(&Targets::Labels(Labels::Int((0..20).map(|i| i % 3).collect())));
+        classifier.preprocessor.feature_names = Some(["a", "b", "c"].map(String::from).to_vec());
+        for fitted in [regressor, classifier.clone()] {
+            let (preprocessor, training) = (&fitted.preprocessor, fitted.training.as_ref());
+            assert!(training.is_some());
+            for training in [training, None] {
+                let bytes = encode(preprocessor, training, &sha).unwrap();
+                assert_eq!(
+                    decode(&bytes).unwrap(),
+                    (sha, preprocessor.clone(), training.cloned())
+                );
+                for index in [0, 9, 20, bytes.len() / 2, bytes.len() - 1] {
+                    let mut corrupt = bytes.clone();
+                    corrupt[index] ^= 1;
+                    assert!(decode(&corrupt).is_err(), "byte {index}");
+                }
+                assert!(decode(&bytes[..bytes.len() - 1]).is_err());
             }
-            assert!(decode(&bytes[..bytes.len() - 1]).is_err());
         }
         // A classifier with a target scale, digest and all.
-        let mut inconsistent = classifier;
+        let mut inconsistent = classifier.preprocessor.clone();
         inconsistent.target_scale = Some((0.0, 1.0));
-        assert!(decode(&encode(&inconsistent, &sha).unwrap()).is_err());
+        assert!(decode(&encode(&inconsistent, None, &sha).unwrap()).is_err());
+        // Training targets that are not classes, or values that are not finite.
+        let mut training = classifier.training.clone().unwrap();
+        training.targets[0] = 3.0;
+        assert!(decode(&encode(&classifier.preprocessor, Some(&training), &sha).unwrap()).is_err());
+        let mut training = classifier.training.unwrap();
+        training.group_rows[1][0] = f32::NAN;
+        assert!(decode(&encode(&classifier.preprocessor, Some(&training), &sha).unwrap()).is_err());
     }
 }

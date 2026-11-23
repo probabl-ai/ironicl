@@ -2,27 +2,34 @@
 
 ## Command Shape
 
-Ironicl ships one binary with four commands. Model commands take named inputs, not positional file
-paths.
+Ironicl ships one binary. Each command takes its file or directory as the first argument.
 
 ```text
 ironicl help [COMMAND]
 ironicl platform
-ironicl inspect (--checkpoint FILE | --model FILE)
-ironicl import --checkpoint FILE --output FILE
+ironicl inspect PATH [--weights DIR]
+ironicl import CHECKPOINT [-o FILE]
+ironicl prepare DIR [--weights DIR] [--optimize safe|auto|fast]
+ironicl serve DIR [--weights DIR] [--optimize safe|auto|fast] [--bind ADDR]
+              [--max-request-rows N] [--max-body SIZE] [--max-batch-rows N] [--max-queue MS]
 ```
 
 Use `ironicl help COMMAND` or `ironicl COMMAND --help` for command-specific help.
 
-The CLI does not fit or predict yet. Use the [Python estimators](python.md) for that. A CLI that
-takes raw rows, as the estimators do, is planned; see the [roadmap](roadmap.md).
+The CLI does not fit yet. Fit with the [Python estimators](python.md) and write a model directory
+with `export`.
 
-## Source Flags
+## Model Directories and Weights
 
-- `--checkpoint FILE` selects a PyTorch ZIP checkpoint such as `.ckpt`, `.pt`, or `.pth`.
-- `--model FILE` selects a validated Ironicl model artifact (`IRMODEL`).
-- `inspect` requires exactly one source flag.
-- `--output FILE` names a newly written artifact. It is not a model source.
+A model directory holds one fitted model: its metadata (`ironicl.json`), its preprocessing with
+the training rows (`preprocessing.irprep`), and optionally its KV cache (`context.ircntxt`); see
+[python.md](python.md#exporting-for-the-server). It holds no weights. The weights stay in a shared
+folder as `<checkpoint SHA-256>.irmodel` files, so many models share one copy.
+
+`--weights DIR` names that folder. By default it is the folder that loading a checkpoint fills:
+`~/.cache/ironicl/models/v1`, or `$XDG_CACHE_HOME/ironicl/models/v1` when `XDG_CACHE_HOME` is set.
+`export` and `import` write there. On another machine, import the checkpoint once, or copy the
+folder and pass `--weights`.
 
 ## Platform
 
@@ -36,37 +43,59 @@ ironicl platform
 ## Inspect
 
 ```bash
-ironicl inspect --checkpoint tabicl-classifier-v2-20260212.ckpt
-ironicl inspect --model classifier.irmodel
+ironicl inspect my-model
+ironicl inspect tabicl-classifier-v2-20260212.ckpt
+ironicl inspect ~/.cache/ironicl/models/v1/<sha256>.irmodel
 ```
 
-Checkpoint inspection parses the checkpoint without executing pickle code and reports:
+`inspect` tells what `PATH` is:
 
-- the source SHA-256;
-- the recognized model profile, bound to the official source SHA-256;
-- tensor and parameter counts;
-- tensor payload bytes and dtypes;
-- selected TabICLv2 configuration values.
-
-Model inspection applies full structural and checksum validation before it reports.
+- a model directory: its task, features and their names, classes, the weights it needs and
+  whether they are in the weights folder, and the KV cache's level and size;
+- Ironicl weights (`IRMODEL`): full structural and checksum validation, then the source SHA-256,
+  profile, tensor and parameter counts, dtypes, and configuration;
+- a PyTorch ZIP checkpoint (`.ckpt`, `.pt`, `.pth`), parsed without executing pickle code: the
+  same, with the source SHA-256 bound to the recognized official model.
 
 ## Import
 
 ```bash
-ironicl import \
-  --checkpoint tabicl-classifier-v2-20260212.ckpt \
-  --output classifier.irmodel
+ironicl import tabicl-classifier-v2-20260212.ckpt
+ironicl import tabicl-classifier-v2-20260212.ckpt -o classifier.irmodel
 ```
 
 `import` validates the checkpoint, keeps its source identity, copies the tensors into a
 deterministic, 64-byte-aligned portable layout, writes atomically, and verifies the complete
-artifact before it returns. The model holds no preprocessing state and no dataset-specific
-caches; see [artifact-format.md](artifact-format.md).
+weights before it returns. Without `-o`, it writes into the shared weights folder, where `prepare`
+and `serve` look; an import that is already there is kept. The weights hold no preprocessing state
+and no dataset-specific caches; see [artifact-format.md](artifact-format.md).
 
-The Python estimators import checkpoints themselves, through a content-addressed cache, so a
-manual import is only needed to inspect or ship a model artifact.
+## Prepare
+
+```bash
+ironicl prepare my-model --optimize auto
+```
+
+`prepare` makes sure that `my-model/context.ircntxt` is the KV cache this model builds at the
+level: it reuses a saved cache that is exactly that one, and otherwise builds it from the training
+rows on this machine's device and replaces the file atomically. A saved cache that cannot be read
+is rebuilt too, with a warning. The level defaults to the saved cache's, else `safe`. Running it
+twice does nothing the second time. Use it on the serving machine,
+for example in a container build, so that `serve` starts at once. `IRONICL_MEMORY_LIMIT` and
+`IRONICL_DEVICE_MEMORY_LIMIT` limit the build as they do in Python.
+
+## Serve
+
+```bash
+ironicl serve my-model
+```
+
+`serve` prepares the model as `prepare` does, then serves it over HTTP; it needs the `server`
+feature. It predicts concurrent requests together, up to `--max-batch-rows` rows at once, and
+refuses a request that would wait longer than `--max-queue` milliseconds. See
+[server.md](server.md).
 
 ## Stability
 
-The command names and the source-flag convention are intended to stay stable. New commands and
-options arrive as named flags once their data contracts exist.
+The command names are intended to stay stable. The parser moves to `clap` next, which keeps these
+forms.

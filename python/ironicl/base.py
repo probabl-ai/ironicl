@@ -66,12 +66,13 @@ class TabICLBase(BaseEstimator):
             random_state=self.random_state,
             norm_methods=self._norm_methods(),
             outlier_threshold=float(self.outlier_threshold),
+            feature_names=None if names is None else list(names),
+            **self._aggregation(),
         )
         plan = _plan(self._task, *preprocessed.shape, optimize, *limits)
         _enforce(plan, policy, stacklevel=3)
         checkpoint = self._checkpoint()
         self.fitted_ = self._build(checkpoint, preprocessed, optimize, limits)
-        self._training = (x.copy(), y.copy())  # Copies: the caller may change X and y.
         self.memory_plan_ = plan
         self.checkpoint_path_ = checkpoint
         self.n_features_in_ = x.shape[1]
@@ -83,6 +84,10 @@ class TabICLBase(BaseEstimator):
     def _targets(self, y) -> dict:
         """The checked targets ``y`` as ``_core.preprocess`` takes them."""
         raise NotImplementedError
+
+    def _aggregation(self) -> dict:
+        """The classifier's prediction settings, which a saved model keeps."""
+        return {}
 
     def _build(self, checkpoint: Path, preprocessed, optimize, limits):
         """Build the context of ``preprocessed``, through ``cache_dir`` when set.
@@ -97,17 +102,10 @@ class TabICLBase(BaseEstimator):
         """Load the fitted model from its ``IRPREP`` and ``IRCNTXT`` bytes, or
         without the context, build it from the training data as ``_build`` does."""
         model = self._task_model(checkpoint)
-        x, y = getattr(self, "_training", (None, None))
-        training = {} if x is None else {"x": x, **self._targets(y)}
         with self._progress("Building context", "estimator") as progress:
             arguments = (optimize, self._resolve_threads(), *limits)
             return model.load_fitted(
-                preprocessor,
-                *arguments,
-                progress=progress,
-                cache_dir=_cache_dir(self.cache_dir),
-                context=context,
-                **training,
+                preprocessor, *arguments, progress=progress, cache_dir=_cache_dir(self.cache_dir), context=context
             )
 
     def _task_model(self, checkpoint: Path) -> Model:
@@ -157,6 +155,25 @@ class TabICLBase(BaseEstimator):
         finally:
             del self._save_options
 
+    def export(self, path: str | Path, kv_cache: bool = True) -> None:
+        """Export the fitted model to the directory ``path`` for ``ironicl serve``.
+
+        It holds the fitted preprocessing with its training rows
+        (``preprocessing.irprep``), the KV cache built at this fit's ``optimize``
+        level when ``kv_cache`` is set (``context.ircntxt``), and last the
+        metadata (``ironicl.json``), which marks the directory complete. The
+        weights stay in the shared weights folder, into which this imports the
+        checkpoint when it is not there. Each file replaces the old one whole and
+        is readable only by its owner on Unix.
+        """
+        check_is_fitted(self)
+        if not self.fitted_.preprocessed.has_training:
+            raise ValueError(
+                "export needs the training data, which this estimator was saved without; "
+                "save it with save_training_data=True"
+            )
+        self.fitted_.export(Path(path), Path(self.checkpoint_path_), kv_cache)
+
     @classmethod
     def load(cls, path: str | Path, device: str | None = None):
         """Load an estimator that ``save`` wrote. ``device`` accepts what the constructor does."""
@@ -176,10 +193,8 @@ class TabICLBase(BaseEstimator):
         weights, training, context = state.pop("_save_options", (False, True, True))
         state["_ironicl_version"] = _version()
         if "fitted_" in state:
-            state["fitted_"] = self.fitted_.preprocessor_bytes()
+            state["fitted_"] = self.fitted_.preprocessor_bytes(training=training)
             state["_context"] = self.fitted_.context_bytes() if context else None
-            if not training:
-                state.pop("_training", None)
             if weights:
                 state["_checkpoint_bytes"] = Path(self.checkpoint_path_).read_bytes()
         return state

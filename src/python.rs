@@ -132,15 +132,14 @@ impl Model {
         .map(FittedModel)
     }
 
-    /// Load a fitted model from `FittedModel.preprocessor_bytes` (`IRPREP`),
-    /// with `context`, the bytes of `FittedModel.context_bytes`, or the raw
-    /// training rows `x` and their `labels` or `values`, as `preprocess` takes
-    /// them; without a context, it is built from the training rows, as `build`
+    /// Load a fitted model from `FittedModel.preprocessor_bytes` (`IRPREP`) and
+    /// `context`, the bytes of `FittedModel.context_bytes`; without a context,
+    /// it is built from the training rows in the `IRPREP` bytes, as `build`
     /// builds it. The other arguments are as for `build`.
     #[expect(clippy::too_many_arguments, reason = "mirrors the Python call's parameters")]
     #[pyo3(signature = (
         preprocessor, optimize, threads, memory_limit=None, device_memory_limit=None, progress=None,
-        cache_dir=None, *, context=None, x=None, labels=None, values=None,
+        cache_dir=None, *, context=None,
     ))]
     fn load_fitted(
         &self,
@@ -153,24 +152,14 @@ impl Model {
         progress: Option<Py<PyAny>>,
         cache_dir: Option<PathBuf>,
         context: Option<&[u8]>,
-        x: Option<&Bound<'_, PyAny>>,
-        labels: Option<(String, Bound<'_, PyAny>)>,
-        values: Option<PyBuffer<f32>>,
     ) -> PyResult<FittedModel> {
         let optimize = optimize.parse::<Optimize>().map_err(py_error)?;
         let limits = MemoryLimits::resolve(memory_limit.as_deref(), device_memory_limit.as_deref())
             .map_err(py_error)?;
-        let training = match x {
-            Some(x) => Some((Matrix::read(py, x)?, read_targets(py, labels, values)?)),
-            None => None,
-        };
         run(py, progress, || {
             self.0.load_fitted(
                 preprocessor,
                 context,
-                training
-                    .as_ref()
-                    .map(|((x, columns), targets)| (x.features(), *columns, targets)),
                 optimize,
                 threads,
                 limits,
@@ -389,7 +378,10 @@ fn f32_bytes<'py>(py: Python<'py>, values: &[f32]) -> Bound<'py, PyBytes> {
 /// regressor with float32 `values`. The result's `shape` plans the memory to
 /// build its context with `Model.build`.
 #[pyfunction]
-#[pyo3(signature = (x, *, labels=None, values=None, n_estimators, random_state, norm_methods, outlier_threshold))]
+#[pyo3(signature = (
+    x, *, labels=None, values=None, n_estimators, random_state, norm_methods, outlier_threshold,
+    feature_names=None, softmax_temperature=0.9, average_logits=true,
+))]
 #[expect(clippy::too_many_arguments, reason = "mirrors the Python call's parameters")]
 fn preprocess(
     py: Python<'_>,
@@ -400,7 +392,15 @@ fn preprocess(
     random_state: i128,
     norm_methods: Vec<String>,
     outlier_threshold: f64,
+    feature_names: Option<Vec<String>>,
+    softmax_temperature: f32,
+    average_logits: bool,
 ) -> PyResult<Preprocessed> {
+    if !(softmax_temperature.is_finite() && softmax_temperature > 0.0) {
+        return Err(PyValueError::new_err(
+            "softmax_temperature must be positive and finite",
+        ));
+    }
     let (x, columns) = Matrix::read(py, x)?;
     let targets = read_targets(py, labels, values)?;
     let options = PreprocessOptions {
@@ -413,9 +413,19 @@ fn preprocess(
             .map_err(py_error)?,
         outlier_threshold,
     };
-    py.detach(|| crate::Preprocessed::fit(&options, x.features(), columns, &targets))
-        .map(|preprocessed| Preprocessed(Arc::new(preprocessed)))
-        .map_err(py_error)
+    let mut preprocessed = py
+        .detach(|| crate::Preprocessed::fit(&options, x.features(), columns, &targets))
+        .map_err(py_error)?;
+    // Saved for serving; Python passes its own settings to every prediction.
+    let preprocessor = &mut preprocessed.preprocessor;
+    preprocessor.feature_names = feature_names;
+    if let Some(aggregation) = &mut preprocessor.aggregation {
+        *aggregation = ClassifierAggregation {
+            softmax_temperature,
+            average_logits,
+        };
+    }
+    Ok(Preprocessed(Arc::new(preprocessed)))
 }
 
 /// Fitted preprocessing and its training rows, before or within a `FittedModel`.
@@ -586,10 +596,23 @@ impl FittedModel {
         self.0.batch_rows()
     }
 
-    /// The fitted preprocessing as `IRPREP` bytes, for `Model.load_fitted`.
-    fn preprocessor_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = self.0.preprocessor_bytes().map_err(py_error)?;
+    /// The fitted preprocessing as `IRPREP` bytes, for `Model.load_fitted`, with
+    /// the training rows when `training` is set and they were kept.
+    #[pyo3(signature = (training=true))]
+    fn preprocessor_bytes<'py>(&self, py: Python<'py>, training: bool) -> PyResult<Bound<'py, PyBytes>> {
+        let bytes = self.0.preprocessor_bytes(training).map_err(py_error)?;
         Ok(PyBytes::new(py, &bytes))
+    }
+
+    /// Write the model directory `path` for `ironicl serve`, with the KV cache
+    /// when `kv_cache` is set, and import `checkpoint`, the model's, into the
+    /// shared weights folder when it is not there.
+    fn export(&self, py: Python<'_>, path: PathBuf, checkpoint: PathBuf, kv_cache: bool) -> PyResult<()> {
+        py.detach(|| {
+            crate::prepare_checkpoint(&checkpoint, &crate::CheckpointCacheOptions::default())?;
+            crate::models::tabicl_v2::directory::write(&path, &self.0, kv_cache)
+        })
+        .map_err(py_error)
     }
 
     /// The training context as `IRCNTXT` bytes, for `Model.load_fitted`.

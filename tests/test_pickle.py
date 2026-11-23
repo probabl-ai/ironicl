@@ -3,6 +3,7 @@ default cache, which ``allow_auto_download`` fills; each estimator is skipped
 without its own."""
 
 import copy
+import json
 import os
 import pickle
 import shutil
@@ -12,6 +13,7 @@ from pathlib import Path
 
 import numpy as np
 
+from ironicl import _core
 from ironicl import IroniclMemoryError, IroniclMemoryWarning, TabICLClassifier, TabICLRegressor
 
 CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "ironicl" / "checkpoints"
@@ -121,6 +123,39 @@ class PickleTest(unittest.TestCase):
         model = pickle.loads(pickle.dumps(TabICLClassifier(n_estimators=4)))
         self.assertEqual(model.n_estimators, 4)
         self.assertFalse(hasattr(model, "fitted_"))
+
+    def test_export_writes_a_model_directory(self):
+        for estimator in (TabICLClassifier, TabICLRegressor):
+            with self.subTest(estimator=estimator.__name__):
+                model = fitted(estimator)
+                path = self.directory / estimator.__name__
+                model.export(path)
+                files = ["context.ircntxt", "ironicl.json", "preprocessing.irprep"]
+                self.assertEqual(sorted(file.name for file in path.iterdir()), files)
+                metadata = json.loads((path / "ironicl.json").read_text())
+                self.assertEqual(
+                    (metadata["format"], metadata["version"], metadata["task"], metadata["n_features"]),
+                    ("ironicl-model", 1, model._task, model.n_features_in_),
+                )
+                if os.name == "posix":  # The preprocessing and the cache hold the training data.
+                    for name in files:
+                        self.assertEqual((path / name).stat().st_mode & 0o777, 0o600, name)
+                # Rust loads it, with the cache or, without it, from the training rows.
+                rust = _core.Model(Path(model.checkpoint_path_))
+                preprocessor = (path / "preprocessing.irprep").read_bytes()
+                self.assertEqual(preprocessor, model.fitted_.preprocessor_bytes())
+                for context in ((path / "context.ircntxt").read_bytes(), None):
+                    loaded = rust.load_fitted(preprocessor, "safe", None, context=context)
+                    self.assertEqual(loaded.preprocessor_bytes(), preprocessor)
+                # Again, over the first export, without the cache.
+                model.export(path, kv_cache=False)
+                self.assertEqual(sorted(file.name for file in path.iterdir()), files[1:])
+
+    def test_export_needs_the_training_data(self):
+        saved = self.directory / "no-training.pkl"
+        fitted(TabICLClassifier).save(saved, save_training_data=False)
+        with self.assertRaisesRegex(ValueError, "save_training_data=True"):
+            TabICLClassifier.load(saved).export(self.directory / "no-training")
 
 
 if __name__ == "__main__":

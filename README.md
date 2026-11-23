@@ -5,98 +5,110 @@
 [![License](https://img.shields.io/badge/license-BSD--3--Clause-blue.svg)](LICENSE)
 
 Ironicl is an inference engine for [TabICLv2](https://github.com/soda-inria/tabicl),
-written in Rust. It runs without PyTorch on the compute built into the host. It
-is built for a training table that does not change: Ironicl computes the
-training context once, stores it, and then answers new test rows against it.
+written in Rust. It runs without PyTorch on the compute built into the host: the
+CPU, Apple's Metal GPU, or an NVIDIA GPU. It computes a training table's context
+once and then answers new rows against it.
+
+Use it in two ways:
+
+- **In Python**, as a drop-in for TabICL's `TabICLClassifier` and `TabICLRegressor`.
+- **As a server**, which serves a fitted model over HTTP without Python.
 
 > [!WARNING]
 > Ironicl is experimental. Formats, commands, and APIs can change without notice.
-> The optimized paths target AMD Zen 5 (Ryzen 7 9800X3D) and Apple Silicon, where
-> dense layers and attention use Apple Accelerate. Other CPUs, including Intel
-> Macs, use a slower portable path.
+> The optimized paths target AMD Zen 5 (Ryzen 7 9800X3D) and Apple Silicon. Other
+> CPUs, including Intel Macs, use a slower portable path.
+
+## Quick start
+
+### 1. Use it from Python
+
+Install the package with Python 3.12 or newer, using one of these. It builds
+from source: with pip or uv, install Rust first ([rustup](https://rustup.rs));
+pixi gets it from conda-forge.
+
+```bash
+# pip
+pip install git+https://github.com/probabl-ai/ironicl.git
+
+# uv
+uv add "ironicl @ git+https://github.com/probabl-ai/ironicl.git"
+
+# pixi
+pixi add "python>=3.12" rust
+pixi add --pypi "ironicl @ git+https://github.com/probabl-ai/ironicl.git"
+```
+
+Then change only the import:
+
+```python
+from sklearn.datasets import load_iris
+from ironicl import TabICLClassifier  # was: from tabicl import TabICLClassifier
+
+X, y = load_iris(return_X_y=True)
+clf = TabICLClassifier().fit(X, y)
+clf.predict_proba(X[:3])
+```
+
+The first fit downloads the TabICLv2 checkpoint (110 MB). `TabICLRegressor`
+works the same way, with TabICL's `output_type` and `alphas`. See
+[Python package](docs/python.md) for options and supported inputs.
+
+### 2. Export the fitted model
+
+```python
+clf.export("my-model")
+```
+
+```text
+my-model/
+├── ironicl.json           what the model is: task, features, classes
+├── preprocessing.irprep   the fitted preprocessing and training data
+└── context.ircntxt        the KV cache, ready to serve
+```
+
+The weights are not copied: every model directory uses the one copy in
+`~/.cache/ironicl`.
+
+### 3. Serve it
+
+Install the `ironicl` command with the server, then serve the directory:
+
+```bash
+cargo install --locked --git https://github.com/probabl-ai/ironicl.git \
+    --features server,metal   # drop metal off Apple Silicon
+ironicl serve my-model
+```
+
+```bash
+curl -s localhost:8080/v1/predict -d '{"data": [[5.1, 3.5, 1.4, 0.2]]}'
+```
+
+```json
+{"labels": [0], "classes": [0, 1, 2], "probabilities": [[0.9999957, 0.0000031, 0.0000012]]}
+```
+
+To serve on another machine, copy `my-model/` there and run `ironicl import` on
+the checkpoint once; the server builds the KV cache for that machine on first
+start. NVIDIA GPUs need a CUDA build ([CUDA build targets](docs/source-layout.md#cuda-build-targets)).
+See [Server](docs/server.md) for the API, sending a pandas DataFrame, batching, and measured
+throughput.
 
 ## Status
 
 | Works now | Not yet |
 |---|---|
-| Safe checkpoint import in pure Rust (no pickle execution) | Overlapping CPU and GPU work |
-| FP32 classifier and regressor inference on any CPU | More than 10 classes |
-| Static training context with AVX-512 kernels on Zen 5 | Categorical features and missing values |
-| Accelerate kernels and Metal prediction and context building on Apple Silicon | A prediction server |
-| Python `TabICLClassifier` and `TabICLRegressor`, drop-ins for TabICL's | Published packages on crates.io or PyPI |
-| TabICL's preprocessing in pure Rust, at parity with TabICL | |
-
-## Quickstart
-
-You need Rust (via [rustup](https://rustup.rs)) and Python 3.12 or newer.
-
-1. Build Ironicl:
-
-   ```bash
-   git clone https://github.com/probabl-ai/ironicl.git
-   cd ironicl
-   cargo build --release
-   ```
-
-2. Download the released TabICLv2 classifier checkpoint (110 MB):
-
-   ```bash
-   curl -LO https://huggingface.co/jingang/TabICL/resolve/main/tabicl-classifier-v2-20260212.ckpt
-   ```
-
-3. Convert the checkpoint into an Ironicl model:
-
-   ```bash
-   ./target/release/ironicl import \
-     --checkpoint tabicl-classifier-v2-20260212.ckpt \
-     --output classifier.irmodel
-   ```
-
-4. Install the Python package:
-
-   ```bash
-   python3 -m venv .venv
-   .venv/bin/python -m pip install .
-   ```
-
-5. Fit and predict on a small dataset:
-
-   ```python
-   from sklearn.datasets import load_iris
-   from ironicl import TabICLClassifier
-
-   X, y = load_iris(return_X_y=True)
-   clf = TabICLClassifier(model_path="tabicl-classifier-v2-20260212.ckpt").fit(X[::2], y[::2])
-   print(clf.predict_proba(X[1::2][:5]))
-   ```
-
-   Ironicl prints one row of class probabilities for each test row.
-
-See the [command-line reference](docs/cli.md) for `platform`, `inspect`,
-and `import`.
-
-## Python Package
-
-The `ironicl` Python package replaces TabICL's classifier and regressor without
-PyTorch. Change only the import:
-
-```python
-from ironicl import TabICLClassifier, TabICLRegressor  # was: from tabicl import ...
-
-clf = TabICLClassifier(n_estimators=8, random_state=42).fit(X_train, y_train)
-proba = clf.predict_proba(X_test)
-
-reg = TabICLRegressor().fit(X_train, y_train)
-mean, q = reg.predict(X_test), reg.predict(X_test, output_type="quantiles", alphas=[0.05, 0.95])
-```
-
-Building the package needs Rust. `fit` builds the training context in Rust,
-and prediction runs only the query rows against it. See
-[Python package](docs/python.md) for supported inputs.
+| Classifier and regressor, at parity with TabICL | Categorical features and missing values |
+| TabICL's preprocessing, in Rust | More than 10 classes |
+| CPU (AVX-512 on Zen 5, Accelerate on Apple Silicon), Metal, CUDA | Packages on PyPI or crates.io |
+| Python drop-ins for TabICL's estimators | |
+| A prediction server that batches requests, without Python | |
+| Checkpoint import without executing pickle code | |
 
 ## Documentation
 
 - [Documentation index](docs/README.md): design, formats, and validation.
+- [Command line](docs/cli.md): `inspect`, `import`, `prepare`, and `serve`, model directories, and weights.
 - [Benchmarking](docs/benchmarking.md): how Ironicl measures latency.
 - [Contributing](CONTRIBUTING.md): development setup and checks.
 

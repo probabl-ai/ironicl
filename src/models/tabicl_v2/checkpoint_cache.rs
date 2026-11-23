@@ -80,6 +80,19 @@ pub fn load_checkpoint_model(path: &Path) -> Result<ModelArtifact> {
     }
 }
 
+/// The folder of imported weights, `<checkpoint SHA-256>.irmodel` files, that
+/// loading a checkpoint fills: `models/v<version>` in Ironicl's cache, under
+/// `XDG_CACHE_HOME` or `~/.cache`.
+///
+/// # Errors
+///
+/// When neither `XDG_CACHE_HOME` nor `HOME` is set.
+pub fn default_weights_dir() -> Result<PathBuf> {
+    Ok(default_cache_dir()?
+        .join("models")
+        .join(format!("v{}", crate::format::model::MODEL_ARTIFACT_VERSION)))
+}
+
 fn default_cache_dir() -> Result<PathBuf> {
     if let Some(path) = env::var_os("XDG_CACHE_HOME").filter(|path| !path.is_empty()) {
         return Ok(PathBuf::from(path).join("ironicl"));

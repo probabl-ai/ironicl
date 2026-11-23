@@ -23,7 +23,7 @@ Entries marked *planned* do not exist yet.
 
 ```text
 src/
-├── lib.rs, main.rs, cli.rs        crate root and the `ironicl` CLI
+├── lib.rs, main.rs, cli.rs        crate root and the `ironicl` CLI, `serve` included
 ├── config.rs, error.rs            TaskKind and StorageDType; Error
 ├── memory.rs                      memory planning
 ├── progress.rs, profile.rs        progress and cancellation; `profile` timers
@@ -56,7 +56,8 @@ src/
 │       ├── quantiles.rs           regression outputs
 │       ├── request.rs             QueryRequest and Request: rows for a prediction
 │       ├── preprocess.rs          TabICL's preprocessing pipeline
-│       └── fitted.rs              the fitted model
+│       ├── fitted.rs              the fitted model
+│       └── directory.rs           model directories: export, prepare, inspect
 ├── format/
 │   ├── mod.rs                     container primitives
 │   ├── model.rs                   model artifacts (IRMODEL)
@@ -64,8 +65,9 @@ src/
 │   └── preprocessor.rs            fitted preprocessing (IRPREP)
 ├── preprocess/                    what must reproduce Python exactly; no `unsafe`:
 │                                  python_random, scale, yeo_johnson, labels
-├── server/                        planned: `server` feature, off by default
-└── bin/ironicl-server.rs          planned: [[bin]] with required-features = ["server"]
+└── server/                        `ironicl serve` (`server` feature, off by default):
+                                   mod.rs startup, api.rs requests and responses,
+                                   worker.rs batching
 ```
 
 ## Steps
@@ -79,7 +81,7 @@ Each step is one pull request.
 | C | Split the CUDA kernels: their device code moves into `kernels/cuda/ops/`, with TabICLv2's fused kernels in `ops/tabicl_v2.rs`. The `#[kernel]` entry points stay in `kernels.rs`, because cuda-oxide generates launchers only for kernels written inline in the `#[cuda_module]` block; it compiles every function reachable from a kernel, wherever it lives. The PTX is unchanged apart from symbol names. | Done |
 | C2 | Move the generic launchers (dense products, layer norm, ICL attention, FP8 encoding, copies) into `kernels/cuda`, with the types they take: `Precision`, the activation forms, the dense and norm weight layouts, and the kernel constants. The launchers of TabICLv2's fused kernels stay with the model. | Planned |
 | D | Rust preprocessing: `preprocess/` and `models/tabicl_v2/preprocess.rs`, fit and transform, at parity with TabICL, and `models/tabicl_v2/fitted.rs`, the fitted model. | Done |
-| E | Prediction server behind the `server` feature: `/health`, `/v1/models`, and `predict` and `predict_proba` per model, in JSON, for models loaded read-only at startup. Needs D, so it runs without Python. | Planned |
+| E | Prediction server behind the `server` feature: `ironicl serve DIR` for one model directory, `POST /v1/predict` and `GET /v1/health` in JSON, with batching; see [server.md](server.md). Needs D, so it runs without Python. | Done |
 
 ## CUDA build targets
 

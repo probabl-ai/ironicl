@@ -3,7 +3,8 @@ use std::{fmt, str::FromStr};
 use crate::error::{Error, Result};
 
 /// The released `TabICLv2` task variants supported by the design.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum TaskKind {
     Classifier,
     Regressor,

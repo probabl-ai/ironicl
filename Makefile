@@ -3,12 +3,12 @@ PYTHON ?= python3
 .PHONY: test-rust lint-rust audit lint-python test-python test-parity test-cuda lint-cuda develop-cuda
 
 test-rust:
-	cargo test --locked
+	cargo test --locked --features server
 
 lint-rust:
 	cargo fmt --all -- --check
 	cargo clippy --locked --all-targets -- -D warnings
-	cargo clippy --locked --all-targets --features python,metal -- -D warnings
+	cargo clippy --locked --all-targets --features python,metal,server -- -D warnings
 
 # RUSTSEC-2024-0436: paste is unmaintained; it comes through candle-core.
 audit:
@@ -35,7 +35,7 @@ test-cuda:
 		&& IRONICL_CUDA_MODULE=sm_80 cargo test --release --locked --features cuda --test 'cuda_*'
 
 lint-cuda:
-	$(CUDA_ENV) && cargo clippy --release --locked --all-targets --features cuda,python -- -D warnings
+	$(CUDA_ENV) && cargo clippy --release --locked --all-targets --features cuda,python,server -- -D warnings
 
 develop-cuda:
 	$(CUDA_ENV) && maturin develop --release --uv --features python,cuda

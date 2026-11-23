@@ -12,8 +12,9 @@ records what each has verified.
 | [model.md](model.md) | TabICLv2 architecture and exact row-streaming boundary |
 | [architecture.md](architecture.md) | Engine components and request lifecycle |
 | [source-layout.md](source-layout.md) | How `src/` is organized, planned moves, and CUDA build targets |
-| [cli.md](cli.md) | The `ironicl` commands and model-source conventions |
+| [cli.md](cli.md) | The `ironicl` commands, model directories, and the shared weights folder |
 | [python.md](python.md) | Python estimators and their interface |
+| [server.md](server.md) | `ironicl serve`: the prediction server and its API |
 | [native-preprocessing.md](native-preprocessing.md) | Rust preprocessing and its parity with TabICL |
 | [artifact-format.md](artifact-format.md) | Model, preprocessing, and static-context formats, and how contexts are built |
 | [precision.md](precision.md) | FP32, BF16, and INT8 numerical policy |

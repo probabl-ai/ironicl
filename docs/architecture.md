@@ -108,8 +108,8 @@ raw X_test -> fitted preprocessing -> transformed rows per estimator
            decoder -> class-order reversal and estimator aggregation -> probabilities or outputs
 ```
 
-The Python estimators drive both lifecycles today. A server that loads the same three files and
-predicts from raw rows is planned ([roadmap.md](roadmap.md)).
+The Python estimators drive both lifecycles, and `ironicl serve` drives prediction from a model
+directory, the same files, on raw rows ([server.md](server.md)).
 
 ## Parallelism
 

@@ -19,7 +19,7 @@ use crate::preprocess::{
     scale::{clamp_outlier, clip_standardized, outlier_bounds, standard_clip, standard_scaler},
     yeo_johnson::{fit_power, yeo_johnson},
 };
-use crate::{Error, Result, TaskKind};
+use crate::{ClassifierAggregation, Error, Result, TaskKind};
 
 /// The most ensemble members fitting may request.
 pub const MAX_MEMBERS: usize = 4096;
@@ -448,6 +448,10 @@ pub struct Preprocessor {
     pub(crate) classes: Option<Labels>,
     /// The regressor's target mean and scale, as `StandardScaler` fits them.
     pub(crate) target_scale: Option<(f64, f64)>,
+    /// The training data's feature names, when it had them.
+    pub(crate) feature_names: Option<Vec<String>>,
+    /// The classifier's `softmax_temperature` and `average_logits`.
+    pub(crate) aggregation: Option<ClassifierAggregation>,
 }
 
 /// Check a C-ordered matrix of finite values and return its rows.
@@ -547,8 +551,10 @@ impl Preprocessor {
             member_groups,
             feature_permutations,
             class_permutations,
+            aggregation: classes.as_ref().map(|_| ClassifierAggregation::default()),
             classes,
             target_scale,
+            feature_names: None,
         })
     }
 
@@ -714,10 +720,18 @@ impl Preprocessor {
         {
             return fail("the classes are invalid");
         }
-        match (&self.classes, self.target_scale) {
-            (Some(_), None) => {}
-            (None, Some((mean, scale))) if mean.is_finite() && scale.is_finite() && scale > 0.0 => {}
-            _ => return fail("the target scale does not match the task"),
+        match (&self.classes, self.target_scale, self.aggregation) {
+            (Some(_), None, Some(aggregation))
+                if aggregation.softmax_temperature.is_finite() && aggregation.softmax_temperature > 0.0 => {}
+            (None, Some((mean, scale)), None) if mean.is_finite() && scale.is_finite() && scale > 0.0 => {}
+            _ => return fail("the target scale or aggregation does not match the task"),
+        }
+        if self
+            .feature_names
+            .as_ref()
+            .is_some_and(|names| names.len() != self.feature_mask.len())
+        {
+            return fail("the feature names do not match the features");
         }
         if !self.normalizations.iter().all(|normalization| {
             normalization
@@ -858,8 +872,8 @@ mod tests {
             }
             let sha = [7; 32];
             assert_eq!(
-                decode(&encode(&preprocessor, &sha).unwrap()).unwrap(),
-                (sha, preprocessor),
+                decode(&encode(&preprocessor, None, &sha).unwrap()).unwrap(),
+                (sha, preprocessor, None),
                 "case {index}"
             );
         }

@@ -68,6 +68,16 @@ pub enum Optimize {
     Fast,
 }
 
+impl std::fmt::Display for Optimize {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Safe => "safe",
+            Self::Auto => "auto",
+            Self::Fast => "fast",
+        })
+    }
+}
+
 impl std::str::FromStr for Optimize {
     type Err = Error;
 
@@ -223,7 +233,7 @@ impl Executor {
         limits: MemoryLimits,
     ) -> Result<StaticExecutor> {
         let context = StaticContextArtifact::read_mapped_prefault(path)?;
-        StaticExecutor::with_executor(self.clone(), context, optimize, threads, limits)
+        self.load_context_artifact(context, optimize, threads, limits)
     }
 
     /// Load a context from the bytes [`StaticExecutor::encode_context`] wrote,
@@ -241,6 +251,22 @@ impl Executor {
         limits: MemoryLimits,
     ) -> Result<StaticExecutor> {
         let context = StaticContextArtifact::from_bytes(bytes)?;
+        self.load_context_artifact(context, optimize, threads, limits)
+    }
+
+    /// Load a decoded context, as [`Self::load_context`] does.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context does not match this model's serving
+    /// contract.
+    pub fn load_context_artifact(
+        &self,
+        context: StaticContextArtifact,
+        optimize: Optimize,
+        threads: Option<usize>,
+        limits: MemoryLimits,
+    ) -> Result<StaticExecutor> {
         StaticExecutor::with_executor(self.clone(), context, optimize, threads, limits)
     }
 
@@ -627,7 +653,7 @@ impl Executor {
     /// Validate a context's inputs and describe it: model and content hashes,
     /// shape, class count, and permutations. The content hash is the context's
     /// cache identity: it covers everything the stored tensors depend on.
-    fn context_metadata(
+    pub(crate) fn context_metadata(
         &self,
         (b, n, h): (usize, usize, usize),
         x: &[f32],
@@ -657,15 +683,10 @@ impl Executor {
         }
         // Bump the prefix when built contexts change within an Ironicl version.
         let mut context_sha256 = Sha256::new_with_prefix(b"ironicl-context-v2\0");
-        let optimize = match optimize {
-            Optimize::Safe => "safe",
-            Optimize::Auto => "auto",
-            Optimize::Fast => "fast",
-        };
         for part in [
             env!("CARGO_PKG_VERSION"),
             &self.model.summary().source_sha256,
-            optimize,
+            &optimize.to_string(),
         ] {
             context_sha256.update(part.as_bytes());
             context_sha256.update([0]);
@@ -686,6 +707,7 @@ impl Executor {
             class_count,
             class_permutations,
             feature_permutations,
+            optimize,
         })
     }
 
@@ -3731,7 +3753,9 @@ mod tests {
     use crate::kernels::reference::{
         OnlineAttentionScratch, affine_f32, tiled_online_scaled_dot_product_attention_f32,
     };
-    use crate::{StaticContextArtifact, StaticContextMetadata, format::static_context::StaticContextTensor};
+    use crate::{
+        Optimize, StaticContextArtifact, StaticContextMetadata, format::static_context::StaticContextTensor,
+    };
 
     fn context(tensors: Vec<StaticContextTensor>) -> StaticContextArtifact {
         StaticContextArtifact::new(
@@ -3744,6 +3768,7 @@ mod tests {
                 class_count: 2,
                 class_permutations: vec![0, 1],
                 feature_permutations: vec![0],
+                optimize: Optimize::Safe,
             },
             tensors,
         )

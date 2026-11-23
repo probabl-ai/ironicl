@@ -7,7 +7,8 @@ use crate::{Error, Result};
 
 /// One label per row, all of one type. Text sorts by Unicode code point, as
 /// `NumPy` sorts strings.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
 pub enum Labels {
     Int(Vec<i64>),
     Float(Vec<f64>),
@@ -51,6 +52,20 @@ impl Labels {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// The labels at `indices`, each below [`Self::len`].
+    #[cfg(feature = "server")]
+    pub(crate) fn select(&self, indices: &[usize]) -> Self {
+        fn pick<T: Clone>(values: &[T], indices: &[usize]) -> Vec<T> {
+            indices.iter().map(|&index| values[index].clone()).collect()
+        }
+        match self {
+            Self::Int(values) => Self::Int(pick(values, indices)),
+            Self::Float(values) => Self::Float(pick(values, indices)),
+            Self::Bool(values) => Self::Bool(pick(values, indices)),
+            Self::Text(values) => Self::Text(pick(values, indices)),
+        }
     }
 
     /// The sorted distinct labels.

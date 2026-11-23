@@ -12,6 +12,7 @@ use memmap2::Advice;
 use memmap2::{Mmap, MmapMut, MmapOptions};
 
 use crate::{
+    Optimize,
     config::StorageDType,
     error::{Error, Result},
     format::{
@@ -73,6 +74,8 @@ pub struct StaticContextMetadata {
     pub class_permutations: Vec<u64>,
     /// Estimator-major feature orders with shape `[B, H]`.
     pub feature_permutations: Vec<u64>,
+    /// The level the context was built at.
+    pub optimize: Optimize,
 }
 
 /// An owned named FP32 tensor in logical row-major order.
@@ -558,8 +561,14 @@ impl StaticContextArtifact {
         let feature_permutation_count = to_usize(u64::from(header.read_u32()?), "feature permutation count")?;
         let directory_length = to_usize(header.read_u64()?, "directory length")?;
         let payload_length = to_usize(header.read_u64()?, "payload length")?;
-        if header.read_u32()? != 0 || !header.is_empty() {
-            return Err(artifact_error("static context header reserved bytes are invalid"));
+        let optimize = match header.read_u32()? {
+            1 => Optimize::Safe,
+            2 => Optimize::Auto,
+            3 => Optimize::Fast,
+            _ => return Err(artifact_error("static context optimize level is invalid")),
+        };
+        if !header.is_empty() {
+            return Err(artifact_error("static context header has trailing bytes"));
         }
         if tensor_count == 0
             || tensor_count > MAX_TENSOR_COUNT
@@ -618,6 +627,7 @@ impl StaticContextArtifact {
             class_count,
             class_permutations,
             feature_permutations,
+            optimize,
         };
         validate_metadata(&metadata)?;
 
@@ -918,7 +928,14 @@ impl StaticContextArtifact {
             &mut head,
             u64::try_from(payload_length).map_err(|_| artifact_error("payload length exceeds u64"))?,
         );
-        write_u32(&mut head, 0);
+        write_u32(
+            &mut head,
+            match self.metadata.optimize {
+                Optimize::Safe => 1,
+                Optimize::Auto => 2,
+                Optimize::Fast => 3,
+            },
+        );
         debug_assert_eq!(head.len(), HEADER_BYTES);
         for value in self
             .metadata
@@ -1196,6 +1213,7 @@ mod tests {
                 class_count: 3,
                 class_permutations: vec![2, 0, 1, 1, 2, 0],
                 feature_permutations: vec![1, 0, 0, 1],
+                optimize: Optimize::Auto,
             },
             fixture_tensors(),
         )

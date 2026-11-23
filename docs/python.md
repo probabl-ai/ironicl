@@ -118,9 +118,9 @@ clf = TabICLClassifier.load("model.pkl", device=None)
   context from the training data, which takes as long as the build in `fit`;
   with `cache_dir` set, a context cached on this machine loads from the cache
   instead.
-- `save_training_data` keeps the training data, `X` and `y` as `fit` received
-  them (`fit` keeps a copy for this). Leaving out both the training data and
-  the context raises `ValueError`.
+- `save_training_data` keeps the training rows as preprocessing transformed
+  them, which a load without the context and `export` need. Leaving out both
+  the training data and the context raises `ValueError`.
 - `save_model_weights` includes the checkpoint, so loading needs no checkpoint
   file or download. Without it, loading uses the saved checkpoint path if it
   exists, otherwise `model_path` or the default location, downloaded when
@@ -129,7 +129,7 @@ clf = TabICLClassifier.load("model.pkl", device=None)
 
 The fitted model is saved in Rust's formats
 ([artifact-format.md](artifact-format.md#fitted-models)): its preprocessing,
-and the context and the training data as the options say. Loading refuses a
+with the training rows, and the context as the options say. Loading refuses a
 different checkpoint.
 
 A 2,000-row, 100-feature classifier with 8 estimators, on an M1 Max:
@@ -156,6 +156,30 @@ on the CPU, `optimize="auto"` predictions moved by at most `6.7e-4` in
 probability. `device` accepts what the constructor does. Loading warns when
 the file was saved with another Ironicl version. Load only files you trust:
 like any pickle, loading can run code.
+
+### Exporting for the server
+
+`export` writes a fitted estimator as a model directory that `ironicl prepare`
+and `ironicl serve` read ([cli.md](cli.md#model-directories-and-weights)):
+
+```python
+clf.export("my-model")                  # with the KV cache built during the fit
+clf.export("my-model", kv_cache=False)  # without it, for another machine
+```
+
+| File | Contents |
+|---|---|
+| `ironicl.json` | the metadata, written last: `format` (`"ironicl-model"`) and `version` (1), which `prepare` and `serve` check, and for people and tools the Ironicl version, `task`, `n_features`, `feature_names`, `classes`, and the weights' SHA-256 |
+| `preprocessing.irprep` | the fitted preprocessing (labels or target scale, feature names, the classifier's `softmax_temperature` and `average_logits`) with the preprocessed training rows |
+| `context.ircntxt` | the KV cache at this fit's `optimize` level, unless `kv_cache=False` |
+
+The weights are not in it. `export` makes sure the shared weights folder has
+the estimator's checkpoint, importing it once when needed. A directory without
+`ironicl.json` is incomplete. Each file replaces the old one whole, so exporting
+again does not break a server that has the old files open, and every file is
+readable only by its owner on Unix, since the preprocessing and the cache hold
+the training data. An estimator saved with `save_training_data=False` cannot be
+exported.
 
 ### Progress and interrupts
 
