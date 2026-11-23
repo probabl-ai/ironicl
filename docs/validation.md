@@ -70,7 +70,7 @@ git -C "$checks/tabicl" checkout --detach bd030d47ff7d9f987f0f33431d743a3003bfe0
 python3.12 -m venv "$checks/parity"
 # On Linux, install CPU-only PyTorch before installing TabICL:
 # "$checks/parity/bin/python" -m pip install torch --index-url https://download.pytorch.org/whl/cpu
-"$checks/parity/bin/python" -m pip install "$checks"/dist/*.whl "$checks/tabicl"
+"$checks/parity/bin/python" -m pip install "$checks"/dist/*.whl "$checks/tabicl" pandas
 env -u PYTHONPATH IRONICL_TABICL_SOURCE="$checks/tabicl/src" \
   "$checks/parity/bin/python" -m unittest discover -s tests/parity -p 'test_*.py' -v
 ```
@@ -89,6 +89,11 @@ from the same raw training data and labels. The oracle does not use Ironicl's
 encoded labels, fitted statistics, masks, or permutations. Tests compare each
 member's rows and align TabICL's normalization groups by name, not by
 hash-dependent iteration order.
+
+The cases include NumPy arrays and pandas DataFrames with every column type
+TabICL encodes: numbers with missing values, `object`, `string`, `category`, and
+nullable `boolean` and `Int64` columns, with categories training never saw. The
+classifier suite needs pandas too, for a DataFrame prediction case.
 
 Live comparisons require exact class ordering, encoded labels, feature masks,
 actual ensemble counts, group membership, feature/class permutations, and

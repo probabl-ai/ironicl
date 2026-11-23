@@ -1,11 +1,12 @@
 //! `TabICLv2`'s preprocessing, fitted and applied in Rust.
 //!
 //! It reproduces `TabICL` 2.1.1 (commit bd030d47ff7d9f987f0f33431d743a3003bfe0d3)
-//! for numeric features and the `none` and `power` normalizations: missing
-//! values (NaN) are replaced by their feature's training mean, constant
-//! features are dropped, each normalization method is fitted once as
-//! a group, and each ensemble member is a group, a feature order, and a class
-//! order. The ensemble comes from `CPython`'s `random.Random(random_state)`, so
+//! for numeric and categorical features and the `none` and `power`
+//! normalizations: categorical features come first, as their category codes
+//! (see `crate::preprocess::columns`), missing numeric values (NaN) are
+//! replaced by their feature's training mean, constant features are dropped,
+//! each normalization method is fitted once as a group, and each ensemble
+//! member is a group, a feature order, and a class order. The ensemble comes from `CPython`'s `random.Random(random_state)`, so
 //! it matches `TabICL` member for member.
 //!
 //! Statistics are fitted and applied in `f64`, whatever the input's type, one
@@ -15,6 +16,7 @@
 use rayon::prelude::*;
 
 use crate::preprocess::{
+    columns::MISSING,
     labels::Labels,
     python_random::PythonRandom,
     scale::{clamp_outlier, clip_standardized, outlier_bounds, standard_clip, standard_scaler},
@@ -444,7 +446,11 @@ fn ensemble(
 /// Fitted `TabICL` preprocessing. It keeps no training rows.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Preprocessor {
-    /// Which input features vary in training; the others are dropped.
+    /// Each input feature's sorted categories, or `None` for a numeric
+    /// feature. A categorical feature's values are category indices or -1.
+    pub(crate) categories: Vec<Option<Labels>>,
+    /// Which features vary in training, categorical features first; the
+    /// others are dropped.
     pub(crate) feature_mask: Vec<bool>,
     /// Each kept feature's training mean, which replaces its missing values:
     /// `SimpleImputer`'s `statistics_`.
@@ -502,9 +508,51 @@ fn column_means(x: Features<'_>, columns: usize) -> Vec<f64> {
         .collect()
 }
 
+/// `x`, `[rows, columns]`, with its categorical features first, as `TabICL`'s
+/// `ColumnTransformer` orders them, or `None` when it has none.
+///
+/// Port of <https://github.com/soda-inria/tabicl/blob/bd030d47ff7d9f987f0f33431d743a3003bfe0d3/src/tabicl/_sklearn/preprocessing.py#L131-L149>.
+fn in_tabicl_order(
+    categories: &[Option<Labels>],
+    x: Features<'_>,
+    columns: usize,
+) -> Result<Option<Vec<f64>>> {
+    if categories.len() != columns {
+        return Err(invalid(format!(
+            "X has {columns} features; expected {}",
+            categories.len()
+        )));
+    }
+    if categories.iter().all(Option::is_none) {
+        return Ok(None);
+    }
+    let order: Vec<usize> = (0..columns)
+        .filter(|&j| categories[j].is_some())
+        .chain((0..columns).filter(|&j| categories[j].is_none()))
+        .collect();
+    let mut ordered = Vec::with_capacity(x.len());
+    for row in 0..x.len() / columns {
+        for &j in &order {
+            let value = x.get(row * columns + j);
+            #[expect(clippy::cast_precision_loss, reason = "Category counts stay far below 2^53")]
+            if let Some(categories) = &categories[j]
+                && value != MISSING
+                && !(value.fract() == 0.0 && (0.0..categories.len() as f64).contains(&value))
+            {
+                return Err(invalid(format!(
+                    "categorical feature {j} has a value that is not a category index"
+                )));
+            }
+            ordered.push(value);
+        }
+    }
+    Ok(Some(ordered))
+}
+
 impl Preprocessor {
-    /// Fit on `x`, `[rows, columns]`, and one target per row: a classifier for
-    /// labels, else a regressor, which shuffles no classes.
+    /// Fit on `x`, `[rows, columns]`, whose features have `categories`, as
+    /// [`Self::categories`] holds them, and one target per row: a classifier
+    /// for labels, else a regressor, which shuffles no classes.
     ///
     /// Port of
     /// <https://github.com/soda-inria/tabicl/blob/bd030d47ff7d9f987f0f33431d743a3003bfe0d3/src/tabicl/_sklearn/preprocessing.py#L1013-L1075>,
@@ -514,16 +562,27 @@ impl Preprocessor {
     ///
     /// # Errors
     ///
-    /// When an option is out of range, `x` is empty, holds infinity, or is
-    /// constant once imputed, or the targets do not fit the task.
+    /// When an option is out of range, `x` is empty, holds infinity or a
+    /// value that is not a category index, or is constant once imputed, or
+    /// the targets do not fit the task.
     pub fn fit(
         options: &PreprocessOptions,
         x: Features<'_>,
         columns: usize,
+        categories: Vec<Option<Labels>>,
         targets: &Targets,
     ) -> Result<Self> {
         options.validate()?;
         let rows = check_matrix(x, columns)?;
+        if categories
+            .iter()
+            .flatten()
+            .any(|categories| !categories.are_classes())
+        {
+            return Err(invalid("categories must be sorted and distinct"));
+        }
+        let ordered = in_tabicl_order(&categories, x, columns)?;
+        let x = ordered.as_deref().map_or(x, Features::F64);
         if targets.len() != rows {
             return Err(invalid("X and y must have the same length"));
         }
@@ -585,6 +644,7 @@ impl Preprocessor {
             })
             .collect();
         Ok(Self {
+            categories,
             feature_mask,
             imputer_statistics: kept.iter().map(|&j| means[j]).collect(),
             normalizations,
@@ -606,8 +666,8 @@ impl Preprocessor {
     ///
     /// # Errors
     ///
-    /// When `x` has the wrong number of features or holds infinity, or a result
-    /// is not finite in FP32.
+    /// When `x` has the wrong number of features, holds infinity or a value
+    /// that is not a category index, or a result is not finite in FP32.
     pub fn transform(&self, x: Features<'_>, columns: usize) -> Result<Vec<Vec<f32>>> {
         if columns != self.n_features_in() {
             return Err(invalid(format!(
@@ -616,6 +676,8 @@ impl Preprocessor {
             )));
         }
         check_matrix(x, columns)?;
+        let ordered = in_tabicl_order(&self.categories, x, columns)?;
+        let x = ordered.as_deref().map_or(x, Features::F64);
         let kept: Vec<usize> = (0..columns).filter(|&j| self.feature_mask[j]).collect();
         self.normalizations
             .iter()
@@ -715,6 +777,11 @@ impl Preprocessor {
     pub fn classes(&self) -> Option<&Labels> {
         self.classes.as_ref()
     }
+    /// Each input feature's sorted categories, or `None` for a numeric feature.
+    #[must_use]
+    pub fn categories(&self) -> &[Option<Labels>] {
+        &self.categories
+    }
 
     /// Check what fitting guarantees, for a preprocessor read from bytes.
     pub(crate) fn validate(&self) -> Result<()> {
@@ -773,6 +840,11 @@ impl Preprocessor {
         {
             return fail("the feature names do not match the features");
         }
+        if self.categories.len() != self.feature_mask.len()
+            || !self.categories.iter().flatten().all(Labels::are_classes)
+        {
+            return fail("the categories are invalid");
+        }
         if self.imputer_statistics.len() != features
             || !self.imputer_statistics.iter().all(|value| value.is_finite())
         {
@@ -792,7 +864,7 @@ impl Preprocessor {
 
 #[cfg(test)]
 mod tests {
-    use super::{FeatureShuffles, Features, NormMethod, PreprocessOptions, Preprocessor, Targets};
+    use super::{FeatureShuffles, Features, MISSING, NormMethod, PreprocessOptions, Preprocessor, Targets};
     use crate::format::preprocessor::{decode, encode};
     use crate::preprocess::{fixture, integers, labels::Labels, numbers, python_random::PythonRandom};
     use serde_json::Value;
@@ -858,7 +930,8 @@ mod tests {
         let labels = Targets::Labels(text.clone());
         for (index, case) in fixture["cases"].as_array().unwrap().iter().enumerate() {
             let (x, q) = (Features::F64(&training), Features::F64(&query));
-            let preprocessor = Preprocessor::fit(&options(), x, columns, &labels).unwrap();
+            let preprocessor =
+                Preprocessor::fit(&options(), x, columns, vec![None; columns], &labels).unwrap();
             let names: Vec<&str> = preprocessor
                 .group_methods()
                 .iter()
@@ -936,7 +1009,14 @@ mod tests {
             x[index] = f64::NAN;
         }
         let labels = Targets::Labels(Labels::Int((0..30).map(|i| i % 3).collect()));
-        let preprocessor = Preprocessor::fit(&options(), Features::F64(&x), columns, &labels).unwrap();
+        let preprocessor = Preprocessor::fit(
+            &options(),
+            Features::F64(&x),
+            columns,
+            vec![None; columns],
+            &labels,
+        )
+        .unwrap();
         assert_eq!(preprocessor.feature_mask(), [true, true, false, true]);
         // The same data with each missing value replaced by its column's mean.
         let means: Vec<f64> = (0..columns)
@@ -960,7 +1040,14 @@ mod tests {
             })
             .collect();
         assert_eq!(preprocessor.imputer_statistics, [means[0], means[1], means[3]]);
-        let reference = Preprocessor::fit(&options(), Features::F64(&filled), columns, &labels).unwrap();
+        let reference = Preprocessor::fit(
+            &options(),
+            Features::F64(&filled),
+            columns,
+            vec![None; columns],
+            &labels,
+        )
+        .unwrap();
         for (data, other) in [(&x, &filled), (&filled, &filled)] {
             assert_eq!(
                 preprocessor.transform(Features::F64(data), columns).unwrap(),
@@ -982,9 +1069,70 @@ mod tests {
     }
 
     #[test]
+    fn categorical_features_come_first() {
+        // Numeric, categorical, numeric, categorical: as numbers, with every
+        // categorical feature moved to the front, the data fits alike.
+        let rows = 30;
+        let text = Labels::Text(["a", "b", "c"].map(String::from).to_vec());
+        let column = |row: usize, j: usize| match j {
+            0 => f64::from(u32::try_from(row * 7 % 11).unwrap()) / 2.0,
+            1 => [0.0, 1.0, 2.0, MISSING][row % 4],
+            2 => {
+                if row.is_multiple_of(5) {
+                    f64::NAN
+                } else {
+                    f64::from(u32::try_from(row).unwrap()).sqrt()
+                }
+            }
+            _ => [1.0, 0.0][row % 2],
+        };
+        let x: Vec<f64> = (0..rows)
+            .flat_map(|row| (0..4).map(move |j| column(row, j)))
+            .collect();
+        let front: Vec<f64> = (0..rows)
+            .flat_map(|row| [1, 3, 0, 2].map(|j| column(row, j)))
+            .collect();
+        let categories = vec![
+            None,
+            Some(text.clone()),
+            None,
+            Some(Labels::Bool(vec![false, true])),
+        ];
+        let labels = Targets::Labels(Labels::Int((0..30).map(|i| i % 3).collect()));
+        let preprocessor =
+            Preprocessor::fit(&options(), Features::F64(&x), 4, categories.clone(), &labels).unwrap();
+        let numeric =
+            Preprocessor::fit(&options(), Features::F64(&front), 4, vec![None; 4], &labels).unwrap();
+        assert_eq!(preprocessor.categories(), categories);
+        assert_eq!(preprocessor.feature_mask, numeric.feature_mask);
+        assert_eq!(preprocessor.imputer_statistics, numeric.imputer_statistics);
+        assert_eq!(
+            preprocessor.transform(Features::F64(&x), 4).unwrap(),
+            numeric.transform(Features::F64(&front), 4).unwrap()
+        );
+        // A categorical feature's values are category indices or -1.
+        for value in [3.0, 0.5, -2.0, f64::NAN] {
+            let mut bad = x.clone();
+            bad[1] = value;
+            assert!(preprocessor.transform(Features::F64(&bad), 4).is_err(), "{value}");
+            assert!(
+                Preprocessor::fit(&options(), Features::F64(&bad), 4, categories.clone(), &labels).is_err(),
+                "{value}"
+            );
+        }
+        let unsorted = vec![None, Some(Labels::Int(vec![2, 1])), None, None];
+        assert!(Preprocessor::fit(&options(), Features::F64(&x), 4, unsorted, &labels).is_err());
+        let sha = [1; 32];
+        assert_eq!(
+            decode(&encode(&preprocessor, None, &sha).unwrap()).unwrap(),
+            (sha, preprocessor, None)
+        );
+    }
+
+    #[test]
     fn infinity_and_all_missing_data_are_rejected() {
         let labels = Targets::Labels(Labels::Int(vec![0, 1, 0, 1]));
-        let fit = |x: &[f64]| Preprocessor::fit(&options(), Features::F64(x), 2, &labels);
+        let fit = |x: &[f64]| Preprocessor::fit(&options(), Features::F64(x), 2, vec![None; 2], &labels);
         assert!(fit(&[1.0, f64::NAN, 2.0, 3.0, f64::INFINITY, 4.0, 0.0, 5.0]).is_err());
         assert!(fit(&[f64::NAN; 8]).is_err());
         let preprocessor = fit(&[1.0, f64::NAN, 2.0, 3.0, 5.0, 4.0, 0.0, 5.0]).unwrap();

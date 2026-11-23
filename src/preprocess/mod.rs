@@ -1,9 +1,11 @@
 //! Model-independent preprocessing: `CPython`'s random module, reproduced
-//! exactly; class labels; and `f64` column statistics that follow scikit-learn
+//! exactly; class labels; typed feature columns and their categories; and
+//! `f64` column statistics that follow scikit-learn
 //! and `SciPy`. Models' own pipelines, such as `models::tabicl_v2::preprocess`,
 //! build on these pieces. This code handles untrusted input, so it may not use `unsafe`.
 #![forbid(unsafe_code)]
 
+pub mod columns;
 pub mod labels;
 pub(crate) mod python_random;
 pub(crate) mod scale;

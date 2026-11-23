@@ -53,7 +53,8 @@ pub struct TrainingInputs {
 }
 
 impl Preprocessed {
-    /// Fit preprocessing on `x`, `[rows, columns]`, and preprocess it.
+    /// Fit preprocessing on `x`, `[rows, columns]`, whose features have
+    /// `categories`, and preprocess it.
     ///
     /// # Errors
     ///
@@ -62,9 +63,10 @@ impl Preprocessed {
         options: &PreprocessOptions,
         x: Features<'_>,
         columns: usize,
+        categories: Vec<Option<Labels>>,
         targets: &Targets,
     ) -> Result<Self> {
-        let preprocessor = Preprocessor::fit(options, x, columns, targets)?;
+        let preprocessor = Preprocessor::fit(options, x, columns, categories, targets)?;
         Self::with_training(preprocessor, x, columns, targets)
     }
 
@@ -519,7 +521,7 @@ mod tests {
             norm_methods: vec![NormMethod::None, NormMethod::Power],
             outlier_threshold: 4.0,
         };
-        Preprocessed::fit(&options, Features::F64(&x()), 3, targets).unwrap()
+        Preprocessed::fit(&options, Features::F64(&x()), 3, vec![None; 3], targets).unwrap()
     }
 
     fn values(a: f32, b: f32) -> Targets {

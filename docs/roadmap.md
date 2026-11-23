@@ -169,7 +169,7 @@ Python ([server.md](server.md)). Its predictions match the Python estimators. It
 batches concurrent requests and bounds their wait
 ([server.md](server.md#batching)). The CLI is parsed with `clap`. Next: `ironicl fit
 classifier|regressor` from Parquet files and `ironicl predict`, so no step needs
-Python; categorical features; a memory planner that sizes batches from the KV cache and
+Python; a memory planner that sizes batches from the KV cache and
 the GPU, so a cache streamed from host memory gets large batches; `/metrics` in
 Prometheus format (queue depth, batch size and time, refusals, GPU memory); and
 a binary or gRPC interface.

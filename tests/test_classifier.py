@@ -5,6 +5,7 @@ None of these needs a checkpoint: fit runs against a stand-in for the Rust model
 
 import os
 import tempfile
+import types
 import unittest
 import warnings
 from pathlib import Path
@@ -102,8 +103,8 @@ class FakeModel:
 
     task = "classifier"
 
-    def build(self, *args, **kwargs):
-        return object()
+    def build(self, preprocessed, *args, **kwargs):
+        return types.SimpleNamespace(preprocessed=preprocessed)
 
 
 class FittedAttributesTest(unittest.TestCase):

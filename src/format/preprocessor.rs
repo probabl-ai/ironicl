@@ -7,7 +7,11 @@
 //!
 //! Little-endian, after the magic and version:
 //! - the checkpoint's SHA-256 (32 bytes, as `IRCNTXT` stores it);
-//! - input features (u64) and their mask (u8 each);
+//! - input features (u64) and their mask (u8 each), in `TabICL`'s order,
+//!   categorical features first;
+//! - per input feature, in input order, its categories: a count (u64) and
+//!   labels as for the classes below, kind 0 and no values for a numeric
+//!   feature;
 //! - groups (u8) and their methods (u8: 0 none, 1 power);
 //! - members (u64), each one's group (u8), feature order (u64 each), and class
 //!   order (u64 each, for the class count below);
@@ -59,6 +63,10 @@ pub(crate) fn encode(
     bytes.extend(checkpoint_sha256);
     write_count(&mut bytes, preprocessor.feature_mask.len())?;
     bytes.extend(preprocessor.feature_mask.iter().map(|&kept| u8::from(kept)));
+    for categories in &preprocessor.categories {
+        write_count(&mut bytes, categories.as_ref().map_or(0, Labels::len))?;
+        write_labels(&mut bytes, categories.as_ref())?;
+    }
     // A fit makes at most two groups, so each count and index fits in a byte.
     bytes.push(
         u8::try_from(preprocessor.normalizations.len()).map_err(|_| artifact_error("too many groups"))?,
@@ -83,29 +91,7 @@ pub(crate) fn encode(
     for &index in preprocessor.class_permutations.iter().flatten() {
         write_count(&mut bytes, index)?;
     }
-    match &preprocessor.classes {
-        None => bytes.push(0),
-        Some(Labels::Int(values)) => {
-            bytes.push(1);
-            for value in values {
-                bytes.extend(value.to_le_bytes());
-            }
-        }
-        Some(Labels::Float(values)) => {
-            bytes.push(2);
-            for value in values {
-                bytes.extend(value.to_le_bytes());
-            }
-        }
-        Some(Labels::Bool(values)) => {
-            bytes.push(3);
-            bytes.extend(values.iter().map(|&value| u8::from(value)));
-        }
-        Some(Labels::Text(values)) => {
-            bytes.push(4);
-            write_strings(&mut bytes, values)?;
-        }
-    }
+    write_labels(&mut bytes, preprocessor.classes.as_ref())?;
     if let Some((mean, scale)) = preprocessor.target_scale {
         bytes.extend(mean.to_le_bytes());
         bytes.extend(scale.to_le_bytes());
@@ -134,6 +120,34 @@ pub(crate) fn encode(
     let digest = sha256(&bytes);
     bytes.extend(digest);
     Ok(bytes)
+}
+
+/// `labels`' kind and values, without their count.
+fn write_labels(bytes: &mut Vec<u8>, labels: Option<&Labels>) -> Result<()> {
+    match labels {
+        None => bytes.push(0),
+        Some(Labels::Int(values)) => {
+            bytes.push(1);
+            for value in values {
+                bytes.extend(value.to_le_bytes());
+            }
+        }
+        Some(Labels::Float(values)) => {
+            bytes.push(2);
+            for value in values {
+                bytes.extend(value.to_le_bytes());
+            }
+        }
+        Some(Labels::Bool(values)) => {
+            bytes.push(3);
+            bytes.extend(values.iter().map(|&value| u8::from(value)));
+        }
+        Some(Labels::Text(values)) => {
+            bytes.push(4);
+            write_strings(bytes, values)?;
+        }
+    }
+    Ok(())
 }
 
 fn write_strings(bytes: &mut Vec<u8>, values: &[String]) -> Result<()> {
@@ -261,6 +275,12 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<([u8; 32], Preprocessor, Option<Tra
     let checkpoint_sha256 = reader.read_array::<32>()?;
     let features_in = reader.read_count("input features")?;
     let feature_mask = read_flags(&mut reader, features_in)?;
+    let categories = (0..features_in)
+        .map(|_| {
+            let count = reader.read_count("categories")?;
+            read_labels(&mut reader, count)
+        })
+        .collect::<Result<_>>()?;
     let features = feature_mask.iter().filter(|kept| **kept).count();
     let group_count = usize::from(reader.read_u8()?);
     let groups = reader
@@ -313,6 +333,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<([u8; 32], Preprocessor, Option<Tra
         return Err(artifact_error("IRPREP has trailing bytes"));
     }
     let preprocessor = Preprocessor {
+        categories,
         feature_mask,
         imputer_statistics,
         normalizations,
@@ -328,22 +349,25 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<([u8; 32], Preprocessor, Option<Tra
     Ok((checkpoint_sha256, preprocessor, training))
 }
 
-fn read_labels(reader: &mut ByteReader<'_>, classes: usize) -> Result<Option<Labels>> {
+/// Labels that `write_labels` wrote, `count` of them.
+fn read_labels(reader: &mut ByteReader<'_>, count: usize) -> Result<Option<Labels>> {
     let labels = match reader.read_u8()? {
         0 => None,
         1 => Some(Labels::Int(
             reader
-                .read_chunks(classes, 8)?
+                .read_chunks(count, 8)?
                 .map(|bytes| i64::from_le_bytes(bytes.try_into().expect("eight bytes")))
                 .collect(),
         )),
-        2 => Some(Labels::Float(reader.read_f64s(classes)?)),
-        3 => Some(Labels::Bool(read_flags(reader, classes)?)),
-        4 => Some(Labels::Text(read_strings(reader, classes)?)),
+        2 => Some(Labels::Float(reader.read_f64s(count)?)),
+        3 => Some(Labels::Bool(read_flags(reader, count)?)),
+        4 => Some(Labels::Text(read_strings(reader, count)?)),
         _ => return Err(artifact_error("IRPREP has an invalid label kind")),
     };
-    if labels.as_ref().map_or(0, Labels::len) != classes {
-        return Err(artifact_error("IRPREP has classes without labels"));
+    if labels.as_ref().map_or(0, Labels::len) != count {
+        return Err(artifact_error(
+            "IRPREP has a count that does not match its labels",
+        ));
     }
     Ok(labels)
 }
@@ -376,7 +400,7 @@ mod tests {
             outlier_threshold: 4.0,
         };
         let x: Vec<f64> = (0..60).map(|i| f64::from((i * 37 % 23) - 11) / 3.0).collect();
-        Preprocessed::fit(&options, Features::F64(&x), 3, targets).unwrap()
+        Preprocessed::fit(&options, Features::F64(&x), 3, vec![None; 3], targets).unwrap()
     }
 
     #[test]

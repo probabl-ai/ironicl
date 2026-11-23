@@ -67,6 +67,8 @@ external batch-wide preprocessing behavior.
 - TabICL's sklearn wrapper drops a feature that is missing in every row of one
   `predict` call, so its predictions can depend on the batch. Ironicl imputes
   that feature's training mean instead, so they do not.
+- TabICL makes `None` in an `object` column a category of its own; Ironicl
+  treats it as missing, like NaN, as the server's `null` must be.
 - A change to a training feature or label invalidates later-layer cache state.
 - Adding a training row is not an exact append-only operation because training
   tokens attend to the full training context at every ICL layer.
