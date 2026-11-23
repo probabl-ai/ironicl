@@ -87,7 +87,7 @@ live TabICL comparisons.
 | `make lint-rust` | Formatting and Clippy for all feature configurations; warnings are errors. |
 | `make audit` | `Cargo.lock` against the RustSec advisory database; needs `cargo install cargo-audit`. |
 | `make lint-python` | Ruff pyflakes (`F`) checks for `python/ironicl` and `tools`; needs `pip install ruff` (or `uvx ruff`). |
-| `make test-python` | Standalone Python tests: estimators, preprocessing bindings, pickling, progress, and memory planning. |
+| `make test-python` | Standalone Python tests: estimators, preprocessing bindings, pickling, progress, and memory planning. The server tests also need pandas and `IRONICL_BIN`, an `ironicl` built with `--features server`. |
 | `make test-parity` | Direct comparisons with the pinned TabICL checkout; requires a separate environment. |
 
 The Python targets use `python3` from `PATH`. Override the interpreter when needed:
