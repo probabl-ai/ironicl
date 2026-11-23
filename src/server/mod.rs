@@ -101,19 +101,14 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
         max_batch_rows,
         queue: Arc::clone(&queue),
     };
-    let limits = Limits {
-        task,
-        features,
-        feature_names,
-        max_request_rows: args.max_request_rows,
-    };
+    let limits = Limits::new(task, features, feature_names, args.max_request_rows);
     // Predict a full batch twice: once to warm up, once to measure the row cost.
-    let warm_up = api::zeros(&limits, max_batch_rows);
+    let failed =
+        |error: ApiError| Error::InvalidConfig(format!("warm-up prediction failed: {}", error.message()));
+    let warm_up = api::zeros(task, features, max_batch_rows).map_err(failed)?;
     for measure in [false, true] {
         let start = Instant::now();
-        worker.predict(&[&warm_up]).map_err(|error| {
-            Error::InvalidConfig(format!("warm-up prediction failed: {}", error.message()))
-        })?;
+        worker.predict(&[&warm_up]).map_err(failed)?;
         if measure {
             queue.measure(max_batch_rows, start.elapsed());
         }

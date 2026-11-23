@@ -1,6 +1,6 @@
 //! The HTTP API: the request, its validation, the responses, and the errors.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use axum::{
     body::Bytes,
@@ -8,7 +8,7 @@ use axum::{
     http::{HeaderName, StatusCode, header},
     response::{IntoResponse, Response},
 };
-use garde::Validate;
+use garde::{Unvalidated, Valid, Validate};
 use serde::{Deserialize, Serialize};
 
 use super::{
@@ -27,9 +27,35 @@ const MAX_ALPHAS: usize = 999;
 pub(super) struct Limits {
     pub task: TaskKind,
     pub features: usize,
-    /// The training data's column names, when it had them.
-    pub feature_names: Option<Vec<String>>,
+    /// Each training column's position, by name, when the training data had
+    /// a distinct name for each.
+    pub columns: Option<HashMap<String, usize>>,
     pub max_request_rows: usize,
+}
+
+impl Limits {
+    pub fn new(
+        task: TaskKind,
+        features: usize,
+        feature_names: Option<Vec<String>>,
+        max_request_rows: usize,
+    ) -> Self {
+        let columns = feature_names
+            .map(|names| {
+                names
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, name)| (name, i))
+                    .collect::<HashMap<_, _>>()
+            })
+            .filter(|columns| columns.len() == features);
+        Self {
+            task,
+            features,
+            columns,
+            max_request_rows,
+        }
+    }
 }
 
 /// `POST /v1/predict`'s body: a table as pandas'
@@ -77,19 +103,22 @@ impl Output {
 #[expect(clippy::ref_option, reason = "garde passes the field as it is")]
 fn match_the_model(columns: &Option<Vec<String>>, limits: &Limits) -> garde::Result {
     let Some(columns) = columns else { return Ok(()) };
-    let Some(names) = &limits.feature_names else {
+    let Some(positions) = &limits.columns else {
         return Err(garde::Error::new(
             "the model was fit without column names; leave columns out",
         ));
     };
-    if let Some(column) = columns.iter().find(|column| !names.contains(column)) {
-        return Err(garde::Error::new(format!("unknown column {column:?}")));
+    let mut seen = vec![false; limits.features];
+    for column in columns {
+        let Some(&i) = positions.get(column) else {
+            return Err(garde::Error::new(format!("unknown column {column:?}")));
+        };
+        if std::mem::replace(&mut seen[i], true) {
+            return Err(garde::Error::new(format!("names column {column:?} twice")));
+        }
     }
-    if let Some(name) = names.iter().find(|name| !columns.contains(name)) {
+    if let Some((name, _)) = positions.iter().find(|&(_, &i)| !seen[i]) {
         return Err(garde::Error::new(format!("missing column {name:?}")));
-    }
-    if columns.len() != names.len() {
-        return Err(garde::Error::new("names a column twice"));
     }
     Ok(())
 }
@@ -159,32 +188,34 @@ fn between_0_and_1(alpha: &f32, _: &Limits) -> garde::Result {
 }
 
 impl PredictRequest {
-    /// The checked request as the worker's query.
-    fn into_query(self, limits: &Limits) -> Query {
+    /// Check the request against `limits`.
+    fn check(self, limits: &Limits) -> Result<Valid<Self>, ApiError> {
+        Unvalidated::new(self)
+            .validate_with(limits)
+            .map_err(|report| ApiError::invalid(report.to_string().trim_end()))
+    }
+
+    /// A checked request as the worker's query.
+    fn into_query(request: Valid<Self>, limits: &Limits) -> Query {
+        let request = request.into_inner();
         // Where each of the model's features is in a row.
-        let order: Vec<usize> = match (&self.columns, &limits.feature_names) {
-            (Some(columns), Some(names)) => names
-                .iter()
-                .map(|name| {
-                    columns
-                        .iter()
-                        .position(|column| column == name)
-                        .expect("the columns were checked against the model")
-                })
-                .collect(),
-            _ => (0..limits.features).collect(),
-        };
+        let mut order: Vec<usize> = (0..limits.features).collect();
+        if let (Some(columns), Some(positions)) = (&request.columns, &limits.columns) {
+            for (i, column) in columns.iter().enumerate() {
+                order[positions[column]] = i;
+            }
+        }
         let rows = Rows {
-            values: self
+            values: request
                 .data
                 .iter()
                 .flat_map(|row| order.iter().map(|&i| row[i].unwrap_or(f64::NAN)))
                 .collect(),
-            count: self.data.len(),
+            count: request.data.len(),
         };
         let outputs = match limits.task {
             TaskKind::Classifier => {
-                let names = self
+                let names = request
                     .output_type
                     .unwrap_or_else(|| vec![Output::Labels, Output::Probabilities]);
                 Outputs::Classifier {
@@ -193,8 +224,8 @@ impl PredictRequest {
                 }
             }
             TaskKind::Regressor => {
-                let alphas = self.alphas.unwrap_or_else(|| DEFAULT_ALPHAS.to_vec());
-                let outputs = self
+                let alphas = request.alphas.unwrap_or_else(|| DEFAULT_ALPHAS.to_vec());
+                let outputs = request
                     .output_type
                     .unwrap_or_else(|| vec![Output::Mean])
                     .into_iter()
@@ -213,15 +244,17 @@ impl PredictRequest {
     }
 }
 
-/// `count` rows of zeros with the default outputs, to warm a model up with.
-pub(super) fn zeros(limits: &Limits, count: usize) -> Query {
+/// `count` rows of zeros with the default outputs, to warm a `task` model up
+/// with.
+pub(super) fn zeros(task: TaskKind, features: usize, count: usize) -> Result<Query, ApiError> {
+    let limits = Limits::new(task, features, None, count);
     let request = PredictRequest {
         columns: None,
-        data: vec![vec![Some(0.0); limits.features]; count],
+        data: vec![vec![Some(0.0); features]; count],
         output_type: None,
         alphas: None,
     };
-    request.into_query(limits)
+    Ok(PredictRequest::into_query(request.check(&limits)?, &limits))
 }
 
 /// A query's rows, flattened in the training data's column order.
@@ -421,10 +454,10 @@ pub(super) async fn predict(
     }
     let request: PredictRequest =
         serde_json::from_slice(&body).map_err(|error| ApiError::invalid(error.to_string()))?;
-    request
-        .validate_with(&server.limits)
-        .map_err(|report| ApiError::invalid(report.to_string().trim_end()))?;
-    server.submit(request.into_query(&server.limits)).await
+    let request = request.check(&server.limits)?;
+    server
+        .submit(PredictRequest::into_query(request, &server.limits))
+        .await
 }
 
 /// `GET /v1/health`: the model is loaded and warmed up.
@@ -434,19 +467,12 @@ pub(super) async fn health() -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use garde::Validate;
-
     use super::{Limits, MAX_ALPHAS, PredictRequest};
     use crate::TaskKind;
 
     /// Limits for a `task` model with the columns `a` and `b`.
     fn limits(task: TaskKind) -> Limits {
-        Limits {
-            task,
-            features: 2,
-            feature_names: Some(vec!["a".into(), "b".into()]),
-            max_request_rows: 3,
-        }
+        Limits::new(task, 2, Some(vec!["a".into(), "b".into()]), 3)
     }
 
     /// The error that parsing and checking `json` against `limits` gives, or
@@ -455,9 +481,9 @@ mod tests {
         match serde_json::from_str::<PredictRequest>(json) {
             Err(error) => error.to_string(),
             Ok(request) => request
-                .validate_with(limits)
+                .check(limits)
                 .err()
-                .map(|report| report.to_string())
+                .map(|error| error.message().to_owned())
                 .unwrap_or_default(),
         }
     }
@@ -477,8 +503,7 @@ mod tests {
             ),
         ] {
             let request: PredictRequest = serde_json::from_str(json).unwrap();
-            request.validate_with(&limits).unwrap();
-            let rows = request.into_query(&limits).rows;
+            let rows = PredictRequest::into_query(request.check(&limits).unwrap(), &limits).rows;
             assert_eq!((rows.values, rows.count), (values.to_vec(), 2), "{json}");
         }
     }
@@ -527,7 +552,7 @@ mod tests {
             (
                 Classifier,
                 r#"{"columns": ["a", "b", "a"], "data": [[1, 2]]}"#,
-                "columns: names a column twice",
+                "columns: names column \"a\" twice",
             ),
             (
                 Classifier,
@@ -568,10 +593,10 @@ mod tests {
                 assert!(got.contains(message), "{json}: {got}");
             }
         }
-        let unnamed = Limits {
-            feature_names: None,
-            ..limits(Classifier)
-        };
+        // Names that are not one per column are no names at all.
+        let repeated = Limits::new(Classifier, 2, Some(vec!["a".into(), "a".into()]), 3);
+        assert!(repeated.columns.is_none());
+        let unnamed = Limits::new(Classifier, 2, None, 3);
         assert!(
             error(&unnamed, r#"{"columns": ["a", "b"], "data": [[1, 2]]}"#)
                 .contains("fit without column names")
