@@ -41,3 +41,18 @@ pub(crate) fn integers(value: &serde_json::Value) -> Vec<u64> {
         .map(|item| item.as_u64().expect("an unsigned integer"))
         .collect()
 }
+
+/// A fixture's indices.
+#[cfg(test)]
+pub(crate) fn indices(value: &serde_json::Value) -> Vec<usize> {
+    integers(value)
+        .into_iter()
+        .map(|index| usize::try_from(index).expect("an index"))
+        .collect()
+}
+
+/// A fixture's rows of indices.
+#[cfg(test)]
+pub(crate) fn rows(value: &serde_json::Value) -> Vec<Vec<usize>> {
+    value.as_array().expect("an array").iter().map(indices).collect()
+}

@@ -56,6 +56,7 @@ src/
 │       ├── quantiles.rs           regression outputs
 │       ├── request.rs             QueryRequest and Request: rows for a prediction
 │       ├── preprocess.rs          TabICL's preprocessing pipeline
+│       ├── ensemble.rs            its ensemble: groups, feature and class orders
 │       ├── fitted.rs              the fitted model
 │       └── directory.rs           model directories: export, prepare, inspect
 ├── format/
