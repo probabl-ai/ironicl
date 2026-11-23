@@ -1,7 +1,8 @@
-"""The server against pandas: a model fit on a DataFrame, exported, served,
-and sent the DataFrame as pandas writes it. Runs the binary that
-``IRONICL_BIN`` names, built with the ``server`` feature, and needs pandas and
-the checkpoints in the default cache; it is skipped without any of them."""
+"""The ``ironicl`` command on exported models: ``prepare`` building and reusing
+the KV cache, and the server against pandas, sent a DataFrame as pandas writes
+it. Runs the binary that ``IRONICL_BIN`` names, built with the ``server``
+feature, and needs the checkpoints in the default cache, and pandas for the
+server; each test is skipped without them."""
 
 import json
 import os
@@ -18,7 +19,7 @@ from pathlib import Path
 import numpy as np
 
 from ironicl import TabICLClassifier, TabICLRegressor
-from test_pickle import checkpoint, data
+from test_pickle import checkpoint, data, fitted
 
 try:
     import pandas as pd
@@ -32,8 +33,43 @@ def free_port() -> int:
         return probe.getsockname()[1]
 
 
+NEEDS_BIN = "needs IRONICL_BIN, an ironicl built with the server feature"
+
+
+@unittest.skipUnless(os.environ.get("IRONICL_BIN"), NEEDS_BIN)
+class PrepareTest(unittest.TestCase):
+    def setUp(self):
+        self.directory = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.directory)
+
+    def prepare(self, *options) -> tuple[str, str]:
+        """Run ``ironicl prepare`` on the model directory: its first line, and
+        its warnings."""
+        command = [os.environ["IRONICL_BIN"], "prepare", str(self.directory / "model"), *options]
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+        warnings = [line for line in result.stderr.splitlines() if line.startswith("warning:")]
+        return result.stdout.splitlines()[0], "\n".join(warnings)
+
+    def test_prepare_reuses_a_matching_cache_and_rebuilds_any_other(self):
+        model = fitted(TabICLClassifier)
+        path = self.directory / "model"
+        model.export(path)
+        built, reused = ("Built the KV cache", ""), ("Reused the KV cache", "")
+        self.assertEqual(self.prepare(), reused)  # export's cache, at safe, on another device
+        self.assertEqual(self.prepare("--optimize", "auto"), built)
+        self.assertEqual(self.prepare(), reused)  # at the saved cache's level, now auto
+        self.assertEqual(self.prepare("--optimize", "auto"), reused)
+        model.export(path, kv_cache=False)
+        self.assertEqual(self.prepare(), built)
+        (path / "context.ircntxt").write_bytes(b"not a KV cache")
+        line, warning = self.prepare()
+        self.assertEqual(line, built[0])
+        self.assertIn("warning: could not read the saved KV cache", warning)
+        self.assertEqual(self.prepare(), reused)
+
+
 @unittest.skipIf(pd is None, "needs pandas")
-@unittest.skipUnless(os.environ.get("IRONICL_BIN"), "needs IRONICL_BIN, an ironicl built with the server feature")
+@unittest.skipUnless(os.environ.get("IRONICL_BIN"), NEEDS_BIN)
 class ServerTest(unittest.TestCase):
     def setUp(self):
         self.directory = Path(tempfile.mkdtemp())
