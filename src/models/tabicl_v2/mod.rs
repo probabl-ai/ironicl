@@ -6,6 +6,7 @@ pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod directory;
+pub(crate) mod ensemble;
 pub(crate) mod execution_plan;
 pub mod fitted;
 #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]

@@ -15,7 +15,8 @@ prediction server uses the same fitted model, saved as `IRPREP` and `IRCNTXT`
 | Typed columns; categories and codes: `OrdinalEncoder` | `src/preprocess/columns.rs` |
 | Yeo-Johnson fit and transform | `src/preprocess/yeo_johnson.rs` |
 | Class labels | `src/preprocess/labels.rs` |
-| TabICL's pipeline: constant-feature mask, ensembles, groups | `src/models/tabicl_v2/preprocess.rs` |
+| TabICL's pipeline: constant-feature mask, normalization groups | `src/models/tabicl_v2/preprocess.rs` |
+| TabICL's ensemble: members' groups, feature and class orders | `src/models/tabicl_v2/ensemble.rs` |
 | Fitting, context building, chunked prediction, saving | `src/models/tabicl_v2/fitted.rs` |
 | Fitted preprocessing as `IRPREP` bytes | `src/format/preprocessor.rs` ([artifact-format.md](artifact-format.md#fitted-models)) |
 | Input conversion, label types, scikit-learn's interface | `python/ironicl/base.py` |
