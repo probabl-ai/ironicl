@@ -509,7 +509,8 @@ fn column_means(x: Features<'_>, columns: usize) -> Vec<f64> {
 }
 
 /// `x`, `[rows, columns]`, with its categorical features first, as `TabICL`'s
-/// `ColumnTransformer` orders them, or `None` when it has none.
+/// `ColumnTransformer` orders them, or `None` when it has none. `categories`
+/// has one entry per column.
 ///
 /// Port of <https://github.com/soda-inria/tabicl/blob/bd030d47ff7d9f987f0f33431d743a3003bfe0d3/src/tabicl/_sklearn/preprocessing.py#L131-L149>.
 fn in_tabicl_order(
@@ -517,12 +518,7 @@ fn in_tabicl_order(
     x: Features<'_>,
     columns: usize,
 ) -> Result<Option<Vec<f64>>> {
-    if categories.len() != columns {
-        return Err(invalid(format!(
-            "X has {columns} features; expected {}",
-            categories.len()
-        )));
-    }
+    debug_assert_eq!(categories.len(), columns, "one entry per column");
     if categories.iter().all(Option::is_none) {
         return Ok(None);
     }
@@ -574,12 +570,10 @@ impl Preprocessor {
     ) -> Result<Self> {
         options.validate()?;
         let rows = check_matrix(x, columns)?;
-        if categories
-            .iter()
-            .flatten()
-            .any(|categories| !categories.are_classes())
-        {
-            return Err(invalid("categories must be sorted and distinct"));
+        if categories.len() != columns || categories.iter().flatten().any(|c| !c.are_classes()) {
+            return Err(invalid(
+                "categories must be one per feature, each sorted and distinct",
+            ));
         }
         let ordered = in_tabicl_order(&categories, x, columns)?;
         let x = ordered.as_deref().map_or(x, Features::F64);
