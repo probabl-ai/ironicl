@@ -15,7 +15,7 @@ use super::{
     Server,
     worker::{Answer, Outputs, Query},
 };
-use crate::preprocess::{columns::MISSING, labels::Label};
+use crate::preprocess::{columns::encode_value, labels::Label};
 use crate::{Error, Labels, RegressionOutput, TaskKind};
 
 /// `TabICLRegressor.predict`'s default quantile levels.
@@ -113,31 +113,14 @@ impl<'de> Deserialize<'de> for Cell {
 }
 
 impl Cell {
-    /// The value of a feature with `categories`, or of a numeric feature
-    /// without them: a number, NaN when it is missing, or a category index,
-    /// [`MISSING`] when it is missing or not a category.
-    fn value(&self, categories: Option<&Labels>) -> Result<f64, &'static str> {
-        #[expect(clippy::cast_precision_loss, reason = "Numbers become float64, as in pandas")]
-        let label = match (self, categories) {
-            (Self::Missing, None) => return Ok(f64::NAN),
-            (Self::Missing, Some(_)) => return Ok(MISSING),
-            (Self::Int(value), None) => return Ok(*value as f64),
-            (Self::Float(value), None) => return Ok(*value),
-            (Self::Bool(_) | Self::Text(_), None) => return Err("must be a number or null"),
-            (Self::Int(value), Some(_)) => Label::Int(*value),
-            (Self::Float(value), Some(_)) => Label::Float(*value),
-            (Self::Bool(value), Some(_)) => Label::Bool(*value),
-            (Self::Text(value), Some(_)) => Label::Text(value),
-        };
-        let categories = categories.expect("a categorical feature");
-        #[expect(clippy::cast_precision_loss, reason = "Category counts stay far below 2^53")]
-        match categories.position(label) {
-            Ok(index) => Ok(index.map_or(MISSING, |index| index as f64)),
-            Err(_) => Err(match categories {
-                Labels::Text(_) => "must be a string or null",
-                Labels::Bool(_) => "must be a boolean or null",
-                Labels::Int(_) | Labels::Float(_) => "must be a number or null",
-            }),
+    /// The value, `None` when it is missing.
+    fn label(&self) -> Option<Label<'_>> {
+        match self {
+            Self::Missing => None,
+            Self::Int(value) => Some(Label::Int(*value)),
+            Self::Float(value) => Some(Label::Float(*value)),
+            Self::Bool(value) => Some(Label::Bool(*value)),
+            Self::Text(value) => Some(Label::Text(value)),
         }
     }
 }
@@ -294,12 +277,14 @@ impl PredictRequest {
         let mut values = Vec::with_capacity(request.data.len() * limits.features);
         for (r, row) in request.data.iter().enumerate() {
             for (&i, categories) in order.iter().zip(&limits.categories) {
-                let value = row[i].value(categories.as_ref()).map_err(|problem| {
+                let value = encode_value(row[i].label(), categories.as_ref()).map_err(|expected| {
                     let column = request
                         .columns
                         .as_ref()
                         .map_or_else(|| i.to_string(), |names| format!("{:?}", names[i]));
-                    ApiError::invalid(format!("data: row {r}, column {column} {problem}"))
+                    ApiError::invalid(format!(
+                        "data: row {r}, column {column} must be {expected} or null"
+                    ))
                 })?;
                 values.push(value);
             }

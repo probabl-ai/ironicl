@@ -3,7 +3,7 @@
 //! sorted distinct values its training rows use, and a value's code is its
 //! category's index, or -1 when it is missing or not a category.
 
-use super::labels::Labels;
+use super::labels::{Label, Labels};
 use crate::{Error, Result};
 
 /// The code of a missing value or of one that is not a category:
@@ -84,9 +84,42 @@ pub fn categories(columns: &[Column]) -> Result<Vec<Option<Labels>>> {
         .collect()
 }
 
-/// `columns` as a C-ordered `[rows, columns]` matrix: numbers as they are, and
-/// each categorical value as its index in that column's `categories`, or
-/// [`MISSING`].
+/// One value of a feature with `categories`, or of a numeric feature without
+/// them, `None` when it is missing, as the model reads it: a number, NaN when
+/// it is missing, or a category index, [`MISSING`] when it is missing or not a
+/// category.
+///
+/// # Errors
+///
+/// When the value's type does not fit the feature, with what the feature
+/// takes: "a number", "a string", or "a boolean".
+pub fn encode_value(
+    value: Option<Label<'_>>,
+    categories: Option<&Labels>,
+) -> std::result::Result<f64, &'static str> {
+    let Some(categories) = categories else {
+        #[expect(clippy::cast_precision_loss, reason = "Numbers become float64, as in pandas")]
+        return match value {
+            None => Ok(f64::NAN),
+            Some(Label::Int(value)) => Ok(value as f64),
+            Some(Label::Float(value)) => Ok(value),
+            Some(Label::Bool(_) | Label::Text(_)) => Err("a number"),
+        };
+    };
+    let Some(value) = value else { return Ok(MISSING) };
+    #[expect(clippy::cast_precision_loss, reason = "Category counts stay far below 2^53")]
+    categories
+        .position(value)
+        .map(|index| index.map_or(MISSING, |index| index as f64))
+        .map_err(|_| match categories {
+            Labels::Text(_) => "a string",
+            Labels::Bool(_) => "a boolean",
+            Labels::Int(_) | Labels::Float(_) => "a number",
+        })
+}
+
+/// `columns` as a C-ordered `[rows, columns]` matrix, each value as
+/// [`encode_value`] encodes it.
 ///
 /// Port of <https://github.com/scikit-learn/scikit-learn/blob/1.9.1/sklearn/preprocessing/_encoders.py#L1598-L1615>.
 ///
@@ -110,20 +143,17 @@ pub fn encode(columns: &[Column], categories: &[Option<Labels>]) -> Result<Vec<f
         match (column, fitted) {
             (Column::Numeric(values), None) => slots.zip(values).for_each(|(slot, &value)| *slot = value),
             (Column::Categorical { categories, codes }, Some(fitted)) => {
-                let positions = (0..categories.len())
-                    .map(|index| fitted.position(categories.get(index)))
-                    .collect::<Result<Vec<_>>>()
-                    .map_err(|_| {
+                // Each distinct category once, then each row by its code.
+                let values = (0..categories.len())
+                    .map(|index| encode_value(Some(categories.get(index)), Some(fitted)))
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .map_err(|expected| {
                         Error::InvalidArgument(format!(
-                            "feature {j} has categories of a different type than in training"
+                            "feature {j} has a category that is not {expected}, as in training"
                         ))
                     })?;
                 for (slot, index) in slots.zip(Column::indices(categories, codes)?) {
-                    #[expect(clippy::cast_precision_loss, reason = "Category counts stay far below 2^53")]
-                    let code = index
-                        .and_then(|index| positions[index])
-                        .map_or(MISSING, |code| code as f64);
-                    *slot = code;
+                    *slot = index.map_or(MISSING, |index| values[index]);
                 }
             }
             (Column::Numeric(_), Some(_)) => {
@@ -143,8 +173,31 @@ pub fn encode(columns: &[Column], categories: &[Option<Labels>]) -> Result<Vec<f
 
 #[cfg(test)]
 mod tests {
-    use super::{Column, MISSING, categories, encode};
-    use crate::preprocess::labels::Labels;
+    use super::{Column, MISSING, categories, encode, encode_value};
+    use crate::preprocess::labels::{Label, Labels};
+
+    #[test]
+    fn a_value_is_a_number_or_a_category_index() {
+        let text = Labels::Text(vec!["a".into(), "b".into()]);
+        for (value, categories, expected) in [
+            (None, None, Ok(f64::NAN)),
+            (Some(Label::Int(3)), None, Ok(3.0)),
+            (Some(Label::Float(0.5)), None, Ok(0.5)),
+            (Some(Label::Text("a")), None, Err("a number")),
+            (Some(Label::Bool(true)), None, Err("a number")),
+            (None, Some(&text), Ok(MISSING)),
+            (Some(Label::Text("b")), Some(&text), Ok(1.0)),
+            (Some(Label::Text("c")), Some(&text), Ok(MISSING)),
+            (Some(Label::Int(1)), Some(&text), Err("a string")),
+        ] {
+            let got = encode_value(value, categories);
+            let same = match (got, expected) {
+                (Ok(a), Ok(b)) => a.total_cmp(&b).is_eq(),
+                (a, b) => a == b,
+            };
+            assert!(same, "{value:?}: {got:?}");
+        }
+    }
 
     fn text(values: &[&str]) -> Labels {
         Labels::Text(values.iter().map(|&value| value.into()).collect())
