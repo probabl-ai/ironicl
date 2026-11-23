@@ -17,10 +17,6 @@ from sklearn.utils.validation import check_is_fitted
 
 from ironicl.base import TabICLBase, _array
 
-OUTPUT_TYPES = ("mean", "variance", "median", "quantiles", "raw_quantiles")
-DEFAULT_ALPHAS = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
-
-
 class TabICLRegressor(RegressorMixin, TabICLBase):
     """TabICLv2 regressor with Ironicl's Rust inference engine.
 
@@ -125,7 +121,7 @@ class TabICLRegressor(RegressorMixin, TabICLBase):
         if isinstance(X, np.ndarray) and X.ndim == 1:
             raise ValueError("The provided input X is one-dimensional. Reshape your data.")
         types = [output_type] if isinstance(output_type, str) else list(output_type)
-        alphas = DEFAULT_ALPHAS if alphas is None else list(alphas)
+        alphas = None if alphas is None else list(alphas)
         x = self._query(X)
         with self._progress("Predicting", "row") as progress:
             results = self.fitted_.predict_regression(x, types, alphas, progress)

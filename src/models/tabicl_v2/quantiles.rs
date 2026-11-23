@@ -24,6 +24,9 @@ const TAIL_QUANTILES: usize = 20;
 /// `QuantileDistributionConfig.MIN_BETA` and `MAX_BETA`.
 const BETA_RANGE: (f64, f64) = (0.01, 100.0);
 
+/// `TabICLRegressor.predict`'s default quantile levels.
+pub const DEFAULT_ALPHAS: [f32; 9] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+
 /// A regression statistic, named as `TabICLRegressor.predict`'s `output_type`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RegressionOutput {

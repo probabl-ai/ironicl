@@ -11,7 +11,9 @@
 
 use std::{path::Path, sync::Arc};
 
-use super::preprocess::{Features, PreprocessOptions, Preprocessor, Targets, flatten_orders, invalid};
+use super::preprocess::{
+    Features, PreprocessOptions, Preprocessor, Targets, flatten_orders, invalid, matrix_rows,
+};
 use crate::preprocess::labels::Labels;
 use crate::{
     ClassifierAggregation, ClassifierProbabilities, Error, Executor, Optimize, QueryRequest,
@@ -179,10 +181,10 @@ impl Preprocessed {
         step: usize,
         mut predict: impl FnMut(QueryRequest<'_>) -> Result<T>,
     ) -> Result<Vec<T>> {
-        if columns == 0 || !x.len().is_multiple_of(columns) || x.len() == 0 {
+        let rows = matrix_rows(x, columns)?;
+        if rows == 0 {
             return Err(invalid("X must be a nonempty matrix of features"));
         }
-        let rows = x.len() / columns;
         let mut results = Vec::new();
         let mut start = 0;
         while start < rows {

@@ -16,10 +16,10 @@ use super::{
     worker::{Answer, Outputs, Query},
 };
 use crate::preprocess::{columns::encode_value, labels::Value};
-use crate::{Error, Labels, RegressionOutput, TaskKind};
+use crate::{DEFAULT_ALPHAS, Error, Labels, RegressionOutput, TaskKind};
 
-/// `TabICLRegressor.predict`'s default quantile levels.
-const DEFAULT_ALPHAS: [f32; 9] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
+/// A classifier's `output_type` names; a regressor's are `RegressionOutput`'s.
+const CLASSIFIER_OUTPUTS: [&str; 2] = ["labels", "probabilities"];
 /// The most quantile levels a request may ask for: as many as the model's raw
 /// quantiles. Each level costs a value per row of the whole batch.
 const MAX_ALPHAS: usize = 999;
@@ -138,31 +138,9 @@ struct PredictRequest {
     #[garde(custom(fit_the_model))]
     data: Vec<Vec<Option<Cell>>>,
     #[garde(length(min = 1), custom(for_the_task_once))]
-    output_type: Option<Vec<Output>>,
+    output_type: Option<Vec<String>>,
     #[garde(custom(for_a_regressor), length(min = 1, max = MAX_ALPHAS), inner(inner(custom(between_0_and_1))))]
     alphas: Option<Vec<f32>>,
-}
-
-/// An `output_type` name.
-#[derive(Deserialize, Serialize, Clone, Copy, PartialEq)]
-#[serde(rename_all = "snake_case")]
-enum Output {
-    Labels,
-    Probabilities,
-    Mean,
-    Median,
-    Variance,
-    Quantiles,
-    RawQuantiles,
-}
-
-impl Output {
-    fn task(self) -> TaskKind {
-        match self {
-            Self::Labels | Self::Probabilities => TaskKind::Classifier,
-            _ => TaskKind::Regressor,
-        }
-    }
 }
 
 #[expect(clippy::ref_option, reason = "garde passes the field as it is")]
@@ -212,13 +190,16 @@ fn fit_the_model(data: &[Vec<Option<Cell>>], schema: &Schema) -> garde::Result {
 }
 
 #[expect(clippy::ref_option, reason = "garde passes the field as it is")]
-fn for_the_task_once(outputs: &Option<Vec<Output>>, schema: &Schema) -> garde::Result {
+fn for_the_task_once(outputs: &Option<Vec<String>>, schema: &Schema) -> garde::Result {
     let Some(outputs) = outputs else { return Ok(()) };
-    if let Some(output) = outputs.iter().find(|output| output.task() != schema.task) {
+    let known = |name: &str| match schema.task {
+        TaskKind::Classifier => CLASSIFIER_OUTPUTS.contains(&name),
+        TaskKind::Regressor => RegressionOutput::parse(name, &[]).is_ok(),
+    };
+    if let Some(name) = outputs.iter().find(|name| !known(name)) {
         return Err(garde::Error::new(format!(
-            "a {} has no output {}",
-            schema.task,
-            serde_json::json!(output)
+            "a {} has no output {name:?}",
+            schema.task
         )));
     }
     if (1..outputs.len()).any(|i| outputs[..i].contains(&outputs[i])) {
@@ -292,28 +273,24 @@ impl PredictRequest {
         };
         let outputs = match schema.task {
             TaskKind::Classifier => {
-                let names = request
-                    .output_type
-                    .unwrap_or_else(|| vec![Output::Labels, Output::Probabilities]);
+                // Without output_type, both.
+                let wants = |output: &str| {
+                    (request.output_type.as_ref()).is_none_or(|names| names.iter().any(|name| name == output))
+                };
                 Outputs::Classifier {
-                    labels: names.contains(&Output::Labels),
-                    probabilities: names.contains(&Output::Probabilities),
+                    labels: wants("labels"),
+                    probabilities: wants("probabilities"),
                 }
             }
             TaskKind::Regressor => {
                 let alphas = request.alphas.unwrap_or_else(|| DEFAULT_ALPHAS.to_vec());
-                let outputs = request
-                    .output_type
-                    .unwrap_or_else(|| vec![Output::Mean])
-                    .into_iter()
-                    .map(|output| match output {
-                        Output::Median => RegressionOutput::Median,
-                        Output::Variance => RegressionOutput::Variance,
-                        Output::Quantiles => RegressionOutput::Quantiles(alphas.clone()),
-                        Output::RawQuantiles => RegressionOutput::RawQuantiles,
-                        Output::Mean | Output::Labels | Output::Probabilities => RegressionOutput::Mean,
-                    })
-                    .collect();
+                let outputs = match request.output_type {
+                    Some(names) => names
+                        .iter()
+                        .map(|name| RegressionOutput::parse(name, &alphas))
+                        .collect::<crate::Result<_>>()?,
+                    None => vec![RegressionOutput::Mean],
+                };
                 Outputs::Regressor { outputs, alphas }
             }
         };
@@ -701,7 +678,12 @@ mod tests {
             (
                 Classifier,
                 r#"{"data": [[1, 2]], "output_type": ["average"]}"#,
-                "unknown variant `average`",
+                "a classifier has no output \"average\"",
+            ),
+            (
+                Regressor,
+                r#"{"data": [[1, 2]], "output_type": ["labels"]}"#,
+                "a regressor has no output \"labels\"",
             ),
             (
                 Classifier,
