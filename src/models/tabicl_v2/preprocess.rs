@@ -474,13 +474,19 @@ pub struct Preprocessor {
 /// Check a C-ordered matrix without infinities and return its rows. NaN marks
 /// a missing value.
 fn check_matrix(x: Features<'_>, columns: usize) -> Result<usize> {
-    if columns == 0 || !x.len().is_multiple_of(columns) {
-        return Err(invalid("X must be a nonempty matrix of features"));
-    }
+    let rows = matrix_rows(x, columns)?;
     if (0..x.len()).any(|index| x.get(index).is_infinite()) {
         return Err(invalid(
             "X must not contain infinity; mark missing values with NaN",
         ));
+    }
+    Ok(rows)
+}
+
+/// The rows of a C-ordered matrix with `columns` columns.
+pub(crate) fn matrix_rows(x: Features<'_>, columns: usize) -> Result<usize> {
+    if columns == 0 || !x.len().is_multiple_of(columns) {
+        return Err(invalid("X must be a nonempty matrix of features"));
     }
     Ok(x.len() / columns)
 }

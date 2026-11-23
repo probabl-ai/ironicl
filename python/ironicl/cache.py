@@ -17,10 +17,16 @@ SUFFIX = ".irctx"
 STALE_TEMPORARY_SECONDS = 3600
 
 
+def _checkpoints_dir() -> Path:
+    """Where downloaded checkpoints go: ``checkpoints`` in Ironicl's cache folder."""
+    return Path(_core.cache_dir()) / "checkpoints"
+
+
 def _cache_dir(cache_dir) -> Path | None:
     """Resolve ``cache_dir`` HuggingFace-style.
 
-    ``None``/``True`` use ``IRONICL_CACHE_DIR`` or ``<cache root>/ironicl/contexts``;
+    ``None``/``True`` use ``IRONICL_CACHE_DIR`` or ``contexts`` in Ironicl's
+    cache folder (``$XDG_CACHE_HOME/ironicl``, else ``~/.cache/ironicl``);
     ``False`` disables caching; a string or path is used directly.
     """
     if cache_dir is False:
@@ -29,8 +35,7 @@ def _cache_dir(cache_dir) -> Path | None:
         override = os.environ.get("IRONICL_CACHE_DIR")
         if override:
             return Path(override)
-        root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
-        return root / "ironicl" / "contexts"
+        return Path(_core.cache_dir()) / "contexts"
     return Path(cache_dir)
 
 

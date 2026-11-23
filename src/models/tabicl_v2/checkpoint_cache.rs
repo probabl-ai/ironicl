@@ -93,7 +93,12 @@ pub fn default_weights_dir() -> Result<PathBuf> {
         .join(format!("v{}", crate::format::model::MODEL_ARTIFACT_VERSION)))
 }
 
-fn default_cache_dir() -> Result<PathBuf> {
+/// Ironicl's cache folder: `$XDG_CACHE_HOME/ironicl`, else `~/.cache/ironicl`.
+///
+/// # Errors
+///
+/// When neither `XDG_CACHE_HOME` nor `HOME` is set.
+pub fn default_cache_dir() -> Result<PathBuf> {
     if let Some(path) = env::var_os("XDG_CACHE_HOME").filter(|path| !path.is_empty()) {
         return Ok(PathBuf::from(path).join("ironicl"));
     }

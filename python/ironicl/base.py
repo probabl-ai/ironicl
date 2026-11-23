@@ -25,7 +25,7 @@ from sklearn.utils.validation import check_array, check_is_fitted
 
 from ironicl import _core
 from ironicl._core import Model
-from ironicl.cache import _cache_dir
+from ironicl.cache import _cache_dir, _checkpoints_dir
 from ironicl.memory import _enforce, _limit_text, _overflow_policy, _plan
 from ironicl.progress import Progress
 
@@ -310,8 +310,7 @@ class TabICLBase(BaseEstimator):
         if self.model_path is not None:
             path = Path(self.model_path)
         else:
-            cache_root = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
-            path = cache_root / "ironicl" / "checkpoints" / self.checkpoint_version
+            path = _checkpoints_dir() / self.checkpoint_version
         if path.exists():
             return path
         if data is None and not self.allow_auto_download:

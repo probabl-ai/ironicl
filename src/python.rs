@@ -23,8 +23,8 @@ use pyo3::{
 };
 
 use crate::{
-    ClassifierAggregation, Error, Executor, Features, Labels, NormMethod, Optimize, PreprocessOptions,
-    RegressionOutput, StaticExecutor, Targets, TaskKind, load_checkpoint_model,
+    ClassifierAggregation, DEFAULT_ALPHAS, Error, Executor, Features, Labels, NormMethod, Optimize,
+    PreprocessOptions, RegressionOutput, StaticExecutor, Targets, TaskKind, load_checkpoint_model,
     memory::{Builder, MemoryLimits, Verdict},
     models::tabicl_v2::preprocess::flatten_orders,
     plan_context,
@@ -253,6 +253,12 @@ fn plan_memory<'py>(
     dict.set_item("memory_limit", limits.host.map(|limit| limit.bytes))?;
     dict.set_item("device_memory_limit", limits.device.map(|limit| limit.bytes))?;
     Ok(dict)
+}
+
+/// Ironicl's cache folder: `$XDG_CACHE_HOME/ironicl`, else `~/.cache/ironicl`.
+#[pyfunction]
+fn cache_dir() -> PyResult<PathBuf> {
+    crate::default_cache_dir().map_err(py_error)
 }
 
 /// A size such as `"16G"` in bytes, as the memory limits read it.
@@ -649,20 +655,21 @@ impl FittedModel {
 
     /// Each `output_types` entry for `x` in the target's units, as FP32 bytes
     /// and its `[rows, columns]` shape. `alphas` are the levels for
-    /// `"quantiles"`; `progress` is as for `predict_proba`.
-    #[pyo3(signature = (x, output_types, alphas, progress=None))]
+    /// `"quantiles"`, `TabICL`'s default when `None`; `progress` is as for
+    /// `predict_proba`.
+    #[pyo3(signature = (x, output_types, alphas=None, progress=None))]
     fn predict_regression<'py>(
         &self,
         py: Python<'py>,
         x: &Bound<'py, PyAny>,
         output_types: Vec<String>,
-        alphas: Vec<f32>,
+        alphas: Option<Vec<f32>>,
         progress: Option<Py<PyAny>>,
     ) -> PyResult<Vec<(Bound<'py, PyBytes>, [usize; 2])>> {
         let x = RawFeatures::read(py, x)?;
         let outputs = output_types
             .iter()
-            .map(|name| RegressionOutput::parse(name, &alphas))
+            .map(|name| RegressionOutput::parse(name, alphas.as_deref().unwrap_or(&DEFAULT_ALPHAS)))
             .collect::<Result<Vec<_>, _>>()
             .map_err(py_error)?;
         let (results, rows) = run(py, progress, || {
@@ -748,6 +755,7 @@ fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<FittedModel>()?;
     module.add_function(wrap_pyfunction!(preprocess, module)?)?;
     module.add_function(wrap_pyfunction!(parse_size, module)?)?;
+    module.add_function(wrap_pyfunction!(cache_dir, module)?)?;
     module.add_function(wrap_pyfunction!(system_info, module)?)?;
     module.add_function(wrap_pyfunction!(profile_report, module)?)?;
     module.add_function(wrap_pyfunction!(profile_reset, module)?)?;

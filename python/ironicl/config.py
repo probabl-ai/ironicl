@@ -5,10 +5,9 @@ from __future__ import annotations
 import os
 import platform
 from importlib.metadata import PackageNotFoundError, version
-from pathlib import Path
 
 from ironicl import _core
-from ironicl.cache import cache_info
+from ironicl.cache import _checkpoints_dir, cache_info
 from ironicl.memory import _plan
 
 PACKAGES = ("numpy", "scikit-learn", "scipy", "tqdm")
@@ -48,7 +47,7 @@ def _config() -> str:
     for level in ("safe", "auto", "fast"):
         plan = _plan("classifier", *EXAMPLE, level, None, None)
         lines.append(f"  {level}: {plan.storage}, built on the {plan.builder.upper()}, {_gib(plan.context_bytes)}")
-    checkpoints = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "ironicl" / "checkpoints"
+    checkpoints = _checkpoints_dir()
     found = sorted(checkpoints.glob("*.ckpt")) if checkpoints.is_dir() else []
     lines += ["", f"Checkpoints: {checkpoints}"]
     lines += [f"  {path.name} ({_gib(path.stat().st_size)})" for path in found] or ["  none downloaded"]
