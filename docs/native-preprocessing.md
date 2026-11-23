@@ -11,6 +11,7 @@ prediction server uses the same fitted model, saved as `IRPREP` and `IRCNTXT`
 |---|---|
 | `CPython`'s `random.Random`: seeding, `choice`, `shuffle`, `sample` | `src/preprocess/python_random.rs`, on `rand_mt` |
 | Standardize and clip; two-pass outlier bounds; `StandardScaler` | `src/preprocess/scale.rs` |
+| Missing values: `SimpleImputer`'s mean | `src/models/tabicl_v2/preprocess.rs` |
 | Yeo-Johnson fit and transform | `src/preprocess/yeo_johnson.rs` |
 | Class labels | `src/preprocess/labels.rs` |
 | TabICL's pipeline: constant-feature mask, ensembles, groups | `src/models/tabicl_v2/preprocess.rs` |
@@ -45,6 +46,20 @@ Fitting copies the kept features once, column by column, as float64, and fits
 each feature in parallel, keeping only its statistics. Transforming writes each
 group's FP32 rows directly from the input.
 
+## Missing Values
+
+A missing value is NaN, in Python and in Rust; the server reads `null` as NaN.
+Fitting takes each feature's mean over its values that are not missing, as
+`SimpleImputer(strategy="mean")` does, and preprocessing replaces every missing
+value with it before anything else. A feature missing in every training row is
+constant once imputed, so the feature mask drops it; `TabICL` 2.1.1's imputer drops
+it too. Infinity is rejected, as `TabICL` rejects it.
+
+`TabICL`'s estimators also drop, for one `predict` call, any feature that is
+missing in every row of that call, and skip the KV cache to do so. Ironicl does
+not: it imputes the training mean, so a row preprocesses alike alone and in any
+batch, and the cached context stays valid.
+
 ## The Ensemble
 
 TabICL draws its feature and class orders from `random.Random(random_state)`.
@@ -73,8 +88,8 @@ log-likelihood, the lambda, and the transformer.
 
 ## Next
 
-- Missing values and categorical features: TabICL's `TransformToNumerical`,
-  mean imputation and ordinal codes.
+- Categorical features: the rest of TabICL's `TransformToNumerical`, ordinal
+  codes.
 - Kumo's preprocessing, on the same pieces where it uses them.
 
 ## References

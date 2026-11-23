@@ -69,7 +69,8 @@ struct PredictRequest {
     /// the values are in the training data's order.
     #[garde(custom(match_the_model))]
     columns: Option<Vec<String>>,
-    /// The rows. `null`, pandas' missing value, parses but is refused.
+    /// The rows. `null`, pandas' missing value, is replaced by its feature's
+    /// training mean.
     #[garde(custom(fit_the_model))]
     data: Vec<Vec<Option<f64>>>,
     #[garde(length(min = 1), custom(for_the_task_once))]
@@ -140,11 +141,6 @@ fn fit_the_model(data: &[Vec<Option<f64>>], limits: &Limits) -> garde::Result {
                 "row {i} has {} values; the model expects {}",
                 row.len(),
                 limits.features
-            )));
-        }
-        if row.contains(&None) {
-            return Err(garde::Error::new(format!(
-                "row {i} has a missing value; missing values are not supported yet"
             )));
         }
     }
@@ -531,11 +527,7 @@ mod tests {
                 r#"{"data": [[1, 2], [1, 2], [1, 2], [1, 2]]}"#,
                 "data: 4 rows; the limit is 3",
             ),
-            (
-                Classifier,
-                r#"{"data": [[1, null]]}"#,
-                "row 0 has a missing value; missing values are not supported yet",
-            ),
+            (Classifier, r#"{"data": [[1, null]]}"#, ""),
             (Classifier, r#"{"data": [[1, "x"]]}"#, "invalid type: string"),
             (Classifier, r#"{"data": [1]}"#, "invalid type: integer"),
             (Classifier, r#"{"rows": [[1, 2]]}"#, "unknown field `rows`"),

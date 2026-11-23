@@ -81,6 +81,11 @@ class TabICLBase(BaseEstimator):
         elif hasattr(self, "feature_names_in_"):
             del self.feature_names_in_  # Left by an earlier fit on named data.
 
+    def __sklearn_tags__(self):
+        tags = super().__sklearn_tags__()
+        tags.input_tags.allow_nan = True
+        return tags
+
     def _targets(self, y) -> dict:
         """The checked targets ``y`` as ``_core.preprocess`` takes them."""
         raise NotImplementedError
@@ -318,7 +323,8 @@ class TabICLBase(BaseEstimator):
 
 
 def _features(X) -> tuple[np.ndarray, tuple[str, ...] | None]:
-    """``X`` as a C-ordered float32 or float64 matrix, and its feature names if it has any."""
+    """``X`` as a C-ordered float32 or float64 matrix, NaN marking a missing value,
+    and its feature names if it has any."""
     names = None
     if hasattr(X, "columns"):
         names = tuple(X.columns)
@@ -328,7 +334,7 @@ def _features(X) -> tuple[np.ndarray, tuple[str, ...] | None]:
         raise TypeError(
             "X must contain dense, real numeric features; categorical and sparse inputs are unsupported"
         )
-    return check_array(X, dtype=[np.float64, np.float32], order="C"), names
+    return check_array(X, dtype=[np.float64, np.float32], order="C", ensure_all_finite="allow-nan"), names
 
 
 def _array(values: bytes, shape, dtype=np.float32) -> np.ndarray:

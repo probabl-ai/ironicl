@@ -31,7 +31,7 @@ writes them as a model directory, with the weights in a shared folder
 the normalization groups, each member's group and feature and class order, the class labels
 (integers, floats, booleans, or UTF-8 text) with the classifier's `softmax_temperature` and
 `average_logits`, or the regressor's target mean and scale, the feature names when the training
-data had them, per group each kept feature's statistics as `f64` (mean, scale, range, outlier
+data had them, each kept feature's training mean, which replaces its missing values, per group each kept feature's statistics as `f64` (mean, scale, range, outlier
 bounds, and for the power group its lambda and standardization), and optionally the preprocessed
 training rows a context is built from: each group's `[rows, features]` matrix and each row's
 target (a class index or the standardized value), as `f32`. Decoding checks every length against

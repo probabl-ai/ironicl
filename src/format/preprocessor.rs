@@ -18,6 +18,7 @@
 //!   logits (u8);
 //! - feature names (u64: 0, or one per input feature), each a u32-length UTF-8
 //!   string;
+//! - f64 per kept feature: the training mean that replaces a missing value;
 //! - per group, f64 per kept feature: mean, scale, minimum, maximum, lower and
 //!   upper bounds, and for a power group its lambdas, mean, and scale;
 //! - training rows (u64, 0 when absent), then per group the preprocessed rows
@@ -116,6 +117,9 @@ pub(crate) fn encode(
     let names = preprocessor.feature_names.as_deref().unwrap_or_default();
     write_count(&mut bytes, names.len())?;
     write_strings(&mut bytes, names)?;
+    for value in &preprocessor.imputer_statistics {
+        bytes.extend(value.to_le_bytes());
+    }
     for normalization in &preprocessor.normalizations {
         for value in normalization.statistics().into_iter().flatten() {
             bytes.extend(value.to_le_bytes());
@@ -299,6 +303,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<([u8; 32], Preprocessor, Option<Tra
     let feature_names = (names != 0)
         .then(|| read_strings(&mut reader, names))
         .transpose()?;
+    let imputer_statistics = reader.read_f64s(features)?;
     let normalizations = groups
         .iter()
         .map(|&method| read_normalization(&mut reader, method, features))
@@ -309,6 +314,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<([u8; 32], Preprocessor, Option<Tra
     }
     let preprocessor = Preprocessor {
         feature_mask,
+        imputer_statistics,
         normalizations,
         member_groups,
         feature_permutations,

@@ -120,8 +120,8 @@ class ServerTest(unittest.TestCase):
         self.assertEqual(self.post(url, reordered), answer)
         missing = test.iloc[:2].copy()
         missing.iloc[1, 0] = np.nan
-        error = self.post(url, missing.to_json(orient="split", index=False))["error"]["message"]
-        self.assertIn("row 1 has a missing value", error)
+        answer = self.post(url, missing.to_json(orient="split", index=False))
+        np.testing.assert_allclose(answer["probabilities"], model.predict_proba(missing), atol=1e-4)
 
     def test_a_regressor_takes_options_next_to_the_dataframe(self):
         checkpoint(TabICLRegressor)

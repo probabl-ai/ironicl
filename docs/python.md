@@ -239,11 +239,15 @@ attributes, such as `X_encoder_`, `ensemble_generator_`, and the regressor's
 
 ## Supported Inputs
 
-This initial implementation supports finite dense numeric inputs, 2–10 classes
+This initial implementation supports dense numeric inputs, 2–10 classes
 whose labels are all integers, all floats, all booleans, or all strings, and the
 default `none`/`power` transforms with Latin feature and cyclic class
 permutations. It removes constant features and rejects all-constant training
-data. Categorical inputs, missing values, and sparse matrices are not supported.
+data. A missing value (NaN) becomes its feature's training mean, as TabICL's
+`SimpleImputer` does; infinity is rejected. Unlike TabICL, a feature that is
+missing in every row of one `predict` call is still imputed, not dropped for that
+call, so a row's prediction does not depend on the rows predicted with it.
+Categorical inputs and sparse matrices are not supported.
 Numeric DataFrames must have unique string column names in the same order at
 prediction time. Preprocessing is fitted on training data only and does not
 require `PYTHONHASHSEED` configuration. It preserves TabICL's power-transform
