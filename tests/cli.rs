@@ -9,9 +9,9 @@ fn help_lists_the_commands() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 CLI output");
-    for command in ["platform", "inspect", "import"] {
+    for command in ["platform", "inspect", "import", "prepare", "serve"] {
         assert!(
-            stdout.contains(&format!("ironicl {command}")),
+            stdout.contains(&format!("\n  {command} ")),
             "{command} is missing"
         );
     }
@@ -26,5 +26,5 @@ fn plan_is_no_longer_a_command() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8(output.stderr).expect("UTF-8 CLI output");
-    assert!(stderr.contains("unknown command 'plan'"), "{stderr}");
+    assert!(stderr.contains("unrecognized subcommand 'plan'"), "{stderr}");
 }

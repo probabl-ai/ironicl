@@ -14,7 +14,8 @@ ironicl serve DIR [--weights DIR] [--optimize safe|auto|fast] [--bind ADDR]
               [--max-request-rows N] [--max-body SIZE] [--max-batch-rows N] [--max-queue MS]
 ```
 
-Use `ironicl help COMMAND` or `ironicl COMMAND --help` for command-specific help.
+Use `ironicl help COMMAND` or `ironicl COMMAND --help` for command-specific help, and
+`ironicl --version` for the version.
 
 The CLI does not fit yet. Fit with the [Python estimators](python.md) and write a model directory
 with `export`.
@@ -97,5 +98,5 @@ refuses a request that would wait longer than `--max-queue` milliseconds. See
 
 ## Stability
 
-The command names are intended to stay stable. The parser moves to `clap` next, which keeps these
-forms.
+The command names are intended to stay stable. The CLI is parsed with `clap`: an unknown option or
+an invalid value exits with status 2 and a message naming the option.

@@ -167,7 +167,7 @@ directory with shared weights, `ironicl prepare`, and `ironicl serve` with
 `POST /v1/predict` and `GET /v1/health` in JSON, for one model directory, without
 Python ([server.md](server.md)). Its predictions match the Python estimators. It
 batches concurrent requests and bounds their wait
-([server.md](server.md#batching)). Next: `clap` for the CLI; `ironicl fit
+([server.md](server.md#batching)). The CLI is parsed with `clap`. Next: `ironicl fit
 classifier|regressor` from Parquet files and `ironicl predict`, so no step needs
 Python; missing values and
 categorical features; a memory planner that sizes batches from the KV cache and

@@ -17,7 +17,7 @@ mod python;
 #[cfg(feature = "server")]
 pub mod server;
 
-pub use cli::{Command, HelpTopic, ImportArgs, InspectArgs, PrepareArgs, ServeArgs, parse_cli};
+pub use cli::{Cli, Command, ImportArgs, InspectArgs, PrepareArgs, ServeArgs};
 pub use config::{StorageDType, TaskKind};
 pub use error::{Error, Result};
 pub use format::model::{

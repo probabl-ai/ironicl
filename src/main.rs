@@ -1,13 +1,13 @@
-use std::{env, process, time::Instant};
+use std::{process, time::Instant};
 
 use std::path::{Path, PathBuf};
 
+use clap::Parser;
 use ironicl::{
-    CheckpointCacheOptions, Command, CpuCapabilities, HelpTopic, ImportArgs, InspectArgs, Isa, PrepareArgs,
+    CheckpointCacheOptions, Cli, Command, CpuCapabilities, ImportArgs, InspectArgs, Isa, PrepareArgs,
     error::Result,
     memory::{ByteSize, MemoryLimits},
     models::tabicl_v2::directory,
-    parse_cli,
 };
 
 fn main() {
@@ -18,9 +18,7 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let args = env::args().skip(1).collect::<Vec<_>>();
-    match parse_cli(&args)? {
-        Command::Help(topic) => print_help(topic),
+    match Cli::parse().command {
         Command::Platform => print_platform(),
         Command::Inspect(args) => inspect(&args)?,
         Command::Import(args) => import(&args)?,
@@ -210,52 +208,4 @@ fn prepare(args: &PrepareArgs) -> Result<()> {
     println!("size:          {}", ByteSize(bytes));
     println!("time:          {:.2} s", start.elapsed().as_secs_f64());
     Ok(())
-}
-
-fn print_help(topic: Option<HelpTopic>) {
-    let text = match topic {
-        None => {
-            "Ironicl\n\n\
-             Usage:\n\
-               ironicl platform\n\
-               ironicl inspect PATH [--weights DIR]\n\
-               ironicl import CHECKPOINT [-o FILE]\n\
-               ironicl prepare DIR [--weights DIR] [--optimize safe|auto|fast]\n\
-               ironicl serve DIR [--weights DIR] [--optimize safe|auto|fast] [--bind ADDR]\n\
-             \x20 [--max-request-rows N] [--max-body SIZE] [--max-batch-rows N] [--max-queue MS]\n\n\
-             Use 'ironicl help COMMAND' for command-specific help."
-        }
-        Some(HelpTopic::Platform) => "Usage: ironicl platform",
-        Some(HelpTopic::Inspect) => {
-            "Usage: ironicl inspect PATH [--weights DIR]\n\n\
-             Inspect a model directory, Ironicl weights (.irmodel), or a PyTorch\n\
-             checkpoint. For a model directory, --weights is the folder its weights\n\
-             are looked for in, by default the shared one."
-        }
-        Some(HelpTopic::Import) => {
-            "Usage: ironicl import CHECKPOINT [-o FILE]\n\n\
-             Convert a PyTorch checkpoint to Ironicl weights: by default into the\n\
-             shared weights folder (~/.cache/ironicl/models/v1, under\n\
-             XDG_CACHE_HOME when set), where prepare and serve look for them."
-        }
-        Some(HelpTopic::Prepare) => {
-            "Usage: ironicl prepare DIR [--weights DIR] [--optimize safe|auto|fast]\n\n\
-             Build the KV cache of a model directory on this machine's device and\n\
-             write it to DIR/context.ircntxt, unless the saved cache is already the\n\
-             one this model builds at the level. The level defaults to the saved\n\
-             cache's, else safe. --weights is the folder of weights, by default the\n\
-             shared one."
-        }
-        Some(HelpTopic::Serve) => {
-            "Usage: ironicl serve DIR [--weights DIR] [--optimize safe|auto|fast] [--bind ADDR]\n\
-             \x20      [--max-request-rows N] [--max-body SIZE] [--max-batch-rows N] [--max-queue MS]\n\n\
-             Serve a model directory over HTTP: POST /v1/predict, GET /v1/health. It\n\
-             first prepares the KV cache as ironicl prepare does. Concurrent requests\n\
-             are predicted together, up to --max-batch-rows rows at once; a request\n\
-             that would wait longer than --max-queue is refused with 503. Defaults:\n\
-             --bind 127.0.0.1:8080, --max-request-rows 10000, --max-body 16M,\n\
-             --max-batch-rows 1024 on a GPU and 32 on the CPU, --max-queue 1000."
-        }
-    };
-    println!("{text}");
 }

@@ -1,14 +1,27 @@
+//! The `ironicl` command line, parsed with clap. Each command's and option's
+//! help is its doc comment.
+#![expect(
+    clippy::doc_markdown,
+    reason = "the doc comments are the terminal help, where backticks show"
+)]
+
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use crate::{
-    Optimize,
-    error::{Error, Result},
-};
+use clap::{Args, Parser, Subcommand, builder::RangedU64ValueParser};
 
-/// A parsed Ironicl command.
-#[derive(Debug, Clone, PartialEq)]
+use crate::Optimize;
+
+/// Ironicl: TabICLv2 inference without Python.
+#[derive(Debug, Parser)]
+#[command(name = "ironicl", version, arg_required_else_help = true)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Debug, Clone, PartialEq, Subcommand)]
 pub enum Command {
-    Help(Option<HelpTopic>),
+    /// Show the CPU features the kernels detect.
     Platform,
     Inspect(InspectArgs),
     Import(ImportArgs),
@@ -16,274 +29,135 @@ pub enum Command {
     Serve(ServeArgs),
 }
 
-/// Command-specific help pages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HelpTopic {
-    Platform,
-    Inspect,
-    Import,
-    Prepare,
-    Serve,
-}
-
-/// Arguments for inspecting a model directory, an Ironicl model, or a
+/// Inspect a model directory, Ironicl weights (.irmodel), or a PyTorch
 /// checkpoint.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct InspectArgs {
+    /// A model directory, an .irmodel file, or a checkpoint.
     pub path: PathBuf,
-    /// The weights folder a model directory's weights are looked for in.
+    /// The folder a model directory's weights are looked for in [default: the
+    /// shared one]
+    #[arg(long, value_name = "DIR")]
     pub weights: Option<PathBuf>,
 }
 
-/// Arguments for converting a `PyTorch` checkpoint into Ironicl weights.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Convert a PyTorch checkpoint to Ironicl weights.
+///
+/// By default they go into the shared weights folder,
+/// ~/.cache/ironicl/models/v1 (under XDG_CACHE_HOME when set), where prepare
+/// and serve look for them.
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct ImportArgs {
+    /// The checkpoint file.
     pub checkpoint: PathBuf,
-    /// Where to write the weights; by default, into the shared weights folder.
+    /// Write the weights to FILE instead.
+    #[arg(short, long, value_name = "FILE")]
     pub output: Option<PathBuf>,
 }
 
-/// Arguments for building a model directory's KV cache.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Build a model directory's KV cache.
+///
+/// It builds the cache on this machine's device and writes it to
+/// DIR/context.ircntxt, unless the saved cache is already the one this model
+/// builds at the level. A saved cache that cannot be read is rebuilt, with a
+/// warning.
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct PrepareArgs {
+    /// The model directory.
     pub dir: PathBuf,
-    /// The weights folder; by default, the shared one.
+    /// The folder of weights [default: the shared one]
+    #[arg(long, value_name = "DIR")]
     pub weights: Option<PathBuf>,
-    /// The cache's level; by default, the saved cache's, else `safe`.
+    /// safe, auto, or fast [default: the saved cache's, else safe]
+    #[arg(long, value_name = "LEVEL", value_parser = level)]
     pub optimize: Option<Optimize>,
 }
 
-/// Arguments for serving a model directory over HTTP.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Serve a model directory over HTTP.
+///
+/// It serves POST /v1/predict and GET /v1/health, after preparing the KV cache
+/// as ironicl prepare does. Concurrent requests are predicted together, up to
+/// --max-batch-rows rows at once; a request that would wait longer than
+/// --max-queue is refused with 503.
+#[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct ServeArgs {
+    /// The model directory.
     pub dir: PathBuf,
+    /// The folder of weights [default: the shared one]
+    #[arg(long, value_name = "DIR")]
     pub weights: Option<PathBuf>,
+    /// safe, auto, or fast [default: the saved cache's, else safe]
+    #[arg(long, value_name = "LEVEL", value_parser = level)]
     pub optimize: Option<Optimize>,
+    /// The address to listen on.
+    #[arg(long, value_name = "ADDR", default_value = "127.0.0.1:8080")]
     pub bind: SocketAddr,
+    /// The most rows a request may have.
+    #[arg(long, value_name = "N", default_value = "10000", value_parser = positive())]
     pub max_request_rows: usize,
+    /// The largest request body, such as 512K or 16M.
+    #[arg(long, value_name = "SIZE", default_value = "16M", value_parser = bytes)]
     pub max_body: usize,
-    /// Rows predicted together at most; by default, by device.
+    /// The most rows predicted together [default: 1024 on a GPU, 32 on the CPU]
+    #[arg(long, value_name = "N", value_parser = positive())]
     pub max_batch_rows: Option<usize>,
-    /// How long a request may wait for its batch before it is refused.
+    /// How long, in milliseconds, a request may wait for its batch.
+    #[arg(long, value_name = "MS", default_value = "1000", value_parser = milliseconds)]
     pub max_queue: Duration,
 }
 
-/// Parse command-line arguments excluding the executable name.
-///
-/// # Errors
-///
-/// Returns [`Error::InvalidArgument`] for unknown commands or options,
-/// duplicate options, missing or invalid values, and a missing path.
-pub fn parse_cli(args: &[String]) -> Result<Command> {
-    let Some((command, rest)) = args.split_first() else {
-        return Ok(Command::Help(None));
-    };
-
-    match command.as_str() {
-        "help" | "--help" | "-h" => parse_help(rest),
-        "platform" => parse_no_args(rest, HelpTopic::Platform, Command::Platform),
-        "inspect" => parse_inspect(rest),
-        "import" => parse_import(rest),
-        "prepare" => parse_prepare(rest),
-        "serve" => parse_serve(rest),
-        _ => Err(Error::InvalidArgument(format!("unknown command '{command}'"))),
-    }
+fn level(value: &str) -> Result<Optimize, String> {
+    value
+        .parse()
+        .map_err(|_| "expected safe, auto, or fast".to_owned())
 }
 
-fn parse_help(args: &[String]) -> Result<Command> {
-    match args {
-        [] => Ok(Command::Help(None)),
-        [topic] => Ok(Command::Help(Some(parse_help_topic(topic)?))),
-        _ => Err(Error::InvalidArgument(
-            "help accepts at most one command name".into(),
-        )),
-    }
+fn positive() -> RangedU64ValueParser<usize> {
+    RangedU64ValueParser::new().range(1..)
 }
 
-fn parse_help_topic(value: &str) -> Result<HelpTopic> {
-    match value {
-        "platform" => Ok(HelpTopic::Platform),
-        "inspect" => Ok(HelpTopic::Inspect),
-        "import" => Ok(HelpTopic::Import),
-        "prepare" => Ok(HelpTopic::Prepare),
-        "serve" => Ok(HelpTopic::Serve),
-        _ => Err(Error::InvalidArgument(format!("unknown help topic '{value}'"))),
-    }
+fn bytes(value: &str) -> Result<usize, String> {
+    let bytes = crate::memory::parse_bytes(value).map_err(|error| error.to_string())?;
+    usize::try_from(bytes).map_err(|_| "too large".to_owned())
 }
 
-fn parse_no_args(args: &[String], topic: HelpTopic, command: Command) -> Result<Command> {
-    if is_help(args) {
-        return Ok(Command::Help(Some(topic)));
+fn milliseconds(value: &str) -> Result<Duration, String> {
+    match value.parse() {
+        Ok(0) | Err(_) => Err("expected a positive number of milliseconds".to_owned()),
+        Ok(milliseconds) => Ok(Duration::from_millis(milliseconds)),
     }
-    if let Some(argument) = args.first() {
-        return Err(Error::InvalidArgument(format!(
-            "command does not accept argument '{argument}'"
-        )));
-    }
-    Ok(command)
-}
-
-fn parse_inspect(args: &[String]) -> Result<Command> {
-    if is_help(args) {
-        return Ok(Command::Help(Some(HelpTopic::Inspect)));
-    }
-    let (path, rest) = path(args, "inspect", "a path")?;
-    let mut weights = None;
-    for (flag, value) in options(rest)? {
-        match flag {
-            "--weights" => set_once(&mut weights, PathBuf::from(value), flag)?,
-            _ => return Err(unknown(flag, "inspect")),
-        }
-    }
-    Ok(Command::Inspect(InspectArgs { path, weights }))
-}
-
-fn parse_import(args: &[String]) -> Result<Command> {
-    if is_help(args) {
-        return Ok(Command::Help(Some(HelpTopic::Import)));
-    }
-    let (checkpoint, rest) = path(args, "import", "a checkpoint")?;
-    let mut output = None;
-    for (flag, value) in options(rest)? {
-        match flag {
-            "-o" | "--output" => set_once(&mut output, PathBuf::from(value), flag)?,
-            _ => return Err(unknown(flag, "import")),
-        }
-    }
-    Ok(Command::Import(ImportArgs { checkpoint, output }))
-}
-
-fn parse_prepare(args: &[String]) -> Result<Command> {
-    if is_help(args) {
-        return Ok(Command::Help(Some(HelpTopic::Prepare)));
-    }
-    let (dir, rest) = path(args, "prepare", "a model directory")?;
-    let (mut weights, mut optimize) = (None, None);
-    for (flag, value) in options(rest)? {
-        match flag {
-            "--weights" => set_once(&mut weights, PathBuf::from(value), flag)?,
-            "--optimize" => set_once(&mut optimize, value.parse()?, flag)?,
-            _ => return Err(unknown(flag, "prepare")),
-        }
-    }
-    Ok(Command::Prepare(PrepareArgs {
-        dir,
-        weights,
-        optimize,
-    }))
-}
-
-fn parse_serve(args: &[String]) -> Result<Command> {
-    if is_help(args) {
-        return Ok(Command::Help(Some(HelpTopic::Serve)));
-    }
-    let (dir, rest) = path(args, "serve", "a model directory")?;
-    let (mut weights, mut optimize, mut bind) = (None, None, None);
-    let (mut max_request_rows, mut max_body, mut max_batch_rows, mut max_queue) = (None, None, None, None);
-    for (flag, value) in options(rest)? {
-        let invalid = || Error::InvalidArgument(format!("invalid value '{value}' for {flag}"));
-        match flag {
-            "--weights" => set_once(&mut weights, PathBuf::from(value), flag)?,
-            "--optimize" => set_once(&mut optimize, value.parse()?, flag)?,
-            "--bind" => set_once(&mut bind, value.parse().map_err(|_| invalid())?, flag)?,
-            "--max-request-rows" => {
-                set_once(&mut max_request_rows, positive(value).ok_or_else(invalid)?, flag)?;
-            }
-            "--max-body" => set_once(&mut max_body, crate::memory::parse_bytes(value)?, flag)?,
-            "--max-batch-rows" => set_once(&mut max_batch_rows, positive(value).ok_or_else(invalid)?, flag)?,
-            "--max-queue" => {
-                let milliseconds = positive(value).ok_or_else(invalid)?;
-                set_once(&mut max_queue, Duration::from_millis(milliseconds as u64), flag)?;
-            }
-            _ => return Err(unknown(flag, "serve")),
-        }
-    }
-    Ok(Command::Serve(ServeArgs {
-        dir,
-        weights,
-        optimize,
-        bind: bind.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 8080))),
-        max_request_rows: max_request_rows.unwrap_or(10_000),
-        max_body: usize::try_from(max_body.unwrap_or(16 << 20))
-            .map_err(|_| Error::InvalidArgument("--max-body is too large".into()))?,
-        max_batch_rows,
-        max_queue: max_queue.unwrap_or(Duration::from_secs(1)),
-    }))
-}
-
-fn positive(value: &str) -> Option<usize> {
-    value.parse().ok().filter(|&value| value > 0)
-}
-
-/// The path that leads `args`, and the options after it.
-fn path<'a>(args: &'a [String], command: &str, what: &str) -> Result<(PathBuf, &'a [String])> {
-    match args.split_first() {
-        Some((path, rest)) if !path.starts_with('-') => Ok((PathBuf::from(path), rest)),
-        _ => Err(Error::InvalidArgument(format!("{command} requires {what}"))),
-    }
-}
-
-/// `args` as `(flag, value)` pairs.
-fn options(args: &[String]) -> Result<Vec<(&str, &str)>> {
-    args.chunks(2)
-        .map(|pair| match pair {
-            [flag, value] if flag.starts_with('-') => Ok((flag.as_str(), value.as_str())),
-            [flag] if flag.starts_with('-') => {
-                Err(Error::InvalidArgument(format!("missing value for {flag}")))
-            }
-            [argument, ..] => Err(Error::InvalidArgument(format!(
-                "unexpected positional argument '{argument}'"
-            ))),
-            [] => unreachable!("chunks are never empty"),
-        })
-        .collect()
-}
-
-fn unknown(flag: &str, command: &str) -> Error {
-    Error::InvalidArgument(format!("unknown option '{flag}' for {command}"))
-}
-
-fn set_once<T>(slot: &mut Option<T>, value: T, flag: &str) -> Result<()> {
-    if slot.replace(value).is_some() {
-        return Err(Error::InvalidArgument(format!("duplicate option '{flag}'")));
-    }
-    Ok(())
-}
-
-fn is_help(args: &[String]) -> bool {
-    matches!(args, [value] if value == "--help" || value == "-h")
 }
 
 #[cfg(test)]
 mod tests {
+    use clap::{CommandFactory, Parser};
+
     use super::*;
 
-    fn args(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| (*value).to_owned()).collect()
+    fn parse(args: &[&str]) -> Result<Command, clap::Error> {
+        Cli::try_parse_from([&["ironicl"], args].concat()).map(|cli| cli.command)
+    }
+
+    #[test]
+    fn the_command_line_is_consistent() {
+        Cli::command().debug_assert();
     }
 
     #[test]
     fn parses_inspect_and_import() {
         assert_eq!(
-            parse_cli(&args(&["inspect", "my-model", "--weights", "w"])),
-            Ok(Command::Inspect(InspectArgs {
+            parse(&["inspect", "my-model", "--weights", "w"]).unwrap(),
+            Command::Inspect(InspectArgs {
                 path: PathBuf::from("my-model"),
                 weights: Some(PathBuf::from("w")),
-            }))
+            })
         );
         assert_eq!(
-            parse_cli(&args(&["import", "model.ckpt"])),
-            Ok(Command::Import(ImportArgs {
-                checkpoint: PathBuf::from("model.ckpt"),
-                output: None,
-            }))
-        );
-        assert_eq!(
-            parse_cli(&args(&["import", "model.ckpt", "-o", "model.irmodel"])),
-            Ok(Command::Import(ImportArgs {
+            parse(&["import", "model.ckpt", "-o", "model.irmodel"]).unwrap(),
+            Command::Import(ImportArgs {
                 checkpoint: PathBuf::from("model.ckpt"),
                 output: Some(PathBuf::from("model.irmodel")),
-            }))
+            })
         );
         for bad in [
             &["inspect"][..],
@@ -291,46 +165,32 @@ mod tests {
             &["import", "model.ckpt", "-o"],
             &["import", "model.ckpt", "-o", "a", "-o", "b"],
             &["import", "model.ckpt", "extra"],
+            &["plan"],
         ] {
-            assert!(parse_cli(&args(bad)).is_err(), "{bad:?}");
+            assert!(parse(bad).is_err(), "{bad:?}");
         }
     }
 
     #[test]
     fn parses_prepare() {
         assert_eq!(
-            parse_cli(&args(&["prepare", "my-model"])),
-            Ok(Command::Prepare(PrepareArgs {
-                dir: PathBuf::from("my-model"),
-                weights: None,
-                optimize: None,
-            }))
-        );
-        assert_eq!(
-            parse_cli(&args(&[
-                "prepare",
-                "my-model",
-                "--optimize",
-                "auto",
-                "--weights",
-                "w"
-            ])),
-            Ok(Command::Prepare(PrepareArgs {
+            parse(&["prepare", "my-model", "--optimize", "auto", "--weights", "w"]).unwrap(),
+            Command::Prepare(PrepareArgs {
                 dir: PathBuf::from("my-model"),
                 weights: Some(PathBuf::from("w")),
                 optimize: Some(Optimize::Auto),
-            }))
+            })
         );
-        assert!(parse_cli(&args(&["prepare", "--optimize", "auto"])).is_err());
-        assert!(parse_cli(&args(&["prepare", "my-model", "--optimize", "max"])).is_err());
+        assert!(parse(&["prepare", "--optimize", "auto"]).is_err());
+        assert!(parse(&["prepare", "my-model", "--optimize", "max"]).is_err());
     }
 
     #[test]
     fn parses_serve() {
-        let serve = |extra: &[&str]| parse_cli(&args(&[&["serve", "my-model"], extra].concat()));
+        let serve = |extra: &[&str]| parse(&[&["serve", "my-model"], extra].concat());
         assert_eq!(
-            serve(&[]),
-            Ok(Command::Serve(ServeArgs {
+            serve(&[]).unwrap(),
+            Command::Serve(ServeArgs {
                 dir: PathBuf::from("my-model"),
                 weights: None,
                 optimize: None,
@@ -339,7 +199,7 @@ mod tests {
                 max_body: 16 << 20,
                 max_batch_rows: None,
                 max_queue: Duration::from_secs(1),
-            }))
+            })
         );
         assert_eq!(
             serve(&[
@@ -357,8 +217,9 @@ mod tests {
                 "64",
                 "--max-queue",
                 "10",
-            ]),
-            Ok(Command::Serve(ServeArgs {
+            ])
+            .unwrap(),
+            Command::Serve(ServeArgs {
                 dir: PathBuf::from("my-model"),
                 weights: Some(PathBuf::from("w")),
                 optimize: Some(Optimize::Fast),
@@ -367,31 +228,19 @@ mod tests {
                 max_body: 1 << 20,
                 max_batch_rows: Some(64),
                 max_queue: Duration::from_millis(10),
-            }))
+            })
         );
         for bad in [
             &["--max-request-rows", "0"][..],
             &["--max-batch-rows", "0"],
             &["--max-queue", "0"],
+            &["--max-body", "lots"],
             &["--bind", "nowhere"],
             &["--max-request-rows", "1", "--max-request-rows", "2"],
             &["--max-rows", "5"],
-            &["--port", "1"],
         ] {
             assert!(serve(bad).is_err(), "{bad:?}");
         }
-        assert!(parse_cli(&args(&["serve", "--bind", "0.0.0.0:9000"])).is_err());
-    }
-
-    #[test]
-    fn parses_command_help() {
-        assert_eq!(
-            parse_cli(&args(&["inspect", "--help"])),
-            Ok(Command::Help(Some(HelpTopic::Inspect)))
-        );
-        assert_eq!(
-            parse_cli(&args(&["help", "import"])),
-            Ok(Command::Help(Some(HelpTopic::Import)))
-        );
+        assert!(parse(&["serve", "--bind", "0.0.0.0:9000"]).is_err());
     }
 }
