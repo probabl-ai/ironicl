@@ -1,8 +1,9 @@
 //! `TabICLv2`'s preprocessing, fitted and applied in Rust.
 //!
 //! It reproduces `TabICL` 2.1.1 (commit bd030d47ff7d9f987f0f33431d743a3003bfe0d3)
-//! for finite numeric features and the `none` and `power` normalizations:
-//! constant features are dropped, each normalization method is fitted once as
+//! for numeric features and the `none` and `power` normalizations: missing
+//! values (NaN) are replaced by their feature's training mean, constant
+//! features are dropped, each normalization method is fitted once as
 //! a group, and each ensemble member is a group, a feature order, and a class
 //! order. The ensemble comes from `CPython`'s `random.Random(random_state)`, so
 //! it matches `TabICL` member for member.
@@ -138,6 +139,12 @@ impl Features<'_> {
         }
     }
 
+    /// The value at `index`, or `fill` when it is missing (NaN).
+    fn get_or(self, index: usize, fill: f64) -> f64 {
+        let value = self.get(index);
+        if value.is_nan() { fill } else { value }
+    }
+
     /// Rows `start..end` of a matrix with `columns` columns.
     pub(crate) fn rows(self, start: usize, end: usize, columns: usize) -> Self {
         match self {
@@ -237,16 +244,17 @@ impl Normalization {
         Some(clamp_outlier(value, self.lower[k], self.upper[k]))
     }
 
-    /// The FP32 `[rows, features]` matrix of `x`'s `kept` columns.
+    /// The FP32 `[rows, features]` matrix of `x`'s `kept` columns, with a
+    /// missing value of kept feature `k` replaced by `means[k]`.
     ///
     /// Port of <https://github.com/soda-inria/tabicl/blob/bd030d47ff7d9f987f0f33431d743a3003bfe0d3/src/tabicl/_sklearn/preprocessing.py#L740-L769>.
-    fn transform(&self, x: Features<'_>, columns: usize, kept: &[usize]) -> Result<Vec<f32>> {
+    fn transform(&self, x: Features<'_>, columns: usize, kept: &[usize], means: &[f64]) -> Result<Vec<f32>> {
         let mut out = vec![0.0; x.len() / columns * kept.len()];
         #[expect(clippy::cast_possible_truncation, reason = "The model reads FP32")]
         let fill = |out: &mut [f32], clip: bool| {
             out.par_chunks_mut(kept.len()).enumerate().all(|(row, out)| {
                 out.iter_mut().zip(kept).enumerate().all(|(k, (out, &column))| {
-                    self.value(x.get(row * columns + column), k, clip)
+                    self.value(x.get_or(row * columns + column, means[k]), k, clip)
                         .map(|value| *out = value as f32)
                         .is_some()
                 })
@@ -438,6 +446,9 @@ fn ensemble(
 pub struct Preprocessor {
     /// Which input features vary in training; the others are dropped.
     pub(crate) feature_mask: Vec<bool>,
+    /// Each kept feature's training mean, which replaces its missing values:
+    /// `SimpleImputer`'s `statistics_`.
+    pub(crate) imputer_statistics: Vec<f64>,
     /// One per group, in group order.
     pub(crate) normalizations: Vec<Normalization>,
     /// Each member's group, feature order, and class order (empty for regression).
@@ -454,15 +465,41 @@ pub struct Preprocessor {
     pub(crate) aggregation: Option<ClassifierAggregation>,
 }
 
-/// Check a C-ordered matrix of finite values and return its rows.
+/// Check a C-ordered matrix without infinities and return its rows. NaN marks
+/// a missing value.
 fn check_matrix(x: Features<'_>, columns: usize) -> Result<usize> {
     if columns == 0 || !x.len().is_multiple_of(columns) {
         return Err(invalid("X must be a nonempty matrix of features"));
     }
-    if (0..x.len()).any(|index| !x.get(index).is_finite()) {
-        return Err(invalid("X must contain only finite values"));
+    if (0..x.len()).any(|index| x.get(index).is_infinite()) {
+        return Err(invalid(
+            "X must not contain infinity; mark missing values with NaN",
+        ));
     }
     Ok(x.len() / columns)
+}
+
+/// `SimpleImputer(strategy="mean")`'s statistics: each column's mean over its
+/// values that are not missing, row after row, or 0 for a column with none.
+/// `TabICL` 2.1.1's imputer drops such a column; it is constant here, so the
+/// feature mask drops it instead.
+///
+/// Port of <https://github.com/scikit-learn/scikit-learn/blob/1.9.1/sklearn/impute/_base.py#L529-L543>.
+fn column_means(x: Features<'_>, columns: usize) -> Vec<f64> {
+    let mut sums = vec![0.0; columns];
+    let mut counts = vec![0_usize; columns];
+    for index in 0..x.len() {
+        let value = x.get(index);
+        if !value.is_nan() {
+            sums[index % columns] += value;
+            counts[index % columns] += 1;
+        }
+    }
+    #[expect(clippy::cast_precision_loss, reason = "Counts stay far below 2^53")]
+    sums.iter()
+        .zip(counts)
+        .map(|(&sum, count)| if count == 0 { 0.0 } else { sum / count as f64 })
+        .collect()
 }
 
 impl Preprocessor {
@@ -477,8 +514,8 @@ impl Preprocessor {
     ///
     /// # Errors
     ///
-    /// When an option is out of range, `x` is empty, not finite, or constant, or
-    /// the targets do not fit the task.
+    /// When an option is out of range, `x` is empty, holds infinity, or is
+    /// constant once imputed, or the targets do not fit the task.
     pub fn fit(
         options: &PreprocessOptions,
         x: Features<'_>,
@@ -509,9 +546,11 @@ impl Preprocessor {
                 (None, Some(standard_scaler(&values)))
             }
         };
+        let means = column_means(x, columns);
+        let value = |row: usize, j: usize| x.get_or(row * columns + j, means[j]);
         #[expect(clippy::float_cmp, reason = "A feature is kept when any value differs")]
         let feature_mask: Vec<bool> = (0..columns)
-            .map(|j| (1..rows).any(|row| x.get(row * columns + j) != x.get(j)))
+            .map(|j| (1..rows).any(|row| value(row, j) != value(0, j)))
             .collect();
         let kept: Vec<usize> = (0..columns).filter(|&j| feature_mask[j]).collect();
         if kept.is_empty() {
@@ -527,8 +566,8 @@ impl Preprocessor {
             .par_chunks_mut(rows)
             .zip(&kept)
             .for_each(|(values, &column)| {
-                for (row, value) in values.iter_mut().enumerate() {
-                    *value = x.get(row * columns + column);
+                for (row, slot) in values.iter_mut().enumerate() {
+                    *slot = value(row, column);
                 }
             });
         let features: Vec<Vec<Vec<f64>>> = by_feature
@@ -547,6 +586,7 @@ impl Preprocessor {
             .collect();
         Ok(Self {
             feature_mask,
+            imputer_statistics: kept.iter().map(|&j| means[j]).collect(),
             normalizations,
             member_groups,
             feature_permutations,
@@ -566,8 +606,8 @@ impl Preprocessor {
     ///
     /// # Errors
     ///
-    /// When `x` has the wrong number of features or values that are not finite,
-    /// or a result is not finite in FP32.
+    /// When `x` has the wrong number of features or holds infinity, or a result
+    /// is not finite in FP32.
     pub fn transform(&self, x: Features<'_>, columns: usize) -> Result<Vec<Vec<f32>>> {
         if columns != self.n_features_in() {
             return Err(invalid(format!(
@@ -579,7 +619,7 @@ impl Preprocessor {
         let kept: Vec<usize> = (0..columns).filter(|&j| self.feature_mask[j]).collect();
         self.normalizations
             .iter()
-            .map(|normalization| normalization.transform(x, columns, &kept))
+            .map(|normalization| normalization.transform(x, columns, &kept, &self.imputer_statistics))
             .collect()
     }
 
@@ -733,6 +773,11 @@ impl Preprocessor {
         {
             return fail("the feature names do not match the features");
         }
+        if self.imputer_statistics.len() != features
+            || !self.imputer_statistics.iter().all(|value| value.is_finite())
+        {
+            return fail("the imputer statistics are invalid");
+        }
         if !self.normalizations.iter().all(|normalization| {
             normalization
                 .statistics()
@@ -880,6 +925,82 @@ mod tests {
     }
 
     #[test]
+    fn missing_values_are_the_training_mean() {
+        let columns = 4;
+        // Column 2 is all missing, so it is constant once imputed and dropped.
+        let mut x: Vec<f64> = (0..120).map(|i| f64::from((i * 37 % 29) - 14) / 3.0).collect();
+        for row in 0..30 {
+            x[row * columns + 2] = f64::NAN;
+        }
+        for index in [1, 6, 13, 50, 97] {
+            x[index] = f64::NAN;
+        }
+        let labels = Targets::Labels(Labels::Int((0..30).map(|i| i % 3).collect()));
+        let preprocessor = Preprocessor::fit(&options(), Features::F64(&x), columns, &labels).unwrap();
+        assert_eq!(preprocessor.feature_mask(), [true, true, false, true]);
+        // The same data with each missing value replaced by its column's mean.
+        let means: Vec<f64> = (0..columns)
+            .map(|j| {
+                let (sum, count) = (0..30)
+                    .map(|row| x[row * columns + j])
+                    .filter(|v| !v.is_nan())
+                    .fold((0.0, 0.0), |(sum, count), v| (sum + v, count + 1.0));
+                if count == 0.0 { 0.0 } else { sum / count }
+            })
+            .collect();
+        let filled: Vec<f64> = x
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                if value.is_nan() {
+                    means[index % columns]
+                } else {
+                    value
+                }
+            })
+            .collect();
+        assert_eq!(preprocessor.imputer_statistics, [means[0], means[1], means[3]]);
+        let reference = Preprocessor::fit(&options(), Features::F64(&filled), columns, &labels).unwrap();
+        for (data, other) in [(&x, &filled), (&filled, &filled)] {
+            assert_eq!(
+                preprocessor.transform(Features::F64(data), columns).unwrap(),
+                reference.transform(Features::F64(other), columns).unwrap()
+            );
+        }
+        // A query row preprocesses alike alone and in a batch, whatever else is missing.
+        let query = [f64::NAN, 1.0, f64::NAN, 2.0, 0.5, f64::NAN, 3.0, f64::NAN];
+        let batch = preprocessor.transform(Features::F64(&query), columns).unwrap();
+        let alone = preprocessor
+            .transform(Features::F64(&query[..columns]), columns)
+            .unwrap();
+        assert_eq!(batch[0][..3], alone[0][..]);
+        let sha = [1; 32];
+        assert_eq!(
+            decode(&encode(&preprocessor, None, &sha).unwrap()).unwrap(),
+            (sha, preprocessor, None)
+        );
+    }
+
+    #[test]
+    fn infinity_and_all_missing_data_are_rejected() {
+        let labels = Targets::Labels(Labels::Int(vec![0, 1, 0, 1]));
+        let fit = |x: &[f64]| Preprocessor::fit(&options(), Features::F64(x), 2, &labels);
+        assert!(fit(&[1.0, f64::NAN, 2.0, 3.0, f64::INFINITY, 4.0, 0.0, 5.0]).is_err());
+        assert!(fit(&[f64::NAN; 8]).is_err());
+        let preprocessor = fit(&[1.0, f64::NAN, 2.0, 3.0, 5.0, 4.0, 0.0, 5.0]).unwrap();
+        assert!(
+            preprocessor
+                .transform(Features::F64(&[f64::NEG_INFINITY, 1.0]), 2)
+                .is_err()
+        );
+        assert!(
+            preprocessor
+                .transform(Features::F64(&[f64::NAN, f64::NAN]), 2)
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn an_overflowing_power_transform_clips_the_whole_batch() {
         use super::{NormMethod, Normalization};
         let statistics = [0.0, 1.0, -1.0, 0.25, -1e30, 1e30, 200.0, 0.0, 1.0];
@@ -887,7 +1008,7 @@ mod tests {
             NormMethod::Power,
             statistics.iter().map(|&value| vec![value]).collect(),
         );
-        let transform = |x: &[f64]| normalization.transform(Features::F64(x), 1, &[0]);
+        let transform = |x: &[f64]| normalization.transform(Features::F64(x), 1, &[0], &[0.0]);
         // 51^200 overflows f64, so the batch falls back: every row is clipped
         // to the training range, including 0.5, which alone would not be.
         let batch = transform(&[50.0, 0.5]).unwrap();

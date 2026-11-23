@@ -164,7 +164,8 @@ A classifier uses the `softmax_temperature` and `average_logits` it was fitted w
 ← {"mean": [195.58], "alphas": [0.1, 0.9], "quantiles": [[103.75, 285.18]]}
 ```
 
-Missing values (`null`) and categorical features (strings) are not supported yet and return 400.
+A missing value (`null`) becomes its feature's training mean, as in `predict`. Categorical features
+(strings) are not supported yet and return 400.
 
 ## `GET /v1/health`
 

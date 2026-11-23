@@ -114,7 +114,22 @@ class PreprocessingTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "features"):
             preprocessed.query_rows(self.q[:, :3])
         with self.assertRaises(ValueError):
-            preprocessed.query_rows(np.full_like(self.q, np.nan))
+            preprocessed.query_rows(np.full_like(self.q, np.inf))
+
+    def test_missing_values_are_the_training_mean(self):
+        x = self.x.copy()
+        x[::3, 0] = np.nan
+        x[:, 4] = np.nan  # Missing everywhere, so dropped.
+        preprocessed = preprocess(x, self.y)
+        self.assertEqual(preprocessed.feature_mask, [True, False, True, True, False])
+        means = np.nanmean(np.where(np.isnan(x).all(axis=0), 0, x), axis=0)
+        reference = preprocess(np.where(np.isnan(x), means, x), self.y)
+        self.assertEqual(preprocessed.training_inputs(), reference.training_inputs())
+        q = self.q.copy()
+        q[:, 0] = np.nan  # Missing in every query row: still the training mean.
+        self.assertEqual(preprocessed.query_rows(q), reference.query_rows(np.where(np.isnan(q), means, q)))
+        alone = np.concatenate([_array(*preprocessed.query_rows(row[None, :])) for row in q], axis=1)
+        assert_array_equal(_array(*preprocessed.query_rows(q)), alone)
 
     def test_sparse_inputs_are_rejected(self):
         from scipy.sparse import csr_matrix

@@ -215,7 +215,12 @@ class TabICLPreprocessingParityTest(unittest.TestCase):
         preprocessed = preprocess(x, y, **options)
         # The encoded labels are checked through the permuted training targets below.
         self.assert_equal(np.unique(_labels(y)), encoder.classes_, "classes")
-        self.assert_equal(preprocessed.feature_mask, expected.unique_filter_.features_to_keep_, "feature mask")
+        # TabICL 2.1.1's imputer drops a feature missing in every row before its
+        # filter sees it; Ironicl's mask drops it.
+        empty = np.isnan(upcast(x)).all(axis=0)
+        mask = np.zeros(len(empty), dtype=bool)
+        mask[~empty] = expected.unique_filter_.features_to_keep_
+        self.assert_equal(preprocessed.feature_mask, mask, "feature mask")
         members, training_rows, features = preprocessed.shape
         self.assertEqual(features, expected.n_features_in_)
         canonical_names = tuple(method for method in options["norm_methods"] if method in expected.ensemble_configs_)
@@ -295,6 +300,17 @@ class TabICLPreprocessingParityTest(unittest.TestCase):
                 x[:, 0] = 1 + x[:, 0] * 1e-5
                 q[:, 0] = 1 + q[:, 0] * 1e-5
                 self.run_case("near constant", x, q, y)
+
+    def test_missing_values(self):
+        for dtype in (np.float32, np.float64):
+            with self.subTest(dtype=dtype):
+                x, q, y = synthetic(dtype, seed=5)
+                rng = np.random.default_rng(5)
+                x[rng.random(x.shape) < 0.15] = np.nan
+                q[rng.random(q.shape) < 0.15] = np.nan
+                x[:, 3] = np.nan  # Missing in every training row.
+                q[:, 5] = np.nan  # Missing in every query row.
+                self.run_case("missing", x, q, y, random_state=5)
 
     def test_skewed_heavy_tails(self):
         for dtype in (np.float32, np.float64):

@@ -98,8 +98,8 @@ throughput.
 
 | Works now | Not yet |
 |---|---|
-| Classifier and regressor, at parity with TabICL | Categorical features and missing values |
-| TabICL's preprocessing, in Rust | More than 10 classes |
+| Classifier and regressor, at parity with TabICL | Categorical features |
+| TabICL's preprocessing, in Rust, with missing values | More than 10 classes |
 | CPU (AVX-512 on Zen 5, Accelerate on Apple Silicon), Metal, CUDA | Packages on PyPI or crates.io |
 | Python drop-ins for TabICL's estimators | |
 | A prediction server that batches requests, without Python | |

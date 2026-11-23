@@ -64,8 +64,9 @@ external batch-wide preprocessing behavior.
 ## Boundaries and Exceptions
 
 - The current cached classifier path supports at most 10 classes.
-- Batch-wide all-NaN feature masking in the sklearn wrapper can change behavior.
-  Ironicl requires an explicit, fixed feature schema for serving.
+- TabICL's sklearn wrapper drops a feature that is missing in every row of one
+  `predict` call, so its predictions can depend on the batch. Ironicl imputes
+  that feature's training mean instead, so they do not.
 - A change to a training feature or label invalidates later-layer cache state.
 - Adding a training row is not an exact append-only operation because training
   tokens attend to the full training context at every ICL layer.
