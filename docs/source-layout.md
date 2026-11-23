@@ -64,10 +64,10 @@ src/
 │   ├── static_context.rs          static contexts (IRCNTXT)
 │   └── preprocessor.rs            fitted preprocessing (IRPREP)
 ├── preprocess/                    what must reproduce Python exactly; no `unsafe`:
-│                                  python_random, scale, yeo_johnson, labels
+│                                  python_random, scale, yeo_johnson, labels, columns
 └── server/                        `ironicl serve` (`server` feature, off by default):
-                                   mod.rs startup, api.rs requests and responses,
-                                   worker.rs batching
+                                   mod.rs startup, api.rs handlers, request.rs,
+                                   response.rs, error.rs, worker.rs batching
 ```
 
 ## Steps
