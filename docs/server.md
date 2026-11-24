@@ -47,8 +47,17 @@ predicts a full batch before it opens the port, so any answer means it is ready.
 | `--max-batch-rows N` | `1024` on a GPU, `32` on the CPU |
 | `--max-queue MS` | `1000` |
 
-The server has no authentication or TLS: keep it on localhost or put it behind a proxy that has
-them. Each connection takes a file descriptor: for thousands of connections, raise the open-file
+A real deployment needs a proper reverse proxy in front. The server has no TLS, authentication,
+connection timeouts, or per-client limits, and leaves them to the proxy; it warns at startup when
+`--bind` is not a loopback address. Ctrl-C or SIGTERM stops it after the requests in progress.
+
+The server logs to stderr at the level `RUST_LOG` sets, in
+[`EnvFilter`](https://docs.rs/tracing-subscriber/0.3.23/tracing_subscriber/filter/struct.EnvFilter.html)
+syntax. The default, `info`, logs startup, warnings, shutdown, and the cause of each internal
+error. `RUST_LOG=debug` adds one line per predict request, with its status, rows, and times;
+`RUST_LOG=warn` quiets the server. Request bodies and feature values are never logged.
+
+Each connection takes a file descriptor: for thousands of connections, raise the open-file
 limit (`ulimit -n`, or `LimitNOFILE` under systemd).
 
 ## Batching
@@ -182,4 +191,4 @@ Errors are `{"error": {"code": ..., "message": ...}}`.
 | 400 | `invalid_request` | Malformed JSON, a wrong type, or an unknown field; `data` empty, with a row of another length than the training data's, or longer than `--max-request-rows`; `columns` that are not the training data's column names, each once; an output the model does not have, or one named twice; `alphas` for a classifier, outside (0, 1), or more than 999 of them. The message names the field. |
 | 413 | `body_too_large` | A body larger than `--max-body`. |
 | 503 | `overloaded` | The request would wait longer than `--max-queue`. Retry after the `Retry-After` seconds. |
-| 500 | `internal` | A failed prediction. It fails every request in the same batch. |
+| 500 | `internal` | A failed prediction, which fails every request in the same batch. The message is always `internal error`; the server logs the cause. |
