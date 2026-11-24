@@ -35,6 +35,9 @@ pub struct Model {
     /// The NVIDIA GPU that fits and predicts, when there is one.
     #[cfg(feature = "cuda")]
     cuda: Option<super::cuda::Cuda>,
+    /// The Apple Silicon GPU that fits and predicts, when there is one.
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    metal: Option<super::metal::Metal>,
 }
 
 /// Keys and values for `groups` independent attentions, each over `rows`
@@ -76,6 +79,19 @@ pub struct Context {
     icl: Vec<Kv>,
     #[cfg(feature = "cuda")]
     cuda: Option<super::cuda::Context>,
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    metal: Option<super::metal::Context>,
+}
+
+impl Context {
+    /// Each column's kind: 1 for category codes, else 0.
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    fn kinds(&self) -> Vec<f32> {
+        self.categorical
+            .iter()
+            .map(|&categorical| f32::from(u8::from(categorical)))
+            .collect()
+    }
 }
 
 /// How a block scales its queries by the key count `n`: not, by
@@ -210,12 +226,18 @@ impl Model {
             artifact,
             #[cfg(feature = "cuda")]
             cuda,
+            #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+            metal: super::metal::Metal::new(config, Self::dim(release.outputs())),
         })
     }
 
-    /// Where the model runs: `"cuda"` or `"cpu"`.
+    /// Where the model runs: `"cuda"`, `"metal"`, or `"cpu"`.
     #[must_use]
     pub fn device(&self) -> &'static str {
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        if self.metal.is_some() {
+            return "metal";
+        }
         #[cfg(feature = "cuda")]
         if self.cuda.is_some() {
             return "cuda";
@@ -320,7 +342,21 @@ impl Model {
             icl: Vec::new(),
             #[cfg(feature = "cuda")]
             cuda: None,
+            #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+            metal: None,
         };
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        if let Some(metal) = &self.metal {
+            let (cell, icl) = (self.cell(), Self::dim(self.config.icl_channels));
+            let (mut cell_labels, mut icl_labels) = (vec![0.0; rows * cell], vec![0.0; rows * icl]);
+            self.add_labels("row_embedding", &mut cell_labels, cell, targets);
+            self.add_labels("icl_block", &mut icl_labels, icl, targets);
+            let weights = |name: &str| -> Result<&[f32]> { Ok(self.tensor(name)) };
+            let kinds = context.kinds();
+            context.metal =
+                Some(metal.fit(&weights, (x, &context.means, &kinds), (&cell_labels, &icl_labels))?);
+            return Ok(context);
+        }
         #[cfg(feature = "cuda")]
         if let Some(cuda) = &self.cuda {
             let (cell, icl) = (self.cell(), Self::dim(self.config.icl_channels));
@@ -369,6 +405,10 @@ impl Model {
         if self.cuda.is_some() && context.cuda.is_some() {
             return true;
         }
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        if self.metal.is_some() && context.metal.is_some() {
+            return true;
+        }
         let _ = context;
         false
     }
@@ -387,6 +427,11 @@ impl Model {
         #[cfg(feature = "cuda")]
         if let (Some(cuda), Some(fitted)) = (&self.cuda, &context.cuda) {
             return cuda.predict(fitted, x);
+        }
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        if let (Some(metal), Some(fitted)) = (&self.metal, &context.metal) {
+            let weights = |name: &str| -> Result<&[f32]> { Ok(self.tensor(name)) };
+            return metal.predict(&weights, fitted, (x, &context.means, &context.kinds()));
         }
         let mut out = Vec::new();
         for chunk in x.chunks(CHUNK_ROWS * columns) {

@@ -5,8 +5,8 @@ At size `large` it is second on [TabArena](https://huggingface.co/spaces/TabAren
 and first among models whose weights allow commercial use. Ironicl is adding it as its second
 model, next to TabICLv2.
 
-Status: the classifier and the regressor fit and predict on the CPU and on NVIDIA GPUs, from
-Python and through `ironicl serve`. Metal comes next.
+Status: the classifier and the regressor fit and predict on the CPU, on NVIDIA GPUs, and on Apple
+Silicon GPUs, from Python and through `ironicl serve`.
 
 ```python
 from ironicl import KumoTabularClassifier, KumoTabularRegressor
@@ -81,6 +81,13 @@ embeddings are saved transposed; import copies them into row-major order.
   the kernels' 64. Kumo-Tabular's own kernels build the cell embedding's features and the row
   stage's sequences. The weights upload once per process. A context that does not fit in device
   memory is built on the CPU, and `IRONICL_NO_CUDA` keeps everything there.
+- `metal.rs`: on an Apple Silicon GPU, with the `metal` feature, a member's whole forward pass
+  runs as one `MPSGraph` executable in FP32: one per training shape to fit, which outputs the
+  member's column and ICL keys and values, and one per power-of-two query bucket to predict,
+  which reads them. The blocks are the transformer block TabICLv2's Metal graphs use
+  (`kernels/metal/block.rs`), with `RMSNorm`, `RoPE`, the per-head norm, query scaling, and shared
+  key heads. The weights are bound to buffers shared with the CPU, and attentions run in chunks
+  that bound the scores held at once. `IRONICL_NO_METAL` keeps everything on the CPU.
 - `fitted.rs`: the ensemble. It averages the members' logits, or above 10 classes their codebook
   scores, and applies softmax; or it combines the members' quantiles.
 
@@ -112,7 +119,7 @@ FP32 and records each member's draws, preprocessed rows, and outputs, and the pr
 Outputs are the members' logits or standardized quantiles; the prediction is the probabilities,
 or the quantiles relative to their size. The errors are the largest absolute ones, relative for
 the preprocessed rows, on an Apple M1 Max and on an AMD Ryzen 7 9800X3D. The CUDA path, on an
-RTX 5080, matches within the same bounds. The tests need the checkpoints in `IRONICL_CHECKPOINT_FIXTURES`:
+RTX 5080, and the Metal path, on the M1 Max, match within the same bounds. The tests need the checkpoints in `IRONICL_CHECKPOINT_FIXTURES`:
 
 ```bash
 IRONICL_CHECKPOINT_FIXTURES=checkpoints cargo test --release --lib kumo_tabular -- --include-ignored
@@ -130,6 +137,19 @@ uploads the weights (1.8 s):
 | 1,000 | 5.3 s | 0.44 s | 2.1 s | 0.22 s |
 | 5,000 | 39.3 s | 2.1 s | 3.3 s | 0.28 s |
 
+NVIDIA's code on the same GPU, in FP32 and in FP16, fits in 0.24 s and 0.09 s and predicts in 0.10 s
+and 0.04 s at 1,000 rows; at 5,000 rows it fits in 1.51 s and 0.42 s and predicts in 0.17 s and
+0.05 s. Tensor cores and fewer allocations are the follow-ups.
+
+On an Apple M1 Max, medium with 4 members on 20 features and 500 query rows, after a first fit
+that compiles the graphs (about 1.4 s), against NVIDIA's code on the GPU through PyTorch's MPS
+backend:
+
+| Training rows | CPU fit | Metal fit | MPS fit | CPU predict | Metal predict | MPS predict |
+|---|---|---|---|---|---|---|
+| 1,000 | 3.77 s | 0.48 s | 0.68 s | 1.73 s | 0.19 s | 0.30 s |
+| 5,000 | 21.95 s | 2.88 s | 3.84 s | 2.31 s | 0.27 s | 0.42 s |
+
 ## License
 
 The weights are under OpenMDW-1.1, which allows commercial use, modification, conversion, and
@@ -143,5 +163,5 @@ notices. Ironicl downloads the weights from Hugging Face and never ships them. N
 2. The classifier on the CPU, as `KumoTabularClassifier`, with pickling, export, and the server.
    Done.
 3. The regressor on the CPU, as `KumoTabularRegressor`. Done.
-4. Metal.
+4. Metal. Done, in FP32.
 5. CUDA. Done, in FP32; the tensor-core levels of `optimize` come next.

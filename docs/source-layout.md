@@ -38,7 +38,8 @@ src/
 │   │   └── tests.rs
 │   ├── metal/
 │   │   ├── mod.rs                 device, shared buffers, model weight buffers
-│   │   └── builder.rs             MPSGraph builder and generic operations
+│   │   ├── builder.rs             MPSGraph builder and generic operations
+│   │   └── block.rs               the transformer block both models build
 │   └── cuda/
 │       ├── mod.rs                 Device, Arch, the embedded modules and their choice
 │       ├── kernels.rs             the #[kernel] entry points, in one #[cuda_module]
@@ -52,6 +53,7 @@ src/
 │   │   ├── preprocess.rs          NVIDIA's recipe and the random draws
 │   │   ├── cpu.rs                 the forward pass and a member's context
 │   │   ├── cuda.rs                both on an NVIDIA GPU, the context resident
+│   │   ├── metal.rs               both on an Apple Silicon GPU, as MPSGraph graphs
 │   │   └── fitted.rs              the fitted ensemble
 │   └── tabicl_v2/
 │       ├── mod.rs                 Device: where a context predicts

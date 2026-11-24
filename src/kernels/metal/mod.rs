@@ -35,6 +35,7 @@ pub(crate) fn kind(storage: TensorStorage) -> MPSDataType {
 
 pub(crate) const FLOAT: MPSDataType = MPSDataType::Float32;
 
+pub(crate) mod block;
 pub(crate) mod builder;
 
 pub(crate) type Tensor = Retained<MPSGraphTensor>;
