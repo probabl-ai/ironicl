@@ -860,6 +860,12 @@ impl KumoFitted {
         self.0.training().categories.iter().map(Option::is_some).collect()
     }
 
+    /// Members that run on the CPU because they did not fit in GPU memory.
+    #[getter]
+    fn cpu_members(&self) -> usize {
+        self.0.cpu_members()
+    }
+
     /// `(probabilities as float32 bytes, [rows, classes])` for `x`, as `fit` reads it.
     #[pyo3(signature = (x, progress=None))]
     fn predict_proba<'py>(

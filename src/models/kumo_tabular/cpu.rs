@@ -361,6 +361,18 @@ impl Model {
         Ok(context)
     }
 
+    /// Whether `context` lives on the model's GPU: false on the CPU, or when
+    /// it did not fit in device memory.
+    #[must_use]
+    pub fn on_device(&self, context: &Context) -> bool {
+        #[cfg(feature = "cuda")]
+        if self.cuda.is_some() && context.cuda.is_some() {
+            return true;
+        }
+        let _ = context;
+        false
+    }
+
     /// The outputs, 10 logits or 999 quantiles, of each of the `[rows, columns]`
     /// preprocessed query rows `x`.
     ///

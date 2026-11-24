@@ -63,6 +63,9 @@ class _KumoTabular(BaseEstimator):
         self._validate()
         x, names = _features(X)
         checkpoint = self._checkpoint()
+        # The previous fit's contexts may hold GPU memory the new one needs.
+        if hasattr(self, "fitted_"):
+            del self.fitted_
         with self._progress("Building context", "estimator") as progress:
             self.fitted_ = _model(checkpoint).fit(
                 x,
@@ -73,6 +76,7 @@ class _KumoTabular(BaseEstimator):
                 feature_names=None if names is None else list(names),
                 progress=progress,
             )
+        _warn_cpu_members(self.fitted_)
         self.checkpoint_path_ = checkpoint
         self.n_features_in_ = len(x) if isinstance(x, list) else x.shape[1]
         if names is not None:
@@ -133,6 +137,7 @@ class _KumoTabular(BaseEstimator):
                 self.checkpoint_path_ = self._checkpoint()
             with self._progress("Building context", "estimator") as progress:
                 self.fitted_ = _model(self.checkpoint_path_).load(self.fitted_, self._threads(), progress)
+            _warn_cpu_members(self.fitted_)
 
     def _validate(self) -> None:
         if self.size not in SIZES:
@@ -169,6 +174,16 @@ class _KumoTabular(BaseEstimator):
         partial.replace(path)
         return path
 
+
+
+def _warn_cpu_members(fitted) -> None:
+    if fitted.cpu_members:
+        warnings.warn(
+            f"{fitted.cpu_members} ensemble members did not fit in GPU memory and run on the CPU, "
+            "which is much slower; use fewer n_estimators or training rows",
+            UserWarning,
+            stacklevel=3,
+        )
 
 
 class KumoTabularClassifier(ClassifierMixin, _KumoTabular):

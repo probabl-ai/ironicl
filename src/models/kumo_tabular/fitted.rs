@@ -140,6 +140,19 @@ impl Fitted {
         self.model.device()
     }
 
+    /// Members whose context runs on the CPU although the model has a GPU,
+    /// because it did not fit in device memory.
+    #[must_use]
+    pub fn cpu_members(&self) -> usize {
+        if self.model.device() == "cpu" {
+            return 0;
+        }
+        self.contexts
+            .iter()
+            .filter(|contexts| contexts.iter().any(|c| !self.model.on_device(c)))
+            .count()
+    }
+
     /// A classifier's classes, sorted.
     #[must_use]
     pub fn classes(&self) -> Option<&Labels> {
