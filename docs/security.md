@@ -74,6 +74,6 @@ on Unix.
 - Calculate memory before allocation.
 - Reject non-finite request data after the defined missing-value transform.
 - Bound concurrent executors and scratch allocations.
-- Apply request timeouts outside the kernel layer. The server sets no
-  connection or read timeouts, so a slow client can hold a connection open:
-  expose it only behind a reverse proxy that times out idle and slow clients.
+- A real deployment requires a proper reverse proxy in front of the server.
+  The server bounds only body size, rows, quantile levels, and queue wait; TLS,
+  timeouts for slow clients, and per-client limits belong to the proxy.
