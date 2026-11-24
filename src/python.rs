@@ -721,7 +721,7 @@ impl FittedModel {
     fn export(&self, py: Python<'_>, path: PathBuf, checkpoint: PathBuf, kv_cache: bool) -> PyResult<()> {
         py.detach(|| {
             crate::prepare_checkpoint(&checkpoint, &crate::CheckpointCacheOptions::default())?;
-            crate::models::tabicl_v2::directory::write(&path, &self.0, kv_cache)
+            crate::models::directory::write(&path, &self.0, kv_cache)
         })
         .map_err(py_error)
     }

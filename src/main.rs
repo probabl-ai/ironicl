@@ -7,7 +7,7 @@ use ironicl::{
     CheckpointCacheOptions, Cli, Command, CpuCapabilities, ImportArgs, InspectArgs, Isa, PrepareArgs,
     error::Result,
     memory::{ByteSize, MemoryLimits},
-    models::tabicl_v2::directory,
+    models::directory,
 };
 
 fn main() {

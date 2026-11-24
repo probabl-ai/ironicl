@@ -33,7 +33,7 @@ use self::{
     request::Schema,
     worker::{Answer, Job, Query, Queue, Worker},
 };
-use crate::{Error, Result, ServeArgs, memory::MemoryLimits, models::tabicl_v2::directory};
+use crate::{Error, Result, ServeArgs, memory::MemoryLimits, models::directory};
 
 /// Default `--max-batch-rows` on a GPU and on the CPU.
 const GPU_BATCH_ROWS: usize = 1024;
