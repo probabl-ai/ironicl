@@ -51,56 +51,12 @@ pub use predictor::{ContextTensors, Prediction, Predictor};
 pub use weights::ModelWeights;
 pub use workspace::Shape;
 
-use crate::models::tabicl_v2::cpu::{
-    COLUMN_BLOCKS, COLUMN_DIM, HEADS, ICL_DIM, INDUCING, Optimize, RESERVED,
-};
+use crate::models::tabicl_v2::cpu::{COLUMN_BLOCKS, COLUMN_DIM, HEADS, ICL_DIM, INDUCING, RESERVED};
 
-/// Attention head width the ICL kernels are built for.
-pub const HEAD_DIM: usize = 64;
-/// Keys per tile of the ICL attention kernels.
-pub const KEY_TILE: usize = 64;
+pub use crate::kernels::cuda::launch::{HEAD_DIM, KEY_TILE, Precision};
 /// ICL transformer blocks.
 pub const ICL_BLOCKS: usize = crate::models::tabicl_v2::cpu::ICL_BLOCKS;
 /// Values of one column's cached inducing-point keys (or values): 8 heads x
 /// 128 inducing points x 16 dims.
 const COLUMN_CACHE: usize = HEADS * INDUCING * 16;
 const ROW_BLOCKS: usize = 3;
-/// Scale of a value's low FP16 part; matches `LO_SCALE` in the kernels.
-const LO_SCALE: f32 = 2048.0;
-
-/// How the GPU's products run.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Precision {
-    /// FP32 on the CUDA cores, no tensor cores (`optimize="safe"`).
-    Fp32,
-    /// On tensor cores, every input split into a high FP16 part and a scaled
-    /// low one, three products each: close to FP32 (`optimize="auto"`).
-    Split,
-    /// On tensor cores, FP16 inputs, one product each (`optimize="fast"`).
-    Half,
-}
-
-impl Precision {
-    /// The precision of `optimize`'s GPU products.
-    #[must_use]
-    pub const fn for_optimize(optimize: Optimize) -> Self {
-        match optimize {
-            Optimize::Safe => Self::Fp32,
-            Optimize::Auto => Self::Split,
-            Optimize::Fast => Self::Half,
-        }
-    }
-
-    /// Token rows from which the ICL and decoder products run on tensor cores
-    /// rather than in FP32 on the CUDA cores: measured on an RTX 5080, a split
-    /// product's three tensor-core products only pay off on larger products.
-    /// Never at [`Self::Fp32`].
-    #[must_use]
-    pub const fn tensor_rows(self) -> usize {
-        match self {
-            Self::Fp32 => usize::MAX,
-            Self::Split => 256,
-            Self::Half => 64,
-        }
-    }
-}

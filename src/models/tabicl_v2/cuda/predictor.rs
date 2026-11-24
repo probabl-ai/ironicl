@@ -526,15 +526,19 @@ impl Stages<'_> {
             false,
         )?;
         let fp32 = cache.precision == Precision::Fp32;
-        device.qass_pack(
+        // No `RoPE` in the ICL stage: an empty table.
+        let no_rope = device.zeroed(0).map_err(gpu_error)?;
+        device.pack_heads(
             (work.x1.get(), work.gate.get()),
-            (&self.base_scales[block], cache.key_scales),
+            (&self.base_scales[block], cache.key_scales, &no_rope),
             if fp32 {
                 Output::F32(work.packed32.get_mut())
             } else {
                 Output::Half(work.packed.get_mut())
             },
             (b, q, padded),
+            (HEADS, HEAD_DIM),
+            false,
         )?;
         device.attend_icl(
             cache.precision,
@@ -546,12 +550,14 @@ impl Stages<'_> {
             (cache.keys, cache.values),
             (work.part.get_mut(), work.lse.get_mut(), work.attention.get_mut()),
             (pairs, padded, rows),
+            1,
         )?;
         let attended = self.output(tensor, &mut work.a, &mut work.attended);
         device.heads_to_tokens(
             (work.attention.get(), cache.value_scales),
             attended,
             (b, q, padded),
+            (HEADS, HEAD_DIM),
         )?;
         self.icl_feed_forward(work, hidden, block, seqs)
     }

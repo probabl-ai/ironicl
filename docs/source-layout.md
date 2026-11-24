@@ -42,8 +42,10 @@ src/
 │   └── cuda/
 │       ├── mod.rs                 Device, Arch, the embedded modules and their choice
 │       ├── kernels.rs             the #[kernel] entry points, in one #[cuda_module]
-│       └── ops/                   their device code: attention, fp8, linear,
-│                                  tabicl_v2 (the fused block and column kernels)
+│       ├── launch.rs              the launchers any model's blocks chain
+│       └── ops/                   their device code: attention, block (norms,
+│                                  packing heads), fp8, linear, tabicl_v2 (the
+│                                  fused block and column kernels)
 ├── models/
 │   ├── checkpoint.rs              checkpoint import, of any model
 │   ├── checkpoint_cache.rs        imported weights, by checkpoint SHA-256
@@ -80,7 +82,7 @@ Each step is one pull request.
 | A | Move files into this layout: the CPU kernel split, `cache.rs` into `memory.rs`, the Metal and CUDA splits by file, `models/tabicl_v2/`, `format/`. No logic changes. | Done |
 | B | Consolidate: fold `platform.rs` and `backend.rs` into `kernels/cpu` (`Isa`); one `Device` enum for TabICLv2; separate the Metal graph builder's generic operations from the TabICLv2 stages. | Done |
 | C | Split the CUDA kernels: their device code moves into `kernels/cuda/ops/`, with TabICLv2's fused kernels in `ops/tabicl_v2.rs`. The `#[kernel]` entry points stay in `kernels.rs`, because cuda-oxide generates launchers only for kernels written inline in the `#[cuda_module]` block; it compiles every function reachable from a kernel, wherever it lives. The PTX is unchanged apart from symbol names. | Done |
-| C2 | Move the generic launchers (dense products, layer norm, ICL attention, FP8 encoding, copies) into `kernels/cuda`, with the types they take: `Precision`, the activation forms, the dense and norm weight layouts, and the kernel constants. The launchers of TabICLv2's fused kernels stay with the model. | Planned |
+| C2 | Move the generic launchers into `kernels/cuda/launch.rs` (dense products, norms, attention over cached keys and values, packing queries into heads, copies), with the types they take: `Precision`, the activation forms, the dense and norm weights, and the kernel constants. Their kernels take any width and head count, `RoPE` and a per-head norm when packing heads, and key and value heads shared by groups of query heads, so other models' blocks chain them. The launchers of TabICLv2's fused kernels stay with the model. | Done |
 | D | Rust preprocessing: `preprocess/` and `models/tabicl_v2/preprocess.rs`, fit and transform, at parity with TabICL, and `models/tabicl_v2/fitted.rs`, the fitted model. | Done |
 | E | Prediction server behind the `server` feature: `ironicl serve DIR` for one model directory, `POST /v1/predict` and `GET /v1/health` in JSON, with batching; see [server.md](server.md). Needs D, so it runs without Python. | Done |
 

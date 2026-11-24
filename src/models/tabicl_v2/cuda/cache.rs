@@ -20,6 +20,7 @@ use super::{
     launch::padded_rows,
 };
 use crate::error::{Error, Result};
+pub(crate) use crate::kernels::cuda::launch::value_bytes;
 
 /// One ICL block's keys or values on the host, `[B, 8, N, 64]`.
 #[derive(Clone, Copy)]
@@ -61,15 +62,6 @@ impl<'a> IclValues<'a> {
 pub trait IclSource: Send + Sync {
     /// ICL block `block`'s keys and values.
     fn block(&self, block: usize) -> (IclValues<'_>, IclValues<'_>);
-}
-
-/// Bytes per cached key or value at `precision`: FP32, FP16, or FP8.
-pub(super) const fn value_bytes(precision: Precision) -> usize {
-    match precision {
-        Precision::Fp32 => 4,
-        Precision::Split => 2,
-        Precision::Half => 1,
-    }
 }
 
 /// 16-bit units of one block's keys (or values) for `pairs` pairs and `rows`
