@@ -38,7 +38,8 @@ src/
 │   │   └── tests.rs
 │   ├── metal/
 │   │   ├── mod.rs                 device, shared buffers, model weight buffers
-│   │   └── builder.rs             MPSGraph builder and generic operations
+│   │   ├── builder.rs             MPSGraph builder and generic operations
+│   │   └── block.rs               the transformer block models build
 │   └── cuda/
 │       ├── mod.rs                 Device, Arch, the embedded modules and their choice
 │       ├── kernels.rs             the #[kernel] entry points, in one #[cuda_module]
