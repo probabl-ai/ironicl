@@ -1,11 +1,8 @@
 //! `TabICLv2`.
 
-pub mod checkpoint;
-pub mod checkpoint_cache;
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
-pub mod directory;
 pub(crate) mod ensemble;
 pub(crate) mod execution_plan;
 pub mod fitted;

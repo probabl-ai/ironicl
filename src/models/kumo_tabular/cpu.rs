@@ -247,7 +247,7 @@ impl Model {
 
     /// The checkpoint's SHA-256.
     pub(crate) fn sha256(&self) -> [u8; 32] {
-        crate::models::tabicl_v2::checkpoint::decode_sha256(&self.artifact.summary().source_sha256)
+        crate::models::checkpoint::decode_sha256(&self.artifact.summary().source_sha256)
             .expect("a verified model's SHA-256")
     }
 

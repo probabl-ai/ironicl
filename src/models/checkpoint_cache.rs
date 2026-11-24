@@ -7,7 +7,7 @@ use crate::{
     ModelArtifact, ModelArtifactSummary,
     error::{Error, Result},
     import_checkpoint, inspect_model_artifact, load_model_artifact,
-    models::tabicl_v2::checkpoint::{checkpoint_sha256, model_from_checkpoint},
+    models::checkpoint::{checkpoint_sha256, model_from_checkpoint},
 };
 
 /// Controls where and whether [`prepare_checkpoint`] reuses an imported model.

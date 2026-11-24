@@ -18,7 +18,7 @@ use super::{
     request::Rows,
     response::{classifier_response, regressor_response},
 };
-use crate::{Labels, RegressionOutput, models::tabicl_v2::directory::Fitted};
+use crate::{Labels, RegressionOutput, models::directory::Fitted};
 
 /// A checked request: its rows and the outputs it asks for.
 pub(super) struct Query {
