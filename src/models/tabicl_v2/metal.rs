@@ -27,8 +27,10 @@ use objc2_metal_performance_shaders_graph::{
 };
 
 use crate::kernels::metal::{
-    Binding, Buffer, FLOAT, Gpu, ModelWeights, Tensor, Weights, builder::Builder, dictionary, kind,
-    metal_error, shape,
+    Binding, Buffer, FLOAT, Gpu, ModelWeights, Tensor, Weights,
+    block::{Norm, Rope, Source, Spec},
+    builder::Builder,
+    dictionary, kind, metal_error, shape,
 };
 use crate::{
     Result,
@@ -102,18 +104,6 @@ pub(crate) fn group_features_into(
     true
 }
 
-/// Attention sources: cached keys and values, or tokens projected in the block.
-enum Source<'t> {
-    Cached(&'t Tensor, &'t Tensor),
-    Tokens(&'t Tensor),
-}
-
-/// `RoPE` tables for queries and keys, each `[rows, head_dim]` cos and sin.
-struct Rope<'t> {
-    query: (&'t Tensor, &'t Tensor),
-    key: (&'t Tensor, &'t Tensor),
-}
-
 // SAFETY (all methods): plain `MPSGraph` construction on `self.graph`, as in
 // the `Builder` impl: every tensor came from `self.graph`, names are `None`, and
 // no call touches buffer memory.
@@ -124,18 +114,10 @@ impl Builder<'_, '_> {
         self.constant(values, &[1, HEADS as isize, 1, head_dim as isize])
     }
 
-    /// `[lead, rows, heads * head_dim]` -> `[lead, heads, rows, head_dim]`.
-    fn split_heads(&self, input: &Tensor, lead: isize, rows: isize, head_dim: usize) -> Tensor {
-        self.transpose(
-            &self.reshape(input, &[lead, rows, HEADS as isize, head_dim as isize]),
-            1,
-            2,
-        )
-    }
-
-    /// One pre-norm transformer block: attention with a residual, then a GELU
-    /// feed-forward with a residual. `input` is `[lead, q_rows, dim]`. Returns
-    /// the output and the head-major keys and values it attended to.
+    /// One of `TabICLv2`'s pre-norm blocks, `prefix`, on `input` `[lead,
+    /// q_rows, dim]`: the shared block with its `LayerNorm`s, `RoPE` when
+    /// given, and `QASSMax` with base scale `qass` when given. Returns the
+    /// output and the head-major keys and values it attended to.
     #[expect(
         clippy::too_many_arguments,
         reason = "a graph stage takes its inputs, weights, and shape as plain arguments"
@@ -145,86 +127,40 @@ impl Builder<'_, '_> {
         input: &Tensor,
         source: &Source<'_>,
         prefix: &str,
-        (lead, q_rows, source_rows): (isize, isize, isize),
+        rows: (isize, isize, isize),
         dim: usize,
         rope: Option<&Rope<'_>>,
         qass: Option<&Tensor>,
     ) -> Result<(Tensor, Tensor, Tensor)> {
-        let head_dim = dim / HEADS;
-        let norm = format!("{prefix}.norm1");
         let attn = format!("{prefix}.attn");
-        // The query, key, and value projections are parts 0, 1, and 2 of one fused weight.
-        let in_proj = (format!("{attn}.in_proj_weight"), format!("{attn}.in_proj_bias"));
-        let project = |part: usize, x: &Tensor| self.affine(x, (&in_proj.0, &in_proj.1), part, (dim, dim));
-        let query = project(0, &self.layer_norm(input, &norm, dim)?)?;
-        let mut query = self.split_heads(&query, lead, q_rows, head_dim);
-        if let Some(base_scale) = qass {
-            // QASSMax: q * base_scale * (1 + tanh(mlp(q))), the MLP shared across heads.
-            let ssmax = format!("{attn}.ssmax_layer");
-            let hidden = self.gelu(&self.linear(&query, &format!("{ssmax}.query_mlp.0"), head_dim, 64)?);
-            let modulation = self.linear(&hidden, &format!("{ssmax}.query_mlp.2"), 64, head_dim)?;
-            // SAFETY: graph construction on `self.graph` (impl comment).
-            let gate = self.add(
-                &unsafe { self.graph.tanhWithTensor_name(&modulation, None) },
-                &self.scalar(1.0),
-            );
-            query = self.multiply(&self.multiply(&query, base_scale), &gate);
-        }
-        let (key, value) = match *source {
-            Source::Cached(key, value) => (key.clone(), value.clone()),
-            Source::Tokens(tokens) => {
-                let normalized = self.layer_norm(tokens, &norm, dim)?;
-                (
-                    self.split_heads(&project(1, &normalized)?, lead, source_rows, head_dim),
-                    self.split_heads(&project(2, &normalized)?, lead, source_rows, head_dim),
-                )
-            }
+        let names = [
+            format!("{prefix}.norm1"),
+            format!("{attn}.in_proj_weight"),
+            format!("{attn}.in_proj_bias"),
+            format!("{attn}.out_proj"),
+            format!("{prefix}.norm2"),
+            format!("{prefix}.linear1"),
+            format!("{prefix}.linear2"),
+            format!("{attn}.ssmax_layer.query_mlp.0"),
+            format!("{attn}.ssmax_layer.query_mlp.2"),
+        ];
+        let spec = Spec {
+            width: dim,
+            heads: HEADS,
+            norm: Norm::Layer,
+            query_norm: &names[0],
+            key_value_norm: &names[0],
+            qkv: (&names[1], &names[2]),
+            out: &names[3],
+            mlp_norm: &names[4],
+            mlp_in: &names[5],
+            mlp_out: &names[6],
+            rope,
+            head_norm: false,
+            scale: qass,
+            gate: qass.map(|_| (names[7].as_str(), names[8].as_str())),
         };
-        let (query, key) = match rope {
-            Some(rope) => (
-                self.rope(&query, rope.query, head_dim),
-                self.rope(&key, rope.key, head_dim),
-            ),
-            None => (query, key),
-        };
-        // Reduced-precision caches: attention runs in their type, so the
-        // caches are read as stored instead of converted to an FP32 copy.
-        // Stored 16-bit caches set the attention type; otherwise `self.attention` does.
-        // SAFETY: a property read of a live tensor.
-        let stored = unsafe { key.dataType() };
-        let kind = if stored == FLOAT {
-            self.attention.get()
-        } else {
-            stored
-        };
-        // SAFETY: graph construction on `self.graph` (impl comment).
-        let attended = unsafe {
-            self.graph
-                .scaledDotProductAttentionWithQueryTensor_keyTensor_valueTensor_scale_name(
-                    &self.cast(&query, kind),
-                    &self.cast(&key, kind),
-                    &self.cast(&value, kind),
-                    (head_dim as f32).sqrt().recip(),
-                    None,
-                )
-        };
-        let attended = self.cast(&attended, FLOAT);
-        let merged = self.reshape(&self.transpose(&attended, 1, 2), &[lead, q_rows, dim as isize]);
-        let residual = self.add(
-            input,
-            &self.linear(&merged, &format!("{attn}.out_proj"), dim, dim)?,
-        );
-        let hidden = self.gelu(&self.linear(
-            &self.layer_norm(&residual, &format!("{prefix}.norm2"), dim)?,
-            &format!("{prefix}.linear1"),
-            dim,
-            2 * dim,
-        )?);
-        let output = self.add(
-            &residual,
-            &self.linear(&hidden, &format!("{prefix}.linear2"), 2 * dim, dim)?,
-        );
-        Ok((output, key, value))
+        self.transformer_block(input, source, &spec, rows)
     }
 
     /// The row stage for `[B * H, rows, 128]` column embeddings: the row
