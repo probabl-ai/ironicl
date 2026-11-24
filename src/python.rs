@@ -97,8 +97,11 @@ impl Model {
     /// memory when the cache is not writable, and load it.
     #[new]
     fn new(py: Python<'_>, checkpoint: PathBuf) -> PyResult<Self> {
-        py.detach(|| load_checkpoint_model(&checkpoint).map(|model| Self(Executor::new(model))))
-            .map_err(py_error)
+        py.detach(|| {
+            load_checkpoint_model(&checkpoint, crate::CheckpointKind::TabIclV2)
+                .map(|model| Self(Executor::new(model)))
+        })
+        .map_err(py_error)
     }
 
     /// Build the context of `preprocess`'s result. `optimize` is `"safe"`, `"auto"`,
@@ -720,7 +723,11 @@ impl FittedModel {
     /// shared weights folder when it is not there.
     fn export(&self, py: Python<'_>, path: PathBuf, checkpoint: PathBuf, kv_cache: bool) -> PyResult<()> {
         py.detach(|| {
-            crate::prepare_checkpoint(&checkpoint, &crate::CheckpointCacheOptions::default())?;
+            crate::prepare_checkpoint(
+                &checkpoint,
+                crate::CheckpointKind::TabIclV2,
+                &crate::CheckpointCacheOptions::default(),
+            )?;
             crate::models::directory::write(&path, &self.0, kv_cache)
         })
         .map_err(py_error)

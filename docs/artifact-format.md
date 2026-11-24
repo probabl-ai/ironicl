@@ -4,7 +4,7 @@ Ironicl writes three binary formats:
 
 | Format | Magic | Holds | Source |
 |---|---|---|---|
-| model | `IRMODEL\0` v1 | checkpoint weights | `src/format/model.rs` |
+| model | `IRMODEL\0` v1 | checkpoint weights, TabICLv2 or Kumo-Tabular | `src/format/model.rs` |
 | preprocessor | `IRPREP\0\0` v1 | fitted preprocessing | `src/format/preprocessor.rs` |
 | static context | `IRCNTXT\0` v1 and v2 | the training rows' attention keys and values | `src/format/static_context.rs` |
 
@@ -15,8 +15,12 @@ bytes. None uses native Rust struct serialization.
 
 `ironicl import` and the content-addressed checkpoint cache write `IRMODEL` v1. It stores the
 validated logical checkpoint tensors in a deterministic, 64-byte-aligned layout, with the source
-checkpoint's SHA-256 as the model's identity. It is portable rather than kernel-packed: kernels
-pack weights at load time. A packed format can take a new version without changing the CLI or the
+checkpoint's SHA-256 as the model's identity. The header names the architecture, 1 for TabICLv2 or
+2 for [Kumo-Tabular](kumo-tabular.md), and seven of its values: TabICLv2's classes, quantiles,
+widths, and block counts, or Kumo-Tabular's classes, quantiles, cell channels, column and row
+layers, inducing points, ICL channels, and ICL layers, which identify its size. A file holds at
+most 1 GiB, for Kumo-Tabular large. It is portable rather than kernel-packed: kernels pack weights
+at load time. A packed format can take a new version without changing the CLI or the
 cache.
 
 ## Fitted Models

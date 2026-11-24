@@ -25,7 +25,7 @@ pub use format::model::{
 };
 pub use format::static_context::{StaticContextArtifact, StaticContextMetadata};
 pub use kernels::cpu::{CpuCapabilities, Isa};
-pub use models::checkpoint::{CheckpointProfile, import_checkpoint, inspect_checkpoint};
+pub use models::checkpoint::{CheckpointKind, CheckpointProfile, import_checkpoint, inspect_checkpoint};
 pub use models::checkpoint_cache::{
     CheckpointCacheOptions, PreparedCheckpoint, default_cache_dir, load_checkpoint_model, prepare_checkpoint,
 };
