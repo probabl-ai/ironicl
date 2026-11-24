@@ -8,7 +8,7 @@ use crate::error::Result;
 
 /// A dense layer `[n, k]`: FP32 for the CUDA cores, FP16 high and scaled low
 /// parts for the tensor cores, and its bias.
-pub(super) struct Dense {
+pub(crate) struct Dense {
     pub(super) w: DeviceBuffer<f32>,
     pub(super) hi: DeviceBuffer<u16>,
     pub(super) lo: DeviceBuffer<u16>,
@@ -17,7 +17,7 @@ pub(super) struct Dense {
 
 impl Dense {
     /// A dense layer from its FP32 weight `[n, k]` and bias.
-    pub(super) fn upload(device: &Device, w: &[f32], b: &[f32]) -> Result<Self> {
+    pub(crate) fn upload(device: &Device, w: &[f32], b: &[f32]) -> Result<Self> {
         let (hi, lo): (Vec<u16>, Vec<u16>) = w
             .iter()
             .map(|&v| {

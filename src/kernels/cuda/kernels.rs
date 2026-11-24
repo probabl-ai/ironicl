@@ -680,6 +680,163 @@ pub(crate) mod device {
         }
     }
 
+    // ---------------------------------------------------------------------------
+    // Generic block pieces, for Kumo-Tabular: any width, head dims up to 64.
+    // ---------------------------------------------------------------------------
+
+    /// Each of `rows` rows of `width` values divided by its root mean square
+    /// plus `eps`, times `weight` when `weighted`, into `y`. One warp per row.
+    #[kernel]
+    pub fn rms_rows(
+        x: &[f32],
+        weight: &[f32],
+        mut y: DisjointSlice<f32>,
+        rows: u32,
+        width: u32,
+        eps: f32,
+        weighted: u32,
+    ) {
+        let global =
+            thread::blockIdx_x() as usize * thread::blockDim_x() as usize + thread::threadIdx_x() as usize;
+        let (row, lane) = (global / 32, global % 32);
+        let width = width as usize;
+        // Warp-uniform: every lane of a warp has the same row.
+        if row >= rows as usize {
+            return;
+        }
+        let mut squares = 0.0f32;
+        let mut i = lane;
+        while i < width {
+            let value = x[row * width + i];
+            squares += value * value;
+            i += 32;
+        }
+        #[allow(clippy::cast_precision_loss, reason = "Widths are at most a few thousand")]
+        let scale = 1.0 / libm::sqrtf(warp::reduce_sum_f32(squares) / width as f32 + eps);
+        let mut i = lane;
+        while i < width {
+            let value = x[row * width + i] * scale * if weighted != 0 { weight[i] } else { 1.0 };
+            // SAFETY: `row < rows` and `i < width`; the launcher sizes `y` to `[rows, width]`, and
+            // each index is one lane's.
+            unsafe { *y.get_unchecked_mut(row * width + i) = value };
+            i += 32;
+        }
+    }
+
+    /// Token-major `x[groups * rows, heads * dim]` into head-major
+    /// `y[groups * heads, padded, 64]`: split-half `RoPE` at each row's
+    /// position when `frequencies` is not empty, then with `norm` division by
+    /// the head's root mean square plus 1e-6. Dims from `dim` to 64 are left
+    /// as they are. One warp per (group, row, head); lane `p < dim / 2` holds
+    /// dims `p` and `p + dim / 2`.
+    #[kernel]
+    pub fn to_heads(
+        x: &[f32],
+        frequencies: &[f32],
+        mut y: DisjointSlice<f32>,
+        groups: u32,
+        rows: u32,
+        heads: u32,
+        dim: u32,
+        padded: u32,
+        norm: u32,
+    ) {
+        let global =
+            thread::blockIdx_x() as usize * thread::blockDim_x() as usize + thread::threadIdx_x() as usize;
+        let (item, lane) = (global / 32, global % 32);
+        let (rows, heads, dim, padded) = (rows as usize, heads as usize, dim as usize, padded as usize);
+        // Warp-uniform, as in `rms_rows`.
+        if item >= groups as usize * rows * heads {
+            return;
+        }
+        let (head, rest) = (item % heads, item / heads);
+        let (row, group) = (rest % rows, rest / rows);
+        let half = dim / 2;
+        let active = lane < half;
+        let base = (group * rows + row) * heads * dim + head * dim;
+        let (mut a, mut b) = if active {
+            (x[base + lane], x[base + lane + half])
+        } else {
+            (0.0, 0.0)
+        };
+        if active && !frequencies.is_empty() {
+            #[allow(clippy::cast_precision_loss, reason = "Positions are small")]
+            let angle = row as f32 * frequencies[lane];
+            let (sin, cos) = (libm::sinf(angle), libm::cosf(angle));
+            (a, b) = (a * cos - b * sin, b * cos + a * sin);
+        }
+        if norm != 0 {
+            #[allow(clippy::cast_precision_loss, reason = "Head dims are at most 64")]
+            let scale = 1.0 / libm::sqrtf(warp::reduce_sum_f32(a * a + b * b) / dim as f32 + 1e-6);
+            a *= scale;
+            b *= scale;
+        }
+        if active {
+            let to = ((group * heads + head) * padded + row) * 64;
+            // SAFETY: `group < groups`, `head < heads`, `row < rows <= padded`, and `lane + half <
+            // dim <= 64`; the launcher sizes `y` to `[groups * heads, padded, 64]`, and each
+            // (group, row, head, lane) writes its own two dims.
+            unsafe {
+                *y.get_unchecked_mut(to + lane) = a;
+                *y.get_unchecked_mut(to + lane + half) = b;
+            }
+        }
+    }
+
+    /// Queries `q[pairs, padded, 64]`, the first `dim` dims of each, times
+    /// their head's `scales[head]`, and with `gated` times `1 + tanh(g)` for
+    /// `g = gates[pair * padded + row, d]` (`[pairs * padded, dim]`). One
+    /// thread per value.
+    #[kernel]
+    pub fn scale_queries(
+        mut q: DisjointSlice<f32>,
+        scales: &[f32],
+        gates: &[f32],
+        pairs: u32,
+        padded: u32,
+        heads: u32,
+        dim: u32,
+        gated: u32,
+    ) {
+        let i = thread::index_1d().get();
+        let (padded, dim) = (padded as usize, dim as usize);
+        let d = i % 64;
+        if i >= pairs as usize * padded * 64 || d >= dim {
+            return;
+        }
+        let (row, pair) = ((i / 64) % padded, i / (64 * padded));
+        let mut scale = scales[pair % heads as usize];
+        if gated != 0 {
+            scale *= 1.0 + libm::tanhf(gates[(pair * padded + row) * dim + d]);
+        }
+        // SAFETY: `i < pairs * padded * 64`, the launcher's size of `q`; each thread touches its own `q[i]`.
+        unsafe { *q.get_unchecked_mut(i) *= scale };
+    }
+
+    /// Attention outputs `attended[groups * heads, padded, 64]` back to tokens
+    /// `[groups * rows, heads * dim]`. One thread per token value.
+    #[kernel]
+    pub fn from_heads(
+        attended: &[f32],
+        mut tokens: DisjointSlice<f32>,
+        groups: u32,
+        rows: u32,
+        heads: u32,
+        dim: u32,
+        padded: u32,
+    ) {
+        let i = thread::index_1d().get();
+        let (rows, heads, dim) = (rows as usize, heads as usize, dim as usize);
+        if i >= groups as usize * rows * heads * dim {
+            return;
+        }
+        let (d, head, token) = (i % dim, (i / dim) % heads, i / (dim * heads));
+        let (row, group) = (token % rows, token / rows);
+        let value = attended[((group * heads + head) * padded as usize + row) * 64 + d];
+        // SAFETY: `i < groups * rows * heads * dim`, the launcher's size of `tokens`; one thread per `i`.
+        unsafe { *tokens.get_unchecked_mut(i) = value };
+    }
+
     /// `out[offset + i] = source[i]` for `len` values.
     #[kernel]
     pub fn copy_into(source: &[f32], mut out: DisjointSlice<f32>, offset: u32, len: u32) {

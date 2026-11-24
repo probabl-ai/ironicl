@@ -178,7 +178,8 @@ a binary or gRPC interface.
 
 NVIDIA's Kumo-Tabular as a second model ([kumo-tabular.md](kumo-tabular.md)). Done: importing
 and inspecting its six checkpoints, the classifier and the regressor on the CPU, and their
-transformer blocks on Apple Silicon GPUs. Next: CUDA.
+transformer blocks on Apple Silicon and NVIDIA GPUs. Next: whole stages on the GPU, and closing the
+CPU gap to PyTorch.
 
 Exit gate: predictions match NVIDIA's `structured-data-models` on the same random draws, and the
 GPU paths match the CPU within their gates.

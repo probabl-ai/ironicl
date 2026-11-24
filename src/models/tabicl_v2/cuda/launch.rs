@@ -29,7 +29,7 @@ use crate::error::Result;
 /// cores, FP16 for `fast`'s tensor cores, or FP16 high and scaled low parts for
 /// `auto`'s.
 #[derive(Clone, Copy)]
-pub(super) enum Activation<'a> {
+pub(crate) enum Activation<'a> {
     F32(&'a DeviceBuffer<f32>),
     Half(&'a DeviceBuffer<u16>),
     Split {
@@ -55,7 +55,7 @@ impl CacheOutput<'_> {
 }
 
 /// Where a kernel writes an activation, in one of the forms of [`Activation`].
-pub(super) enum Output<'a> {
+pub(crate) enum Output<'a> {
     F32(&'a mut DeviceBuffer<f32>),
     Half(&'a mut DeviceBuffer<u16>),
     Split {
@@ -152,13 +152,13 @@ const fn threads(total: usize) -> (usize, usize, usize) {
 }
 
 /// Training rows padded to whole key tiles, as the ICL caches hold them.
-pub(super) const fn padded_rows(rows: usize) -> usize {
+pub(crate) const fn padded_rows(rows: usize) -> usize {
     rows.next_multiple_of(KEY_TILE)
 }
 
 /// Query rows padded for the ICL attention kernels: 16 for up to 16 queries,
 /// else a multiple of 64.
-pub(super) const fn padded_query_rows(rows: usize) -> usize {
+pub(crate) const fn padded_query_rows(rows: usize) -> usize {
     if rows <= 16 { 16 } else { rows.div_ceil(64) * 64 }
 }
 
@@ -178,7 +178,7 @@ impl Device {
     /// per chunk, chunks)`, enough chunks for about three blocks per
     /// multiprocessor. FP32's 32-row blocks never take more chunks than the
     /// tensor cores' 64-row ones.
-    pub(super) fn icl_split(
+    pub(crate) fn icl_split(
         &self,
         precision: Precision,
         pairs: usize,
@@ -854,7 +854,7 @@ impl Device {
         clippy::too_many_arguments,
         reason = "a launcher takes its kernel's buffers and shape as plain arguments"
     )]
-    pub(super) fn product(
+    pub(crate) fn product(
         &self,
         input: Activation<'_>,
         dense: &Dense,
@@ -1045,7 +1045,7 @@ impl Device {
     /// `values` `[pairs, padded_rows, 64]` (FP32 for `safe`, FP16 for `auto`,
     /// FP8 for `fast`), into `out` in FP32, through the chunks' partial
     /// outputs `part` and log-sum-exps `lse`.
-    pub(super) fn attend_icl(
+    pub(crate) fn attend_icl(
         &self,
         precision: Precision,
         queries: Activation<'_>,

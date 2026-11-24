@@ -45,9 +45,13 @@ mod workspace;
 use crate::kernels::cuda::{self as device, kernels};
 
 pub use build::{BuildInputs, BuildOutputs, build, context_bytes, fits};
+// Kumo-Tabular's blocks reuse these until the generic launchers move to
+// `kernels::cuda` (docs/source-layout.md, step C2).
 pub use cache::{BuiltCache, IclSource, IclValues};
 pub use device::{Arch, Device};
+pub(crate) use launch::{Activation, padded_query_rows, padded_rows};
 pub use predictor::{ContextTensors, Prediction, Predictor};
+pub(crate) use weights::Dense;
 pub use weights::ModelWeights;
 pub use workspace::Shape;
 

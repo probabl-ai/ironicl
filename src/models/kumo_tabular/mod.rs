@@ -5,6 +5,8 @@
 //! The weights are under OpenMDW-1.1; see `docs/kumo-tabular.md`.
 
 pub mod cpu;
+#[cfg(feature = "cuda")]
+pub(crate) mod cuda;
 pub mod fitted;
 #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
 pub(crate) mod metal;

@@ -35,6 +35,9 @@ pub struct Model {
     /// The GPU that runs the transformer blocks, when there is one.
     #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
     metal: Option<super::metal::Metal>,
+    /// The NVIDIA GPU that runs the transformer blocks, when there is one.
+    #[cfg(feature = "cuda")]
+    cuda: Option<super::cuda::Cuda>,
 }
 
 /// Keys and values for `groups` independent attentions, each over `rows`
@@ -197,12 +200,18 @@ impl Model {
             artifact,
             #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
             metal: super::metal::Metal::new(),
+            #[cfg(feature = "cuda")]
+            cuda: super::cuda::Cuda::new(),
         })
     }
 
-    /// Where the transformer blocks run: `"metal"` or `"cpu"`.
+    /// Where the transformer blocks run: `"metal"`, `"cuda"`, or `"cpu"`.
     #[must_use]
     pub fn device(&self) -> &'static str {
+        #[cfg(feature = "cuda")]
+        if self.cuda.is_some() {
+            return "cuda";
+        }
         #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
         if self.metal.is_some() {
             return "metal";
@@ -807,6 +816,18 @@ impl Block<'_> {
         self.width / self.heads
     }
 
+    #[cfg(feature = "cuda")]
+    fn cuda_spec<'a>(&'a self, tensor: &'a dyn Fn(&str) -> &'a [f32]) -> super::cuda::Spec<'a> {
+        super::cuda::Spec {
+            name: &self.name,
+            width: self.width,
+            heads: self.heads,
+            rope: self.rope,
+            scaling: self.scaling,
+            tensor,
+        }
+    }
+
     fn tensor(&self, suffix: &str) -> &[f32] {
         self.model.tensor(&format!("{}.{suffix}", self.name))
     }
@@ -842,6 +863,19 @@ impl Block<'_> {
 
     /// Keys and values of `groups` equal parts of the `[rows, width]` rows `x`.
     fn key_value(&self, x: &[f32], groups: usize) -> Result<Kv> {
+        #[cfg(feature = "cuda")]
+        if let Some(cuda) = &self.model.cuda {
+            let tensor = |suffix: &str| self.tensor(suffix);
+            let (key, value) = cuda.key_value(&self.cuda_spec(&tensor), x, groups)?;
+            let rows = x.len() / (groups * self.width);
+            return Ok(Kv {
+                key,
+                value,
+                groups,
+                heads: self.heads,
+                rows,
+            });
+        }
         #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
         if let Some(metal) = &self.model.metal {
             return self.key_value_metal(metal, x, groups);
@@ -873,6 +907,18 @@ impl Block<'_> {
     /// [`Self::forward`] for `rows` query rows per group; `kv` may have one
     /// group for all.
     fn forward_rows(&self, query: &[f32], rows: usize, groups: usize, kv: &Kv) -> Result<Vec<f32>> {
+        #[cfg(feature = "cuda")]
+        if let Some(cuda) = &self.model.cuda {
+            let tensor = |suffix: &str| self.tensor(suffix);
+            let kv = super::cuda::KeyValues {
+                key: &kv.key,
+                value: &kv.value,
+                groups: kv.groups,
+                heads: kv.heads,
+                rows: kv.rows,
+            };
+            return cuda.forward(&self.cuda_spec(&tensor), query, (rows, groups), &kv);
+        }
         #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
         if let Some(metal) = &self.model.metal {
             return self.forward_metal(metal, query, rows, groups, kv);

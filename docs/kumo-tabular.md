@@ -5,8 +5,8 @@ At size `large` it is second on [TabArena](https://huggingface.co/spaces/TabAren
 and first among models whose weights allow commercial use. Ironicl is adding it as its second
 model, next to TabICLv2.
 
-Status: the classifier and the regressor fit and predict on the CPU and on Apple Silicon GPUs,
-from Python and through `ironicl serve`. CUDA comes next.
+Status: the classifier and the regressor fit and predict on the CPU, on Apple Silicon GPUs, and on
+NVIDIA GPUs, from Python and through `ironicl serve`.
 
 ```python
 from ironicl import KumoTabularClassifier, KumoTabularRegressor
@@ -76,6 +76,11 @@ embeddings are saved transposed; import copies them into row-major order.
   The layer's weights are graph inputs, so all layers of a kind share one executable per shape,
   and the weights stay in shared GPU buffers. `IRONICL_NO_METAL` keeps the blocks on the CPU.
   The cell embedding, the labels, and the ICL head stay on the CPU.
+- `cuda.rs`: on an NVIDIA GPU, with the `cuda` feature, the same blocks run in FP32 on
+  `TabICLv2`'s product kernel, with its bias, GELU, and residual epilogues, and its split ICL
+  attention, plus three small kernels for the norms, `RoPE`, and query scaling. The attention takes
+  64-wide heads, so the small model's 32-wide heads are zero-padded. `IRONICL_NO_CUDA` keeps the
+  blocks on the CPU.
 - `fitted.rs`: the ensemble. It averages the members' logits, or above 10 classes their codebook
   scores, and applies softmax; or it combines the members' quantiles.
 
@@ -106,8 +111,8 @@ FP32 and records each member's draws, preprocessed rows, and outputs, and the pr
 
 Outputs are the members' logits or standardized quantiles; the prediction is the probabilities,
 or the quantiles relative to their size. The errors are the largest absolute ones, relative for
-the preprocessed rows, on an Apple M1 Max and on an AMD Ryzen 7 9800X3D. The Metal path matches
-within the same bounds. The tests need the checkpoints in `IRONICL_CHECKPOINT_FIXTURES`:
+the preprocessed rows, on an Apple M1 Max and on an AMD Ryzen 7 9800X3D. The Metal and CUDA paths
+match within the same bounds. The tests need the checkpoints in `IRONICL_CHECKPOINT_FIXTURES`:
 
 ```bash
 IRONICL_CHECKPOINT_FIXTURES=checkpoints cargo test --release --lib kumo_tabular -- --include-ignored
@@ -125,7 +130,15 @@ time:
 | 1,000 | 4.0 s | 2.2 s | 1.9 s | 0.9 s |
 | 5,000 | 25.3 s | 11.8 s | 2.4 s | 1.1 s |
 
-The GPU waits for the CPU between blocks; running whole stages as one graph is the next step.
+On a Ryzen 7 9800X3D with an RTX 5080, large with 4 members on 20 features and 500 query rows:
+
+| Training rows | CPU fit | CUDA fit | CPU predict | CUDA predict |
+|---|---|---|---|---|
+| 1,000 | 6.3 s | 4.1 s | 2.1 s | 0.8 s |
+| 5,000 | 39.0 s | 10.3 s | 3.3 s | 1.3 s |
+
+On both GPUs, each block's inputs and outputs cross to the host and back, and the GPU waits for
+the CPU between blocks; running whole stages on the GPU is the next step.
 
 ## License
 
@@ -141,4 +154,4 @@ notices. Ironicl downloads the weights from Hugging Face and never ships them. N
    Done.
 3. The regressor on the CPU, as `KumoTabularRegressor`. Done.
 4. Metal. Done: the transformer blocks.
-5. CUDA.
+5. CUDA. Done: the transformer blocks.

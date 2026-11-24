@@ -50,6 +50,7 @@ src/
 │   │   ├── preprocess.rs          NVIDIA's recipe and the random draws
 │   │   ├── cpu.rs                 the forward pass and a member's context
 │   │   ├── metal.rs               its transformer blocks as MPSGraph executables
+│   │   ├── cuda.rs                its transformer blocks on CUDA kernels
 │   │   └── fitted.rs              the fitted ensemble
 │   └── tabicl_v2/
 │       ├── mod.rs                 Device: where a context predicts
@@ -87,7 +88,7 @@ Each step is one pull request.
 | A | Move files into this layout: the CPU kernel split, `cache.rs` into `memory.rs`, the Metal and CUDA splits by file, `models/tabicl_v2/`, `format/`. No logic changes. | Done |
 | B | Consolidate: fold `platform.rs` and `backend.rs` into `kernels/cpu` (`Isa`); one `Device` enum for TabICLv2; separate the Metal graph builder's generic operations from the TabICLv2 stages. | Done |
 | C | Split the CUDA kernels: their device code moves into `kernels/cuda/ops/`, with TabICLv2's fused kernels in `ops/tabicl_v2.rs`. The `#[kernel]` entry points stay in `kernels.rs`, because cuda-oxide generates launchers only for kernels written inline in the `#[cuda_module]` block; it compiles every function reachable from a kernel, wherever it lives. The PTX is unchanged apart from symbol names. | Done |
-| C2 | Move the generic launchers (dense products, layer norm, ICL attention, FP8 encoding, copies) into `kernels/cuda`, with the types they take: `Precision`, the activation forms, the dense and norm weight layouts, and the kernel constants. The launchers of TabICLv2's fused kernels stay with the model. | Planned |
+| C2 | Move the generic launchers (dense products, layer norm, ICL attention, FP8 encoding, copies) into `kernels/cuda`, with the types they take: `Precision`, the activation forms, the dense and norm weight layouts, and the kernel constants. The launchers of TabICLv2's fused kernels stay with the model. Until then, Kumo-Tabular's CUDA blocks call `product` and `attend_icl` from `models/tabicl_v2/cuda`. | Planned |
 | D | Rust preprocessing: `preprocess/` and `models/tabicl_v2/preprocess.rs`, fit and transform, at parity with TabICL, and `models/tabicl_v2/fitted.rs`, the fitted model. | Done |
 | E | Prediction server behind the `server` feature: `ironicl serve DIR` for one model directory, `POST /v1/predict` and `GET /v1/health` in JSON, with batching; see [server.md](server.md). Needs D, so it runs without Python. | Done |
 
