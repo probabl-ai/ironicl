@@ -859,7 +859,7 @@ struct KumoFitted(Fitted);
 
 #[pymethods]
 impl KumoFitted {
-    /// Where the model runs: `"cuda"` or `"cpu"`.
+    /// Where the model runs: `"metal"`, `"cuda"`, or `"cpu"`.
     #[getter]
     fn device(&self) -> &'static str {
         self.0.device()

@@ -29,10 +29,11 @@ pub(crate) struct Rope<'t> {
     pub(crate) key: (&'t Tensor, &'t Tensor),
 }
 
-/// A block's norms: `LayerNorm` with weight and bias.
+/// A block's norms: `LayerNorm` with weight and bias, or `RMSNorm` with weight.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Norm {
     Layer,
+    Rms,
 }
 
 /// A block's names and options.
@@ -99,6 +100,10 @@ impl Builder<'_, '_> {
     fn block_norm(&self, input: &Tensor, prefix: &str, spec: &Spec<'_>) -> Result<Tensor> {
         match spec.norm {
             Norm::Layer => self.layer_norm(input, prefix, spec.width),
+            Norm::Rms => {
+                let weight = self.named_weight(&format!("{prefix}.weight"), &[spec.width as isize])?;
+                Ok(self.rms(input, Some(&weight), f64::from(f32::EPSILON)))
+            }
         }
     }
 
@@ -156,6 +161,15 @@ impl Builder<'_, '_> {
             key = self.rms(&key, None, 1e-6);
         }
         Ok((key, split(2)?))
+    }
+
+    /// `x` broadcast to `dimensions`.
+    pub(crate) fn broadcast(&self, x: &Tensor, dimensions: &[isize]) -> Tensor {
+        // SAFETY: graph construction on `self.graph` (impl comment).
+        unsafe {
+            self.graph
+                .broadcastTensor_toShape_name(x, &shape(dimensions), None)
+        }
     }
 
     /// One block on `input` `[lead, q_rows, width]`, attending to `source`.

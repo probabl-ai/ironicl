@@ -180,7 +180,7 @@ def _warn_cpu_members(fitted) -> None:
 
 
 class KumoTabularClassifier(ClassifierMixin, _KumoTabular):
-    """Kumo-Tabular classifier with Ironicl's Rust inference engine, on the CPU or an NVIDIA GPU.
+    """Kumo-Tabular classifier with Ironicl's Rust inference engine, on the CPU or a GPU.
 
     ``size`` is ``"small"``, ``"medium"``, or ``"large"``. ``n_estimators``
     ensemble members each preprocess the data differently; ``None`` uses
@@ -226,7 +226,7 @@ class KumoTabularClassifier(ClassifierMixin, _KumoTabular):
 
 
 class KumoTabularRegressor(RegressorMixin, _KumoTabular):
-    """Kumo-Tabular regressor with Ironicl's Rust inference engine, on the CPU or an NVIDIA GPU.
+    """Kumo-Tabular regressor with Ironicl's Rust inference engine, on the CPU or a GPU.
 
     Each member predicts 999 quantiles; their sorted values are averaged over
     the members after dropping the lowest and highest fifth, as NVIDIA's code
