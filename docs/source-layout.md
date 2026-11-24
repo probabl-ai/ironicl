@@ -57,6 +57,7 @@ src/
 │   │   ├── mod.rs                 sizes, released checkpoints, tensor manifests
 │   │   ├── preprocess.rs          NVIDIA's recipe and the random draws
 │   │   ├── cpu.rs                 the forward pass and a member's context
+│   │   ├── cuda.rs                both on an NVIDIA GPU, the context resident
 │   │   └── fitted.rs              the fitted ensemble
 │   └── tabicl_v2/
 │       ├── mod.rs                 Device: where a context predicts

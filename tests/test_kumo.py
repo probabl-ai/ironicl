@@ -11,6 +11,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+from sklearn.exceptions import NotFittedError
 
 from ironicl import KumoTabularClassifier, KumoTabularRegressor
 
@@ -120,6 +121,15 @@ class FitTest(unittest.TestCase):
                         self.assertIn("Kumo-Tabular does not support memory limits", result.stderr)
                         self.assertIn(variable, result.stderr)
 
+    def test_a_failed_refit_leaves_the_estimator_unfitted(self):
+        for y in (None, self.y[:60]):  # Failure in Python validation or in the native fit.
+            with self.subTest(missing_y=y is None):
+                self.model.fit(self.x[:70], self.y[:70])
+                with self.assertRaises(ValueError):
+                    self.model.fit(self.x[:70], y)
+                with self.assertRaises(NotFittedError):
+                    self.model.predict(self.x[70:])
+
     def test_columns_must_match_training(self):
         with self.assertRaises(ValueError):
             self.model.predict_proba(self.x[70:][["color", "a"]])
@@ -157,6 +167,12 @@ class RegressorTest(unittest.TestCase):
     def test_pickling_fits_the_same_model(self):
         loaded = pickle.loads(pickle.dumps(self.model))
         np.testing.assert_array_equal(loaded.predict(self.x[70:]), self.model.predict(self.x[70:]))
+
+    def test_invalid_target_clears_the_previous_fit(self):
+        with self.assertRaises(ValueError):
+            self.model.fit(self.x[:70], None)
+        with self.assertRaises(NotFittedError):
+            self.model.predict(self.x[70:])
 
     def test_a_column_vector_y_fits_the_same_model(self):
         with self.assertWarns(Warning):

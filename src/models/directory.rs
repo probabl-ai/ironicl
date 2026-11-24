@@ -242,7 +242,7 @@ impl Fitted {
     pub fn device(&self) -> &'static str {
         match self {
             Self::TabIclV2(model) => model.device(),
-            Self::KumoTabular(_) => "cpu",
+            Self::KumoTabular(model) => model.device(),
         }
     }
 

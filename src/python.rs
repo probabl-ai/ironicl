@@ -859,10 +859,22 @@ struct KumoFitted(Fitted);
 
 #[pymethods]
 impl KumoFitted {
+    /// Where the model runs: `"cuda"` or `"cpu"`.
+    #[getter]
+    fn device(&self) -> &'static str {
+        self.0.device()
+    }
+
     /// Which input features are categorical.
     #[getter]
     fn categorical(&self) -> Vec<bool> {
         self.0.training().categories.iter().map(Option::is_some).collect()
+    }
+
+    /// Members that run on the CPU because they did not fit in GPU memory.
+    #[getter]
+    fn cpu_members(&self) -> usize {
+        self.0.cpu_members()
     }
 
     /// `(probabilities as float32 bytes, [rows, classes])` for `x`, as `fit` reads it.
