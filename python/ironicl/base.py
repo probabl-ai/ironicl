@@ -123,11 +123,14 @@ class TabICLBase(BaseEstimator):
 
     def _query(self, X):
         """``X`` as Rust predicts from it, checked against the training data."""
+        expected = tuple(self.feature_names_in_) if hasattr(self, "feature_names_in_") else None
+        # Names first: the fitted categorical flags apply to columns by position.
+        if hasattr(X, "columns") and len(X.columns) == self.n_features_in_ and tuple(X.columns) != expected:
+            raise ValueError("X must have the same feature names and order as the training data")
         x, names = _features(X, self.fitted_.preprocessed.categorical)
         width = len(x) if isinstance(x, list) else x.shape[1]
         if width != self.n_features_in_:
             raise ValueError(f"X has {width} features; expected {self.n_features_in_}")
-        expected = tuple(self.feature_names_in_) if hasattr(self, "feature_names_in_") else None
         if names != expected:
             raise ValueError("X must have the same feature names and order as the training data")
         return x

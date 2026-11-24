@@ -127,7 +127,7 @@ class TabICLRegressor(RegressorMixin, TabICLBase):
         types = [output_type] if isinstance(output_type, str) else list(output_type)
         alphas = DEFAULT_ALPHAS if alphas is None else list(alphas)
         x = self._query(X)
-        with self._progress("Predicting", "row", len(x)) as progress:
+        with self._progress("Predicting", "row") as progress:
             results = self.fitted_.predict_regression(x, types, alphas, progress)
         final = {}
         for name, (values, shape) in zip(types, results):
