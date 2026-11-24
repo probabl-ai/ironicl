@@ -298,47 +298,61 @@ fn system_info(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     Ok(dict)
 }
 
-/// A C-ordered float32 or float64 matrix copied from a Python buffer.
+/// A C-ordered float32 or float64 matrix with `columns` columns.
 enum Matrix {
-    F32(Vec<f32>),
-    F64(Vec<f64>),
+    F32 { values: Vec<f32>, columns: usize },
+    F64 { values: Vec<f64>, columns: usize },
 }
 
 impl Matrix {
-    /// The values of a two-dimensional float64 or float32 buffer, and its column count.
-    fn read(py: Python<'_>, x: &Bound<'_, PyAny>) -> PyResult<(Self, usize)> {
+    /// A copy of a two-dimensional float64 or float32 buffer.
+    fn read(py: Python<'_>, x: &Bound<'_, PyAny>) -> PyResult<Self> {
         let columns = |shape: &[usize]| match *shape {
             [_, columns] => Ok(columns),
             _ => Err(PyValueError::new_err("X must be two-dimensional")),
         };
         if let Ok(buffer) = PyBuffer::<f64>::get(x) {
-            return Ok((Self::F64(buffer.to_vec(py)?), columns(buffer.shape())?));
+            let columns = columns(buffer.shape())?;
+            return Ok(Self::F64 {
+                values: buffer.to_vec(py)?,
+                columns,
+            });
         }
         let buffer = PyBuffer::<f32>::get(x)?;
-        Ok((Self::F32(buffer.to_vec(py)?), columns(buffer.shape())?))
+        let columns = columns(buffer.shape())?;
+        Ok(Self::F32 {
+            values: buffer.to_vec(py)?,
+            columns,
+        })
     }
 
     fn features(&self) -> Features<'_> {
         match self {
-            Self::F32(values) => Features::F32(values),
-            Self::F64(values) => Features::F64(values),
+            Self::F32 { values, .. } => Features::F32(values),
+            Self::F64 { values, .. } => Features::F64(values),
+        }
+    }
+
+    fn columns(&self) -> usize {
+        match self {
+            Self::F32 { columns, .. } | Self::F64 { columns, .. } => *columns,
         }
     }
 }
 
-/// Features from Python: a matrix, or a list of columns, each a float64
-/// array or a categorical column's `(kind, categories, codes)`, with the
-/// categories as `read_labels` takes them and int64 codes, -1 when missing.
-enum Input {
-    Matrix(Matrix, usize),
+/// X as Python passes it, before it becomes a matrix: a matrix already, or a
+/// list of columns, each a float64 array or a categorical column's `(kind,
+/// categories, codes)`, with the categories as `read_labels` takes them and
+/// int64 codes, -1 when missing.
+enum RawFeatures {
+    Matrix(Matrix),
     Columns(Vec<Column>),
 }
 
-impl Input {
+impl RawFeatures {
     fn read(py: Python<'_>, x: &Bound<'_, PyAny>) -> PyResult<Self> {
         let Ok(list) = x.cast::<PyList>() else {
-            let (matrix, columns) = Matrix::read(py, x)?;
-            return Ok(Self::Matrix(matrix, columns));
+            return Ok(Self::Matrix(Matrix::read(py, x)?));
         };
         let columns = list
             .iter()
@@ -358,28 +372,35 @@ impl Input {
         Ok(Self::Columns(columns))
     }
 
-    /// The matrix to fit on, its column count, and its features' categories.
-    fn fit(self) -> crate::Result<(Matrix, usize, Vec<Option<Labels>>)> {
+    /// The matrix to fit on, and its features' categories.
+    fn fit(self) -> crate::Result<(Matrix, Vec<Option<Labels>>)> {
         match self {
-            Self::Matrix(matrix, columns) => Ok((matrix, columns, vec![None; columns])),
+            Self::Matrix(matrix) => {
+                let columns = matrix.columns();
+                Ok((matrix, vec![None; columns]))
+            }
             Self::Columns(columns) => {
                 let categories = columns::categories(&columns)?;
+                let values = columns::encode(&columns, &categories)?;
                 Ok((
-                    Matrix::F64(columns::encode(&columns, &categories)?),
-                    columns.len(),
+                    Matrix::F64 {
+                        values,
+                        columns: columns.len(),
+                    },
                     categories,
                 ))
             }
         }
     }
 
-    /// The matrix to predict from, with the fitted `categories`, and its column count.
-    fn encode(self, categories: &[Option<Labels>]) -> crate::Result<(Matrix, usize)> {
+    /// The matrix to predict from, with the fitted `categories`.
+    fn encode(self, categories: &[Option<Labels>]) -> crate::Result<Matrix> {
         match self {
-            Self::Matrix(matrix, columns) => Ok((matrix, columns)),
-            Self::Columns(columns) => {
-                Ok((Matrix::F64(columns::encode(&columns, categories)?), columns.len()))
-            }
+            Self::Matrix(matrix) => Ok(matrix),
+            Self::Columns(columns) => Ok(Matrix::F64 {
+                values: columns::encode(&columns, categories)?,
+                columns: columns.len(),
+            }),
         }
     }
 }
@@ -433,7 +454,7 @@ fn f32_bytes<'py>(py: Python<'py>, values: &[f32]) -> Bound<'py, PyBytes> {
 }
 
 /// Fit preprocessing on `x`, a float32 or float64 `[rows, columns]` array or
-/// a list of columns as `Input` reads them, for
+/// a list of columns as `RawFeatures` reads them, for
 /// a classifier with `labels` (`(kind, values)`, as `read_labels` takes) or a
 /// regressor with float32 `values`. The result's `shape` plans the memory to
 /// build its context with `Model.build`.
@@ -461,7 +482,7 @@ fn preprocess(
             "softmax_temperature must be positive and finite",
         ));
     }
-    let x = Input::read(py, x)?;
+    let x = RawFeatures::read(py, x)?;
     let targets = read_targets(py, labels, values)?;
     let options = PreprocessOptions {
         n_estimators,
@@ -475,8 +496,8 @@ fn preprocess(
     };
     let mut preprocessed = py
         .detach(|| {
-            let (x, columns, categories) = x.fit()?;
-            crate::Preprocessed::fit(&options, x.features(), columns, categories, &targets)
+            let (x, categories) = x.fit()?;
+            crate::Preprocessed::fit(&options, x.features(), x.columns(), categories, &targets)
         })
         .map_err(py_error)?;
     // Saved for serving; Python passes its own settings to every prediction.
@@ -583,11 +604,11 @@ impl Preprocessed {
         py: Python<'py>,
         x: &Bound<'py, PyAny>,
     ) -> PyResult<(Bound<'py, PyBytes>, [usize; 3])> {
-        let x = Input::read(py, x)?;
+        let x = RawFeatures::read(py, x)?;
         let (rows, shape) = py
             .detach(|| {
-                let (x, columns) = x.encode(self.0.preprocessor().categories())?;
-                self.0.query_rows(x.features(), columns)
+                let x = x.encode(self.0.preprocessor().categories())?;
+                self.0.query_rows(x.features(), x.columns())
             })
             .map_err(py_error)?;
         Ok((f32_bytes(py, &rows), shape))
@@ -613,14 +634,15 @@ impl FittedModel {
         average_logits: bool,
         progress: Option<Py<PyAny>>,
     ) -> PyResult<(Bound<'py, PyBytes>, [usize; 2])> {
-        let x = Input::read(py, x)?;
+        let x = RawFeatures::read(py, x)?;
         let aggregation = ClassifierAggregation {
             softmax_temperature,
             average_logits,
         };
         let probabilities = run(py, progress, || {
-            let (x, columns) = x.encode(self.0.preprocessed().preprocessor().categories())?;
-            self.0.predict_probabilities(x.features(), columns, aggregation)
+            let x = x.encode(self.0.preprocessed().preprocessor().categories())?;
+            self.0
+                .predict_probabilities(x.features(), x.columns(), aggregation)
         })?;
         Ok((f32_bytes(py, probabilities.values()), probabilities.shape()))
     }
@@ -637,16 +659,19 @@ impl FittedModel {
         alphas: Vec<f32>,
         progress: Option<Py<PyAny>>,
     ) -> PyResult<Vec<(Bound<'py, PyBytes>, [usize; 2])>> {
-        let x = Input::read(py, x)?;
+        let x = RawFeatures::read(py, x)?;
         let outputs = output_types
             .iter()
             .map(|name| RegressionOutput::parse(name, &alphas))
             .collect::<Result<Vec<_>, _>>()
             .map_err(py_error)?;
         let (results, rows) = run(py, progress, || {
-            let (x, columns) = x.encode(self.0.preprocessed().preprocessor().categories())?;
-            let rows = x.features().len() / columns.max(1);
-            Ok((self.0.predict_regression(x.features(), columns, &outputs)?, rows))
+            let x = x.encode(self.0.preprocessed().preprocessor().categories())?;
+            let rows = x.features().len() / x.columns().max(1);
+            Ok((
+                self.0.predict_regression(x.features(), x.columns(), &outputs)?,
+                rows,
+            ))
         })?;
         Ok(results
             .into_iter()

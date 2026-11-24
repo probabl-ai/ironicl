@@ -24,7 +24,7 @@ use axum::{
 use tokio::sync::oneshot;
 
 use self::{
-    api::{ApiError, Limits},
+    api::{ApiError, Schema},
     worker::{Answer, Job, Query, Queue, Worker},
 };
 use crate::{Error, Result, ServeArgs, memory::MemoryLimits, models::tabicl_v2::directory};
@@ -33,10 +33,10 @@ use crate::{Error, Result, ServeArgs, memory::MemoryLimits, models::tabicl_v2::d
 const GPU_BATCH_ROWS: usize = 1024;
 const CPU_BATCH_ROWS: usize = 32;
 
-/// What the handlers share: the limits requests are checked against, the
+/// What the handlers share: the schema requests are checked against, the
 /// queue, and the way to the worker.
 struct Server {
-    limits: Limits,
+    schema: Schema,
     queue: Arc<Queue>,
     jobs: mpsc::Sender<Job>,
 }
@@ -105,7 +105,7 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
         max_batch_rows,
         queue: Arc::clone(&queue),
     };
-    let limits = Limits::new(task, categories.clone(), feature_names, args.max_request_rows);
+    let schema = Schema::new(task, categories.clone(), feature_names, args.max_request_rows);
     // Predict a full batch twice: once to warm up, once to measure the row cost.
     let failed =
         |error: ApiError| Error::InvalidConfig(format!("warm-up prediction failed: {}", error.message()));
@@ -126,7 +126,7 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
             std::process::exit(1);
         }
     });
-    let server = Server { limits, queue, jobs };
+    let server = Server { schema, queue, jobs };
     let app = Router::new()
         .route("/v1/predict", post(api::predict))
         .route("/v1/health", get(api::health))

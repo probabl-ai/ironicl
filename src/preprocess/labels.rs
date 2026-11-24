@@ -39,9 +39,9 @@ fn float_order(a: f64, b: f64) -> Ordering {
     a.partial_cmp(&b).expect("labels are not NaN")
 }
 
-/// One label, to look up among classes.
+/// One value, to look up among labels: a class or a category.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Label<'a> {
+pub enum Value<'a> {
     Int(i64),
     Float(f64),
     Bool(bool),
@@ -64,33 +64,33 @@ impl Labels {
         self.len() == 0
     }
 
-    /// The label at `index`, below [`Self::len`].
-    pub(crate) fn get(&self, index: usize) -> Label<'_> {
+    /// The value at `index`, below [`Self::len`].
+    pub(crate) fn get(&self, index: usize) -> Value<'_> {
         match self {
-            Self::Int(values) => Label::Int(values[index]),
-            Self::Float(values) => Label::Float(values[index]),
-            Self::Bool(values) => Label::Bool(values[index]),
-            Self::Text(values) => Label::Text(&values[index]),
+            Self::Int(values) => Value::Int(values[index]),
+            Self::Float(values) => Value::Float(values[index]),
+            Self::Bool(values) => Value::Bool(values[index]),
+            Self::Text(values) => Value::Text(&values[index]),
         }
     }
 
-    /// The index of `label` in these classes, `None` when it is not one of
+    /// The index of `value` in these classes, `None` when it is not one of
     /// them or is NaN. Integers and floats compare as numbers, as `NumPy`
     /// compares them.
     ///
     /// # Errors
     ///
-    /// When `label` is a boolean or text and these classes are not, or the
+    /// When `value` is a boolean or text and these classes are not, or the
     /// reverse.
-    pub(crate) fn position(&self, label: Label<'_>) -> Result<Option<usize>> {
+    pub(crate) fn position(&self, value: Value<'_>) -> Result<Option<usize>> {
         let found = |result: std::result::Result<usize, usize>| Ok(result.ok());
-        match (self, label) {
-            (Self::Int(classes), Label::Int(value)) => found(classes.binary_search(&value)),
+        match (self, value) {
+            (Self::Int(classes), Value::Int(value)) => found(classes.binary_search(&value)),
             #[expect(
                 clippy::cast_possible_truncation,
                 reason = "Only integral values in range are cast"
             )]
-            (Self::Int(classes), Label::Float(value)) => {
+            (Self::Int(classes), Value::Float(value)) => {
                 // 2^63 is exact in f64; values at or above it are no i64.
                 if value.fract() == 0.0 && (-(2.0_f64.powi(63))..2.0_f64.powi(63)).contains(&value) {
                     found(classes.binary_search(&(value as i64)))
@@ -99,13 +99,13 @@ impl Labels {
                 }
             }
             #[expect(clippy::cast_precision_loss, reason = "NumPy compares them as float64 too")]
-            (Self::Float(_), Label::Int(value)) => self.position(Label::Float(value as f64)),
-            (Self::Float(_), Label::Float(value)) if value.is_nan() => Ok(None),
-            (Self::Float(classes), Label::Float(value)) => {
+            (Self::Float(_), Value::Int(value)) => self.position(Value::Float(value as f64)),
+            (Self::Float(_), Value::Float(value)) if value.is_nan() => Ok(None),
+            (Self::Float(classes), Value::Float(value)) => {
                 found(classes.binary_search_by(|class| float_order(*class, value)))
             }
-            (Self::Bool(classes), Label::Bool(value)) => found(classes.binary_search(&value)),
-            (Self::Text(classes), Label::Text(value)) => {
+            (Self::Bool(classes), Value::Bool(value)) => found(classes.binary_search(&value)),
+            (Self::Text(classes), Value::Text(value)) => {
                 found(classes.binary_search_by(|class| class.as_str().cmp(value)))
             }
             _ => Err(Error::InvalidArgument(
@@ -177,36 +177,36 @@ impl Labels {
 
 #[cfg(test)]
 mod tests {
-    use super::{Label, Labels};
+    use super::{Labels, Value};
 
     #[test]
     fn positions_compare_numbers_as_numbers() {
         let ints = Labels::Int(vec![-3, 2, 10]);
         let floats = Labels::Float(vec![-0.5, 2.0]);
-        for (classes, label, position) in [
-            (&ints, Label::Int(10), Some(2)),
-            (&ints, Label::Int(5), None),
-            (&ints, Label::Float(2.0), Some(1)),
-            (&ints, Label::Float(2.5), None),
-            (&ints, Label::Float(1e300), None),
-            (&ints, Label::Float(f64::NAN), None),
-            (&floats, Label::Int(2), Some(1)),
-            (&floats, Label::Float(-0.5), Some(0)),
-            (&floats, Label::Float(f64::NAN), None),
+        for (classes, value, position) in [
+            (&ints, Value::Int(10), Some(2)),
+            (&ints, Value::Int(5), None),
+            (&ints, Value::Float(2.0), Some(1)),
+            (&ints, Value::Float(2.5), None),
+            (&ints, Value::Float(1e300), None),
+            (&ints, Value::Float(f64::NAN), None),
+            (&floats, Value::Int(2), Some(1)),
+            (&floats, Value::Float(-0.5), Some(0)),
+            (&floats, Value::Float(f64::NAN), None),
         ] {
-            assert_eq!(classes.position(label).unwrap(), position, "{label:?}");
+            assert_eq!(classes.position(value).unwrap(), position, "{value:?}");
         }
         let text = Labels::Text(vec!["a".into(), "b".into()]);
-        assert_eq!(text.position(Label::Text("b")).unwrap(), Some(1));
+        assert_eq!(text.position(Value::Text("b")).unwrap(), Some(1));
         assert_eq!(
             Labels::Bool(vec![false, true])
-                .position(Label::Bool(true))
+                .position(Value::Bool(true))
                 .unwrap(),
             Some(1)
         );
-        assert!(text.position(Label::Int(1)).is_err());
-        assert!(ints.position(Label::Text("1")).is_err());
-        assert!(ints.position(Label::Bool(true)).is_err());
+        assert!(text.position(Value::Int(1)).is_err());
+        assert!(ints.position(Value::Text("1")).is_err());
+        assert!(ints.position(Value::Bool(true)).is_err());
     }
 
     #[test]
