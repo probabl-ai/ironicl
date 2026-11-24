@@ -162,7 +162,7 @@ class _KumoTabular(BaseEstimator):
         """The checkpoint, downloaded at the pinned revision if missing; Rust checks its SHA-256."""
         if self.model_path is not None:
             return Path(self.model_path)
-        path = _checkpoints_dir() / "kumo-tabular" / REVISION / f"{self.size}-{self._task}.pt"
+        path = _checkpoints_dir("kumo-tabular") / f"{self.size}-{self._task}.pt"
         if path.exists():
             return path
         if not self.allow_auto_download:

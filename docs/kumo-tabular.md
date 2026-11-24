@@ -37,7 +37,8 @@ NVIDIA releases a classifier and a regressor in three sizes, as FP32 PyTorch fil
 revision `c5893d418e162b9f841ae179dc767afefff73831` of `nvidia/Kumo-Tabular` and recognizes each
 file by its SHA-256 (`src/models/kumo_tabular/mod.rs`). The architecture values come from
 [`model.py`](https://github.com/NVIDIA/structured-data-models/blob/3fdf108a1f1b719b1b983373b71bbba79fcab7e6/sdm/models/kumo/tabular/model.py#L24-L64),
-not from the checkpoint.
+not from the checkpoint. Python downloads them to `checkpoints/kumo-tabular/<size>-<task>.pt` in
+Ironicl's cache folder.
 
 | Size | Cell channels | Column and row layers | Inducing points | ICL channels | ICL layers | ICL heads | Classifier | Regressor |
 |---|---|---|---|---|---|---|---|---|

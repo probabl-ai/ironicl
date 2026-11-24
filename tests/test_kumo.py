@@ -13,7 +13,6 @@ from pathlib import Path
 import numpy as np
 
 from ironicl import KumoTabularClassifier, KumoTabularRegressor
-from ironicl.kumo import REVISION
 
 try:
     import pandas as pd
@@ -21,9 +20,9 @@ except ImportError:
     pd = None
 
 CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "ironicl" / "checkpoints"
-CHECKPOINT = CACHE / "kumo-tabular" / REVISION / "small-classifier.pt"
+CHECKPOINT = CACHE / "kumo-tabular" / "small-classifier.pt"
 NEEDS_CHECKPOINT = f"needs {CHECKPOINT}"
-REGRESSOR = CACHE / "kumo-tabular" / REVISION / "small-regressor.pt"
+REGRESSOR = CACHE / "kumo-tabular" / "small-regressor.pt"
 
 
 class ValidateTest(unittest.TestCase):

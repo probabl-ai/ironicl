@@ -27,7 +27,8 @@ The constructor, `fit`, `predict_proba`, and `predict` have TabICL 2.1.1's
 parameter names and defaults. A live parity test checks this.
 
 - Without `model_path`, `fit` downloads the released checkpoint from Hugging Face
-  to `$XDG_CACHE_HOME/ironicl/checkpoints` (default `~/.cache`). The Rust
+  to a folder per model in `$XDG_CACHE_HOME/ironicl/checkpoints` (default `~/.cache`):
+  `tabicl/tabicl-classifier-v2-20260212.ckpt`, `kumo-tabular/large-classifier.pt`. The Rust
   importer verifies its SHA-256 and caches the converted model under
   `$XDG_CACHE_HOME/ironicl/models`. When that directory is not writable, as in a
   read-only container, it converts the checkpoint in memory on every load.
