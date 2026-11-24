@@ -93,17 +93,18 @@ pub fn default_weights_dir() -> Result<PathBuf> {
         .join(format!("v{}", crate::format::model::MODEL_ARTIFACT_VERSION)))
 }
 
-/// Ironicl's cache folder: `$XDG_CACHE_HOME/ironicl`, else `~/.cache/ironicl`.
+/// Ironicl's cache folder: `$XDG_CACHE_HOME/ironicl`, else `.cache/ironicl`
+/// in the home folder (`HOME`, else the account's, or `USERPROFILE` on Windows).
 ///
 /// # Errors
 ///
-/// When neither `XDG_CACHE_HOME` nor `HOME` is set.
+/// When `XDG_CACHE_HOME` is unset and there is no home folder.
 pub fn default_cache_dir() -> Result<PathBuf> {
     if let Some(path) = env::var_os("XDG_CACHE_HOME").filter(|path| !path.is_empty()) {
         return Ok(PathBuf::from(path).join("ironicl"));
     }
-    if let Some(path) = env::var_os("HOME").filter(|path| !path.is_empty()) {
-        return Ok(PathBuf::from(path).join(".cache/ironicl"));
+    if let Some(path) = env::home_dir().filter(|path| !path.as_os_str().is_empty()) {
+        return Ok(path.join(".cache").join("ironicl"));
     }
     Err(Error::Cache(
         "cannot resolve cache directory; set XDG_CACHE_HOME or HOME".into(),
