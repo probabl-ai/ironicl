@@ -79,6 +79,7 @@ impl Device {
             (&block.cache.keys, &block.cache.values),
             (&mut part, &mut lse, &mut out),
             (pairs, padded, rows),
+            1,
         )?;
         let padded_out = self.download(&out)?;
         let mut result = Vec::with_capacity(pairs * query_rows * HEAD_DIM);

@@ -1,6 +1,7 @@
 //! The CUDA device: its streams and the kernels for its architecture.
 
 pub(crate) mod kernels;
+pub(crate) mod launch;
 mod ops;
 
 use std::{fmt::Display, sync::Arc};

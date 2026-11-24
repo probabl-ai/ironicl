@@ -71,6 +71,7 @@ pub(crate) fn fast_body<const KW: usize, const DECODE: bool, const HALF: bool, c
     chunk_tiles: u32,
     splits: u32,
     scale_log2: f32,
+    kv_share: u32,
 ) {
     static mut QS: SharedArray<u32, { 64 * 32 }, 128> = SharedArray::UNINIT;
     static mut KS: SharedArray<u32, { 2 * 64 * 32 }, 128> = SharedArray::UNINIT;
@@ -85,6 +86,8 @@ pub(crate) fn fast_body<const KW: usize, const DECODE: bool, const HALF: bool, c
     // together and share them in L2.
     let block = thread::blockIdx_y() as usize;
     let (bh, chunk) = (block / splits as usize, block % splits as usize);
+    // Query heads share key and value heads in groups of `kv_share`.
+    let kv = bh / kv_share as usize;
     let q0 = thread::blockIdx_x() as usize * rows_per_block;
     let (qp, np) = (qp as usize, np as usize);
     let first_tile = chunk * chunk_tiles as usize;
@@ -119,7 +122,7 @@ pub(crate) fn fast_body<const KW: usize, const DECODE: bool, const HALF: bool, c
     // `buf < 2`. The stage's previous readers passed the barrier that ends their stage, and it is
     // read only after a wait and a barrier.
     let load_stage = |tile: usize, buf: usize| unsafe {
-        let base = (bh * np + tile * 64) * 64;
+        let base = (kv * np + tile * 64) * 64;
         let mut i = tid;
         while i < 64 * 8 {
             let (row, c) = (i / 8, i % 8);
@@ -135,7 +138,7 @@ pub(crate) fn fast_body<const KW: usize, const DECODE: bool, const HALF: bool, c
     // tensor, `[K0, K1, V0, V1]`, as chunk index i = tid + 128 j: row i / 4,
     // dims (i % 4) * 16 on.
     let fetch8 = |tile: usize| -> [[u32; 4]; 4] {
-        let base = (bh * np + tile * 64) * 64;
+        let base = (kv * np + tile * 64) * 64;
         let mut out = [[0u32; 4]; 4];
         #[unroll]
         for j in 0..2 {
