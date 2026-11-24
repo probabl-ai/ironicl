@@ -108,24 +108,34 @@ fn inspect_model_file(path: &Path) -> Result<()> {
         .collect::<Vec<_>>()
         .join(", ");
     println!("dtypes:        {dtypes}");
-    println!("task:          {}", optional_display(summary.config.task()));
-    println!("max classes:   {}", optional_display(summary.config.max_classes));
-    println!(
-        "quantiles:     {}",
-        optional_display(summary.config.num_quantiles)
-    );
-    println!("embedding dim: {}", optional_display(summary.config.embed_dim));
-    println!(
-        "column blocks: {}",
-        optional_display(summary.config.column_blocks)
-    );
-    println!("row blocks:    {}", optional_display(summary.config.row_blocks));
-    println!(
-        "row CLS:       {}",
-        optional_display(summary.config.row_cls_tokens)
-    );
-    println!("ICL blocks:    {}", optional_display(summary.config.icl_blocks));
+    match summary.config {
+        ironicl::format::model::ModelConfig::TabIclV2(config) => {
+            println!("task:          {}", optional_display(config.task()));
+            println!("max classes:   {}", optional_display(config.max_classes));
+            println!("quantiles:     {}", optional_display(config.num_quantiles));
+            println!("embedding dim: {}", optional_display(config.embed_dim));
+            println!("column blocks: {}", optional_display(config.column_blocks));
+            println!("row blocks:    {}", optional_display(config.row_blocks));
+            println!("row CLS:       {}", optional_display(config.row_cls_tokens));
+            println!("ICL blocks:    {}", optional_display(config.icl_blocks));
+        }
+        ironicl::format::model::ModelConfig::KumoTabular(release) => print_kumo_tabular(release),
+    }
     Ok(())
+}
+
+fn print_kumo_tabular(release: ironicl::models::kumo_tabular::Release) {
+    let config = release.size.config();
+    println!("task:          {}", release.task);
+    println!("size:          {}", release.size);
+    println!(
+        "cell layers:   {} x {} channels, {} inducing points",
+        config.embedding_layers, config.cell_channels, config.inducing_points
+    );
+    println!(
+        "ICL layers:    {} x {} channels, {} heads",
+        config.icl_layers, config.icl_channels, config.icl_heads
+    );
 }
 
 fn inspect_checkpoint_file(path: &Path) -> Result<()> {
@@ -144,6 +154,9 @@ fn inspect_checkpoint_file(path: &Path) -> Result<()> {
         .collect::<Vec<_>>()
         .join(", ");
     println!("dtypes:        {dtypes}");
+    if let ironicl::CheckpointProfile::KumoTabular(release) = summary.profile {
+        print_kumo_tabular(release);
+    }
     if let Some(config) = summary.config {
         println!("task:          {}", optional_display(config.task()));
         println!("max classes:   {}", optional_display(config.max_classes));

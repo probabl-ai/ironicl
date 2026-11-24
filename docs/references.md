@@ -77,6 +77,10 @@ official v2 checkpoints pass these gates with Candle 0.11.1.
 Ironicl uses the [BSD 3-Clause License](../LICENSE), copyright 2026, Probabl.
 The project license does not replace upstream copyright or license notices.
 
+The Kumo-Tabular weights use OpenMDW-1.1, and NVIDIA's `structured-data-models` code uses the
+Apache License 2.0; see [kumo-tabular.md](kumo-tabular.md#license). Ironicl downloads the weights
+and does not distribute them.
+
 The local TabICL code uses the BSD 3-Clause License, with separate terms noted
 for its forecast-derived code. Ironicl does not need forecast code.
 

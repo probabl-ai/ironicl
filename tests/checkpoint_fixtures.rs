@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use ironicl::models::kumo_tabular::Release;
 use ironicl::{
     CheckpointCacheOptions, CheckpointProfile, Executor, Optimize, PreparedCheckpoint, QueryRequest, Request,
     TaskKind, import_checkpoint, inspect_checkpoint, inspect_model_artifact, load_model_artifact,
@@ -303,6 +304,33 @@ fn reduced_precision_context_predicts_all_missing_rows() {
             "logit {index}: auto {auto}, safe {safe}"
         );
     }
+}
+
+#[test]
+#[ignore = "needs Kumo-Tabular checkpoints as kumo-tabular-<size>-<task>.pt in IRONICL_CHECKPOINT_FIXTURES"]
+fn imports_the_kumo_tabular_checkpoints_that_are_available() {
+    let directory = std::env::var_os("IRONICL_CHECKPOINT_FIXTURES").expect("IRONICL_CHECKPOINT_FIXTURES");
+    let output = tempdir().expect("temporary directory");
+    let mut found = 0;
+    for release in Release::ALL {
+        let checkpoint =
+            Path::new(&directory).join(format!("kumo-tabular-{}-{}.pt", release.size, release.task));
+        if !checkpoint.is_file() {
+            continue;
+        }
+        found += 1;
+        let summary = inspect_checkpoint(&checkpoint).expect("Kumo-Tabular checkpoint");
+        assert_eq!(summary.profile, CheckpointProfile::KumoTabular(release));
+        assert_eq!(summary.source_sha256, release.sha256());
+        let model = output.path().join("model.irmodel");
+        let imported = import_checkpoint(&checkpoint, &model).expect("import");
+        assert_eq!(imported.profile, ironicl::ModelProfile::KumoTabular(release));
+        assert_eq!(inspect_model_artifact(&model).expect("inspect"), imported);
+    }
+    assert!(
+        found > 0,
+        "no Kumo-Tabular checkpoint in IRONICL_CHECKPOINT_FIXTURES"
+    );
 }
 
 fn fixture(name: &str) -> Option<PathBuf> {

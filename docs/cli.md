@@ -46,6 +46,7 @@ ironicl platform
 ```bash
 ironicl inspect my-model
 ironicl inspect tabicl-classifier-v2-20260212.ckpt
+ironicl inspect large/classifier.pt
 ironicl inspect ~/.cache/ironicl/models/v1/<sha256>.irmodel
 ```
 
@@ -56,7 +57,8 @@ ironicl inspect ~/.cache/ironicl/models/v1/<sha256>.irmodel
 - Ironicl weights (`IRMODEL`): full structural and checksum validation, then the source SHA-256,
   profile, tensor and parameter counts, dtypes, and configuration;
 - a PyTorch ZIP checkpoint (`.ckpt`, `.pt`, `.pth`), parsed without executing pickle code: the
-  same, with the source SHA-256 bound to the recognized official model.
+  same, with the source SHA-256 bound to the recognized official model, TabICLv2 or one of the
+  six [Kumo-Tabular](kumo-tabular.md) checkpoints.
 
 ## Import
 
