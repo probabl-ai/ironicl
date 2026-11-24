@@ -217,6 +217,21 @@ impl Device {
         DeviceBuffer::zeroed(&self.stream, len)
     }
 
+    /// `len` zeroed elements on the device, allocated and zeroed in stream
+    /// order: unlike [`Self::zeroed`], it does not wait for the GPU, and the
+    /// buffer is freed in stream order too.
+    pub(crate) fn zeroed_async<T: DeviceCopy>(
+        &self,
+        len: usize,
+    ) -> std::result::Result<DeviceBuffer<T>, DriverError> {
+        #[expect(unsafe_code, reason = "an uninitialized allocation, zeroed before any read")]
+        // SAFETY: the zeroing is enqueued on the same stream right after the allocation, so
+        // nothing reads the buffer before it is written.
+        let mut buffer = unsafe { DeviceBuffer::uninitialized_async(&self.stream, len)? };
+        buffer.zero_async(&self.stream)?;
+        Ok(buffer)
+    }
+
     /// `values` copied to the device.
     pub(crate) fn upload<T: DeviceCopy>(&self, values: &[T]) -> Result<DeviceBuffer<T>> {
         DeviceBuffer::from_host(&self.stream, values).map_err(gpu_error)

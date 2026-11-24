@@ -272,6 +272,7 @@ pub(crate) mod device {
         ldr: u32,
         mode: u32,
         k_chunk: u32,
+        row_tile0: u32,
     ) {
         static mut AS: SharedArray<f32, { 2 * 16 * 64 }, 16> = SharedArray::UNINIT;
         static mut BS: SharedArray<f32, { 2 * 16 * 64 }, 16> = SharedArray::UNINIT;
@@ -284,7 +285,8 @@ pub(crate) mod device {
         let tid = thread::threadIdx_x() as usize;
         let (m, n, k) = (m as usize, n as usize, k as usize);
         let (ldx, ldy, ldr) = (ldx as usize, ldy as usize, ldr as usize);
-        let row0 = thread::blockIdx_y() as usize * 64;
+        // A launch covers row tiles `row_tile0..`: grids hold at most 65,535 blocks in y.
+        let row0 = (row_tile0 as usize + thread::blockIdx_y() as usize) * 64;
         let col0 = thread::blockIdx_x() as usize * 64;
         let split = thread::blockIdx_z() as usize;
         let splits = thread::gridDim_z() as usize;
@@ -569,8 +571,8 @@ pub(crate) mod device {
 
     /// Attention outputs `[(b * heads + j) * qp + q, 64]` back to tokens
     /// `[B * Q, heads * dim]`, times `value_scale[b * heads + j]`, the FP8
-    /// values' scale per dim, or ones; written as [`store_activation`] does
-    /// with `format`.
+    /// values' scale per dim, unless `value_scale` is empty; written as
+    /// [`store_activation`] does with `format`.
     #[kernel]
     pub fn heads_to_tokens(
         attended: &[f32],
@@ -593,7 +595,10 @@ pub(crate) mod device {
         let (d, head, token) = (i % dim, (i / dim) % heads, i / (heads * dim));
         let (b, row) = (token / q, token % q);
         let pair = b * heads + head;
-        let value = attended[(pair * qp as usize + row) * 64 + d] * value_scale[pair * 64 + d];
+        let mut value = attended[(pair * qp as usize + row) * 64 + d];
+        if !value_scale.is_empty() {
+            value *= value_scale[pair * 64 + d];
+        }
         // SAFETY: `i < B * q * heads * dim` (returned above), within the buffers `format` names,
         // which the launcher sizes to at least `[B q, heads * dim]`; one thread per `i`.
         unsafe { store_activation((&mut tokens, &mut tokens_hi, &mut tokens_lo), format, i, value) };
@@ -649,6 +654,190 @@ pub(crate) mod device {
             // `debug_assert!` only); `i` is this thread's own.
             unsafe { *out.get_unchecked_mut(i) = source[i % period as usize] };
         }
+    }
+
+    /// `RMSNorm` with weight `gamma` and epsilon `eps` over `width` values (at
+    /// most 1024) of each of `rows` rows, as [`layer_norm`] writes them; see
+    /// [`norm_rows`]. 256 threads per block, one warp per row.
+    #[kernel]
+    pub fn rms_norm(
+        x: &[f32],
+        gamma: &[f32],
+        mut y: DisjointSlice<f32>,
+        mut y_hi: DisjointSlice<u16>,
+        mut y_lo: DisjointSlice<u16>,
+        rows: u32,
+        width: u32,
+        format: u32,
+        eps: f32,
+    ) {
+        norm_rows::<32, true>(
+            x, gamma, gamma, &mut y, &mut y_hi, &mut y_lo, rows, width, width, width, format, eps,
+        );
+    }
+
+    /// `x[g, r, :] += vectors[r, :]` for `groups` groups of `rows` rows of
+    /// `width` values, in place: the same row vectors added to every group.
+    #[kernel]
+    pub fn add_rows(mut x: DisjointSlice<f32>, vectors: &[f32], rows: u32, width: u32, len: u32) {
+        let i = thread::index_1d().get();
+        if i >= len as usize {
+            return;
+        }
+        let rows_width = rows as usize * width as usize;
+        // SAFETY: `i < len <= x.len()`, asserted by the launcher; the thread reads and writes
+        // only `x[i]`.
+        unsafe { *x.get_unchecked_mut(i) += vectors[i % rows_width] };
+    }
+
+    /// Packed queries `q[pairs, padded, 64]`, the first `dim` dims of each,
+    /// times `base[head, d]` and `1 + tanh(g)` for `g = gates[pair * padded +
+    /// row, d]` (`[pairs * padded, dim]`). One thread per value.
+    #[kernel]
+    pub fn scale_heads(
+        mut q: DisjointSlice<f32>,
+        base: &[f32],
+        gates: &[f32],
+        pairs: u32,
+        padded: u32,
+        heads: u32,
+        dim: u32,
+    ) {
+        let i = thread::index_1d().get();
+        let (padded, dim) = (padded as usize, dim as usize);
+        let d = i % 64;
+        if i >= pairs as usize * padded * 64 || d >= dim {
+            return;
+        }
+        let (row, pair) = ((i / 64) % padded, i / (64 * padded));
+        let scale =
+            base[(pair % heads as usize) * dim + d] * (1.0 + gates[(pair * padded + row) * dim + d].tanh());
+        // SAFETY: `i < pairs * padded * 64`, the launcher's size of `q`; each thread touches
+        // its own `q[i]`.
+        unsafe { *q.get_unchecked_mut(i) *= scale };
+    }
+
+    // ---------------------------------------------------------------------------
+    // Kumo-Tabular: the cell embedding's features and the row stage's sequences.
+    // ---------------------------------------------------------------------------
+
+    /// Column `column`'s cell features `out[rows, 208]` from the preprocessed
+    /// rows `x[rows, columns]`. For each grouped column `g` of 3, column
+    /// `(column + 2^g - 1) % columns`: the sines and then the cosines of its
+    /// value times its kind's 32 frequencies, the value replaced by the
+    /// column's mean when missing. Then each grouped column's missing flag,
+    /// then zeros. One thread per value.
+    #[kernel]
+    pub fn kumo_cell_features(
+        x: &[f32],
+        means: &[f32],
+        kinds: &[f32],
+        numeric: &[f32],
+        categorical: &[f32],
+        mut out: DisjointSlice<f32>,
+        rows: u32,
+        columns: u32,
+        column: u32,
+    ) {
+        let i = thread::index_1d().get();
+        let (rows, columns, column) = (rows as usize, columns as usize, column as usize);
+        if i >= rows * 208 {
+            return;
+        }
+        let (j, row) = (i % 208, i / 208);
+        let value = if j < 192 {
+            let (g, k) = (j / 64, j % 64);
+            let source = (column + (1 << g) - 1) % columns;
+            let raw = x[row * columns + source];
+            let value = if raw.is_nan() { means[source] } else { raw };
+            let table = if kinds[source] > 0.5 { categorical } else { numeric };
+            let z = value * table[g * 32 + k % 32];
+            if k < 32 { libm::sinf(z) } else { libm::cosf(z) }
+        } else if j < 195 {
+            let source = (column + (1 << (j - 192)) - 1) % columns;
+            if x[row * columns + source].is_nan() {
+                1.0
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        // SAFETY: `i < rows * 208`, the launcher's size of `out`; one thread per `i`.
+        unsafe { *out.get_unchecked_mut(i) = value };
+    }
+
+    /// Rows `start..start + rows` of the row stage's sequences `[rows,
+    /// tokens, width]`, `tokens` being the `readouts` readout tokens and then,
+    /// unless `tokens == readout`, each column's cell: gathered from
+    /// `readouts[total, readout, width]` and `cells[columns, total, width]`
+    /// (`scatter` 0), or written back to them (1). One thread per value.
+    #[kernel]
+    pub fn kumo_sequences(
+        mut readouts: DisjointSlice<f32>,
+        mut cells: DisjointSlice<f32>,
+        mut sequences: DisjointSlice<f32>,
+        start: u32,
+        rows: u32,
+        total: u32,
+        readout: u32,
+        tokens: u32,
+        width: u32,
+        scatter: u32,
+    ) {
+        let i = thread::index_1d().get();
+        let (rows, total, readout, tokens, width) = (
+            rows as usize,
+            total as usize,
+            readout as usize,
+            tokens as usize,
+            width as usize,
+        );
+        if i >= rows * tokens * width {
+            return;
+        }
+        let (c, token, row) = (i % width, (i / width) % tokens, i / (width * tokens));
+        let global = start as usize + row;
+        // SAFETY: `row < rows`, `start + rows <= total`, `token < tokens`, and `c < width`, as the
+        // launcher asserts: the readout slot lies in `[total, readout, width]`, the cell slot in
+        // `[columns, total, width]` for column `token - readout`, and `i` in `sequences`; each
+        // thread touches its own slots, which no two threads share.
+        unsafe {
+            let other = if token < readout {
+                readouts.get_unchecked_mut((global * readout + token) * width + c)
+            } else {
+                cells.get_unchecked_mut(((token - readout) * total + global) * width + c)
+            };
+            let sequence = sequences.get_unchecked_mut(i);
+            if scatter == 0 {
+                *sequence = *other;
+            } else {
+                *other = *sequence;
+            }
+        }
+    }
+
+    /// One slot's `[groups, chunk]` values into `out` `[groups, slots, chunk]`
+    /// at `slot`: Kumo-Tabular stacks its members' column keys and values so
+    /// each (column, member) group is contiguous. One thread per source value.
+    #[kernel]
+    pub fn kumo_interleave(
+        source: &[f32],
+        mut out: DisjointSlice<f32>,
+        groups: u32,
+        slots: u32,
+        slot: u32,
+        chunk: u32,
+    ) {
+        let i = thread::index_1d().get();
+        let (groups, slots, chunk) = (groups as usize, slots as usize, chunk as usize);
+        if i >= groups * chunk {
+            return;
+        }
+        let (group, at) = (i / chunk, i % chunk);
+        // SAFETY: `group < groups`, `slot < slots`, and `at < chunk`, which the launcher checks
+        // against `out` `[groups, slots, chunk]`; each thread writes its own slot.
+        unsafe { *out.get_unchecked_mut((group * slots + slot as usize) * chunk + at) = source[i] };
     }
 
     /// `out[offset + i] = source[i]` for `len` values.
@@ -1504,6 +1693,7 @@ pub(crate) mod device {
         splits: u32,
         scale_log2: f32,
         kv_share: u32,
+        block0: u32,
     ) {
         // Q and K rows padded to 68 values, so that rows four apart and keys
         // one apart start in different banks.
@@ -1523,7 +1713,9 @@ pub(crate) mod device {
         let ps = unsafe { SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(PS)) };
         let tid = thread::threadIdx_x() as usize;
         let (ty, tx) = (tid / 16, tid % 16);
-        let block = thread::blockIdx_y() as usize;
+        // A launch covers blocks `block0..` of `pairs * splits`: grids hold at most 65,535
+        // blocks in y.
+        let block = block0 as usize + thread::blockIdx_y() as usize;
         let (bh, chunk) = (block / splits as usize, block % splits as usize);
         // Query heads share key and value heads in groups of `kv_share`.
         let kv = bh / kv_share as usize;

@@ -7,6 +7,7 @@ scikit-learn's interface. See docs/kumo-tabular.md.
 
 from __future__ import annotations
 
+import warnings
 from functools import cache
 from numbers import Integral
 from pathlib import Path
@@ -64,6 +65,12 @@ class _KumoTabular(SavedEstimator, BaseEstimator):
     _task: str
     _needs_training_data = True
 
+    def _reset_fit(self) -> None:
+        # Release the previous context before validation or allocating another one.
+        for name in tuple(vars(self)):
+            if name.endswith("_") and not name.startswith("_"):
+                delattr(self, name)
+
     def _fit(self, X, targets: dict) -> None:
         """Fit the members' preprocessing and contexts in Rust on ``X`` and
         ``targets``, as ``_core.KumoTabular.fit`` takes them."""
@@ -71,7 +78,7 @@ class _KumoTabular(SavedEstimator, BaseEstimator):
         x, names = _features(X)
         checkpoint = self._checkpoint()
         with self._progress("Building context", "estimator") as progress:
-            self.fitted_ = _model(checkpoint, self._release()).fit(
+            fitted = _model(checkpoint, self._release()).fit(
                 x,
                 **targets,
                 n_estimators=self._estimators(),
@@ -80,12 +87,12 @@ class _KumoTabular(SavedEstimator, BaseEstimator):
                 feature_names=None if names is None else list(names),
                 progress=progress,
             )
-        self.checkpoint_path_ = checkpoint
-        self.n_features_in_ = len(x) if isinstance(x, list) else x.shape[1]
+        _warn_cpu_members(fitted)
         if names is not None:
             self.feature_names_in_ = np.asarray(names, dtype=object)
-        elif hasattr(self, "feature_names_in_"):
-            del self.feature_names_in_  # Left by an earlier fit on named data.
+        self.n_features_in_ = len(x) if isinstance(x, list) else x.shape[1]
+        self.checkpoint_path_ = checkpoint
+        self.fitted_ = fitted
 
     def _query(self, X):
         """``X`` as Rust predicts from it, checked against the training data."""
@@ -128,6 +135,7 @@ class _KumoTabular(SavedEstimator, BaseEstimator):
             self.fitted_ = _model(self.checkpoint_path_, self._release()).load(
                 self.fitted_, self._threads(), progress, context
             )
+        _warn_cpu_members(self.fitted_)
 
     def _validate(self) -> None:
         if self.size not in SIZES:
@@ -161,8 +169,18 @@ class _KumoTabular(SavedEstimator, BaseEstimator):
         return fetch(path, url, SHA256.get(name), allow_download=self.allow_auto_download, data=data)
 
 
+def _warn_cpu_members(fitted) -> None:
+    if fitted.cpu_members:
+        warnings.warn(
+            f"{fitted.cpu_members} ensemble members did not fit in GPU memory and run on the CPU, "
+            "which is much slower; use fewer n_estimators or training rows",
+            UserWarning,
+            stacklevel=3,
+        )
+
+
 class KumoTabularClassifier(ClassifierMixin, _KumoTabular):
-    """Kumo-Tabular classifier with Ironicl's Rust inference engine, on the CPU.
+    """Kumo-Tabular classifier with Ironicl's Rust inference engine, on the CPU or an NVIDIA GPU.
 
     ``size`` is ``"small"``, ``"medium"``, or ``"large"``. ``n_estimators``
     ensemble members each preprocess the data differently; ``None`` uses
@@ -182,12 +200,15 @@ class KumoTabularClassifier(ClassifierMixin, _KumoTabular):
     _task = "classifier"
 
     def fit(self, X, y) -> KumoTabularClassifier:
-        """Fit the members' preprocessing and contexts in Rust."""
+        """Discard any previous fit and fit the classifier. A failed fit leaves it unfitted."""
+        self._reset_fit()
         if y is None:
             raise ValueError("This classifier requires y to be passed, but the target y is None.")
         labels = _labels(y)
-        self._fit(X, {"labels": _label_values(labels)})
-        self.classes_ = np.unique(labels)  # Rust sorts the classes as NumPy does.
+        targets = _label_values(labels)
+        classes = np.unique(labels)  # Rust sorts the classes as NumPy does.
+        self._fit(X, {"labels": targets})
+        self.classes_ = classes
         self.n_classes_ = len(self.classes_)
         return self
 
@@ -200,11 +221,12 @@ class KumoTabularClassifier(ClassifierMixin, _KumoTabular):
 
     def predict(self, X) -> np.ndarray:
         """Return the most probable class label for each sample."""
-        return self.classes_[np.argmax(self.predict_proba(X), axis=1)]
+        probabilities = self.predict_proba(X)  # Checks first that the estimator is fitted.
+        return self.classes_[np.argmax(probabilities, axis=1)]
 
 
 class KumoTabularRegressor(RegressorMixin, _KumoTabular):
-    """Kumo-Tabular regressor with Ironicl's Rust inference engine, on the CPU.
+    """Kumo-Tabular regressor with Ironicl's Rust inference engine, on the CPU or an NVIDIA GPU.
 
     Each member predicts 999 quantiles; their sorted values are averaged over
     the members after dropping the lowest and highest fifth, as NVIDIA's code
@@ -215,7 +237,8 @@ class KumoTabularRegressor(RegressorMixin, _KumoTabular):
     _task = "regressor"
 
     def fit(self, X, y) -> KumoTabularRegressor:
-        """Fit the members' preprocessing and contexts in Rust."""
+        """Discard any previous fit and fit the regressor. A failed fit leaves it unfitted."""
+        self._reset_fit()
         if y is None:
             raise ValueError("This regressor requires y to be passed, but the target y is None.")
         # A column vector becomes one-dimensional, with scikit-learn's warning.

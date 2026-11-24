@@ -52,6 +52,17 @@ impl Dense {
         })
     }
 
+    /// A dense layer for FP32 products only, without the FP16 parts the
+    /// tensor cores read.
+    pub(crate) fn upload_f32(device: &Device, w: &[f32], b: &[f32]) -> Result<Self> {
+        Ok(Self {
+            w: device.upload(w)?,
+            hi: empty(device)?,
+            lo: empty(device)?,
+            b: device.upload(b)?,
+        })
+    }
+
     /// Device memory the layer takes.
     pub(crate) fn bytes(&self) -> usize {
         4 * (self.w.len() + self.b.len()) + 2 * (self.hi.len() + self.lo.len())
@@ -174,15 +185,16 @@ fn empty<T: DeviceCopy>(device: &Device) -> Result<DeviceBuffer<T>> {
     device.zeroed(0).map_err(gpu_error)
 }
 
-/// A size as the kernels take it, in `u32`: a build caps its buffers at
-/// `u32::MAX` values (see `build::plan`), and a prediction's counts are per
-/// run of at most 1024 rows, except the query rows `total` and `start`, which
-/// feed only bounds-checked reads and the `missing` offset.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "callers pass sizes the build plan caps below u32::MAX"
-)]
+/// Blocks a launch grid holds at most in y and z.
+pub(crate) const MAX_GRID_YZ: usize = 65_535;
+
+/// A size as the kernels take it, in `u32`. `TabICLv2`'s build caps its
+/// buffers at `u32::MAX` values (see `build::plan`) and its predictions run at
+/// most 1024 rows at a time; Kumo-Tabular's sizes are its tables'. A size that
+/// does not fit panics rather than wrapping.
+#[expect(clippy::cast_possible_truncation, reason = "checked against u32::MAX first")]
 pub(crate) const fn n(value: usize) -> u32 {
+    assert!(value <= u32::MAX as usize, "a size past what the kernels index");
     value as u32
 }
 
@@ -432,33 +444,38 @@ impl Device {
             splits == 1 || splits * rows * width <= partial.len(),
             "split-K partials past their buffer"
         );
-        let grid = config((width.div_ceil(64), rows.div_ceil(64), splits), 256);
         let (m, w, k) = (n(rows), n(width), n(depth));
-        // SAFETY: grid (ceil(width / 64), ceil(rows / 64), splits) of 256 threads, as `linear64`
-        // asks; `depth` (a multiple of 16) and `chunk` (a multiple of 16) meet its multiples, and
-        // `cuMemAlloc` its 16-byte alignment. `input` holds `rows * depth`, `dense.w` is `[width,
-        // depth]`, `out` holds `rows * width`, and the assert keeps the partials in `partial`.
-        let launch = unsafe {
-            self.kernels.linear64(
-                self.stream(),
-                grid,
-                input,
-                &dense.w,
-                &dense.b,
-                residual,
-                out,
-                partial,
-                m,
-                w,
-                k,
-                k,
-                w,
-                w,
-                mode,
-                n(chunk),
-            )
-        };
-        launch.map_err(gpu_error)?;
+        let tiles = rows.div_ceil(64);
+        for first in (0..tiles).step_by(MAX_GRID_YZ) {
+            let grid = config((width.div_ceil(64), MAX_GRID_YZ.min(tiles - first), splits), 256);
+            // SAFETY: grid (ceil(width / 64), row tiles `first..` of ceil(rows / 64), splits) of
+            // 256 threads, as `linear64` asks; `depth` (a multiple of 16) and `chunk` (a multiple
+            // of 16) meet its multiples, and `cuMemAlloc` its 16-byte alignment. `input` holds
+            // `rows * depth`, `dense.w` is `[width, depth]`, `out` holds `rows * width`, and the
+            // assert keeps the partials in `partial`.
+            let launch = unsafe {
+                self.kernels.linear64(
+                    self.stream(),
+                    grid,
+                    input,
+                    &dense.w,
+                    &dense.b,
+                    residual,
+                    &mut *out,
+                    &mut *partial,
+                    m,
+                    w,
+                    k,
+                    k,
+                    w,
+                    w,
+                    mode,
+                    n(chunk),
+                    n(first),
+                )
+            };
+            launch.map_err(gpu_error)?;
+        }
         if splits == 1 {
             return Ok(());
         }
@@ -532,6 +549,40 @@ impl Device {
         launch.map_err(gpu_error)
     }
 
+    /// `RMSNorm` of `rows` rows of `width` (at most 1024) into `out`, with
+    /// weight `gamma` and epsilon `eps`.
+    pub(crate) fn rms_norm(
+        &self,
+        x: &DeviceBuffer<f32>,
+        gamma: &DeviceBuffer<f32>,
+        out: Output<'_>,
+        (rows, width): (usize, usize),
+        eps: f32,
+    ) -> Result<()> {
+        assert!(width <= 1024);
+        let mut unused = Unused::new(self)?;
+        let (y, hi, lo, format) = unused.outputs(Some(out));
+        // SAFETY: one warp per row (`rows * 32` threads), writing `row * width + i < rows * width`
+        // only to the buffers `format` names, which `Unused::outputs` matches to `out`'s; callers'
+        // `x` and `out` hold `rows * width` values and `gamma` `width`.
+        let launch = unsafe {
+            self.kernels.rms_norm(
+                self.stream(),
+                config(threads(rows * 32), 256),
+                x,
+                gamma,
+                y,
+                hi,
+                lo,
+                n(rows),
+                n(width),
+                format,
+                eps,
+            )
+        };
+        launch.map_err(gpu_error)
+    }
+
     /// Softmax attention of `queries` `[pairs, padded_queries, 64]`, FP32 at
     /// [`Precision::Fp32`] and FP16 otherwise, against the cache's `keys` and
     /// `values` `[pairs, padded_rows, 64]` (FP32 for `safe`, FP16 for `auto`,
@@ -568,34 +619,51 @@ impl Device {
                 && lse.len() >= chunks
                 && out.len() >= pairs * padded_queries * HEAD_DIM
         );
-        let grid = config((padded_queries.div_ceil(block_rows), pairs * splits, 1), 128);
+        let blocks = pairs * splits;
         let (qp, np, splits32) = (n(padded_queries), n(padded_rows(rows)), n(splits));
         let scale = 0.125 / std::f32::consts::LN_2; // 1 / sqrt(64), in the exp2 domain
         let stream = self.stream();
-        // SAFETY: grid (qp / block_rows, pairs * splits) of 128 threads, `block_rows` being the
-        // chosen kernel's rows per block; `qp` (`padded_query_rows`) is a multiple of it, so the
-        // unchecked query copies stay in `[pairs, qp, 64]`. The caches hold `pairs * np * 64`
-        // values of the precision's width and `part` and `lse` hold every chunk, as asserted above
-        // (`BlockCache` and `Workspace::reserve` size them so). Chunks start below `np / 64` tiles.
+        let tiles = padded_queries.div_ceil(block_rows);
+        // SAFETY: grid (qp / block_rows, blocks of `pairs * splits`) of 128 threads,
+        // `block_rows` being the chosen kernel's rows per block; `qp` (`padded_query_rows`) is a
+        // multiple of it, so the unchecked query copies stay in `[pairs, qp, 64]`. The caches hold
+        // `pairs / kv_share * np * 64` values of the precision's width and `part` and `lse` hold
+        // every chunk, as asserted above (`BlockCache` and `Workspace::reserve` size them so).
+        // Chunks start below `np / 64` tiles.
         let launch = unsafe {
             match (precision, queries) {
-                (Precision::Fp32, Activation::F32(queries)) => self.kernels.icl_attention_f32(
-                    stream,
-                    grid,
-                    queries,
-                    keys,
-                    values,
-                    part,
-                    lse,
-                    qp,
-                    np,
-                    n(rows),
-                    n(chunk_tiles),
-                    splits32,
-                    scale,
-                    n(kv_share),
-                ),
+                (Precision::Fp32, Activation::F32(queries)) => {
+                    // Blocks past the grid's y limit run in further launches.
+                    for first in (0..blocks).step_by(MAX_GRID_YZ) {
+                        let grid = config((tiles, MAX_GRID_YZ.min(blocks - first), 1), 128);
+                        self.kernels
+                            .icl_attention_f32(
+                                stream,
+                                grid,
+                                queries,
+                                keys,
+                                values,
+                                &mut *part,
+                                &mut *lse,
+                                qp,
+                                np,
+                                n(rows),
+                                n(chunk_tiles),
+                                splits32,
+                                scale,
+                                n(kv_share),
+                                n(first),
+                            )
+                            .map_err(gpu_error)?;
+                    }
+                    Ok(())
+                }
                 (Precision::Split | Precision::Half, Activation::Half(queries)) => {
+                    assert!(
+                        blocks <= MAX_GRID_YZ,
+                        "tensor-core attention past the grid's y limit"
+                    );
+                    let grid = config((tiles, blocks, 1), 128);
                     let kernel = match (precision, block_rows == 16) {
                         (Precision::Split, true) => LoadedModule::icl_attention_decode,
                         (Precision::Split, false) => LoadedModule::icl_attention_wide,
@@ -619,6 +687,7 @@ impl Device {
                         scale,
                         n(kv_share),
                     )
+                    .map_err(gpu_error)
                 }
                 _ => {
                     return Err(gpu_error(
@@ -627,7 +696,7 @@ impl Device {
                 }
             }
         };
-        launch.map_err(gpu_error)?;
+        launch?;
         let config = config(threads(pairs * padded_queries * HEAD_DIM), 256);
         // SAFETY: every access of `icl_attention_merge` is bounds-checked (its write goes through
         // `get_mut`); one thread per output value of `[pairs, qp, 64]`.
@@ -639,7 +708,8 @@ impl Device {
     }
 
     /// Attention outputs `[ensembles * heads, qp, 64]` back to tokens
-    /// `[ensembles * q, heads * dim]`, times the values' scales, into `out`.
+    /// `[ensembles * q, heads * dim]`, times the values' scales unless
+    /// `value_scale` is empty, into `out`.
     pub(crate) fn heads_to_tokens(
         &self,
         (attended, value_scale): (&DeviceBuffer<f32>, &DeviceBuffer<f32>),
@@ -652,7 +722,7 @@ impl Device {
         let config = config(threads(ensembles * q * heads * dim), 256);
         // SAFETY: one thread per token value, writing `i < ensembles * q * heads * dim` to the
         // buffers `format` names; callers' `out` holds `[ensembles * q, heads * dim]`, `attended`
-        // `[ensembles * heads, qp, 64]`, and `value_scale` `[ensembles * heads, 64]`.
+        // `[ensembles * heads, qp, 64]`, and `value_scale` is empty or `[ensembles * heads, 64]`.
         let launch = unsafe {
             self.kernels.heads_to_tokens(
                 self.stream(),
@@ -671,5 +741,114 @@ impl Device {
             )
         };
         launch.map_err(gpu_error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Activation, Dense, HEAD_DIM, MAX_GRID_YZ, Precision, padded_query_rows, padded_rows};
+    use crate::kernels::cuda::Device;
+
+    #[expect(clippy::cast_precision_loss, reason = "Small test values")]
+    fn value(i: usize, period: usize) -> f32 {
+        (i % period) as f32 / period as f32 - 0.5
+    }
+
+    /// Products and FP32 attention past the grid's 65,535 blocks in y run in
+    /// several launches and match the host.
+    #[test]
+    fn launches_past_the_grid_limit() {
+        let Some(device) = Device::new().expect("load CUDA kernels") else {
+            eprintln!("no CUDA device; skipping");
+            return;
+        };
+        // A product one row tile past the limit.
+        let (rows, width, depth) = (MAX_GRID_YZ * 64 + 64, 4, 16);
+        let inputs: Vec<f32> = (0..rows * depth).map(|i| value(i, 97)).collect();
+        let weights: Vec<f32> = (0..width * depth).map(|i| value(i, 13)).collect();
+        let bias = vec![0.25_f32; width];
+        let dense = Dense::upload_f32(&device, &weights, &bias).unwrap();
+        let input = device.upload(&inputs).unwrap();
+        let mut out = device.zeroed::<f32>(rows * width).unwrap();
+        let mut partial = device.zeroed::<f32>(0).unwrap();
+        let shape = (rows, width, depth);
+        device
+            .product(
+                Activation::F32(&input),
+                &dense,
+                None,
+                (Some(&mut out), None),
+                &mut partial,
+                shape,
+                false,
+            )
+            .unwrap();
+        let out = device.download(&out).unwrap();
+        for row in [0, rows / 2, rows - 1] {
+            for col in 0..width {
+                let expected = bias[col]
+                    + (0..depth)
+                        .map(|k| inputs[row * depth + k] * weights[col * depth + k])
+                        .sum::<f32>();
+                assert!(
+                    (out[row * width + col] - expected).abs() < 1e-4,
+                    "row {row}, column {col}"
+                );
+            }
+        }
+        // Attention with more pairs than a grid holds in y.
+        let (pairs, keys) = (MAX_GRID_YZ + 7, 64);
+        let (qp, np) = (padded_query_rows(1), padded_rows(keys));
+        let queries: Vec<f32> = (0..pairs * qp * HEAD_DIM).map(|i| value(i, 31)).collect();
+        let (key_data, value_data): (Vec<f32>, Vec<f32>) = (
+            (0..pairs * np * HEAD_DIM).map(|i| value(i, 37)).collect(),
+            (0..pairs * np * HEAD_DIM).map(|i| value(i, 41)).collect(),
+        );
+        let bytes = |data: &[f32]| device.upload(data).unwrap().cast_chunks::<u8>().ok().unwrap();
+        let (k_bytes, v_bytes) = (bytes(&key_data), bytes(&value_data));
+        let (_, splits) = device.icl_split(Precision::Fp32, pairs, qp, keys);
+        let mut part = device.zeroed::<f32>(pairs * qp * splits * HEAD_DIM).unwrap();
+        let mut lse = device.zeroed::<f32>(pairs * qp * splits).unwrap();
+        let mut attended = device.zeroed::<f32>(pairs * qp * HEAD_DIM).unwrap();
+        let query_buffer = device.upload(&queries).unwrap();
+        device
+            .attend_icl(
+                Precision::Fp32,
+                Activation::F32(&query_buffer),
+                (&k_bytes, &v_bytes),
+                (&mut part, &mut lse, &mut attended),
+                (pairs, qp, keys),
+                1,
+            )
+            .unwrap();
+        let attended = device.download(&attended).unwrap();
+        for pair in [0, MAX_GRID_YZ / 2, pairs - 1] {
+            let query = &queries[pair * qp * HEAD_DIM..][..HEAD_DIM];
+            let scores: Vec<f32> = (0..keys)
+                .map(|key| {
+                    let at = (pair * np + key) * HEAD_DIM;
+                    query
+                        .iter()
+                        .zip(&key_data[at..at + HEAD_DIM])
+                        .map(|(a, b)| a * b)
+                        .sum::<f32>()
+                        / 8.0
+                })
+                .collect();
+            let peak = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let weights: Vec<f32> = scores.iter().map(|s| (s - peak).exp()).collect();
+            let total: f32 = weights.iter().sum();
+            for d in 0..HEAD_DIM {
+                let expected = (0..keys)
+                    .map(|key| weights[key] * value_data[(pair * np + key) * HEAD_DIM + d])
+                    .sum::<f32>()
+                    / total;
+                let got = attended[pair * qp * HEAD_DIM + d];
+                assert!(
+                    (got - expected).abs() < 1e-4,
+                    "pair {pair}, dim {d}: {got} vs {expected}"
+                );
+            }
+        }
     }
 }

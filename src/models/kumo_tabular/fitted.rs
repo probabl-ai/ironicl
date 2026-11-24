@@ -44,6 +44,10 @@ pub struct Fitted {
     training: Training,
     preprocessor: Preprocessor,
     contexts: Vec<Vec<Context>>,
+    /// The contexts stacked on the GPU, every member's predicted in one pass,
+    /// when they all live there.
+    #[cfg(feature = "cuda")]
+    stack: Option<super::cuda::Ensemble>,
 }
 
 impl Fitted {
@@ -126,18 +130,45 @@ impl Fitted {
             );
             progress::report(Stage::Build, member + 1, members)?;
         }
+        #[cfg(feature = "cuda")]
+        let stack = model.stack(&mut contexts)?;
         Ok(Self {
             model,
             pool,
             training,
             preprocessor,
             contexts,
+            #[cfg(feature = "cuda")]
+            stack,
         })
     }
 
     #[must_use]
     pub fn task(&self) -> TaskKind {
         self.model.release.task
+    }
+
+    /// Where the model runs: `"cuda"` or `"cpu"`.
+    #[must_use]
+    pub fn device(&self) -> &'static str {
+        self.model.device()
+    }
+
+    /// Members whose context runs on the CPU although the model has a GPU,
+    /// because it did not fit in device memory.
+    #[must_use]
+    pub fn cpu_members(&self) -> usize {
+        if self.model.device() == "cpu" {
+            return 0;
+        }
+        #[cfg(feature = "cuda")]
+        if self.stack.is_some() {
+            return 0;
+        }
+        self.contexts
+            .iter()
+            .filter(|contexts| contexts.iter().any(|c| !self.model.on_device(c)))
+            .count()
     }
 
     /// A classifier's classes, sorted.
@@ -225,12 +256,48 @@ impl Fitted {
         Ok(out)
     }
 
-    /// Each member's outputs of the rows `x`, per context.
-    fn outputs(&self, x: &[f64], member: usize) -> Result<Vec<Vec<f32>>> {
-        let query = self.preprocessor.transform(x, member)?;
-        self.contexts[member]
+    /// The contexts in order, member then codebook task, with their member
+    /// and task.
+    fn slots(&self) -> impl Iterator<Item = (usize, usize, &Context)> {
+        self.contexts
             .iter()
-            .map(|context| self.pool.install(|| self.model.predict(context, &query.x)))
+            .enumerate()
+            .flat_map(|(member, tasks)| tasks.iter().enumerate().map(move |(task, c)| (member, task, c)))
+    }
+
+    /// Each member's outputs of the rows `x`, per context: all members in
+    /// one pass when they are stacked on the GPU, else one member at a time.
+    fn outputs(&self, x: &[f64]) -> Result<Vec<Vec<Vec<f32>>>> {
+        let queries = (0..self.contexts.len())
+            .map(|member| self.preprocessor.transform(x, member))
+            .collect::<Result<Vec<_>>>()?;
+        #[cfg(feature = "cuda")]
+        if let Some(stack) = &self.stack {
+            let xs: Vec<&[f32]> = self
+                .slots()
+                .map(|(member, _, _)| queries[member].x.as_slice())
+                .collect();
+            let mut outputs = self.model.predict_stacked(stack, &xs)?.into_iter();
+            return Ok(self
+                .contexts
+                .iter()
+                .map(|tasks| {
+                    tasks
+                        .iter()
+                        .map(|_| outputs.next().expect("one output per slot"))
+                        .collect()
+                })
+                .collect());
+        }
+        self.contexts
+            .iter()
+            .zip(&queries)
+            .map(|(tasks, query)| {
+                tasks
+                    .iter()
+                    .map(|context| self.pool.install(|| self.model.predict(context, &query.x)))
+                    .collect()
+            })
             .collect()
     }
 
@@ -249,10 +316,9 @@ impl Fitted {
         let (mean, scale) = self.preprocessor.target_scale.expect("a regressor");
         let members = self.contexts.len();
         let mut all = Vec::with_capacity(members);
-        for member in 0..members {
+        for (member, mut outputs) in self.outputs(x)?.into_iter().enumerate() {
             let sign = self.preprocessor.draws.target_signs[member];
-            let mut values: Vec<f64> = self
-                .outputs(x, member)?
+            let mut values: Vec<f64> = outputs
                 .remove(0)
                 .into_iter()
                 .map(|q| f64::from(q) * sign * scale + mean)
@@ -282,8 +348,7 @@ impl Fitted {
         let classes = self.classes().map_or(0, Labels::len);
         let rows = x.len() / self.training.categories.len();
         let mut sums = vec![0.0_f32; rows * classes];
-        for member in 0..self.contexts.len() {
-            let logits = self.outputs(x, member)?;
+        for (member, logits) in self.outputs(x)?.into_iter().enumerate() {
             let scores = if logits.len() == 1 {
                 logits[0]
                     .chunks(MAX_CLASSES)
@@ -335,17 +400,18 @@ impl Fitted {
     ///
     /// When the contexts do not fit the format.
     pub fn context_bytes(&self) -> Result<Vec<u8>> {
-        let tensors = self
-            .contexts
-            .iter()
-            .enumerate()
-            .flat_map(|(member, tasks)| {
-                tasks
-                    .iter()
-                    .enumerate()
-                    .flat_map(move |(task, context)| context.tensors(&format!("{member}.{task}")))
-            })
-            .collect();
+        let mut tensors = Vec::new();
+        #[cfg(feature = "cuda")]
+        if let Some(stack) = &self.stack {
+            let contexts: Vec<(&Context, String)> =
+                self.slots().map(|(m, t, c)| (c, format!("{m}.{t}"))).collect();
+            tensors = self.model.stacked_tensors(stack, &contexts)?;
+        }
+        if tensors.is_empty() {
+            for (member, task, context) in self.slots() {
+                tensors.extend(self.model.context_tensors(context, &format!("{member}.{task}"))?);
+            }
+        }
         StaticContextArtifact::new(self.context_metadata(&self.to_bytes()?), tensors)?.to_bytes()
     }
 
@@ -400,6 +466,8 @@ impl Fitted {
             training,
             preprocessor,
             contexts: Vec::new(),
+            #[cfg(feature = "cuda")]
+            stack: None,
         };
         let mut expected = fitted.context_metadata(bytes);
         let tasks: Vec<usize> = fitted
@@ -426,11 +494,18 @@ impl Fitted {
                 (0..count)
                     .map(|task| {
                         let prefix = format!("{member}.{task}");
-                        fitted.model.read_context(&artifact, &prefix, &categorical, rows)
+                        let context = fitted
+                            .model
+                            .read_context(&artifact, &prefix, &categorical, rows)?;
+                        fitted.model.place(context)
                     })
                     .collect::<Result<_>>()
             })
             .collect::<Result<_>>()?;
+        #[cfg(feature = "cuda")]
+        {
+            fitted.stack = fitted.model.stack(&mut fitted.contexts)?;
+        }
         Ok(fitted)
     }
 }

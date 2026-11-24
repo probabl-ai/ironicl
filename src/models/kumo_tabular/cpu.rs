@@ -33,17 +33,20 @@ pub struct Model {
     pub release: Release,
     config: Config,
     artifact: ModelArtifact,
+    /// The NVIDIA GPU that fits and predicts, when there is one.
+    #[cfg(feature = "cuda")]
+    cuda: Option<super::cuda::Cuda>,
 }
 
 /// Keys and values for `groups` independent attentions, each over `rows`
 /// rows, stored `[groups, heads, rows, head_dim]`.
 #[derive(Clone, Debug, PartialEq)]
-struct Kv {
-    key: Vec<f32>,
-    value: Vec<f32>,
-    groups: usize,
-    heads: usize,
-    rows: usize,
+pub(super) struct Kv {
+    pub(super) key: Vec<f32>,
+    pub(super) value: Vec<f32>,
+    pub(super) groups: usize,
+    pub(super) heads: usize,
+    pub(super) rows: usize,
 }
 
 impl Kv {
@@ -66,19 +69,20 @@ impl Kv {
 
 /// A member's fitted context: the column imputation means, each layer's
 /// column keys and values (one group per column), and each ICL layer's keys
-/// and values.
-#[derive(Clone, Debug, PartialEq)]
+/// and values; or, fitted on an NVIDIA GPU, all of these there.
 pub struct Context {
     categorical: Vec<bool>,
     means: Vec<f32>,
     columns: Vec<Kv>,
     icl: Vec<Kv>,
+    #[cfg(feature = "cuda")]
+    cuda: Option<super::cuda::Context>,
 }
 
 /// How a block scales its queries by the key count `n`: not, by
 /// `head_scale · ln n`, or that gated by `1 + tanh(gate(q))`.
-#[derive(Clone, Copy, PartialEq)]
-enum Scaling {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Scaling {
     None,
     Log,
     Gated,
@@ -160,6 +164,18 @@ fn unstack(artifact: &StaticContextArtifact, name: &str, layers: usize) -> Resul
 }
 
 impl Context {
+    /// The column and ICL layers' keys and values on the host.
+    #[cfg(feature = "cuda")]
+    pub(super) fn kvs(&self) -> (&[Kv], &[Kv]) {
+        (&self.columns, &self.icl)
+    }
+
+    /// Each column's kind, true for category codes, and imputation mean.
+    #[cfg(feature = "cuda")]
+    pub(super) fn columns_and_means(&self) -> (&[bool], &[f32]) {
+        (&self.categorical, &self.means)
+    }
+
     /// The context as named FP32 tensors under `prefix`: the imputation means
     /// and the columns' kinds (1 for category codes), `[columns]`, and the
     /// column and ICL layers' keys and values, each stage stacked.
@@ -200,6 +216,8 @@ impl Context {
             means,
             columns: unstack(artifact, &format!("{prefix}.columns"), column_layers)?,
             icl: unstack(artifact, &format!("{prefix}.icl"), icl_layers)?,
+            #[cfg(feature = "cuda")]
+            cuda: None,
         })
     }
 }
@@ -290,6 +308,10 @@ fn from_heads(x: &[f32], groups: usize, heads: usize, head_dim: usize) -> Vec<f3
 impl Model {
     /// The model of a Kumo-Tabular checkpoint's artifact.
     ///
+    /// # Panics
+    ///
+    /// Never: a Kumo-Tabular artifact holds every tensor of its release.
+    ///
     /// # Errors
     ///
     /// When the artifact is another model.
@@ -299,11 +321,31 @@ impl Model {
                 "the model is not a Kumo-Tabular checkpoint".into(),
             ));
         };
+        let config = release.size.config();
+        #[cfg(feature = "cuda")]
+        let cuda = super::cuda::Cuda::new(config, Self::dim(release.outputs()), &|name| {
+            artifact
+                .tensor_f32(name)
+                .map(crate::format::model::ModelTensorF32::values)
+                .expect("the manifest has every tensor")
+        });
         Ok(Self {
             release,
-            config: release.size.config(),
+            config,
             artifact,
+            #[cfg(feature = "cuda")]
+            cuda,
         })
+    }
+
+    /// Where the model runs: `"cuda"` or `"cpu"`.
+    #[must_use]
+    pub fn device(&self) -> &'static str {
+        #[cfg(feature = "cuda")]
+        if self.cuda.is_some() {
+            return "cuda";
+        }
+        "cpu"
     }
 
     /// The checkpoint's SHA-256.
@@ -465,7 +507,25 @@ impl Model {
             means,
             columns: Vec::new(),
             icl: Vec::new(),
+            #[cfg(feature = "cuda")]
+            cuda: None,
         };
+        #[cfg(feature = "cuda")]
+        if let Some(cuda) = &self.cuda {
+            let (cell, icl) = (self.cell(), Self::dim(self.config.icl_channels));
+            let (mut cell_labels, mut icl_labels) = (vec![0.0; rows * cell], vec![0.0; rows * icl]);
+            self.add_labels("row_embedding", &mut cell_labels, cell, targets);
+            self.add_labels("icl_block", &mut icl_labels, icl, targets);
+            match cuda.fit(x, categorical, (&cell_labels, &icl_labels)) {
+                Ok(fitted) => {
+                    context.cuda = Some(fitted);
+                    return Ok(context);
+                }
+                // A context that does not fit in device memory is built on the CPU.
+                Err(Error::UnsupportedBackend(message)) if message == super::cuda::OUT_OF_MEMORY => {}
+                Err(error) => return Err(error),
+            }
+        }
         let mut recorded = Vec::new();
         let mut rows = self.row_embedding(x, &context, Columns::Record(&mut recorded, targets))?;
         context.columns = recorded;
@@ -490,6 +550,158 @@ impl Model {
         Ok(context)
     }
 
+    /// `context` as named FP32 tensors under `prefix`, as
+    /// [`Context::tensors`] gives them, copied from the GPU when it lives there.
+    ///
+    /// # Errors
+    ///
+    /// When the copy from the GPU fails.
+    #[cfg_attr(
+        not(feature = "cuda"),
+        expect(
+            clippy::unused_self,
+            clippy::unnecessary_wraps,
+            reason = "The GPU path reads it and can fail"
+        )
+    )]
+    pub(crate) fn context_tensors(
+        &self,
+        context: &Context,
+        prefix: &str,
+    ) -> Result<Vec<StaticContextTensor>> {
+        #[cfg(feature = "cuda")]
+        if let (Some(cuda), Some(fitted)) = (&self.cuda, &context.cuda) {
+            let (columns, icl) = cuda.download(fitted)?;
+            let host = Context {
+                categorical: context.categorical.clone(),
+                means: context.means.clone(),
+                columns,
+                icl,
+                cuda: None,
+            };
+            return Ok(host.tensors(prefix));
+        }
+        Ok(context.tensors(prefix))
+    }
+
+    /// The loaded `context` where this model predicts: on its GPU when it has
+    /// one and the context fits in device memory, else on the CPU.
+    ///
+    /// # Errors
+    ///
+    /// When the copy to the GPU fails for another reason.
+    #[cfg_attr(
+        not(feature = "cuda"),
+        expect(
+            unused_mut,
+            clippy::unused_self,
+            clippy::unnecessary_wraps,
+            reason = "The GPU path moves the context there and can fail"
+        )
+    )]
+    pub(crate) fn place(&self, mut context: Context) -> Result<Context> {
+        #[cfg(feature = "cuda")]
+        if let Some(cuda) = &self.cuda {
+            let training_rows = context.icl.first().map_or(0, |kv| kv.rows);
+            match cuda.upload_context(&context, training_rows) {
+                Ok(fitted) => {
+                    context.cuda = Some(fitted);
+                    context.columns = Vec::new();
+                    context.icl = Vec::new();
+                }
+                Err(Error::UnsupportedBackend(message)) if message == super::cuda::OUT_OF_MEMORY => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(context)
+    }
+
+    /// The members' `contexts` stacked on the GPU so one pass predicts them
+    /// all, when every one lives there, they have the same columns, and the
+    /// stacking fits in device memory; their device buffers move into the stack.
+    ///
+    /// # Errors
+    ///
+    /// When stacking fails on the device.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn stack(&self, contexts: &mut [Vec<Context>]) -> Result<Option<super::cuda::Ensemble>> {
+        let Some(cuda) = &self.cuda else {
+            return Ok(None);
+        };
+        let all = || contexts.iter().flatten();
+        let columns = all().next().map_or(0, |context| context.categorical.len());
+        if all().any(|context| context.cuda.is_none() || context.categorical.len() != columns) {
+            return Ok(None);
+        }
+        // Without the memory to stack, the members keep predicting one at a time.
+        let on_device: Vec<_> = all().filter_map(|context| context.cuda.as_ref()).collect();
+        if !cuda.stack_fits(&on_device)? {
+            return Ok(None);
+        }
+        let taken = contexts
+            .iter_mut()
+            .flatten()
+            .map(|context| context.cuda.take().expect("checked above"))
+            .collect();
+        cuda.stack(taken).map(Some)
+    }
+
+    /// Each stacked slot's outputs of its preprocessed query rows `xs[slot]`.
+    ///
+    /// # Errors
+    ///
+    /// When the rows do not have the contexts' columns.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn predict_stacked(
+        &self,
+        stack: &super::cuda::Ensemble,
+        xs: &[&[f32]],
+    ) -> Result<Vec<Vec<f32>>> {
+        self.cuda
+            .as_ref()
+            .expect("a stack lives on its model's GPU")
+            .predict_ensemble(stack, xs)
+    }
+
+    /// The stacked slots as named FP32 tensors, under the prefix next to each
+    /// slot's `contexts`, as [`Self::context_tensors`] gives them.
+    ///
+    /// # Errors
+    ///
+    /// When the copy from the GPU fails.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn stacked_tensors(
+        &self,
+        stack: &super::cuda::Ensemble,
+        contexts: &[(&Context, String)],
+    ) -> Result<Vec<StaticContextTensor>> {
+        let cuda = self.cuda.as_ref().expect("a stack lives on its model's GPU");
+        let mut tensors = Vec::new();
+        for ((columns, icl), (context, prefix)) in cuda.download_ensemble(stack)?.into_iter().zip(contexts) {
+            let host = Context {
+                categorical: context.categorical.clone(),
+                means: context.means.clone(),
+                columns,
+                icl,
+                cuda: None,
+            };
+            tensors.extend(host.tensors(prefix));
+        }
+        Ok(tensors)
+    }
+
+    /// Whether `context` lives on the model's GPU: false on the CPU, or when
+    /// it did not fit in device memory.
+    #[must_use]
+    pub fn on_device(&self, context: &Context) -> bool {
+        #[cfg(feature = "cuda")]
+        if self.cuda.is_some() && context.cuda.is_some() {
+            return true;
+        }
+        let _ = context;
+        false
+    }
+
     /// The outputs, 10 logits or 999 quantiles, of each of the `[rows, columns]`
     /// preprocessed query rows `x`.
     ///
@@ -500,6 +712,10 @@ impl Model {
         let columns = context.categorical.len();
         if x.is_empty() || !x.len().is_multiple_of(columns) {
             return Err(invalid("the query rows do not have the context's columns"));
+        }
+        #[cfg(feature = "cuda")]
+        if let (Some(cuda), Some(fitted)) = (&self.cuda, &context.cuda) {
+            return cuda.predict(fitted, x);
         }
         let mut out = Vec::new();
         for chunk in x.chunks(CHUNK_ROWS * columns) {
