@@ -699,6 +699,7 @@ impl Executor {
         context_sha256.update(bytemuck::cast_slice::<u64, u8>(&class_permutations));
         context_sha256.update(bytemuck::cast_slice::<u64, u8>(&feature_permutations));
         Ok(StaticContextMetadata {
+            architecture: crate::format::static_context::ContextArchitecture::TabIclV2,
             model_sha256,
             context_sha256: context_sha256.finalize().into(),
             ensemble_count: b,
@@ -3040,15 +3041,7 @@ fn validate_static_cache_contract(context: &StaticContextArtifact) -> Result<()>
         metadata.training_rows,
         metadata.feature_count,
     ) {
-        let tensor = context
-            .tensor(&name)
-            .ok_or_else(|| Error::Artifact(format!("static context cache tensor '{name}' is missing")))?;
-        if tensor.dimensions != expected_shape {
-            return Err(Error::Artifact(format!(
-                "static context cache tensor '{name}' has shape {:?}; expected {expected_shape:?}",
-                tensor.dimensions
-            )));
-        }
+        let tensor = context.check_tensor(&name, &expected_shape)?;
         // Only the removed Python exporter wrote BF16 ICL keys.
         if name.starts_with("icl.")
             && name.rsplit('.').next() == Some("key")
@@ -3760,6 +3753,7 @@ mod tests {
     fn context(tensors: Vec<StaticContextTensor>) -> StaticContextArtifact {
         StaticContextArtifact::new(
             StaticContextMetadata {
+                architecture: crate::format::static_context::ContextArchitecture::TabIclV2,
                 model_sha256: [1; 32],
                 context_sha256: [2; 32],
                 ensemble_count: 1,

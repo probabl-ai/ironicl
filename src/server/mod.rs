@@ -83,9 +83,12 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
         .map_or_else(directory::default_weights_dir, Ok)?;
     let start = Instant::now();
     let limits = MemoryLimits::resolve(None, None)?;
-    let prepared = directory::prepare(&args.dir, &weights, args.optimize, None, limits)?;
+    let prepared = directory::load(&args.dir, &weights, args.optimize, None, limits)?;
     if let Some(warning) = &prepared.warning {
         tracing::warn!("{warning}");
+    }
+    if let Err(error) = prepared.save_cache_if_built(&args.dir) {
+        tracing::warn!("could not save the KV cache; serving from memory: {error}");
     }
     let cache = if prepared.built {
         format!("KV cache built in {:.1} s", start.elapsed().as_secs_f64())
@@ -93,13 +96,11 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
         "KV cache loaded".to_owned()
     };
     let model = prepared.model;
-    let preprocessor = model.preprocessed().preprocessor();
-    let (task, features) = (model.task(), preprocessor.n_features_in());
-    let (categories, classes, aggregation, feature_names) = (
-        preprocessor.categories().to_vec(),
-        preprocessor.classes().cloned(),
-        preprocessor.aggregation.unwrap_or_default(),
-        preprocessor.feature_names.clone(),
+    let (task, features) = (model.task(), model.categories().len());
+    let (categories, classes, feature_names) = (
+        model.categories().to_vec(),
+        model.classes().cloned(),
+        model.feature_names().map(<[String]>::to_vec),
     );
     let device = model.device();
     let max_batch_rows = args.max_batch_rows.unwrap_or(if device == "cpu" {
@@ -110,9 +111,7 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
     let queue = Arc::new(Queue::new(args.max_queue));
     let worker = Worker {
         model,
-        features,
         classes,
-        aggregation,
         max_batch_rows,
         queue: Arc::clone(&queue),
     };

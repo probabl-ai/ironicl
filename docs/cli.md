@@ -91,8 +91,12 @@ level: it reuses a saved cache that is exactly that one, and otherwise builds it
 rows on this machine's device and replaces the file atomically. A saved cache that cannot be read
 is rebuilt too, with a warning. The level defaults to the saved cache's, else `safe`. Running it
 twice does nothing the second time. Use it on the serving machine,
-for example in a container build, so that `serve` starts at once. `IRONICL_MEMORY_LIMIT` and
-`IRONICL_DEVICE_MEMORY_LIMIT` limit the build as they do in Python.
+for example in a container build, so that `serve` starts at once. If the cache cannot be saved,
+`prepare` exits with an error. `serve` instead logs a warning and serves the in-memory model.
+
+`IRONICL_MEMORY_LIMIT` and `IRONICL_DEVICE_MEMORY_LIMIT` set TabICLv2's build budgets. For a
+Kumo-Tabular directory, `prepare` and `serve` reject either limit: Kumo-Tabular does not yet
+support memory budgets.
 
 ## Serve
 

@@ -1,7 +1,8 @@
 # Python Package
 
 The `ironicl` Python package replaces TabICL's `TabICLClassifier` and
-`TabICLRegressor`. It requires
+`TabICLRegressor`, and runs NVIDIA's Kumo-Tabular as `KumoTabularClassifier`
+([kumo-tabular.md](kumo-tabular.md)). It requires
 Python 3.12+, NumPy, and scikit-learn. It does not depend on TabICL or
 PyTorch. Building it from source requires Rust, because maturin compiles the
 private `ironicl._core` extension module, which preprocesses, builds the
@@ -227,6 +228,25 @@ shasum -a 256 "$D"/tabicl/*.ckpt
 |---|---|
 | `tabicl/tabicl-classifier-v2-20260212.ckpt` | `bdc7dbd5e4ff21f8f0456fcf90c6b7cdf72dbea960f2d05b19bec19f9b3d4ed0` |
 | `tabicl/tabicl-regressor-v2-20260212.ckpt` | `0db9cb538f114e79026bf08f45f41ad8dd7ad2de2aaca9a5ca8cd3bd9748ae7a` |
+
+Kumo-Tabular's checkpoints go to `kumo-tabular/<size>-<task>.pt`:
+
+```bash
+R=https://huggingface.co/nvidia/Kumo-Tabular/resolve/c5893d418e162b9f841ae179dc767afefff73831
+for size in small medium large; do for task in classifier regressor; do
+  curl -fL --create-dirs -o "$D/kumo-tabular/$size-$task.pt" "$R/$size/$task.pt"
+done; done
+shasum -a 256 "$D"/kumo-tabular/*.pt
+```
+
+| File | SHA-256 |
+|---|---|
+| `kumo-tabular/small-classifier.pt` | `1ff91f484e19021aaf7d9eff6cc07e6d95a60b4aaad473e83e2ab2c3bfd2b617` |
+| `kumo-tabular/small-regressor.pt` | `fc672f536501d64356036050ac2acea7e46927f7b9ad38366abe048f88e7d423` |
+| `kumo-tabular/medium-classifier.pt` | `70d6aee8fd13416300afead71a5145a40edb790952e2417d87f27b3f7e57793d` |
+| `kumo-tabular/medium-regressor.pt` | `daa6a17420b5aed231007e5d2f9c712abe093b4f94b3e1189b178947a95fb725` |
+| `kumo-tabular/large-classifier.pt` | `cc21484316949641cc3d65a7bb6c36cdea854cc569435755ff23b850018ec613` |
+| `kumo-tabular/large-regressor.pt` | `745e0e5d97e4256d8a24cb61c2eecbd1128da6c83938c196b7589ea6f62e7421` |
 
 ## Regressor
 

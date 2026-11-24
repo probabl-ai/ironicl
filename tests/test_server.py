@@ -150,6 +150,19 @@ class ServerTest(unittest.TestCase):
             for line, fields in zip(lines, expected):
                 self.assertIn(fields, line)
 
+    def test_cache_write_failure_stops_prepare_but_not_serve(self):
+        model = fitted(TabICLClassifier)
+        path = self.directory / type(model).__name__
+        model.export(path, kv_cache=False)
+        (path / "context.ircntxt").mkdir()  # Cannot replace a directory, even as root.
+        result = subprocess.run([os.environ["IRONICL_BIN"], "prepare", str(path)], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("Built the KV cache", result.stdout)
+        url = self.serve(model)
+        x, _ = data()
+        self.assertEqual(self.post(url, json.dumps({"data": x[:1].tolist()}))["labels"], list(model.predict(x[:1])))
+        self.assertIn("could not save the KV cache", self.log.read_text())
+
     def test_a_regressor_takes_options_next_to_the_dataframe(self):
         checkpoint(TabICLRegressor)
         x, y = self.frame()

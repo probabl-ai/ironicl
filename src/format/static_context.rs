@@ -1,8 +1,10 @@
-//! Checked static-context artifacts for exact exported `TabICLv2` cache tensors.
+//! Checked static-context artifacts: a fitted model's cache tensors, `TabICLv2`'s
+//! or Kumo-Tabular's.
 //!
 //! The format is separate from model artifacts. It stores fixed context metadata,
-//! class and feature permutations, named little-endian cache tensors, and a
-//! trailing SHA-256 digest. Version 1 stores FP32. Version 2 tags each tensor
+//! class and feature permutations (`TabICLv2` only), named little-endian cache
+//! tensors, and a trailing SHA-256 digest. The header's kind is 1 for
+//! `TabICLv2`, 2 for Kumo-Tabular. Version 1 stores FP32. Version 2 tags each tensor
 //! FP32, BF16, or FP16. Version 3, with pre-packed ICL keys, is rejected.
 
 use std::{collections::BTreeMap, fs::File, path::Path, sync::Arc};
@@ -19,6 +21,7 @@ use crate::{
         ByteReader, CHECKSUM_BYTES, TENSOR_ALIGNMENT, align_up, pad_to_alignment, sha256, write_u16,
         write_u32, write_u64,
     },
+    models::kumo_tabular::Release,
 };
 
 /// Magic bytes at the start of a static-context artifact.
@@ -27,6 +30,10 @@ pub const STATIC_CONTEXT_MAGIC: [u8; 8] = *b"IRCNTXT\0";
 pub const STATIC_CONTEXT_VERSION: u32 = 2;
 
 const STATIC_CONTEXT_KIND: u32 = 1;
+const KUMO_TABULAR_CONTEXT_KIND: u32 = 2;
+/// `TabICLv2`'s architecture values: column, row, and ICL blocks, heads, and
+/// the head width.
+const TABICL_V2_VALUES: [u32; 5] = [3, 12, 8, 16, 64];
 const STATIC_CONTEXT_FP32_VERSION: u32 = 1;
 /// Pre-packed ICL keys, written only by the removed Python exporter.
 const STATIC_CONTEXT_PACKED_KEYS_VERSION: u32 = 3;
@@ -55,9 +62,52 @@ const fn byte_limit(bytes: u64) -> usize {
     }
 }
 
+/// The model a static context is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextArchitecture {
+    TabIclV2,
+    /// Kumo-Tabular: no permutations, FP32 at `safe`, one context per
+    /// member and codebook task.
+    KumoTabular(Release),
+}
+
+impl ContextArchitecture {
+    /// The header's kind and its five architecture values: for Kumo-Tabular
+    /// the cell width, column layers, inducing points, ICL width, and outputs.
+    fn header(self) -> (u32, [u32; 5]) {
+        match self {
+            Self::TabIclV2 => (STATIC_CONTEXT_KIND, TABICL_V2_VALUES),
+            Self::KumoTabular(release) => {
+                let config = release.size.config();
+                let value = |value: u64| u32::try_from(value).expect("Kumo-Tabular values fit in u32");
+                (
+                    KUMO_TABULAR_CONTEXT_KIND,
+                    [
+                        value(config.cell_channels),
+                        value(config.embedding_layers),
+                        value(config.inducing_points),
+                        value(config.icl_channels),
+                        value(release.outputs()),
+                    ],
+                )
+            }
+        }
+    }
+
+    fn from_header(kind: u32, values: [u32; 5]) -> Result<Self> {
+        [Self::TabIclV2]
+            .into_iter()
+            .chain(Release::ALL.map(Self::KumoTabular))
+            .find(|architecture| architecture.header() == (kind, values))
+            .ok_or_else(|| artifact_error("static context architecture metadata is unsupported"))
+    }
+}
+
 /// Metadata that identifies and describes one static training context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticContextMetadata {
+    /// The model the context is for.
+    pub architecture: ContextArchitecture,
     /// SHA-256 of the source checkpoint recorded by the model artifact.
     pub model_sha256: [u8; 32],
     /// SHA-256 identity of the source static context and export inputs.
@@ -535,9 +585,7 @@ impl StaticContextArtifact {
                 "static context version {version} is unsupported"
             )));
         }
-        if header.read_u32()? != STATIC_CONTEXT_KIND {
-            return Err(artifact_error("artifact kind is not a static context"));
-        }
+        let kind = header.read_u32()?;
         let model_sha256 = header.read_array()?;
         let context_sha256 = header.read_array()?;
         let ensemble_count = to_usize(header.read_u64()?, "ensemble count")?;
@@ -551,11 +599,7 @@ impl StaticContextArtifact {
             header.read_u32()?,
             header.read_u32()?,
         ];
-        if architecture != [3, 12, 8, 16, 64] {
-            return Err(artifact_error(
-                "static context architecture metadata is unsupported",
-            ));
-        }
+        let architecture = ContextArchitecture::from_header(kind, architecture)?;
         let tensor_count = to_usize(u64::from(header.read_u32()?), "tensor count")?;
         let class_permutation_count = to_usize(u64::from(header.read_u32()?), "class permutation count")?;
         let feature_permutation_count = to_usize(u64::from(header.read_u32()?), "feature permutation count")?;
@@ -579,11 +623,12 @@ impl StaticContextArtifact {
                 "static context section exceeds the resource limit",
             ));
         }
+        let permuted = architecture == ContextArchitecture::TabIclV2;
         let expected_class_permutations = ensemble_count
-            .checked_mul(class_count)
+            .checked_mul(if permuted { class_count } else { 0 })
             .ok_or_else(|| artifact_error("class permutation count overflows usize"))?;
         let expected_feature_permutations = ensemble_count
-            .checked_mul(feature_count)
+            .checked_mul(if permuted { feature_count } else { 0 })
             .ok_or_else(|| artifact_error("feature permutation count overflows usize"))?;
         if class_permutation_count != expected_class_permutations
             || feature_permutation_count != expected_feature_permutations
@@ -619,6 +664,7 @@ impl StaticContextArtifact {
         let class_permutations = read_permutation(&mut permutations, class_permutation_count)?;
         let feature_permutations = read_permutation(&mut permutations, feature_permutation_count)?;
         let metadata = StaticContextMetadata {
+            architecture,
             model_sha256,
             context_sha256,
             ensemble_count,
@@ -888,8 +934,9 @@ impl StaticContextArtifact {
         }
         let mut head = Vec::new();
         head.extend_from_slice(&STATIC_CONTEXT_MAGIC);
+        let (kind, architecture) = self.metadata.architecture.header();
         write_u32(&mut head, version);
-        write_u32(&mut head, STATIC_CONTEXT_KIND);
+        write_u32(&mut head, kind);
         head.extend_from_slice(&self.metadata.model_sha256);
         head.extend_from_slice(&self.metadata.context_sha256);
         for value in [
@@ -903,7 +950,7 @@ impl StaticContextArtifact {
                 u64::try_from(value).map_err(|_| artifact_error("metadata value exceeds u64"))?,
             );
         }
-        for value in [3_u32, 12, 8, 16, 64] {
+        for value in architecture {
             write_u32(&mut head, value);
         }
         write_u32(
@@ -996,6 +1043,30 @@ impl StaticContextArtifact {
             .filter(|context| context.metadata() == expected)
     }
 
+    /// The tensor `name`, after checking that it exists with `dimensions`.
+    ///
+    /// # Errors
+    ///
+    /// When the tensor is missing or has other dimensions.
+    pub(crate) fn check_tensor(&self, name: &str, dimensions: &[u64]) -> Result<StaticContextTensorRef<'_>> {
+        let tensor = self
+            .tensor(name)
+            .ok_or_else(|| artifact_error(format!("static context cache tensor '{name}' is missing")))?;
+        if tensor.dimensions != dimensions {
+            return Err(artifact_error(format!(
+                "static context cache tensor '{name}' has shape {:?}; expected {dimensions:?}",
+                tensor.dimensions
+            )));
+        }
+        Ok(tensor)
+    }
+
+    /// How many tensors the context holds.
+    #[must_use]
+    pub fn tensor_count(&self) -> usize {
+        self.tensors.len()
+    }
+
     /// Verified context metadata.
     #[must_use]
     pub fn metadata(&self) -> &StaticContextMetadata {
@@ -1069,6 +1140,18 @@ fn validate_metadata(metadata: &StaticContextMetadata) -> Result<()> {
         return Err(artifact_error(
             "static context dimensions are outside the resource limits",
         ));
+    }
+    if let ContextArchitecture::KumoTabular(_) = metadata.architecture {
+        if metadata.class_count != 0
+            || !metadata.class_permutations.is_empty()
+            || !metadata.feature_permutations.is_empty()
+            || metadata.optimize != Optimize::Safe
+        {
+            return Err(artifact_error(
+                "a Kumo-Tabular context has no class count or permutations and is at safe",
+            ));
+        }
+        return Ok(());
     }
     validate_estimator_permutations(
         &metadata.class_permutations,
@@ -1205,6 +1288,7 @@ mod tests {
     fn fixture() -> StaticContextArtifact {
         StaticContextArtifact::new(
             StaticContextMetadata {
+                architecture: ContextArchitecture::TabIclV2,
                 model_sha256: [1; 32],
                 context_sha256: [2; 32],
                 ensemble_count: 2,
@@ -1263,6 +1347,7 @@ mod tests {
     fn regression_context_without_classes_round_trips() {
         let artifact = StaticContextArtifact::new(
             StaticContextMetadata {
+                architecture: ContextArchitecture::TabIclV2,
                 class_count: 0,
                 class_permutations: Vec::new(),
                 ..fixture().metadata().clone()
@@ -1391,6 +1476,7 @@ mod tests {
         assert!(StaticContextArtifact::from_bytes(&malformed).is_err());
 
         let metadata = StaticContextMetadata {
+            architecture: ContextArchitecture::TabIclV2,
             feature_permutations: vec![0; MAX_FEATURE_COUNT + 1],
             feature_count: MAX_FEATURE_COUNT + 1,
             ..fixture().metadata().clone()
@@ -1430,6 +1516,7 @@ mod tests {
         );
         // A valid entry of another context, as if it were stored under the wrong name.
         let other = StaticContextMetadata {
+            architecture: ContextArchitecture::TabIclV2,
             context_sha256: [3; 32],
             ..artifact.metadata().clone()
         };
