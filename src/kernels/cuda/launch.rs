@@ -52,6 +52,17 @@ impl Dense {
         })
     }
 
+    /// A dense layer for FP32 products only, without the FP16 parts the
+    /// tensor cores read.
+    pub(crate) fn upload_f32(device: &Device, w: &[f32], b: &[f32]) -> Result<Self> {
+        Ok(Self {
+            w: device.upload(w)?,
+            hi: empty(device)?,
+            lo: empty(device)?,
+            b: device.upload(b)?,
+        })
+    }
+
     /// Device memory the layer takes.
     pub(crate) fn bytes(&self) -> usize {
         4 * (self.w.len() + self.b.len()) + 2 * (self.hi.len() + self.lo.len())
@@ -528,6 +539,40 @@ impl Device {
                 n(dim),
                 u32::from(norm),
                 format,
+            )
+        };
+        launch.map_err(gpu_error)
+    }
+
+    /// `RMSNorm` of `rows` rows of `width` (at most 1024) into `out`, with
+    /// weight `gamma` and epsilon `eps`.
+    pub(crate) fn rms_norm(
+        &self,
+        x: &DeviceBuffer<f32>,
+        gamma: &DeviceBuffer<f32>,
+        out: Output<'_>,
+        (rows, width): (usize, usize),
+        eps: f32,
+    ) -> Result<()> {
+        assert!(width <= 1024);
+        let mut unused = Unused::new(self)?;
+        let (y, hi, lo, format) = unused.outputs(Some(out));
+        // SAFETY: one warp per row (`rows * 32` threads), writing `row * width + i < rows * width`
+        // only to the buffers `format` names, which `Unused::outputs` matches to `out`'s; callers'
+        // `x` and `out` hold `rows * width` values and `gamma` `width`.
+        let launch = unsafe {
+            self.kernels.rms_norm(
+                self.stream(),
+                config(threads(rows * 32), 256),
+                x,
+                gamma,
+                y,
+                hi,
+                lo,
+                n(rows),
+                n(width),
+                format,
+                eps,
             )
         };
         launch.map_err(gpu_error)

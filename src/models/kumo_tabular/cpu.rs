@@ -32,6 +32,9 @@ pub struct Model {
     pub release: Release,
     config: Config,
     artifact: ModelArtifact,
+    /// The NVIDIA GPU that fits and predicts, when there is one.
+    #[cfg(feature = "cuda")]
+    cuda: Option<super::cuda::Cuda>,
 }
 
 /// Keys and values for `groups` independent attentions, each over `rows`
@@ -65,19 +68,20 @@ impl Kv {
 
 /// A member's fitted context: the column imputation means, each layer's
 /// column keys and values (one group per column), and each ICL layer's keys
-/// and values.
-#[derive(Clone, Debug, PartialEq)]
+/// and values; or, fitted on an NVIDIA GPU, all of these there.
 pub struct Context {
     categorical: Vec<bool>,
     means: Vec<f32>,
     columns: Vec<Kv>,
     icl: Vec<Kv>,
+    #[cfg(feature = "cuda")]
+    cuda: Option<super::cuda::Context>,
 }
 
 /// How a block scales its queries by the key count `n`: not, by
 /// `head_scale · ln n`, or that gated by `1 + tanh(gate(q))`.
-#[derive(Clone, Copy, PartialEq)]
-enum Scaling {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Scaling {
     None,
     Log,
     Gated,
@@ -179,6 +183,10 @@ fn from_heads(x: &[f32], groups: usize, heads: usize, head_dim: usize) -> Vec<f3
 impl Model {
     /// The model of a Kumo-Tabular checkpoint's artifact.
     ///
+    /// # Panics
+    ///
+    /// Never: a Kumo-Tabular artifact holds every tensor of its release.
+    ///
     /// # Errors
     ///
     /// When the artifact is another model.
@@ -188,11 +196,31 @@ impl Model {
                 "the model is not a Kumo-Tabular checkpoint".into(),
             ));
         };
+        let config = release.size.config();
+        #[cfg(feature = "cuda")]
+        let cuda = super::cuda::Cuda::new(config, Self::dim(release.outputs()), &|name| {
+            artifact
+                .tensor_f32(name)
+                .map(crate::format::model::ModelTensorF32::values)
+                .expect("the manifest has every tensor")
+        });
         Ok(Self {
             release,
-            config: release.size.config(),
+            config,
             artifact,
+            #[cfg(feature = "cuda")]
+            cuda,
         })
+    }
+
+    /// Where the model runs: `"cuda"` or `"cpu"`.
+    #[must_use]
+    pub fn device(&self) -> &'static str {
+        #[cfg(feature = "cuda")]
+        if self.cuda.is_some() {
+            return "cuda";
+        }
+        "cpu"
     }
 
     /// The checkpoint's SHA-256.
@@ -290,7 +318,25 @@ impl Model {
             means,
             columns: Vec::new(),
             icl: Vec::new(),
+            #[cfg(feature = "cuda")]
+            cuda: None,
         };
+        #[cfg(feature = "cuda")]
+        if let Some(cuda) = &self.cuda {
+            let (cell, icl) = (self.cell(), Self::dim(self.config.icl_channels));
+            let (mut cell_labels, mut icl_labels) = (vec![0.0; rows * cell], vec![0.0; rows * icl]);
+            self.add_labels("row_embedding", &mut cell_labels, cell, targets);
+            self.add_labels("icl_block", &mut icl_labels, icl, targets);
+            match cuda.fit(x, categorical, (&cell_labels, &icl_labels)) {
+                Ok(fitted) => {
+                    context.cuda = Some(fitted);
+                    return Ok(context);
+                }
+                // A context that does not fit in device memory is built on the CPU.
+                Err(Error::UnsupportedBackend(message)) if message == super::cuda::OUT_OF_MEMORY => {}
+                Err(error) => return Err(error),
+            }
+        }
         let mut recorded = Vec::new();
         let mut rows = self.row_embedding(x, &context, Columns::Record(&mut recorded, targets))?;
         context.columns = recorded;
@@ -325,6 +371,10 @@ impl Model {
         let columns = context.categorical.len();
         if x.is_empty() || !x.len().is_multiple_of(columns) {
             return Err(invalid("the query rows do not have the context's columns"));
+        }
+        #[cfg(feature = "cuda")]
+        if let (Some(cuda), Some(fitted)) = (&self.cuda, &context.cuda) {
+            return cuda.predict(fitted, x);
         }
         let mut out = Vec::new();
         for chunk in x.chunks(CHUNK_ROWS * columns) {

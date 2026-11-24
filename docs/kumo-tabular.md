@@ -5,8 +5,8 @@ At size `large` it is second on [TabArena](https://huggingface.co/spaces/TabAren
 and first among models whose weights allow commercial use. Ironicl is adding it as its second
 model, next to TabICLv2.
 
-Status: the classifier and the regressor fit and predict on the CPU, from Python and through
-`ironicl serve`. Metal and CUDA come next.
+Status: the classifier and the regressor fit and predict on the CPU and on NVIDIA GPUs, from
+Python and through `ironicl serve`. Metal comes next.
 
 ```python
 from ironicl import KumoTabularClassifier, KumoTabularRegressor
@@ -71,6 +71,16 @@ embeddings are saved transposed; import copies them into row-major order.
   rows once and keeps each member's context: the column means that replace missing values, each
   column layer's keys and values of its inducing points, and each ICL layer's keys and values,
   in medium and large only the 2 heads query rows use. Predicting runs only the query rows.
+- `cuda.rs`: on an NVIDIA GPU, with the `cuda` feature, a member's whole forward pass runs on
+  the device in FP32 and its context stays there: the imputation means and each layer's column
+  and ICL keys and values. Predicting uploads only the query rows and downloads only the outputs.
+  The blocks chain the kernels TabICLv2's ICL stage uses (`kernels/cuda/launch.rs`): `RMSNorm`,
+  products with their bias, GELU, and residual epilogues, heads packed with `RoPE`, the per-head
+  norm, and query scaling, and split attention over the cached keys and values, which test rows
+  of medium and large read through 2 heads. The small model's 32-wide heads are zero-padded to
+  the kernels' 64. Kumo-Tabular's own kernels build the cell embedding's features and the row
+  stage's sequences. The weights upload once per process. A context that does not fit in device
+  memory is built on the CPU, and `IRONICL_NO_CUDA` keeps everything there.
 - `fitted.rs`: the ensemble. It averages the members' logits, or above 10 classes their codebook
   scores, and applies softmax; or it combines the members' quantiles.
 
@@ -101,7 +111,8 @@ FP32 and records each member's draws, preprocessed rows, and outputs, and the pr
 
 Outputs are the members' logits or standardized quantiles; the prediction is the probabilities,
 or the quantiles relative to their size. The errors are the largest absolute ones, relative for
-the preprocessed rows, on an Apple M1 Max and on an AMD Ryzen 7 9800X3D. The tests need the checkpoints in `IRONICL_CHECKPOINT_FIXTURES`:
+the preprocessed rows, on an Apple M1 Max and on an AMD Ryzen 7 9800X3D. The CUDA path, on an
+RTX 5080, matches within the same bounds. The tests need the checkpoints in `IRONICL_CHECKPOINT_FIXTURES`:
 
 ```bash
 IRONICL_CHECKPOINT_FIXTURES=checkpoints cargo test --release --lib kumo_tabular -- --include-ignored
@@ -110,6 +121,14 @@ IRONICL_CHECKPOINT_FIXTURES=checkpoints cargo test --release --lib kumo_tabular 
 On a Ryzen 7 9800X3D, with 1,000 training and 500 query rows of 20 features and 4 members, Ironicl
 fits small in 1.3 s and predicts in 0.5 s, where NVIDIA's PyTorch code takes 0.8 s and 0.4 s;
 large takes 6.2 s and 2.0 s, against 4.4 s and 1.7 s. Closing that gap is a follow-up.
+
+With its RTX 5080, large with 4 members on 20 features and 500 query rows, after a first fit that
+uploads the weights (1.8 s):
+
+| Training rows | CPU fit | CUDA fit | CPU predict | CUDA predict |
+|---|---|---|---|---|
+| 1,000 | 5.3 s | 0.44 s | 2.1 s | 0.22 s |
+| 5,000 | 39.3 s | 2.1 s | 3.3 s | 0.28 s |
 
 ## License
 
@@ -125,4 +144,4 @@ notices. Ironicl downloads the weights from Hugging Face and never ships them. N
    Done.
 3. The regressor on the CPU, as `KumoTabularRegressor`. Done.
 4. Metal.
-5. CUDA.
+5. CUDA. Done, in FP32; the tensor-core levels of `optimize` come next.

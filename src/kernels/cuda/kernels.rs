@@ -651,6 +651,171 @@ pub(crate) mod device {
         }
     }
 
+    /// `RMSNorm` with weight `gamma` and epsilon `eps` over `width` values (at
+    /// most 1024) of each of `rows` rows, as [`layer_norm`] writes them; see
+    /// [`norm_rows`]. 256 threads per block, one warp per row.
+    #[kernel]
+    pub fn rms_norm(
+        x: &[f32],
+        gamma: &[f32],
+        mut y: DisjointSlice<f32>,
+        mut y_hi: DisjointSlice<u16>,
+        mut y_lo: DisjointSlice<u16>,
+        rows: u32,
+        width: u32,
+        format: u32,
+        eps: f32,
+    ) {
+        norm_rows::<32, true>(
+            x, gamma, gamma, &mut y, &mut y_hi, &mut y_lo, rows, width, width, width, format, eps,
+        );
+    }
+
+    /// `x[g, r, :] += vectors[r, :]` for `groups` groups of `rows` rows of
+    /// `width` values, in place: the same row vectors added to every group.
+    #[kernel]
+    pub fn add_rows(mut x: DisjointSlice<f32>, vectors: &[f32], rows: u32, width: u32, len: u32) {
+        let i = thread::index_1d().get();
+        if i >= len as usize {
+            return;
+        }
+        let rows_width = rows as usize * width as usize;
+        // SAFETY: `i < len <= x.len()`, asserted by the launcher; the thread reads and writes
+        // only `x[i]`.
+        unsafe { *x.get_unchecked_mut(i) += vectors[i % rows_width] };
+    }
+
+    /// Packed queries `q[pairs, padded, 64]`, the first `dim` dims of each,
+    /// times `base[head, d]`, and with `gated` times `1 + tanh(g)` for `g =
+    /// gates[pair * padded + row, d]` (`[pairs * padded, dim]`). One thread
+    /// per value.
+    #[kernel]
+    pub fn scale_heads(
+        mut q: DisjointSlice<f32>,
+        base: &[f32],
+        gates: &[f32],
+        pairs: u32,
+        padded: u32,
+        heads: u32,
+        dim: u32,
+        gated: u32,
+    ) {
+        let i = thread::index_1d().get();
+        let (padded, dim) = (padded as usize, dim as usize);
+        let d = i % 64;
+        if i >= pairs as usize * padded * 64 || d >= dim {
+            return;
+        }
+        let (row, pair) = ((i / 64) % padded, i / (64 * padded));
+        let mut scale = base[(pair % heads as usize) * dim + d];
+        if gated != 0 {
+            scale *= 1.0 + gates[(pair * padded + row) * dim + d].tanh();
+        }
+        // SAFETY: `i < pairs * padded * 64`, the launcher's size of `q`; each thread touches
+        // its own `q[i]`.
+        unsafe { *q.get_unchecked_mut(i) *= scale };
+    }
+
+    // ---------------------------------------------------------------------------
+    // Kumo-Tabular: the cell embedding's features and the row stage's sequences.
+    // ---------------------------------------------------------------------------
+
+    /// Column `column`'s cell features `out[rows, 208]` from the preprocessed
+    /// rows `x[rows, columns]`. For each grouped column `g` of 3, column
+    /// `(column + 2^g - 1) % columns`: the sines and then the cosines of its
+    /// value times its kind's 32 frequencies, the value replaced by the
+    /// column's mean when missing. Then each grouped column's missing flag,
+    /// then zeros. One thread per value.
+    #[kernel]
+    pub fn kumo_cell_features(
+        x: &[f32],
+        means: &[f32],
+        kinds: &[f32],
+        numeric: &[f32],
+        categorical: &[f32],
+        mut out: DisjointSlice<f32>,
+        rows: u32,
+        columns: u32,
+        column: u32,
+    ) {
+        let i = thread::index_1d().get();
+        let (rows, columns, column) = (rows as usize, columns as usize, column as usize);
+        if i >= rows * 208 {
+            return;
+        }
+        let (j, row) = (i % 208, i / 208);
+        let value = if j < 192 {
+            let (g, k) = (j / 64, j % 64);
+            let source = (column + (1 << g) - 1) % columns;
+            let raw = x[row * columns + source];
+            let value = if raw.is_nan() { means[source] } else { raw };
+            let table = if kinds[source] > 0.5 { categorical } else { numeric };
+            let z = value * table[g * 32 + k % 32];
+            if k < 32 { libm::sinf(z) } else { libm::cosf(z) }
+        } else if j < 195 {
+            let source = (column + (1 << (j - 192)) - 1) % columns;
+            if x[row * columns + source].is_nan() {
+                1.0
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        // SAFETY: `i < rows * 208`, the launcher's size of `out`; one thread per `i`.
+        unsafe { *out.get_unchecked_mut(i) = value };
+    }
+
+    /// Rows `start..start + rows` of the row stage's sequences `[rows,
+    /// tokens, width]`, `tokens` being the `readouts` readout tokens and then,
+    /// unless `tokens == readout`, each column's cell: gathered from
+    /// `readouts[total, readout, width]` and `cells[columns, total, width]`
+    /// (`scatter` 0), or written back to them (1). One thread per value.
+    #[kernel]
+    pub fn kumo_sequences(
+        mut readouts: DisjointSlice<f32>,
+        mut cells: DisjointSlice<f32>,
+        mut sequences: DisjointSlice<f32>,
+        start: u32,
+        rows: u32,
+        total: u32,
+        readout: u32,
+        tokens: u32,
+        width: u32,
+        scatter: u32,
+    ) {
+        let i = thread::index_1d().get();
+        let (rows, total, readout, tokens, width) = (
+            rows as usize,
+            total as usize,
+            readout as usize,
+            tokens as usize,
+            width as usize,
+        );
+        if i >= rows * tokens * width {
+            return;
+        }
+        let (c, token, row) = (i % width, (i / width) % tokens, i / (width * tokens));
+        let global = start as usize + row;
+        // SAFETY: `row < rows`, `start + rows <= total`, `token < tokens`, and `c < width`, as the
+        // launcher asserts: the readout slot lies in `[total, readout, width]`, the cell slot in
+        // `[columns, total, width]` for column `token - readout`, and `i` in `sequences`; each
+        // thread touches its own slots, which no two threads share.
+        unsafe {
+            let other = if token < readout {
+                readouts.get_unchecked_mut((global * readout + token) * width + c)
+            } else {
+                cells.get_unchecked_mut(((token - readout) * total + global) * width + c)
+            };
+            let sequence = sequences.get_unchecked_mut(i);
+            if scatter == 0 {
+                *sequence = *other;
+            } else {
+                *other = *sequence;
+            }
+        }
+    }
+
     /// `out[offset + i] = source[i]` for `len` values.
     #[kernel]
     pub fn copy_into(source: &[f32], mut out: DisjointSlice<f32>, offset: u32, len: u32) {

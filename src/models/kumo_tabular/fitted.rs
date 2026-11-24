@@ -134,6 +134,12 @@ impl Fitted {
         self.model.release.task
     }
 
+    /// Where the model runs: `"cuda"` or `"cpu"`.
+    #[must_use]
+    pub fn device(&self) -> &'static str {
+        self.model.device()
+    }
+
     /// A classifier's classes, sorted.
     #[must_use]
     pub fn classes(&self) -> Option<&Labels> {

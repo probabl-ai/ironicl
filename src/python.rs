@@ -848,6 +848,12 @@ struct KumoFitted(Fitted);
 
 #[pymethods]
 impl KumoFitted {
+    /// Where the model runs: `"cuda"` or `"cpu"`.
+    #[getter]
+    fn device(&self) -> &'static str {
+        self.0.device()
+    }
+
     /// Which input features are categorical.
     #[getter]
     fn categorical(&self) -> Vec<bool> {
