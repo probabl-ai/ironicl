@@ -156,7 +156,7 @@ class TabICLClassifier(ClassifierMixin, TabICLBase):
         """Return class probabilities with shape ``(n_samples, n_classes)``."""
         check_is_fitted(self)
         x = self._query(X)
-        with self._progress("Predicting", "row", len(x)) as progress:
+        with self._progress("Predicting", "row") as progress:
             values, shape = self.fitted_.predict_proba(x, self.softmax_temperature, self.average_logits, progress)
         return _array(values, shape).copy()  # Writable, like TabICL's.
 

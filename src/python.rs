@@ -19,7 +19,7 @@ use pyo3::{
     buffer::PyBuffer,
     exceptions::{PyNotImplementedError, PyRuntimeError, PyValueError},
     prelude::*,
-    types::{PyBytes, PyDict, PyList},
+    types::{PyBytes, PyDict, PyList, PyTuple},
 };
 
 use crate::{
@@ -343,9 +343,9 @@ impl Input {
         let columns = list
             .iter()
             .map(|column| {
-                if let Ok((kind, categories, codes)) =
-                    column.extract::<(String, Bound<'_, PyAny>, PyBuffer<i64>)>()
-                {
+                if column.is_instance_of::<PyTuple>() {
+                    let (kind, categories, codes) =
+                        column.extract::<(String, Bound<'_, PyAny>, PyBuffer<i64>)>()?;
                     Ok(Column::Categorical {
                         categories: read_labels(py, (kind, categories))?,
                         codes: codes.to_vec(py)?,
@@ -613,13 +613,13 @@ impl FittedModel {
         average_logits: bool,
         progress: Option<Py<PyAny>>,
     ) -> PyResult<(Bound<'py, PyBytes>, [usize; 2])> {
-        let categories = self.0.preprocessed().preprocessor().categories();
-        let (x, columns) = Input::read(py, x)?.encode(categories).map_err(py_error)?;
+        let x = Input::read(py, x)?;
         let aggregation = ClassifierAggregation {
             softmax_temperature,
             average_logits,
         };
         let probabilities = run(py, progress, || {
+            let (x, columns) = x.encode(self.0.preprocessed().preprocessor().categories())?;
             self.0.predict_probabilities(x.features(), columns, aggregation)
         })?;
         Ok((f32_bytes(py, probabilities.values()), probabilities.shape()))
@@ -637,16 +637,16 @@ impl FittedModel {
         alphas: Vec<f32>,
         progress: Option<Py<PyAny>>,
     ) -> PyResult<Vec<(Bound<'py, PyBytes>, [usize; 2])>> {
-        let categories = self.0.preprocessed().preprocessor().categories();
-        let (x, columns) = Input::read(py, x)?.encode(categories).map_err(py_error)?;
-        let rows = x.features().len() / columns.max(1);
+        let x = Input::read(py, x)?;
         let outputs = output_types
             .iter()
             .map(|name| RegressionOutput::parse(name, &alphas))
             .collect::<Result<Vec<_>, _>>()
             .map_err(py_error)?;
-        let results = run(py, progress, || {
-            self.0.predict_regression(x.features(), columns, &outputs)
+        let (results, rows) = run(py, progress, || {
+            let (x, columns) = x.encode(self.0.preprocessed().preprocessor().categories())?;
+            let rows = x.features().len() / columns.max(1);
+            Ok((self.0.predict_regression(x.features(), columns, &outputs)?, rows))
         })?;
         Ok(results
             .into_iter()
