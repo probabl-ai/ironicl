@@ -177,8 +177,8 @@ a binary or gRPC interface.
 ## Phase 11: Kumo-Tabular
 
 NVIDIA's Kumo-Tabular as a second model ([kumo-tabular.md](kumo-tabular.md)). Done: importing
-and inspecting its six checkpoints, and the classifier and the regressor on the CPU. Next: Metal
-and CUDA.
+and inspecting its six checkpoints, the classifier and the regressor on the CPU, and their
+transformer blocks on Apple Silicon GPUs. Next: CUDA.
 
 Exit gate: predictions match NVIDIA's `structured-data-models` on the same random draws, and the
 GPU paths match the CPU within their gates.

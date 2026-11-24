@@ -32,6 +32,9 @@ pub struct Model {
     pub release: Release,
     config: Config,
     artifact: ModelArtifact,
+    /// The GPU that runs the transformer blocks, when there is one.
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    metal: Option<super::metal::Metal>,
 }
 
 /// Keys and values for `groups` independent attentions, each over `rows`
@@ -76,8 +79,8 @@ pub struct Context {
 
 /// How a block scales its queries by the key count `n`: not, by
 /// `head_scale · ln n`, or that gated by `1 + tanh(gate(q))`.
-#[derive(Clone, Copy, PartialEq)]
-enum Scaling {
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub(crate) enum Scaling {
     None,
     Log,
     Gated,
@@ -192,7 +195,19 @@ impl Model {
             release,
             config: release.size.config(),
             artifact,
+            #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+            metal: super::metal::Metal::new(),
         })
+    }
+
+    /// Where the transformer blocks run: `"metal"` or `"cpu"`.
+    #[must_use]
+    pub fn device(&self) -> &'static str {
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        if self.metal.is_some() {
+            return "metal";
+        }
+        "cpu"
     }
 
     /// The checkpoint's SHA-256.
@@ -570,6 +585,208 @@ impl Model {
     }
 }
 
+/// Attention scores a GPU block computes at once, which bounds its memory.
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+const GPU_SCORES: usize = 1 << 26;
+
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+impl Block<'_> {
+    fn key(&self, forward: bool, (groups, rows): (usize, usize), kv: Option<&Kv>) -> super::metal::Key {
+        super::metal::Key {
+            forward,
+            width: self.width,
+            heads: self.heads,
+            groups,
+            rows,
+            kv_groups: kv.map_or(0, |kv| kv.groups),
+            kv_heads: kv.map_or(0, |kv| kv.heads),
+            kv_rows: kv.map_or(0, |kv| kv.rows),
+            rope: self.rope,
+            scaling: self.scaling,
+        }
+    }
+
+    /// Rows `part` of the fused projection's weight, transposed, and its bias.
+    fn projection(&self, part: usize) -> [super::metal::Feed<'_>; 2] {
+        let name = format!("{}.attn.qkv_lin", self.name);
+        let w = self.width;
+        let weight = &self.tensor("attn.qkv_lin.weight")[part * w * w..][..w * w];
+        [
+            super::metal::Feed::Weight(
+                format!("{name}.weight[{part}]^T"),
+                Box::new(move || transpose(weight, w, w)),
+            ),
+            self.vector_part("attn.qkv_lin.bias", part * w, w),
+        ]
+    }
+
+    /// A `[outputs, inputs]` weight, transposed, and its bias.
+    fn linear_feeds(&self, prefix: &str, inputs: usize, outputs: usize) -> [super::metal::Feed<'_>; 2] {
+        let weight = self.tensor(&format!("{prefix}.weight"));
+        [
+            super::metal::Feed::Weight(
+                format!("{}.{prefix}.weight^T", self.name),
+                Box::new(move || transpose(weight, outputs, inputs)),
+            ),
+            self.vector_part(&format!("{prefix}.bias"), 0, outputs),
+        ]
+    }
+
+    fn vector_part(&self, suffix: &str, start: usize, length: usize) -> super::metal::Feed<'_> {
+        let values = &self.tensor(suffix)[start..][..length];
+        super::metal::Feed::Weight(
+            format!("{}.{suffix}[{start}]", self.name),
+            Box::new(move || values.to_vec()),
+        )
+    }
+
+    /// `RoPE`'s cosines and signed sines for `rows` positions, as
+    /// `Builder::rope` takes them.
+    #[expect(clippy::cast_precision_loss, reason = "Positions are small")]
+    fn rope_tables(&self, rows: usize, key: bool) -> [Vec<f32>; 2] {
+        let name = if key { "key_transform" } else { "query_transform" };
+        let frequencies = self.tensor(&format!("attn.{name}.0.inv_freq"));
+        let (head_dim, half) = (self.head_dim(), self.head_dim() / 2);
+        let (mut cos, mut sin) = (vec![0.0; rows * head_dim], vec![0.0; rows * head_dim]);
+        for row in 0..rows {
+            for (index, frequency) in frequencies.iter().enumerate() {
+                let (s, c) = (row as f32 * frequency).sin_cos();
+                let at = row * head_dim + index;
+                (cos[at], cos[at + half]) = (c, c);
+                (sin[at], sin[at + half]) = (-s, s);
+            }
+        }
+        [cos, sin]
+    }
+
+    fn key_value_metal(&self, metal: &super::metal::Metal, x: &[f32], groups: usize) -> Result<Kv> {
+        use super::metal::Feed;
+        let rows = x.len() / (groups * self.width);
+        let [k_weight, k_bias] = self.projection(1);
+        let [v_weight, v_bias] = self.projection(2);
+        let tables = self.rope.then(|| self.rope_tables(rows, true));
+        let mut feeds = vec![
+            Feed::Data(x),
+            self.vector_part("key_value_norm.weight", 0, self.width),
+        ];
+        feeds.extend([k_weight, k_bias, v_weight, v_bias]);
+        if let Some([cos, sin]) = &tables {
+            feeds.extend([Feed::Data(cos), Feed::Data(sin)]);
+        }
+        let mut outputs = metal.run(self.key(false, (groups, rows), None), feeds)?;
+        let value = outputs.pop().expect("two outputs");
+        let key = outputs.pop().expect("two outputs");
+        Ok(Kv {
+            key,
+            value,
+            groups,
+            heads: self.heads,
+            rows,
+        })
+    }
+
+    /// [`Self::forward_rows`] on the GPU, in chunks of groups, or of rows for
+    /// one group, whose attention scores fit [`GPU_SCORES`].
+    fn forward_metal(
+        &self,
+        metal: &super::metal::Metal,
+        query: &[f32],
+        rows: usize,
+        groups: usize,
+        kv: &Kv,
+    ) -> Result<Vec<f32>> {
+        use super::metal::Feed;
+        let (width, head_dim) = (self.width, self.head_dim());
+        let per_row = self.heads * kv.rows;
+        let kv_group = kv.heads * kv.rows * head_dim;
+        let (group_step, row_step) = if groups == 1 || kv.groups == 1 {
+            (groups, (GPU_SCORES / (groups * per_row)).clamp(1, rows))
+        } else {
+            ((GPU_SCORES / (rows * per_row)).clamp(1, groups), rows)
+        };
+        #[expect(clippy::cast_precision_loss, reason = "Key counts are exact enough in f32")]
+        let log = (kv.rows.max(1) as f32).ln();
+        let scale: Vec<f32> = if self.scaling == Scaling::None {
+            Vec::new()
+        } else {
+            self.tensor("attn.sdpa.query_scaling.head_scale")
+                .iter()
+                .map(|a| a * log)
+                .collect()
+        };
+        let mut out = vec![0.0; query.len()];
+        for group in (0..groups).step_by(group_step) {
+            let count = group_step.min(groups - group);
+            for row in (0..rows).step_by(row_step) {
+                let length = row_step.min(rows - row);
+                let chunk: Vec<f32> = (group..group + count)
+                    .flat_map(|g| &query[(g * rows + row) * width..][..length * width])
+                    .copied()
+                    .collect();
+                let (kv_start, kv_count) = if kv.groups == 1 { (0, 1) } else { (group, count) };
+                let keys = &kv.key[kv_start * kv_group..][..kv_count * kv_group];
+                let values = &kv.value[kv_start * kv_group..][..kv_count * kv_group];
+                let tables = if self.rope {
+                    let [cos, sin] = self.rope_tables(row + length, false);
+                    Some([cos[row * head_dim..].to_vec(), sin[row * head_dim..].to_vec()])
+                } else {
+                    None
+                };
+                let [q_weight, q_bias] = self.projection(0);
+                let mut feeds = vec![
+                    Feed::Data(&chunk),
+                    Feed::Data(keys),
+                    Feed::Data(values),
+                    self.vector_part("query_norm.weight", 0, width),
+                    q_weight,
+                    q_bias,
+                ];
+                if let Some([cos, sin]) = &tables {
+                    feeds.extend([Feed::Data(cos), Feed::Data(sin)]);
+                }
+                if self.scaling != Scaling::None {
+                    feeds.push(Feed::Data(&scale));
+                }
+                if self.scaling == Scaling::Gated {
+                    feeds.extend(self.linear_feeds("attn.sdpa.query_scaling.gate.0", head_dim, 64));
+                    feeds.extend(self.linear_feeds("attn.sdpa.query_scaling.gate.2", 64, head_dim));
+                }
+                feeds.extend(self.linear_feeds("attn.out_lin", width, width));
+                feeds.push(self.vector_part("mlp.0.weight", 0, width));
+                feeds.extend(self.linear_feeds("mlp.1", width, 2 * width));
+                feeds.extend(self.linear_feeds("mlp.3", 2 * width, width));
+                let kv_shape = Kv {
+                    key: Vec::new(),
+                    value: Vec::new(),
+                    groups: kv_count,
+                    heads: kv.heads,
+                    rows: kv.rows,
+                };
+                let result = metal
+                    .run(self.key(true, (count, length), Some(&kv_shape)), feeds)?
+                    .remove(0);
+                for (index, g) in (group..group + count).enumerate() {
+                    out[(g * rows + row) * width..][..length * width]
+                        .copy_from_slice(&result[index * length * width..][..length * width]);
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// A `[rows, columns]` matrix transposed.
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+fn transpose(values: &[f32], rows: usize, columns: usize) -> Vec<f32> {
+    let mut out = vec![0.0; values.len()];
+    for row in 0..rows {
+        for column in 0..columns {
+            out[column * rows + row] = values[row * columns + column];
+        }
+    }
+    out
+}
+
 /// The column stage's keys and values: recorded from the training rows and
 /// their targets, or read from a context.
 enum Columns<'a> {
@@ -625,6 +842,10 @@ impl Block<'_> {
 
     /// Keys and values of `groups` equal parts of the `[rows, width]` rows `x`.
     fn key_value(&self, x: &[f32], groups: usize) -> Result<Kv> {
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        if let Some(metal) = &self.model.metal {
+            return self.key_value_metal(metal, x, groups);
+        }
         let normed = rms_norm(
             x,
             self.width,
@@ -652,6 +873,10 @@ impl Block<'_> {
     /// [`Self::forward`] for `rows` query rows per group; `kv` may have one
     /// group for all.
     fn forward_rows(&self, query: &[f32], rows: usize, groups: usize, kv: &Kv) -> Result<Vec<f32>> {
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        if let Some(metal) = &self.model.metal {
+            return self.forward_metal(metal, query, rows, groups, kv);
+        }
         let (width, heads, head_dim) = (self.width, self.heads, self.head_dim());
         let normed = rms_norm(query, width, Some(self.tensor("query_norm.weight")), NORM_EPS);
         let mut q = self.transform(
