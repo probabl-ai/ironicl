@@ -33,7 +33,7 @@ python = ["dep:pyo3"]
 # through cuda-oxide's codegen backend: see tools/cuda-env.sh.
 cuda = ["dep:cuda-core", "dep:cuda-device", "dep:cuda-host"]
 # `ironicl serve`: an HTTP server for an exported model.
-server = ["dep:axum", "dep:tokio", "dep:garde"]
+server = ["dep:axum", "dep:tokio", "dep:garde", "dep:tracing", "dep:tracing-subscriber"]
 
 [dependencies]
 # cuda-oxide: one revision for all three and for the codegen backend.
@@ -53,11 +53,13 @@ sha2 = "0.11.1"
 tempfile = "3.27.0"
 zip = { version = "9.3.0", default-features = false }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"], optional = true }
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "net", "signal", "sync"], optional = true }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"], optional = true }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 garde = { version = "0.23.0", default-features = false, features = ["derive"], optional = true }
 clap = { version = "4.6.1", features = ["derive"] }
+tracing = { version = "0.1.44", default-features = false, features = ["std"], optional = true }
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std", "env-filter"], optional = true }
 
 # Windows memory: the planner's probe (memory status, job limits, commit
 # charge) and prefetching mapped contexts.

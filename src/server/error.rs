@@ -37,12 +37,18 @@ impl ApiError {
         )
     }
 
-    pub(super) fn worker_stopped() -> Self {
-        Self::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "internal",
-            "the prediction worker stopped",
-        )
+    /// A 500 that hides `detail` from the client and logs it instead.
+    pub(super) fn internal(detail: impl std::fmt::Display) -> Self {
+        tracing::error!("internal error: {detail}");
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", "internal error")
+    }
+
+    pub(super) fn status(&self) -> StatusCode {
+        self.status
+    }
+
+    pub(super) fn code(&self) -> &'static str {
+        self.code
     }
 
     pub(super) fn message(&self) -> &str {
@@ -54,7 +60,7 @@ impl From<Error> for ApiError {
     fn from(error: Error) -> Self {
         match error {
             Error::InvalidArgument(message) => Self::invalid(message),
-            error => Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", error.to_string()),
+            error => Self::internal(error),
         }
     }
 }
@@ -79,5 +85,23 @@ impl IntoResponse for ApiError {
             return (self.status, [(header::RETRY_AFTER, "1")], body).into_response();
         }
         (self.status, body).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ApiError;
+    use crate::Error;
+
+    #[test]
+    fn only_invalid_requests_say_why() {
+        assert_eq!(
+            ApiError::from(Error::InvalidArgument("bad row".into())).message(),
+            "bad row"
+        );
+        assert_eq!(
+            ApiError::from(Error::Cache("/secret/path".into())).message(),
+            "internal error"
+        );
     }
 }
