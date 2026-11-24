@@ -48,9 +48,12 @@ def _config() -> str:
         plan = _plan("classifier", *EXAMPLE, level, None, None)
         lines.append(f"  {level}: {plan.storage}, built on the {plan.builder.upper()}, {_gib(plan.context_bytes)}")
     checkpoints = _checkpoints_dir()
-    found = sorted(checkpoints.glob("*.ckpt")) if checkpoints.is_dir() else []
+    found = sorted(checkpoints.glob("*/*.*")) if checkpoints.is_dir() else []
+    found = [path for path in found if not path.name.endswith(".partial")]
     lines += ["", f"Checkpoints: {checkpoints}"]
-    lines += [f"  {path.name} ({_gib(path.stat().st_size)})" for path in found] or ["  none downloaded"]
+    lines += [
+        f"  {path.relative_to(checkpoints)} ({_gib(path.stat().st_size)})" for path in found
+    ] or ["  none downloaded"]
     cache = cache_info()
     lines.append(
         f"Context cache (used with cache_dir): {cache.directory}, "
