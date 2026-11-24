@@ -15,7 +15,7 @@
 
 use crate::preprocess::labels::Labels;
 use crate::preprocess::python_random::PythonRandom;
-use crate::{Error, Result};
+use crate::{Error, Result, TaskKind};
 
 /// Columns each member keeps after shuffling.
 const MAX_COLUMNS: usize = 500;
@@ -33,25 +33,34 @@ fn invalid(message: &str) -> Error {
 }
 
 /// The random draws of an ensemble: each member's class order (code `c`
-/// becomes `class_orders[m][c]`), numeric route signs, column order, and for
-/// more than [`MAX_CLASSES`] classes its codebook, one row of symbols per
-/// task.
+/// becomes `class_orders[m][c]`) or target sign, numeric route signs, column
+/// order, and for more than [`MAX_CLASSES`] classes its codebook, one row of
+/// symbols per task.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Draws {
     pub class_orders: Vec<Vec<usize>>,
+    pub target_signs: Vec<f64>,
     pub signs: Vec<Vec<f64>>,
     pub column_orders: Vec<Vec<usize>>,
     pub codebooks: Vec<Vec<Vec<usize>>>,
 }
 
 impl Draws {
-    /// Draw from `CPython`'s `random.Random(seed)`, in this order: the class
-    /// offsets, from shuffled pools of every offset; each member's signs,
-    /// negative when `random() < 0.5`; the two shuffles of the Latin column
-    /// orders; and each member's codebook.
+    /// Draw from `CPython`'s `random.Random(seed)`, in this order: for a
+    /// classifier, the class offsets, from shuffled pools of every offset, or
+    /// for a regressor (`classes` is `None`), each member's target sign; each
+    /// member's signs, negative when `random() < 0.5`; the two shuffles of the
+    /// Latin column orders; and each member's codebook.
     #[must_use]
-    pub fn new(seed: i128, members: usize, classes: usize, numeric: usize, columns: usize) -> Self {
+    pub fn new(seed: i128, members: usize, classes: Option<usize>, numeric: usize, columns: usize) -> Self {
         let mut rng = PythonRandom::new(seed);
+        let sign = |rng: &mut PythonRandom| if rng.random() < 0.5 { -1.0 } else { 1.0 };
+        let target_signs = if classes.is_none() {
+            (0..members).map(|_| sign(&mut rng)).collect()
+        } else {
+            vec![1.0; members]
+        };
+        let classes = classes.unwrap_or(0);
         let mut pool = Vec::new();
         let class_orders = (0..members)
             .map(|_| {
@@ -67,11 +76,7 @@ impl Draws {
             })
             .collect();
         let signs = (0..members)
-            .map(|_| {
-                (0..numeric)
-                    .map(|_| if rng.random() < 0.5 { -1.0 } else { 1.0 })
-                    .collect()
-            })
+            .map(|_| (0..numeric).map(|_| sign(&mut rng)).collect())
             .collect();
         let mut base: Vec<usize> = (0..columns).collect();
         let mut rows = base.clone();
@@ -99,6 +104,7 @@ impl Draws {
             .collect();
         Self {
             class_orders,
+            target_signs,
             signs,
             column_orders,
             codebooks,
@@ -277,7 +283,10 @@ pub struct Preprocessor {
     features: usize,
     columns: Vec<RouteColumn>,
     members: Vec<Vec<(usize, f64)>>,
-    pub(crate) classes: Labels,
+    /// A classifier's classes, sorted, or `None` for a regressor.
+    pub(crate) classes: Option<Labels>,
+    /// A regressor's target mean and scale.
+    pub(crate) target_scale: Option<(f64, f64)>,
     pub(crate) draws: Draws,
 }
 
@@ -291,17 +300,30 @@ pub struct MemberRows {
 }
 
 impl Preprocessor {
-    /// Fit on the encoded `[rows, features]` matrix `x`, whose `categorical`
-    /// features hold category codes, and the class `labels`, for `members`
-    /// members drawn from `seed`.
+    /// Fit for `task` on the encoded `[rows, features]` matrix `x`, whose
+    /// `categorical` features hold category codes, and the `labels`, class
+    /// labels or a regressor's target values as floats, for `members` members
+    /// drawn from `seed`.
     ///
     /// # Errors
     ///
-    /// When the shapes disagree or a label is NaN.
-    pub fn fit(x: &[f64], categorical: &[bool], labels: &Labels, members: usize, seed: i128) -> Result<Self> {
-        Self::fit_with(x, categorical, labels, members, |classes, numeric, columns| {
-            Draws::new(seed, members, classes, numeric, columns)
-        })
+    /// When the shapes disagree, a label is NaN, or a target is not finite.
+    pub fn fit(
+        x: &[f64],
+        categorical: &[bool],
+        labels: &Labels,
+        task: TaskKind,
+        members: usize,
+        seed: i128,
+    ) -> Result<Self> {
+        Self::fit_with(
+            x,
+            categorical,
+            labels,
+            task,
+            members,
+            |classes, numeric, columns| Draws::new(seed, members, classes, numeric, columns),
+        )
     }
 
     /// [`Self::fit`] with the draws `draw(classes, numeric route columns, columns)` gives.
@@ -309,8 +331,9 @@ impl Preprocessor {
         x: &[f64],
         categorical: &[bool],
         labels: &Labels,
+        task: TaskKind,
         members: usize,
-        draw: impl FnOnce(usize, usize, usize) -> Draws,
+        draw: impl FnOnce(Option<usize>, usize, usize) -> Draws,
     ) -> Result<Self> {
         let features = categorical.len();
         if features == 0 || x.is_empty() || !x.len().is_multiple_of(features) {
@@ -323,7 +346,13 @@ impl Preprocessor {
         if members == 0 {
             return Err(invalid("n_estimators must be at least 1"));
         }
-        let classes = labels.classes()?;
+        let (classes, target_scale) = match (task, labels) {
+            (TaskKind::Classifier, _) => (Some(labels.classes()?), None),
+            (TaskKind::Regressor, Labels::Float(values)) if values.iter().all(|value| value.is_finite()) => {
+                (None, Some(target_scale(values)))
+            }
+            (TaskKind::Regressor, _) => return Err(invalid("y must be finite numbers")),
+        };
         let sources = sources(x, categorical);
         let used: Vec<bool> = (0..CHOICES).map(|choice| choice < members).collect();
         let mut columns = Vec::new();
@@ -356,8 +385,9 @@ impl Preprocessor {
             columns.push(route);
         }
         let numeric = columns.iter().filter(|column| column.numeric).count();
-        let draws = draw(classes.len(), numeric, columns.len());
+        let draws = draw(classes.as_ref().map(Labels::len), numeric, columns.len());
         if draws.class_orders.len() != members
+            || draws.target_signs.len() != members
             || draws.codebooks.len() != members
             || draws.signs.iter().any(|signs| signs.len() != numeric)
             || draws
@@ -384,6 +414,7 @@ impl Preprocessor {
             columns,
             members,
             classes,
+            target_scale,
             draws,
         })
     }
@@ -435,13 +466,48 @@ impl Preprocessor {
     ///
     /// When a label is not one of the classes.
     pub fn class_codes(&self, labels: &Labels, member: usize) -> Result<Vec<usize>> {
+        let classes = self
+            .classes
+            .as_ref()
+            .ok_or_else(|| invalid("a regressor has no classes"))?;
         let order = &self.draws.class_orders[member];
         Ok(labels
-            .encode(&self.classes)?
+            .encode(classes)?
             .into_iter()
             .map(|code| order[code])
             .collect())
     }
+
+    /// A regressor's training targets, standardized, as member `member` sees them.
+    ///
+    /// # Errors
+    ///
+    /// For a classifier, or when the labels are not floats.
+    pub fn target_values(&self, labels: &Labels, member: usize) -> Result<Vec<f32>> {
+        let (Some((mean, scale)), Labels::Float(values)) = (self.target_scale, labels) else {
+            return Err(invalid("only a regressor has target values, which are numbers"));
+        };
+        let sign = self.draws.target_signs[member];
+        #[expect(clippy::cast_possible_truncation, reason = "The model reads FP32")]
+        Ok(values
+            .iter()
+            .map(|value| (sign * (value - mean) / scale) as f32)
+            .collect())
+    }
+}
+
+/// `Standardize()`'s mean and scale of the target: the population deviation,
+/// or 1 for a constant target.
+fn target_scale(values: &[f64]) -> (f64, f64) {
+    let (mean, variance, count) = moments(values, 0);
+    (
+        mean,
+        if is_constant(variance, mean, count) {
+            1.0
+        } else {
+            variance.sqrt()
+        },
+    )
 }
 
 /// The route columns' sources, each with whether it is a category code
@@ -1026,18 +1092,30 @@ pub(crate) mod fixtures {
         let categories = columns::categories(&training).unwrap();
         let x = columns::encode(&table, &categories).unwrap();
         let y = json["y"].as_array().unwrap();
-        let labels = if y[0].is_string() {
+        let regressor = json["task"] == "regression";
+        let labels = if regressor {
+            Labels::Float(y[..context].iter().map(|v| v.as_f64().unwrap()).collect())
+        } else if y[0].is_string() {
             Labels::Text(y[..context].iter().map(|v| v.as_str().unwrap().into()).collect())
         } else {
             Labels::Int(y[..context].iter().map(|v| v.as_f64().unwrap() as i64).collect())
         };
         let draws = &json["draws"];
+        let members = json["members"].as_array().unwrap().len();
         let draws = Draws {
-            class_orders: draws.get("class_orders").map(orders).unwrap_or_default(),
-            signs: matrix(&draws["flip_signs"][0]),
+            class_orders: draws
+                .get("class_orders")
+                .map_or_else(|| vec![Vec::new(); members], orders),
+            // A regressor flips the target first.
+            target_signs: if regressor {
+                matrix(&draws["flip_signs"][0]).into_iter().flatten().collect()
+            } else {
+                vec![1.0; members]
+            },
+            signs: matrix(&draws["flip_signs"][usize::from(regressor)]),
             column_orders: orders(&draws["column_orders"]),
             codebooks: draws.get("codebooks").map_or_else(
-                || vec![Vec::new(); json["members"].as_array().unwrap().len()],
+                || vec![Vec::new(); members],
                 |books| {
                     let books = books.as_array().unwrap();
                     books
@@ -1070,32 +1148,55 @@ mod parity {
 
     #[test]
     fn members_see_nvidias_preprocessed_rows() {
-        for name in ["numeric", "mixed", "many_classes"] {
+        for name in [
+            "numeric",
+            "mixed",
+            "many_classes",
+            "numeric_regression",
+            "mixed_regression_large",
+        ] {
             let case = case(name);
             let members = case.json["members"].as_array().unwrap();
             let draws = case.draws.clone();
             let context = &case.x[..case.context * case.features];
+            let regressor = case.json["task"] == "regression";
+            let task = if regressor {
+                crate::TaskKind::Regressor
+            } else {
+                crate::TaskKind::Classifier
+            };
             let preprocessor = Preprocessor::fit_with(
                 context,
                 &case.categorical,
                 &case.labels,
+                task,
                 members.len(),
                 |_, _, _| draws,
             )
             .unwrap();
             for (index, member) in members.iter().enumerate() {
                 let names = member["columns"].as_array().unwrap();
-                let codes: Vec<usize> = member["y"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|c| usize::try_from(c.as_u64().unwrap()).unwrap())
-                    .collect();
-                assert_eq!(
-                    preprocessor.class_codes(&case.labels, index).unwrap(),
-                    codes,
-                    "{name} member {index} classes"
-                );
+                let targets = member["y"].as_array().unwrap();
+                if regressor {
+                    let values = preprocessor.target_values(&case.labels, index).unwrap();
+                    for (value, expected) in values.iter().zip(targets) {
+                        let expected = expected.as_f64().unwrap();
+                        assert!(
+                            (f64::from(*value) - expected).abs() < 1e-5 * (1.0 + expected.abs()),
+                            "{name} {index}"
+                        );
+                    }
+                } else {
+                    let codes: Vec<usize> = targets
+                        .iter()
+                        .map(|c| usize::try_from(c.as_u64().unwrap()).unwrap())
+                        .collect();
+                    assert_eq!(
+                        preprocessor.class_codes(&case.labels, index).unwrap(),
+                        codes,
+                        "{name} member {index}"
+                    );
+                }
                 for (rows_name, x, expected) in [
                     ("context", context, rows(&member["x"])),
                     (

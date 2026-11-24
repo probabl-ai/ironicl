@@ -5,14 +5,17 @@ At size `large` it is second on [TabArena](https://huggingface.co/spaces/TabAren
 and first among models whose weights allow commercial use. Ironicl is adding it as its second
 model, next to TabICLv2.
 
-Status: the classifier fits and predicts on the CPU, from Python and through `ironicl serve`. The
-regressor, Metal, and CUDA come next.
+Status: the classifier and the regressor fit and predict on the CPU, from Python and through
+`ironicl serve`. Metal and CUDA come next.
 
 ```python
-from ironicl import KumoTabularClassifier
+from ironicl import KumoTabularClassifier, KumoTabularRegressor
 
 clf = KumoTabularClassifier(size="large").fit(X_train, y_train)
 probabilities = clf.predict_proba(X_test)
+
+reg = KumoTabularRegressor(size="large").fit(X_train, y_train)
+mean = reg.predict(X_test)
 ```
 
 `X` is a NumPy array or a pandas DataFrame with numeric and categorical columns, as for
@@ -21,6 +24,12 @@ probabilities = clf.predict_proba(X_test)
 checkpoint is downloaded from Hugging Face at the pinned revision, unless `model_path` names it.
 Any number of classes works: above 10, members combine tasks of error-correcting output codes, as
 NVIDIA's code does.
+
+The regressor's members each predict 999 quantiles. As in NVIDIA's code, each member's are
+sorted, then averaged over the members after dropping the lowest and highest fifth of them per
+quantile. `predict` summarizes those quantiles as `TabICLRegressor.predict` does, with the same
+`output_type` and `alphas` ([python.md](python.md#regressor)): `"mean"`, their mean, is what
+NVIDIA's benchmark predicts, and `"raw_quantiles"` are NVIDIA's output.
 
 ## Checkpoints
 
@@ -60,16 +69,17 @@ embeddings are saved transposed; import copies them into row-major order.
   `f64`. Each member standardizes, clips, and transforms every column by one of four choices in
   turn (none, Yeo-Johnson, robust scaling, rank to Gaussian), clips it at four sigmas, flips numeric
   columns' signs at random, shuffles the columns, and keeps 500. Categorical features become
-  category codes, with a count column above 50 categories; classes shift by a random offset.
+  category codes, with a count column above 50 categories; classes shift by a random offset. A
+  regressor's target is standardized and flips sign at random.
 - `cpu.rs`: the forward pass in FP32 on the CPU kernels TabICLv2 uses. Fitting runs the training
   rows once and keeps each member's context: the column means that replace missing values, each
   column layer's keys and values of its inducing points, and each ICL layer's keys and values,
   in medium and large only the 2 heads query rows use. Predicting runs only the query rows.
 - `fitted.rs`: the ensemble. It averages the members' logits, or above 10 classes their codebook
-  scores, and applies softmax.
+  scores, and applies softmax; or it combines the members' quantiles.
 
-Random draws: Ironicl draws the class offsets, the signs, the Latin column orders, and the
-codebooks from CPython's `random.Random(random_state)`, in that order, so a seed gives the same
+Random draws: Ironicl draws the class offsets or target signs, the feature signs, the Latin column
+orders, and the codebooks from CPython's `random.Random(random_state)`, in that order, so a seed gives the same
 model on every machine. `random_state=None` is not supported.
 
 Saving: `save`, pickling, and `export` work as for TabICL. They store the training data and the
@@ -84,19 +94,22 @@ training data. Loading always needs the training data, so `save_training_data=Fa
 ## Parity
 
 `tools/export_kumo_fixtures.py` runs NVIDIA's code, pinned to commit `3fdf108`, on the CPU in
-FP32 and records each member's draws, preprocessed rows, and logits, and the probabilities, in
+FP32 and records each member's draws, preprocessed rows, and outputs, and the prediction, in
 `tests/fixtures/kumo_tabular/`. Given NVIDIA's draws, Ironicl matches it:
 
-| Case | Size | Members | Classes | Preprocessed rows | Logits | Probabilities |
+| Case | Size | Members | Classes | Preprocessed rows | Outputs | Prediction |
 |---|---|---|---|---|---|---|
 | numeric, NaN, ±inf, constant and empty columns | small | 4 | 3 | < 1e-5 | 5e-6 | 6e-7 |
 | numeric and categorical, a count column | small | 5 | 4 | < 1e-5 | 3e-6 | 2e-7 |
 | 12 classes, error-correcting output codes | small | 2 | 12 | < 1e-5 | | 8e-8 |
 | numeric and categorical | medium | 2 | 4 | | 4e-6 | |
 | numeric and categorical | large | 2 | 4 | | 4e-6 | |
+| numeric, regression | small | 5 | | < 1e-5 | 4e-6 | 3e-7 |
+| numeric and categorical, regression | large | 2 | | < 1e-5 | 1e-5 | 2e-6 |
 
-The errors are the largest absolute ones, relative for the preprocessed rows, on an Apple M1 Max
-and on an AMD Ryzen 7 9800X3D. The tests need the checkpoints in `IRONICL_CHECKPOINT_FIXTURES`:
+Outputs are the members' logits or standardized quantiles; the prediction is the probabilities,
+or the quantiles relative to their size. The errors are the largest absolute ones, relative for
+the preprocessed rows, on an Apple M1 Max and on an AMD Ryzen 7 9800X3D. The tests need the checkpoints in `IRONICL_CHECKPOINT_FIXTURES`:
 
 ```bash
 IRONICL_CHECKPOINT_FIXTURES=checkpoints cargo test --release --lib kumo_tabular -- --include-ignored
@@ -118,6 +131,6 @@ notices. Ironicl downloads the weights from Hugging Face and never ships them. N
 1. Import the weights. Done.
 2. The classifier on the CPU, as `KumoTabularClassifier`, with pickling, export, and the server.
    Done.
-3. The regressor on the CPU, as `KumoTabularRegressor`.
+3. The regressor on the CPU, as `KumoTabularRegressor`. Done.
 4. Metal.
 5. CUDA.

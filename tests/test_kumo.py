@@ -1,6 +1,7 @@
-"""KumoTabularClassifier: validation, and with the small checkpoint in the
-default cache, which ``allow_auto_download`` fills, fitting, predicting,
-pickling, and exporting. Parity with NVIDIA's code is tested in Rust."""
+"""KumoTabularClassifier and KumoTabularRegressor: validation, and with the
+small checkpoints in the default cache, which ``allow_auto_download`` fills,
+fitting, predicting, pickling, and exporting. Parity with NVIDIA's code is
+tested in Rust."""
 
 import os
 import pickle
@@ -11,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ironicl import KumoTabularClassifier
+from ironicl import KumoTabularClassifier, KumoTabularRegressor
 
 try:
     import pandas as pd
@@ -21,6 +22,7 @@ except ImportError:
 CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "ironicl" / "checkpoints"
 CHECKPOINT = CACHE / "kumo-tabular" / "small-classifier.pt"
 NEEDS_CHECKPOINT = f"needs {CHECKPOINT}"
+REGRESSOR = CACHE / "kumo-tabular" / "small-regressor.pt"
 
 
 class ValidateTest(unittest.TestCase):
@@ -131,6 +133,35 @@ class FitTest(unittest.TestCase):
             self.assertIn("KV cache:      safe", output)
             self.model.export(Path(directory) / "refits", kv_cache=False)
             self.assertFalse((Path(directory) / "refits" / "context.ircntxt").exists())
+
+
+@unittest.skipUnless(REGRESSOR.exists(), f"needs {REGRESSOR}")
+class RegressorTest(unittest.TestCase):
+    def setUp(self):
+        rng = np.random.default_rng(1)
+        self.x = rng.standard_normal((90, 3))
+        self.y = 10 + 3 * self.x[:, 0] - self.x[:, 1] + 0.1 * rng.standard_normal(90)
+        self.model = KumoTabularRegressor(size="small", n_estimators=3).fit(self.x[:70], self.y[:70])
+
+    def test_predicts_in_the_targets_units(self):
+        mean = self.model.predict(self.x[70:])
+        self.assertEqual(mean.shape, (20,))
+        self.assertLess(np.abs(mean - self.y[70:]).mean(), 1.0)
+        outputs = self.model.predict(self.x[70:], output_type=["median", "quantiles", "raw_quantiles"], alphas=[0.1, 0.9])
+        self.assertEqual(outputs["quantiles"].shape, (20, 2))
+        self.assertTrue((outputs["quantiles"][:, 0] <= outputs["quantiles"][:, 1]).all())
+        raw = outputs["raw_quantiles"]
+        self.assertEqual(raw.shape, (20, 999))
+        np.testing.assert_allclose(raw.mean(axis=1), mean, rtol=1e-5)
+
+    def test_pickling_fits_the_same_model(self):
+        loaded = pickle.loads(pickle.dumps(self.model))
+        np.testing.assert_array_equal(loaded.predict(self.x[70:]), self.model.predict(self.x[70:]))
+
+    def test_a_column_vector_y_fits_the_same_model(self):
+        with self.assertWarns(Warning):
+            column = KumoTabularRegressor(size="small", n_estimators=3).fit(self.x[:70], self.y[:70, None])
+        np.testing.assert_array_equal(column.predict(self.x[70:]), self.model.predict(self.x[70:]))
 
 
 if __name__ == "__main__":

@@ -91,6 +91,15 @@ class Capture(Callback):
         return out
 
 
+def compact(value):
+    """FP32 outputs with the 9 significant digits that round-trip them."""
+    if isinstance(value, list):
+        return [compact(item) for item in value]
+    if isinstance(value, dict):
+        return {key: compact(item) for key, item in value.items()}
+    return float(f"{value:.9g}") if isinstance(value, float) and math.isfinite(value) else value
+
+
 def frame(columns: dict) -> pd.DataFrame:
     return pd.DataFrame(columns)
 
@@ -150,11 +159,13 @@ def case(name, size, task, estimators, seed, x: pd.DataFrame, y, context_rows: i
         ],
         "y": [cell(v) for v in y],
         "draws": dict(DRAWS),
-        "members": [
-            {**context, "query": query, "output": output}
-            for context, query, output in zip(capture.contexts, capture.queries, capture.outputs, strict=True)
-        ],
-        "prediction": {"columns": list(prediction.numerical_columns), "values": prediction.numerical.tolist()},
+        "members": compact(
+            [
+                {**context, "query": query, "output": output}
+                for context, query, output in zip(capture.contexts, capture.queries, capture.outputs, strict=True)
+            ]
+        ),
+        "prediction": compact({"columns": list(prediction.numerical_columns), "values": prediction.numerical.tolist()}),
     }
 
 
@@ -181,8 +192,9 @@ def main(out: Path) -> None:
         case("many_classes", "small", "classification", 2, 2, many, many_labels, 96),
         case("mixed_medium", "medium", "classification", 2, 3, mixed, mixed_labels, 120),
         case("mixed_large", "large", "classification", 2, 4, mixed, mixed_labels, 120),
-        case("numeric_regression", "small", "regression", 5, 5, x, target, 48),
-        case("mixed_regression_large", "large", "regression", 2, 6, mixed, mixed_rng.standard_normal(mixed_rows), 120),
+        # 999 quantiles per row: 8 query rows suffice.
+        case("numeric_regression", "small", "regression", 5, 5, x[:56], target[:56], 48),
+        case("mixed_regression_large", "large", "regression", 2, 6, mixed[:128], mixed_rng.standard_normal(mixed_rows)[:128], 120),
     ]
     meta = {"structured-data-models": version("structured-data-models"), "torch": torch.__version__}
     for fixture in cases:
