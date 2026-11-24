@@ -310,7 +310,7 @@ class TabICLBase(BaseEstimator):
         if self.model_path is not None:
             path = Path(self.model_path)
         else:
-            path = _checkpoints_dir() / self.checkpoint_version
+            path = _checkpoints_dir("tabicl") / self.checkpoint_version
         if path.exists():
             return path
         if data is None and not self.allow_auto_download:

@@ -26,7 +26,7 @@ def data():
 
 
 def checkpoint(estimator) -> Path:
-    path = CACHE / estimator().checkpoint_version
+    path = CACHE / "tabicl" / estimator().checkpoint_version
     if not path.exists():
         raise unittest.SkipTest(f"{path.name} is not in {CACHE}")
     return path
