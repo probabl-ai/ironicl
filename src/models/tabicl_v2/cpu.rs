@@ -19,9 +19,9 @@ use crate::{
         source_major_online_attention_with_backend_f32, tiled_online_scaled_dot_product_attention_f32,
     },
     memory::{Builder, ContextShape, MemoryLimits, Plan, Pools, Storage},
+    models::quantiles::summarize,
     models::tabicl_v2::Device,
     models::tabicl_v2::execution_plan::ExecutionPlan,
-    models::tabicl_v2::quantiles::summarize,
     profile::{self, Category},
 };
 

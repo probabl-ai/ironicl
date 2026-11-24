@@ -25,16 +25,16 @@ pub use format::model::{
 };
 pub use format::static_context::{StaticContextArtifact, StaticContextMetadata};
 pub use kernels::cpu::{CpuCapabilities, Isa};
-pub use models::tabicl_v2::checkpoint::{CheckpointProfile, import_checkpoint, inspect_checkpoint};
-pub use models::tabicl_v2::checkpoint_cache::{
+pub use models::checkpoint::{CheckpointProfile, import_checkpoint, inspect_checkpoint};
+pub use models::checkpoint_cache::{
     CheckpointCacheOptions, PreparedCheckpoint, default_cache_dir, load_checkpoint_model, prepare_checkpoint,
 };
+pub use models::quantiles::{DEFAULT_ALPHAS, RegressionOutput};
 pub use models::tabicl_v2::cpu::{
     ClassifierAggregation, ClassifierProbabilities, DecoderOutputs, Executor, Optimize, StaticExecutor,
     plan_context,
 };
 pub use models::tabicl_v2::fitted::{FittedModel, Preprocessed, TrainingInputs};
 pub use models::tabicl_v2::preprocess::{Features, NormMethod, PreprocessOptions, Preprocessor, Targets};
-pub use models::tabicl_v2::quantiles::{DEFAULT_ALPHAS, RegressionOutput};
 pub use models::tabicl_v2::request::{QueryRequest, Request};
 pub use preprocess::labels::Labels;

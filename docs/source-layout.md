@@ -45,20 +45,20 @@ src/
 │       └── ops/                   their device code: attention, fp8, linear,
 │                                  tabicl_v2 (the fused block and column kernels)
 ├── models/
+│   ├── checkpoint.rs              checkpoint import, of any model
+│   ├── checkpoint_cache.rs        imported weights, by checkpoint SHA-256
+│   ├── directory.rs               model directories: export, prepare, inspect
+│   ├── quantiles.rs               regression outputs from quantiles, of any model
 │   └── tabicl_v2/
 │       ├── mod.rs                 Device: where a context predicts
 │       ├── cpu.rs                 Executor, StaticExecutor
 │       ├── execution_plan.rs      worker partitioning
 │       ├── metal.rs               TabICLv2 stages, predict graph, build
 │       ├── cuda/                  build, predictor, launchers, weights, cache, …
-│       ├── checkpoint.rs          checkpoint import
-│       ├── checkpoint_cache.rs    prepared checkpoints
-│       ├── quantiles.rs           regression outputs
 │       ├── request.rs             QueryRequest and Request: rows for a prediction
 │       ├── preprocess.rs          TabICL's preprocessing pipeline
 │       ├── ensemble.rs            its ensemble: groups, feature and class orders
-│       ├── fitted.rs              the fitted model
-│       └── directory.rs           model directories: export, prepare, inspect
+│       └── fitted.rs              the fitted model
 ├── format/
 │   ├── mod.rs                     container primitives
 │   ├── model.rs                   model artifacts (IRMODEL)
