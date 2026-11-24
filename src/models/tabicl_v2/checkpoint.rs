@@ -679,7 +679,7 @@ fn model_dtype(dtype: DType) -> ModelTensorDType {
     }
 }
 
-fn decode_sha256(value: &str) -> Result<[u8; 32]> {
+pub(crate) fn decode_sha256(value: &str) -> Result<[u8; 32]> {
     if value.len() != 64 {
         return Err(Error::Checkpoint("source SHA-256 has an invalid length".into()));
     }

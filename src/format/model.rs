@@ -324,17 +324,20 @@ impl ModelArtifact {
     /// the official manifest.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let parsed = parse_model_artifact_bytes(bytes)?;
-        let task = match parsed.summary.profile {
-            ModelProfile::TabIclV2Classifier => TaskKind::Classifier,
-            ModelProfile::TabIclV2Regressor => TaskKind::Regressor,
-            ModelProfile::KumoTabular(_) | ModelProfile::Unknown => {
+        let (task, manifest) = match parsed.summary.profile {
+            ModelProfile::TabIclV2Classifier => (TaskKind::Classifier, tensor_manifest(TaskKind::Classifier)),
+            ModelProfile::TabIclV2Regressor => (TaskKind::Regressor, tensor_manifest(TaskKind::Regressor)),
+            ModelProfile::KumoTabular(release) => (release.task, release.manifest()),
+            ModelProfile::Unknown => {
                 return Err(Error::Artifact(
-                    "executable model must be an official TabICLv2 classifier or regressor".into(),
+                    "executable model must be an official TabICLv2 or Kumo-Tabular checkpoint".into(),
                 ));
             }
         };
-        validate_config(&parsed.summary.config, task)?;
-        validate_manifest(&parsed.tensors, task)?;
+        if !matches!(parsed.summary.profile, ModelProfile::KumoTabular(_)) {
+            validate_config(&parsed.summary.config, task)?;
+        }
+        validate_manifest(&parsed.tensors, &manifest, task)?;
 
         let mut tensors = BTreeMap::new();
         for tensor in parsed.tensors {
@@ -355,7 +358,7 @@ impl ModelArtifact {
                 },
             );
         }
-        if task == TaskKind::Regressor {
+        if parsed.summary.profile == ModelProfile::TabIclV2Regressor {
             for (name, dimensions) in tensor_manifest(TaskKind::Classifier) {
                 if let std::collections::btree_map::Entry::Vacant(entry) = tensors.entry(name) {
                     let values = vec![0.0; u64_to_usize(dimensions.iter().product(), "layer-norm bias")?];
@@ -794,8 +797,11 @@ fn checked_elements(name: &str, dimensions: &[u64]) -> Result<u64> {
     })
 }
 
-fn validate_manifest(tensors: &[ParsedTensor], task: TaskKind) -> Result<()> {
-    let expected = tensor_manifest(task);
+fn validate_manifest(
+    tensors: &[ParsedTensor],
+    expected: &BTreeMap<String, Vec<u64>>,
+    task: TaskKind,
+) -> Result<()> {
     if tensors.len() != expected.len() {
         return Err(Error::Artifact(format!(
             "official {task} has {} tensors; expected {}",
@@ -1111,14 +1117,28 @@ mod tests {
             })
             .collect::<Vec<_>>();
         tensors[0].dimensions = vec![1];
-        assert!(validate_manifest(&tensors, TaskKind::Classifier).is_err());
+        assert!(
+            validate_manifest(
+                &tensors,
+                &tensor_manifest(TaskKind::Classifier),
+                TaskKind::Classifier
+            )
+            .is_err()
+        );
 
         tensors[0].dimensions = tensor_manifest(TaskKind::Classifier)
             .get(&tensors[0].name)
             .expect("known tensor")
             .clone();
         tensors[0].name = "unexpected.tensor".into();
-        assert!(validate_manifest(&tensors, TaskKind::Classifier).is_err());
+        assert!(
+            validate_manifest(
+                &tensors,
+                &tensor_manifest(TaskKind::Classifier),
+                TaskKind::Classifier
+            )
+            .is_err()
+        );
 
         tensors[0].name = tensor_manifest(TaskKind::Classifier)
             .keys()
@@ -1126,7 +1146,14 @@ mod tests {
             .expect("manifest has tensors")
             .clone();
         tensors[0].dtype = ModelTensorDType::F64;
-        assert!(validate_manifest(&tensors, TaskKind::Classifier).is_err());
+        assert!(
+            validate_manifest(
+                &tensors,
+                &tensor_manifest(TaskKind::Classifier),
+                TaskKind::Classifier
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -84,6 +84,10 @@ fn inspect_directory(dir: &Path, weights: &Path) -> Result<()> {
     let (path, found) = &summary.weights;
     let found = if *found { "" } else { " (missing)" };
     println!("weights:       {}{found}", path.display());
+    if summary.refits {
+        println!("KV cache:      none; Kumo-Tabular fits again when loaded");
+        return Ok(());
+    }
     match summary.cache {
         Some(Ok((optimize, bytes))) => println!("KV cache:      {optimize}, {}", ByteSize(bytes)),
         Some(Err(error)) => println!("KV cache:      unreadable ({error}); ironicl prepare rebuilds it"),
@@ -208,6 +212,11 @@ fn prepare(args: &PrepareArgs) -> Result<()> {
         None,
         MemoryLimits::resolve(None, None)?,
     )?;
+    if let directory::Fitted::KumoTabular(_) = prepared.model {
+        println!("Fitted the Kumo-Tabular model; it keeps no KV cache, so serving fits it again");
+        println!("time:          {:.2} s", start.elapsed().as_secs_f64());
+        return Ok(());
+    }
     let path = args.dir.join(directory::CONTEXT);
     let bytes = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
     if let Some(warning) = &prepared.warning {

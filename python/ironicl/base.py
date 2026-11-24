@@ -248,15 +248,8 @@ class TabICLBase(BaseEstimator):
         methods = self.norm_methods or ["none", "power"]
         return [methods] if isinstance(methods, str) else list(methods)
 
-    @contextlib.contextmanager
     def _progress(self, description: str, unit: str, total: int | None = None):
-        """Yield the callback Rust reports ``(stage, done, total)`` to, which
-        drives a ``Progress`` for ``verbose=True``, else ``None``."""
-        if not self.verbose:
-            yield None
-            return
-        with Progress(description, unit, total) as progress:
-            yield lambda _stage, done, total: progress.update(done, total)
+        return _progress(self.verbose, description, unit, total)
 
     def _validate_params(self, unsupported=(), noops=()) -> None:
         # Values that would change results or request an unimplemented feature raise.
@@ -294,10 +287,7 @@ class TabICLBase(BaseEstimator):
                 )
 
     def _resolve_threads(self) -> int | None:
-        """Map ``n_jobs`` to an executor thread count (``None`` keeps the default)."""
-        if self.n_jobs is None or self.n_jobs > 0:
-            return self.n_jobs
-        return max(1, (os.cpu_count() or 1) + 1 + self.n_jobs)
+        return _threads(self.n_jobs)
 
     def _optimize(self) -> str:
         optimize = self.optimize if self.optimize is not None else os.environ.get("IRONICL_OPTIMIZE", "safe")
@@ -324,6 +314,25 @@ class TabICLBase(BaseEstimator):
             partial.write_bytes(data)
         partial.replace(path)
         return path
+
+
+@contextlib.contextmanager
+def _progress(verbose: bool, description: str, unit: str, total: int | None = None):
+    """Yield the callback Rust reports ``(stage, done, total)`` to, which
+    drives a ``Progress`` for ``verbose=True``, else ``None``."""
+    if not verbose:
+        yield None
+        return
+    with Progress(description, unit, total) as progress:
+        yield lambda _stage, done, total: progress.update(done, total)
+
+
+def _threads(n_jobs: int | None) -> int | None:
+    """Map ``n_jobs`` to a thread count (``None`` keeps the default); negative
+    values count back from all cores, as in TabICL."""
+    if n_jobs is None or n_jobs > 0:
+        return n_jobs
+    return max(1, (os.cpu_count() or 1) + 1 + n_jobs)
 
 
 def _features(X, categorical=None) -> tuple[np.ndarray | list, tuple[str, ...] | None]:

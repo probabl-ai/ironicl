@@ -6,6 +6,8 @@
 //! invariants.
 //!
 //! Little-endian, after the magic and version:
+//! - the architecture (u32): 1 for `TabICLv2`, laid out as below, or 2 for
+//!   Kumo-Tabular, laid out as [`encode_kumo_tabular`] says;
 //! - the checkpoint's SHA-256 (32 bytes, as `IRCNTXT` stores it);
 //! - input features (u64) and their mask (u8 each), in `TabICL`'s order,
 //!   categorical features first;
@@ -34,6 +36,7 @@ use super::{
     ByteReader, CHECKSUM_BYTES, artifact_error, sha256, u64_to_usize, usize_to_u32, usize_to_u64, write_u32,
     write_u64,
 };
+use crate::models::kumo_tabular;
 use crate::models::tabicl_v2::{
     fitted::Training,
     preprocess::{MAX_MEMBERS, NormMethod, Normalization, Preprocessor},
@@ -43,6 +46,8 @@ use crate::{ClassifierAggregation, Result};
 
 pub const PREPROCESSOR_MAGIC: [u8; 8] = *b"IRPREP\0\0";
 pub const PREPROCESSOR_VERSION: u32 = 1;
+const TABICL_V2: u32 = 1;
+pub(crate) const KUMO_TABULAR: u32 = 2;
 /// More classes than any classifier fit makes, so a corrupt count fails early.
 const MAX_CLASSES: usize = 10;
 
@@ -58,9 +63,7 @@ pub(crate) fn encode(
     training: Option<&Training>,
     checkpoint_sha256: &[u8; 32],
 ) -> Result<Vec<u8>> {
-    let mut bytes = PREPROCESSOR_MAGIC.to_vec();
-    write_u32(&mut bytes, PREPROCESSOR_VERSION);
-    bytes.extend(checkpoint_sha256);
+    let mut bytes = header(TABICL_V2, checkpoint_sha256);
     write_count(&mut bytes, preprocessor.feature_mask.len())?;
     bytes.extend(preprocessor.feature_mask.iter().map(|&kept| u8::from(kept)));
     for categories in &preprocessor.categories {
@@ -120,6 +123,136 @@ pub(crate) fn encode(
     let digest = sha256(&bytes);
     bytes.extend(digest);
     Ok(bytes)
+}
+
+fn header(architecture: u32, checkpoint_sha256: &[u8; 32]) -> Vec<u8> {
+    let mut bytes = PREPROCESSOR_MAGIC.to_vec();
+    write_u32(&mut bytes, PREPROCESSOR_VERSION);
+    write_u32(&mut bytes, architecture);
+    bytes.extend(checkpoint_sha256);
+    bytes
+}
+
+/// Kumo-Tabular's training data as `IRPREP` bytes, from which loading fits
+/// again, as deterministic as fitting: after the header, the members (u64)
+/// and the seed (i128), the feature names as for `TabICLv2`, the input
+/// features (u64) and each one's categories, as for `TabICLv2`, the training
+/// rows (u64), the encoded `[rows, features]` matrix (f64), each row's label
+/// as the classes are written, and the SHA-256 of everything before it.
+pub(crate) fn encode_kumo_tabular(
+    training: &kumo_tabular::fitted::Training,
+    checkpoint_sha256: &[u8; 32],
+) -> Result<Vec<u8>> {
+    let mut bytes = header(KUMO_TABULAR, checkpoint_sha256);
+    write_count(&mut bytes, training.members)?;
+    bytes.extend(training.seed.to_le_bytes());
+    let names = training.feature_names.as_deref().unwrap_or_default();
+    write_count(&mut bytes, names.len())?;
+    write_strings(&mut bytes, names)?;
+    write_count(&mut bytes, training.categories.len())?;
+    for categories in &training.categories {
+        write_count(&mut bytes, categories.as_ref().map_or(0, Labels::len))?;
+        write_labels(&mut bytes, categories.as_ref())?;
+    }
+    write_count(&mut bytes, training.labels.len())?;
+    for value in &training.x {
+        bytes.extend(value.to_le_bytes());
+    }
+    write_labels(&mut bytes, Some(&training.labels))?;
+    let digest = sha256(&bytes);
+    bytes.extend(digest);
+    Ok(bytes)
+}
+
+/// The checkpoint's SHA-256 and the training data that
+/// [`encode_kumo_tabular`] wrote.
+pub(crate) fn decode_kumo_tabular(bytes: &[u8]) -> Result<([u8; 32], kumo_tabular::fitted::Training)> {
+    let (mut reader, checkpoint_sha256) = open(bytes, KUMO_TABULAR)?;
+    let members = reader.read_count("members")?;
+    if members == 0 || members > MAX_MEMBERS {
+        return Err(artifact_error("IRPREP has an invalid number of members"));
+    }
+    let seed = i128::from_le_bytes(reader.read_array()?);
+    let names = reader.read_count("feature names")?;
+    let feature_names = read_strings(&mut reader, names)?;
+    let features = reader.read_count("input features")?;
+    let categories: Vec<Option<Labels>> = (0..features)
+        .map(|_| {
+            let count = reader.read_count("categories")?;
+            read_labels(&mut reader, count)
+        })
+        .collect::<Result<_>>()?;
+    if features == 0 || (names != 0 && names != features) {
+        return Err(artifact_error("IRPREP has inconsistent features"));
+    }
+    let rows = reader.read_count("training rows")?;
+    let x = reader.read_f64s(
+        rows.checked_mul(features)
+            .ok_or_else(|| artifact_error("IRPREP length overflows usize"))?,
+    )?;
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::float_cmp,
+        reason = "Category counts stay far below 2^53, and codes are exact"
+    )]
+    let codes_valid = x.chunks(features).all(|row| {
+        row.iter().zip(&categories).all(|(&value, categories)| {
+            categories.as_ref().is_none_or(|categories| {
+                value == -1.0 || (value.fract() == 0.0 && (0.0..categories.len() as f64).contains(&value))
+            })
+        })
+    });
+    let labels = read_labels(&mut reader, rows)?.ok_or_else(|| artifact_error("IRPREP has no labels"))?;
+    if rows == 0 || !codes_valid || !reader.is_empty() {
+        return Err(artifact_error("IRPREP has invalid training data"));
+    }
+    let training = kumo_tabular::fitted::Training {
+        x,
+        categories,
+        labels,
+        members,
+        seed,
+        feature_names: (names != 0).then_some(feature_names),
+    };
+    Ok((checkpoint_sha256, training))
+}
+
+/// The architecture of the `IRPREP` `bytes`, from their header alone.
+pub(crate) fn architecture(bytes: &[u8]) -> Result<u32> {
+    let mut reader = ByteReader::new(bytes);
+    if reader.read_array::<8>()? != PREPROCESSOR_MAGIC {
+        return Err(artifact_error("not fitted preprocessing (IRPREP)"));
+    }
+    reader.read_u32()?;
+    reader.read_u32()
+}
+
+/// A reader after the checked header of `bytes`, which must be for
+/// `architecture`, and the checkpoint's SHA-256.
+fn open(bytes: &[u8], expected: u32) -> Result<(ByteReader<'_>, [u8; 32])> {
+    let header = PREPROCESSOR_MAGIC.len() + 4 + 4 + 32;
+    if bytes.len() < header + CHECKSUM_BYTES {
+        return Err(artifact_error("IRPREP is truncated"));
+    }
+    let (body, digest) = bytes.split_at(bytes.len() - CHECKSUM_BYTES);
+    if sha256(body) != digest {
+        return Err(artifact_error("IRPREP checksum mismatch"));
+    }
+    let mut reader = ByteReader::new(body);
+    if reader.read_array::<8>()? != PREPROCESSOR_MAGIC {
+        return Err(artifact_error("not fitted preprocessing (IRPREP)"));
+    }
+    let version = reader.read_u32()?;
+    if version != PREPROCESSOR_VERSION {
+        return Err(artifact_error(format!(
+            "unsupported IRPREP version {version}; expected {PREPROCESSOR_VERSION}"
+        )));
+    }
+    if reader.read_u32()? != expected {
+        return Err(artifact_error("IRPREP is for another model"));
+    }
+    let checkpoint_sha256 = reader.read_array::<32>()?;
+    Ok((reader, checkpoint_sha256))
 }
 
 /// `labels`' kind and values, without their count.
@@ -248,31 +381,14 @@ pub(crate) fn checkpoint_sha256(bytes: &[u8]) -> Result<[u8; 32]> {
         return Err(artifact_error("not fitted preprocessing (IRPREP)"));
     }
     reader.read_u32()?;
+    reader.read_u32()?;
     reader.read_array()
 }
 
 /// The checkpoint's SHA-256, the preprocessor, and the training rows, when
 /// they were written, that `encode` wrote.
 pub(crate) fn decode(bytes: &[u8]) -> Result<([u8; 32], Preprocessor, Option<Training>)> {
-    let header = PREPROCESSOR_MAGIC.len() + 4 + 32;
-    if bytes.len() < header + CHECKSUM_BYTES {
-        return Err(artifact_error("IRPREP is truncated"));
-    }
-    let (body, digest) = bytes.split_at(bytes.len() - CHECKSUM_BYTES);
-    if sha256(body) != digest {
-        return Err(artifact_error("IRPREP checksum mismatch"));
-    }
-    let mut reader = ByteReader::new(body);
-    if reader.read_array::<8>()? != PREPROCESSOR_MAGIC {
-        return Err(artifact_error("not fitted preprocessing (IRPREP)"));
-    }
-    let version = reader.read_u32()?;
-    if version != PREPROCESSOR_VERSION {
-        return Err(artifact_error(format!(
-            "unsupported IRPREP version {version}; expected {PREPROCESSOR_VERSION}"
-        )));
-    }
-    let checkpoint_sha256 = reader.read_array::<32>()?;
+    let (mut reader, checkpoint_sha256) = open(bytes, TABICL_V2)?;
     let features_in = reader.read_count("input features")?;
     let feature_mask = read_flags(&mut reader, features_in)?;
     let categories = (0..features_in)

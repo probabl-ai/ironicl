@@ -31,7 +31,8 @@ fitted preprocessing with its training rows (`IRPREP`), and optionally the train
 writes them as a model directory, with the weights in a shared folder
 ([cli.md](cli.md#model-directories-and-weights)).
 
-`IRPREP` v1 holds the checkpoint's SHA-256 (32 bytes, as `IRCNTXT` stores it), the feature mask,
+`IRPREP` v1 starts with the architecture, as `IRMODEL` names it. For TabICLv2 (1) it holds the
+checkpoint's SHA-256 (32 bytes, as `IRCNTXT` stores it), the feature mask,
 each input feature's categories (none for a numeric feature),
 the normalization groups, each member's group and feature and class order, the class labels
 (integers, floats, booleans, or UTF-8 text) with the classifier's `softmax_temperature` and
@@ -47,6 +48,13 @@ Loading refuses an `IRPREP` fitted with another checkpoint. With a context, it c
 context matches the preprocessing: checkpoint, `B`, `H`, class count, and each member's
 permutations. Without one, it builds the context from the training rows that `IRPREP` holds, as
 fitting does, so the same context.
+
+For Kumo-Tabular (2), `IRPREP` holds the checkpoint's SHA-256, the members and the seed, the
+feature names, each input feature's categories, and the training data: the encoded `[rows,
+features]` matrix as `f64` (NaN for a missing number, -1 for a missing category) and each row's
+label. Loading fits again from them, which gives the same model; Kumo-Tabular has no `IRCNTXT`.
+Decoding checks every length against the bytes left, and that each category code is -1 or one of
+its feature's categories.
 
 Neither `IRPREP` nor `IRCNTXT` is signed yet: the digests detect corruption, not tampering.
 

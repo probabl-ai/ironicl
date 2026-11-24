@@ -80,19 +80,19 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
     if let Some(warning) = &prepared.warning {
         eprintln!("warning: {warning}");
     }
-    let cache = if prepared.built {
+    let cache = if let directory::Fitted::KumoTabular(_) = prepared.model {
+        format!("fitted in {:.1} s", start.elapsed().as_secs_f64())
+    } else if prepared.built {
         format!("KV cache built in {:.1} s", start.elapsed().as_secs_f64())
     } else {
         "KV cache loaded".to_owned()
     };
     let model = prepared.model;
-    let preprocessor = model.preprocessed().preprocessor();
-    let (task, features) = (model.task(), preprocessor.n_features_in());
-    let (categories, classes, aggregation, feature_names) = (
-        preprocessor.categories().to_vec(),
-        preprocessor.classes().cloned(),
-        preprocessor.aggregation.unwrap_or_default(),
-        preprocessor.feature_names.clone(),
+    let (task, features) = (model.task(), model.categories().len());
+    let (categories, classes, feature_names) = (
+        model.categories().to_vec(),
+        model.classes().cloned(),
+        model.feature_names().map(<[String]>::to_vec),
     );
     let device = model.device();
     let max_batch_rows = args.max_batch_rows.unwrap_or(if device == "cpu" {
@@ -103,9 +103,7 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
     let queue = Arc::new(Queue::new(args.max_queue));
     let worker = Worker {
         model,
-        features,
         classes,
-        aggregation,
         max_batch_rows,
         queue: Arc::clone(&queue),
     };

@@ -1,7 +1,8 @@
 # Python Package
 
 The `ironicl` Python package replaces TabICL's `TabICLClassifier` and
-`TabICLRegressor`. It requires
+`TabICLRegressor`, and runs NVIDIA's Kumo-Tabular as `KumoTabularClassifier`
+([kumo-tabular.md](kumo-tabular.md)). It requires
 Python 3.12+, NumPy, and scikit-learn. It does not depend on TabICL or
 PyTorch. Building it from source requires Rust, because maturin compiles the
 private `ironicl._core` extension module, which preprocesses, builds the

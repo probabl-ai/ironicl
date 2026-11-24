@@ -18,7 +18,7 @@ use super::{
     request::Rows,
     response::{classifier_response, regressor_response},
 };
-use crate::{ClassifierAggregation, Features, FittedModel, Labels, RegressionOutput};
+use crate::{Labels, RegressionOutput, models::tabicl_v2::directory::Fitted};
 
 /// A checked request: its rows and the outputs it asks for.
 pub(super) struct Query {
@@ -103,10 +103,8 @@ impl Queue {
 
 /// Owns the model and predicts each batch of queued queries at once.
 pub(super) struct Worker {
-    pub model: FittedModel,
-    pub features: usize,
+    pub model: Fitted,
     pub classes: Option<Labels>,
-    pub aggregation: ClassifierAggregation,
     pub max_batch_rows: usize,
     pub queue: Arc<Queue>,
 }
@@ -163,12 +161,9 @@ impl Worker {
             .iter()
             .flat_map(|query| query.rows.values.iter().copied())
             .collect();
-        let x = Features::F64(&values);
         if let Some(classes) = &self.classes {
-            let probabilities = self
-                .model
-                .predict_probabilities(x, self.features, self.aggregation)?;
-            let mut rows = probabilities.values().chunks(classes.len());
+            let probabilities = self.model.predict_probabilities(&values)?;
+            let mut rows = probabilities.chunks(classes.len());
             return Ok(queries
                 .iter()
                 .map(|query| {
@@ -192,7 +187,7 @@ impl Worker {
             })
             .collect();
         let (merged, picks) = merge_outputs(requested.iter().map(|(outputs, _)| *outputs));
-        let results = self.model.predict_regression(x, self.features, &merged)?;
+        let results = self.model.predict_regression(&values, &merged)?;
         let mut start = 0;
         Ok(queries
             .iter()

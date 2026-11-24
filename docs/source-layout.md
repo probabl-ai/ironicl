@@ -46,7 +46,10 @@ src/
 │                                  tabicl_v2 (the fused block and column kernels)
 ├── models/
 │   ├── kumo_tabular/
-│   │   └── mod.rs                 sizes, released checkpoints, tensor manifests
+│   │   ├── mod.rs                 sizes, released checkpoints, tensor manifests
+│   │   ├── preprocess.rs          NVIDIA's recipe and the random draws
+│   │   ├── cpu.rs                 the forward pass and a member's context
+│   │   └── fitted.rs              the fitted ensemble
 │   └── tabicl_v2/
 │       ├── mod.rs                 Device: where a context predicts
 │       ├── cpu.rs                 Executor, StaticExecutor
@@ -60,7 +63,8 @@ src/
 │       ├── preprocess.rs          TabICL's preprocessing pipeline
 │       ├── ensemble.rs            its ensemble: groups, feature and class orders
 │       ├── fitted.rs              the fitted model
-│       └── directory.rs           model directories: export, prepare, inspect
+│       └── directory.rs           model directories, of either model: export,
+│                                  prepare, inspect
 ├── format/
 │   ├── mod.rs                     container primitives
 │   ├── model.rs                   model artifacts (IRMODEL)

@@ -26,6 +26,10 @@ use crate::{
     ClassifierAggregation, DEFAULT_ALPHAS, Error, Executor, Features, Labels, NormMethod, Optimize,
     PreprocessOptions, RegressionOutput, StaticExecutor, Targets, TaskKind, load_checkpoint_model,
     memory::{Builder, MemoryLimits, Verdict},
+    models::kumo_tabular::{
+        cpu,
+        fitted::{Fitted, Training},
+    },
     models::tabicl_v2::preprocess::flatten_orders,
     plan_context,
     preprocess::columns::{self, Column},
@@ -97,8 +101,16 @@ impl Model {
     /// memory when the cache is not writable, and load it.
     #[new]
     fn new(py: Python<'_>, checkpoint: PathBuf) -> PyResult<Self> {
-        py.detach(|| load_checkpoint_model(&checkpoint).map(|model| Self(Executor::new(model))))
-            .map_err(py_error)
+        py.detach(|| {
+            let model = load_checkpoint_model(&checkpoint)?;
+            if let crate::ModelProfile::KumoTabular(_) = model.summary().profile {
+                return Err(Error::InvalidArgument(
+                    "the checkpoint is Kumo-Tabular's; use KumoTabularClassifier".into(),
+                ));
+            }
+            Ok(Self(Executor::new(model)))
+        })
+        .map_err(py_error)
     }
 
     /// Build the context of `preprocess`'s result. `optimize` is `"safe"`, `"auto"`,
@@ -342,6 +354,14 @@ impl Matrix {
     fn columns(&self) -> usize {
         match self {
             Self::F32 { columns, .. } | Self::F64 { columns, .. } => *columns,
+        }
+    }
+
+    /// The values as float64, exactly.
+    fn into_f64(self) -> Vec<f64> {
+        match self {
+            Self::F32 { values, .. } => values.into_iter().map(f64::from).collect(),
+            Self::F64 { values, .. } => values,
         }
     }
 }
@@ -747,12 +767,135 @@ fn profile_reset() {
     crate::profile::reset();
 }
 
+/// A loaded Kumo-Tabular checkpoint.
+#[pyclass(frozen)]
+struct KumoTabular(Arc<cpu::Model>);
+
+#[pymethods]
+impl KumoTabular {
+    /// Import a checkpoint as `Model` does, and load it.
+    #[new]
+    fn new(py: Python<'_>, checkpoint: PathBuf) -> PyResult<Self> {
+        py.detach(|| load_checkpoint_model(&checkpoint).and_then(cpu::Model::new))
+            .map(|model| Self(Arc::new(model)))
+            .map_err(py_error)
+    }
+
+    #[getter]
+    fn task(&self) -> String {
+        self.0.release.task.to_string()
+    }
+
+    /// Fit on `x`, as `preprocess` reads it, and the class `labels`
+    /// (`(kind, values)`). `threads` sets the worker threads, `None` all.
+    /// `progress` receives `("build", members built, members)`.
+    #[expect(clippy::too_many_arguments, reason = "mirrors the Python call's parameters")]
+    #[pyo3(signature = (x, labels, n_estimators, random_state, threads=None, feature_names=None, progress=None))]
+    fn fit(
+        &self,
+        py: Python<'_>,
+        x: Bound<'_, PyAny>,
+        labels: (String, Bound<'_, PyAny>),
+        n_estimators: usize,
+        random_state: i128,
+        threads: Option<usize>,
+        feature_names: Option<Vec<String>>,
+        progress: Option<Py<PyAny>>,
+    ) -> PyResult<KumoFitted> {
+        let raw = RawFeatures::read(py, &x)?;
+        let labels = read_labels(py, labels)?;
+        let model = Arc::clone(&self.0);
+        run(py, progress, move || {
+            let (matrix, categories) = raw.fit()?;
+            let training = Training {
+                x: matrix.into_f64(),
+                categories,
+                labels,
+                members: n_estimators,
+                seed: random_state,
+                feature_names,
+            };
+            Fitted::fit(model, training, threads)
+        })
+        .map(KumoFitted)
+    }
+
+    /// Load what `KumoFitted.to_bytes` saved, fitting again, as `fit` does.
+    #[pyo3(signature = (data, threads=None, progress=None))]
+    fn load(
+        &self,
+        py: Python<'_>,
+        data: Vec<u8>,
+        threads: Option<usize>,
+        progress: Option<Py<PyAny>>,
+    ) -> PyResult<KumoFitted> {
+        let model = Arc::clone(&self.0);
+        run(py, progress, move || Fitted::from_bytes(model, &data, threads)).map(KumoFitted)
+    }
+}
+
+/// A fitted Kumo-Tabular classifier.
+#[pyclass(frozen)]
+struct KumoFitted(Fitted);
+
+#[pymethods]
+impl KumoFitted {
+    /// Which input features are categorical.
+    #[getter]
+    fn categorical(&self) -> Vec<bool> {
+        self.0.training().categories.iter().map(Option::is_some).collect()
+    }
+
+    /// `(probabilities as float32 bytes, [rows, classes])` for `x`, as `fit` reads it.
+    #[pyo3(signature = (x, progress=None))]
+    fn predict_proba<'py>(
+        &self,
+        py: Python<'py>,
+        x: Bound<'_, PyAny>,
+        progress: Option<Py<PyAny>>,
+    ) -> PyResult<(Bound<'py, PyBytes>, [usize; 2])> {
+        let raw = RawFeatures::read(py, &x)?;
+        let categories = &self.0.training().categories;
+        let classes = self.0.classes().len();
+        let values = run(py, progress, || {
+            let matrix = raw.encode(categories)?;
+            if matrix.columns() != categories.len() {
+                return Err(Error::InvalidArgument(format!(
+                    "X has {} features; expected {}",
+                    matrix.columns(),
+                    categories.len()
+                )));
+            }
+            self.0.predict_proba(&matrix.into_f64())
+        })?;
+        Ok((f32_bytes(py, &values), [values.len() / classes, classes]))
+    }
+
+    /// Write the model directory `path` for `ironicl serve`, and import
+    /// `checkpoint`, the model's, into the shared weights folder when it is
+    /// not there.
+    fn export(&self, py: Python<'_>, path: PathBuf, checkpoint: PathBuf) -> PyResult<()> {
+        py.detach(|| {
+            crate::prepare_checkpoint(&checkpoint, &crate::CheckpointCacheOptions::default())?;
+            crate::models::tabicl_v2::directory::write_kumo_tabular(&path, &self.0)
+        })
+        .map_err(py_error)
+    }
+
+    /// The `IRPREP` bytes `KumoTabular.load` loads.
+    fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
+        Ok(PyBytes::new(py, &self.0.to_bytes().map_err(py_error)?))
+    }
+}
+
 #[pymodule]
 #[pyo3(name = "_core")]
 fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Model>()?;
     module.add_class::<Preprocessed>()?;
     module.add_class::<FittedModel>()?;
+    module.add_class::<KumoTabular>()?;
+    module.add_class::<KumoFitted>()?;
     module.add_function(wrap_pyfunction!(preprocess, module)?)?;
     module.add_function(wrap_pyfunction!(parse_size, module)?)?;
     module.add_function(wrap_pyfunction!(cache_dir, module)?)?;

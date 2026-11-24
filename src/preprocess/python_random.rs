@@ -47,6 +47,16 @@ impl PythonRandom {
         (high << 32) | low
     }
 
+    /// `random()`: a float in [0, 1) from 53 random bits.
+    ///
+    /// Port of <https://github.com/python/cpython/blob/v3.12.13/Modules/_randommodule.c#L178-L187>.
+    #[expect(clippy::cast_precision_loss, reason = "53 bits are exact in f64")]
+    pub(crate) fn random(&mut self) -> f64 {
+        let high = u64::from(self.0.next_u32() >> 5);
+        let low = u64::from(self.0.next_u32() >> 6);
+        ((high << 26) | low) as f64 / (1_u64 << 53) as f64
+    }
+
     /// `_randbelow(n)`: a uniform integer in `0..n`, by rejection over
     /// `n.bit_length()` bits.
     ///
@@ -128,6 +138,16 @@ impl PythonRandom {
 mod tests {
     use super::PythonRandom;
     use crate::preprocess::integers as numbers;
+
+    #[test]
+    fn random_matches_cpython() {
+        // random.Random(0).random(), twice.
+        let mut rng = PythonRandom::new(0);
+        assert_eq!(
+            [rng.random(), rng.random()],
+            [0.844_421_851_525_048_1, 0.757_954_402_940_302_5]
+        );
+    }
 
     #[test]
     fn draws_match_cpython() {
