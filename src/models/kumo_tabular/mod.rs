@@ -4,6 +4,10 @@
 //! Port of <https://github.com/NVIDIA/structured-data-models/blob/3fdf108a1f1b719b1b983373b71bbba79fcab7e6/sdm/models/kumo/tabular/model.py#L24-L64>.
 //! The weights are under OpenMDW-1.1; see `docs/kumo-tabular.md`.
 
+pub mod cpu;
+pub mod fitted;
+pub mod preprocess;
+
 use std::{collections::BTreeMap, fmt};
 
 use crate::TaskKind;

@@ -1,8 +1,9 @@
-"""TabICLv2 inference without PyTorch."""
+"""TabICLv2 and Kumo-Tabular inference without PyTorch."""
 
 from ironicl.cache import CacheEntry, CacheInfo, cache_info, clear_cache
 from ironicl.classifier import TabICLClassifier
 from ironicl.config import show_config
+from ironicl.kumo import KumoTabularClassifier
 from ironicl.memory import IroniclMemoryError, IroniclMemoryWarning, MemoryPlan, plan_memory
 from ironicl.regressor import TabICLRegressor
 
@@ -11,6 +12,7 @@ __all__ = [
     "CacheInfo",
     "IroniclMemoryError",
     "IroniclMemoryWarning",
+    "KumoTabularClassifier",
     "MemoryPlan",
     "TabICLClassifier",
     "TabICLRegressor",

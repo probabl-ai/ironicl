@@ -31,7 +31,8 @@ fitted preprocessing with its training rows (`IRPREP`), and optionally the train
 writes them as a model directory, with the weights in a shared folder
 ([cli.md](cli.md#model-directories-and-weights)).
 
-`IRPREP` v1 holds the checkpoint's SHA-256 (32 bytes, as `IRCNTXT` stores it), the feature mask,
+`IRPREP` v1 starts with the architecture, as `IRMODEL` names it. For TabICLv2 (1) it holds the
+checkpoint's SHA-256 (32 bytes, as `IRCNTXT` stores it), the feature mask,
 each input feature's categories (none for a numeric feature),
 the normalization groups, each member's group and feature and class order, the class labels
 (integers, floats, booleans, or UTF-8 text) with the classifier's `softmax_temperature` and
@@ -47,6 +48,14 @@ Loading refuses an `IRPREP` fitted with another checkpoint. With a context, it c
 context matches the preprocessing: checkpoint, `B`, `H`, class count, and each member's
 permutations. Without one, it builds the context from the training rows that `IRPREP` holds, as
 fitting does, so the same context.
+
+For Kumo-Tabular (2), `IRPREP` holds the checkpoint's SHA-256, the members and the seed, the
+feature names, each input feature's categories, and the training data: the encoded `[rows,
+features]` matrix as `f64` (NaN for a missing number, -1 for a missing category) and each row's
+label. Loading fits the preprocessing again from them, and the contexts too unless `IRCNTXT`
+holds them, which gives the same model.
+Decoding checks every length against the bytes left, and that each category code is -1 or one of
+its feature's categories.
 
 Neither `IRPREP` nor `IRCNTXT` is signed yet: the digests detect corruption, not tampering.
 
@@ -121,6 +130,21 @@ and, in version 2, its dtype. The executor requires exactly these tensors:
 Tensor dimensions are logical. The CPU attention kernels pack each key tile in dimension-major
 order into scratch, so one AVX-512 vector holds source lanes while a query dimension is
 broadcast. Values stay source-major, so one sequential value row updates all query accumulators.
+
+A Kumo-Tabular context has header kind 2, and in place of TabICLv2's architecture values its
+cell width, column layers, inducing points, ICL width, and outputs (10 or 999), which name the
+release. It has no permutations, class count 0, and `optimize` `safe`. `B` counts its contexts,
+one per member and codebook task, named `{member}.{task}`; `N` and `H` are the training rows and
+the training data's features. A member keeps `C` of its preprocessed columns, which loading checks
+against the preprocessing it fits from `IRPREP`. Each context holds exactly these FP32 tensors,
+which loading checks by shape:
+
+- `{member}.{task}.means` and `.categorical`, `[C]`: the imputation means and the columns'
+  kinds (1 for category codes);
+- `{member}.{task}.columns.{key,value}`, `[layers, C, heads, inducing points, head dim]`;
+- `{member}.{task}.icl.{key,value}`, `[layers, 1, 2 or heads, N, head dim]`.
+
+Its identity is the SHA-256 of the model's `IRPREP`, so it loads only with that fit.
 
 Ironicl no longer reads the optional `icl.index.*` sparse-attention tensors; a context that has
 them loads with them ignored. See

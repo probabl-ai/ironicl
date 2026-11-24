@@ -620,6 +620,7 @@ mod tests {
         let inputs = fitted.training_inputs().unwrap();
         let [members, rows, features] = inputs.shape;
         let metadata = StaticContextMetadata {
+            architecture: crate::format::static_context::ContextArchitecture::TabIclV2,
             model_sha256: SHA,
             context_sha256: [1; 32],
             ensemble_count: members,

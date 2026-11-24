@@ -48,12 +48,16 @@ src/
 │                                  packing heads), fp8, linear, tabicl_v2 (the
 │                                  fused block and column kernels)
 ├── models/
-│   ├── checkpoint.rs              checkpoint import, of any model
+│   ├── checkpoint.rs              checkpoint import, of either model
 │   ├── checkpoint_cache.rs        imported weights, by checkpoint SHA-256
-│   ├── directory.rs               model directories: export, prepare, inspect
+│   ├── directory.rs               model directories, of either model: export,
+│   │                              prepare, inspect
 │   ├── quantiles.rs               regression outputs from quantiles, of any model
 │   ├── kumo_tabular/
-│   │   └── mod.rs                 sizes, released checkpoints, tensor manifests
+│   │   ├── mod.rs                 sizes, released checkpoints, tensor manifests
+│   │   ├── preprocess.rs          NVIDIA's recipe and the random draws
+│   │   ├── cpu.rs                 the forward pass and a member's context
+│   │   └── fitted.rs              the fitted ensemble
 │   └── tabicl_v2/
 │       ├── mod.rs                 Device: where a context predicts
 │       ├── cpu.rs                 Executor, StaticExecutor
