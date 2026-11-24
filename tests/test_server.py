@@ -75,13 +75,21 @@ class ServerTest(unittest.TestCase):
         self.directory = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.directory)
 
-    def serve(self, model) -> str:
-        """Export `model`, serve it, and return its predict URL."""
+    def serve(self, model, log: str | None = None) -> str:
+        """Export `model`, serve it as `self.server` at the `RUST_LOG` level
+        `log`, logging to `self.log`, and return its predict URL."""
         path = self.directory / type(model).__name__
-        model.export(path)
+        if not path.exists():
+            model.export(path)
         port = free_port()
         command = [os.environ["IRONICL_BIN"], "serve", str(path), "--bind", f"127.0.0.1:{port}"]
-        server = subprocess.Popen(command, stdout=subprocess.DEVNULL)
+        environment = {key: value for key, value in os.environ.items() if key != "RUST_LOG"}
+        if log:
+            environment["RUST_LOG"] = log
+        self.log = self.directory / f"server-{port}.log"
+        with open(self.log, "w") as output:
+            server = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=output, env=environment)
+        self.server = server
         self.addCleanup(server.wait)
         self.addCleanup(server.terminate)
         deadline = time.monotonic() + 300
@@ -127,6 +135,20 @@ class ServerTest(unittest.TestCase):
         missing["color"] = [None, "purple", "red"]  # Missing, and a category training never saw.
         answer = self.post(url, missing.to_json(orient="split", index=False))
         np.testing.assert_allclose(answer["probabilities"], model.predict_proba(missing), atol=1e-4)
+
+    def test_debug_logs_each_request_and_sigterm_stops_the_server(self):
+        model = fitted(TabICLClassifier)
+        x, _ = data()
+        for log, expected in ((None, []), ("debug", ["status=200 rows=2", "status=400"])):
+            url = self.serve(model, log)
+            self.post(url, json.dumps({"data": x[:2].tolist()}))
+            self.post(url, json.dumps({"data": [[1]]}))
+            self.server.terminate()
+            self.assertEqual(self.server.wait(timeout=10), 0)
+            lines = [line for line in self.log.read_text().splitlines() if " predict " in line]
+            self.assertEqual(len(lines), len(expected), lines)
+            for line, fields in zip(lines, expected):
+                self.assertIn(fields, line)
 
     def test_a_regressor_takes_options_next_to_the_dataframe(self):
         checkpoint(TabICLRegressor)

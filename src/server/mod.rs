@@ -1,7 +1,9 @@
 //! `ironicl serve`: an HTTP server for one model directory.
 //!
-//! `POST /v1/predict` takes `{"rows": [[...], ...]}` and options named after
-//! `TabICL`'s predict arguments, and answers with one key per output.
+//! `POST /v1/predict` takes a table as pandas'
+//! `to_json(orient="split", index=False)` writes it, `{"columns": [...],
+//! "data": [[...], ...]}`, and options named after `TabICL`'s predict
+//! arguments, and answers with one key per output.
 //! `GET /v1/health` answers once the model is loaded. [`api`] checks each
 //! request and queues it; the [`worker`] thread owns the model and predicts the
 //! queued requests together, in batches of up to `--max-batch-rows` rows. A
@@ -57,8 +59,12 @@ impl Server {
             enqueued_at: Instant::now(),
             reply,
         };
-        self.jobs.send(job).map_err(|_| ApiError::worker_stopped())?;
-        answer.await.map_err(|_| ApiError::worker_stopped())?
+        self.jobs
+            .send(job)
+            .map_err(|_| ApiError::internal("the prediction worker stopped"))?;
+        answer
+            .await
+            .map_err(|_| ApiError::internal("the prediction worker stopped"))?
     }
 }
 
@@ -70,6 +76,7 @@ impl Server {
 /// As [`directory::prepare`], when the warm-up fails, or when the address
 /// cannot be bound.
 pub fn serve(args: &ServeArgs) -> Result<()> {
+    init_logging()?;
     let weights = args
         .weights
         .clone()
@@ -78,7 +85,7 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
     let limits = MemoryLimits::resolve(None, None)?;
     let prepared = directory::prepare(&args.dir, &weights, args.optimize, None, limits)?;
     if let Some(warning) = &prepared.warning {
-        eprintln!("warning: {warning}");
+        tracing::warn!("{warning}");
     }
     let cache = if prepared.built {
         format!("KV cache built in {:.1} s", start.elapsed().as_secs_f64())
@@ -126,7 +133,7 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
     // keep answering /v1/health; a supervisor restarts it.
     std::thread::spawn(move || {
         if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker.run(&receiver))).is_err() {
-            eprintln!("the prediction worker panicked; exiting");
+            tracing::error!("the prediction worker panicked; exiting");
             std::process::exit(1);
         }
     });
@@ -143,19 +150,55 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
         .map_err(failed)?
         .block_on(async {
             let listener = tokio::net::TcpListener::bind(args.bind).await.map_err(failed)?;
-            println!(
-                "Serving {} ({task}, {features} features) on http://{} ({device}, {}; {cache}; \
+            tracing::info!(
+                "serving {} ({task}, {features} features) on http://{} ({device}, {}; {cache}; \
                  batches of up to {max_batch_rows} rows, waits of up to {} ms)",
                 args.dir.display(),
                 args.bind,
                 prepared.optimize,
                 args.max_queue.as_millis()
             );
+            if !args.bind.ip().is_loopback() {
+                tracing::warn!(
+                    "serving on {}; a real deployment needs a reverse proxy in front (docs/server.md)",
+                    args.bind
+                );
+            }
             axum::serve(listener, app)
-                .with_graceful_shutdown(async {
-                    let _ = tokio::signal::ctrl_c().await;
-                })
+                .with_graceful_shutdown(stop_signal())
                 .await
                 .map_err(failed)
         })
+}
+
+/// Ctrl-C, or SIGTERM on Unix, as service managers stop a process.
+async fn stop_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let mut terminate = signal(SignalKind::terminate()).expect("a SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = tokio::signal::ctrl_c().await;
+    tracing::info!("shutting down");
+}
+
+/// Log to stderr at the level `RUST_LOG` sets, `info` when it is unset.
+fn init_logging() -> Result<()> {
+    use tracing_subscriber::EnvFilter;
+    let filter = match std::env::var_os("RUST_LOG") {
+        None => EnvFilter::new("info"),
+        Some(_) => EnvFilter::try_from_default_env()
+            .map_err(|error| Error::InvalidConfig(format!("RUST_LOG: {error}")))?,
+    };
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .init();
+    Ok(())
 }

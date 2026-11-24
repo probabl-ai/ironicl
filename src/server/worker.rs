@@ -45,9 +45,10 @@ pub(super) struct Job {
     pub reply: oneshot::Sender<Reply>,
 }
 
-/// A response body and how long its request waited and its batch ran.
+/// A response body, its rows, and how long its request waited and its batch ran.
 pub(super) struct Answer {
     pub body: Vec<u8>,
+    pub rows: usize,
     pub queue: Duration,
     pub predict: Duration,
 }
@@ -145,8 +146,13 @@ impl Worker {
         match bodies {
             Ok(bodies) => {
                 for (job, body) in batch.into_iter().zip(bodies) {
-                    let queue = start - job.enqueued_at;
-                    let _ = job.reply.send(Ok(Answer { body, queue, predict }));
+                    let answer = Answer {
+                        body,
+                        rows: job.query.rows.count,
+                        queue: start - job.enqueued_at,
+                        predict,
+                    };
+                    let _ = job.reply.send(Ok(answer));
                 }
             }
             Err(error) => {

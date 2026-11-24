@@ -30,21 +30,46 @@ impl IntoResponse for Answer {
 }
 
 /// `POST /v1/predict`: check the request, then queue it for the next batch.
+/// Logs the outcome at debug level.
 pub(super) async fn predict(
     State(server): State<Arc<Server>>,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Answer, ApiError> {
+    let result = answer(server, body).await;
+    match &result {
+        Ok(answer) => tracing::debug!(
+            status = 200,
+            rows = answer.rows,
+            queue_ms = answer.queue.as_secs_f64() * 1e3,
+            predict_ms = answer.predict.as_secs_f64() * 1e3,
+            "predict"
+        ),
+        Err(error) => tracing::debug!(
+            status = error.status().as_u16(),
+            code = error.code(),
+            message = error.message(),
+            "predict"
+        ),
+    }
+    result
+}
+
+async fn answer(server: Arc<Server>, body: Result<Bytes, BytesRejection>) -> Result<Answer, ApiError> {
     let body = body?;
     // A full queue refuses the request before the work of parsing it.
     if !server.queue.has_room() {
         return Err(ApiError::overloaded());
     }
-    let request: PredictRequest =
-        serde_json::from_slice(&body).map_err(|error| ApiError::invalid(error.to_string()))?;
-    let request = request.check(&server.schema)?;
-    server
-        .submit(PredictRequest::into_query(request, &server.schema)?)
-        .await
+    // Parsing a large body takes CPU time; keep it off the threads serving connections.
+    let parsing = Arc::clone(&server);
+    let query = tokio::task::spawn_blocking(move || {
+        let request: PredictRequest =
+            serde_json::from_slice(&body).map_err(|error| ApiError::invalid(error.to_string()))?;
+        PredictRequest::into_query(request.check(&parsing.schema)?, &parsing.schema)
+    })
+    .await
+    .map_err(ApiError::internal)??;
+    server.submit(query).await
 }
 
 /// `GET /v1/health`: the model is loaded and warmed up.
