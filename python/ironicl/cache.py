@@ -17,13 +17,6 @@ SUFFIX = ".irctx"
 STALE_TEMPORARY_SECONDS = 3600
 
 
-def _checkpoints_dir(model: str | None = None) -> Path:
-    """Where downloaded checkpoints go: ``checkpoints`` in Ironicl's cache folder,
-    one folder per model, such as ``checkpoints/tabicl``."""
-    checkpoints = Path(_core.cache_dir()) / "checkpoints"
-    return checkpoints if model is None else checkpoints / model
-
-
 def _cache_dir(cache_dir) -> Path | None:
     """Resolve ``cache_dir`` HuggingFace-style.
 
