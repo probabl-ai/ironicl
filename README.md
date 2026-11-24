@@ -88,9 +88,8 @@ curl -s localhost:8080/v1/predict -d '{"data": [[5.1, 3.5, 1.4, 0.2]]}'
 {"labels": [0], "classes": [0, 1, 2], "probabilities": [[0.9999957, 0.0000031, 0.0000012]]}
 ```
 
-To serve on another machine, copy `my-model/` there and run `ironicl import` on
-the checkpoint once; the server builds the KV cache for that machine on first
-start. NVIDIA GPUs need a CUDA build ([CUDA build targets](docs/source-layout.md#cuda-build-targets)).
+To serve on another machine, copy `my-model/` there and run `ironicl import CHECKPOINT --model tabicl`
+once; the server builds the KV cache for that machine on first start. NVIDIA GPUs need a CUDA build ([CUDA build targets](docs/source-layout.md#cuda-build-targets)).
 See [Server](docs/server.md) for the API, sending a pandas DataFrame, batching, and measured
 throughput.
 

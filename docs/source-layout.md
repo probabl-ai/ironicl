@@ -52,6 +52,8 @@ src/
 │   ├── checkpoint_cache.rs        imported weights, by checkpoint SHA-256
 │   ├── directory.rs               model directories: export, prepare, inspect
 │   ├── quantiles.rs               regression outputs from quantiles, of any model
+│   ├── kumo_tabular/
+│   │   └── mod.rs                 sizes, released checkpoints, tensor manifests
 │   └── tabicl_v2/
 │       ├── mod.rs                 Device: where a context predicts
 │       ├── cpu.rs                 Executor, StaticExecutor
@@ -133,4 +135,4 @@ Not planned or ready; recorded so the layout can take them.
   attention may not map well.
 - **ROCm/HIP** as an alternative to Vulkan on AMD: `kernels/rocm/arch/` by
   `gfx` target.
-- More models under `models/`, such as Kumo-Tabular.
+- More models under `models/`. Kumo-Tabular is in progress ([kumo-tabular.md](kumo-tabular.md)).

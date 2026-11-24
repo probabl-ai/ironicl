@@ -16,12 +16,14 @@ use crate::{
     ModelArtifact, TaskKind,
     error::{Error, Result},
     format::model::{
-        ModelArtifactData, ModelConfig, ModelTensor, ModelTensorDType, encode_model_artifact,
+        ModelArtifactData, ModelConfig, ModelTensor, ModelTensorDType, TabIclV2Config, encode_model_artifact,
         write_model_artifact,
     },
+    models::kumo_tabular::Release,
 };
 
-const MAX_ARCHIVE_BYTES: u64 = 512 * 1024 * 1024;
+/// Kumo-Tabular large is about 860 MB.
+const MAX_ARCHIVE_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: usize = 4096;
 const MAX_PICKLE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PICKLE_OPS: usize = 1_000_000;
@@ -31,7 +33,7 @@ const MAX_PICKLE_OBJECT_DEPTH: usize = 64;
 const MAX_PICKLE_OBJECT_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_TENSOR_COUNT: usize = 4096;
 const MAX_TENSOR_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_TOTAL_TENSOR_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_TOTAL_TENSOR_BYTES: u64 = 1000 * 1024 * 1024;
 const MAX_TENSOR_RANK: usize = 16;
 
 const CLASSIFIER_SHA256: &str = "bdc7dbd5e4ff21f8f0456fcf90c6b7cdf72dbea960f2d05b19bec19f9b3d4ed0";
@@ -45,6 +47,7 @@ type CheckpointArchive = zip::ZipArchive<Cursor<Vec<u8>>>;
 pub enum CheckpointProfile {
     TabIclV2Classifier,
     TabIclV2Regressor,
+    KumoTabular(Release),
     Unknown,
 }
 
@@ -53,12 +56,13 @@ impl fmt::Display for CheckpointProfile {
         match self {
             Self::TabIclV2Classifier => f.write_str("TabICLv2 classifier"),
             Self::TabIclV2Regressor => f.write_str("TabICLv2 regressor"),
+            Self::KumoTabular(release) => release.fmt(f),
             Self::Unknown => f.write_str("unknown/custom"),
         }
     }
 }
 
-/// Selected architecture values retained in the checkpoint's primitive config.
+/// Selected architecture values retained in a `TabICLv2` checkpoint's primitive config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CheckpointModelConfig {
     pub max_classes: Option<u64>,
@@ -96,17 +100,41 @@ pub struct CheckpointSummary {
     pub warnings: Vec<String>,
 }
 
-/// Parse and summarize a `PyTorch` ZIP checkpoint without executing pickle code.
+/// What a checkpoint holds, as its caller knows: a `TabICLv2` checkpoint
+/// carries its own config; a Kumo-Tabular one is a bare state dict of exactly
+/// one release's tensors, `release`'s or, for `None`, the release they match.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointKind {
+    TabIclV2,
+    KumoTabular(Option<Release>),
+}
+
+impl CheckpointKind {
+    /// Whether imported weights with `profile` are this kind's.
+    pub(crate) fn holds(self, profile: crate::ModelProfile) -> bool {
+        match self {
+            Self::TabIclV2 => !matches!(profile, crate::ModelProfile::KumoTabular(_)),
+            Self::KumoTabular(None) => matches!(profile, crate::ModelProfile::KumoTabular(_)),
+            Self::KumoTabular(Some(release)) => profile == crate::ModelProfile::KumoTabular(release),
+        }
+    }
+}
+
+/// Parse and summarize a `PyTorch` ZIP checkpoint of `kind` without executing
+/// pickle code. Without a `kind`, a checkpoint with a config is `TabICLv2`'s
+/// and one without is Kumo-Tabular's.
 ///
-/// Released profiles require both the official SHA-256 and the expected model
-/// metadata. Other valid checkpoints are reported as [`CheckpointProfile::Unknown`].
+/// Released `TabICLv2` profiles require both the official SHA-256 and the
+/// expected model metadata; other valid ones are reported as
+/// [`CheckpointProfile::Unknown`].
 ///
 /// # Errors
 ///
 /// Returns [`Error::Checkpoint`] when the archive, pickle structure, tensor
-/// metadata, or size calculations are invalid.
-pub fn inspect_checkpoint(path: &Path) -> Result<CheckpointSummary> {
-    Ok(load_checkpoint(path)?.summary)
+/// metadata, or size calculations are invalid, or the tensors are not
+/// `kind`'s.
+pub fn inspect_checkpoint(path: &Path, kind: Option<CheckpointKind>) -> Result<CheckpointSummary> {
+    Ok(load_checkpoint(path, kind)?.summary)
 }
 
 pub(crate) fn checkpoint_sha256(path: &Path) -> Result<String> {
@@ -133,13 +161,17 @@ pub(crate) fn checkpoint_sha256(path: &Path) -> Result<String> {
 ///
 /// Returns [`Error::Checkpoint`] when the checkpoint is invalid and
 /// [`Error::Artifact`] when the output cannot be written or verified.
-pub fn import_checkpoint(path: &Path, output: &Path) -> Result<crate::ModelArtifactSummary> {
+pub fn import_checkpoint(
+    path: &Path,
+    kind: CheckpointKind,
+    output: &Path,
+) -> Result<crate::ModelArtifactSummary> {
     if same_file_path(path, output)? {
         return Err(Error::InvalidArgument(
             "checkpoint input and model output must be different files".into(),
         ));
     }
-    write_model_artifact(output, &model_data(path)?)
+    write_model_artifact(output, &model_data(path, kind)?)
 }
 
 /// Convert a validated checkpoint into an executable model in memory, as
@@ -149,19 +181,31 @@ pub fn import_checkpoint(path: &Path, output: &Path) -> Result<crate::ModelArtif
 ///
 /// Returns [`Error::Checkpoint`] when the checkpoint is invalid and
 /// [`Error::Artifact`] when it is not an official model.
-pub(crate) fn model_from_checkpoint(path: &Path) -> Result<ModelArtifact> {
-    ModelArtifact::from_bytes(&encode_model_artifact(&model_data(path)?)?)
+pub(crate) fn model_from_checkpoint(path: &Path, kind: CheckpointKind) -> Result<ModelArtifact> {
+    ModelArtifact::from_bytes(&encode_model_artifact(&model_data(path, kind)?)?)
 }
 
 /// The portable model of a validated checkpoint.
-fn model_data(path: &Path) -> Result<ModelArtifactData> {
-    let loaded = load_checkpoint(path)?;
+fn model_data(path: &Path, kind: CheckpointKind) -> Result<ModelArtifactData> {
+    let loaded = load_checkpoint(path, Some(kind))?;
     let source_sha256 = decode_sha256(&loaded.summary.source_sha256)?;
-    let config = loaded
-        .summary
-        .config
-        .clone()
-        .ok_or_else(|| Error::Checkpoint("validated checkpoint has no model config".into()))?;
+    let config = match (loaded.summary.profile, &loaded.summary.config) {
+        (CheckpointProfile::KumoTabular(release), _) => ModelConfig::KumoTabular(release),
+        (_, Some(config)) => ModelConfig::TabIclV2(TabIclV2Config {
+            max_classes: config.max_classes,
+            num_quantiles: config.num_quantiles,
+            embed_dim: config.embed_dim,
+            column_blocks: config.column_blocks,
+            row_blocks: config.row_blocks,
+            row_cls_tokens: config.row_cls_tokens,
+            icl_blocks: config.icl_blocks,
+        }),
+        (_, None) => {
+            return Err(Error::Checkpoint(
+                "validated checkpoint has no model config".into(),
+            ));
+        }
+    };
     let tensors = loaded
         .tensors
         .into_iter()
@@ -187,15 +231,7 @@ fn model_data(path: &Path) -> Result<ModelArtifactData> {
         .collect::<Result<Vec<_>>>()?;
     Ok(ModelArtifactData {
         source_sha256,
-        config: ModelConfig {
-            max_classes: config.max_classes,
-            num_quantiles: config.num_quantiles,
-            embed_dim: config.embed_dim,
-            column_blocks: config.column_blocks,
-            row_blocks: config.row_blocks,
-            row_cls_tokens: config.row_cls_tokens,
-            icl_blocks: config.icl_blocks,
-        },
+        config,
         tensors,
     })
 }
@@ -210,18 +246,50 @@ struct LoadedTensor {
     data: Vec<u8>,
 }
 
-fn load_checkpoint(path: &Path) -> Result<LoadedCheckpoint> {
+fn load_checkpoint(path: &Path, kind: Option<CheckpointKind>) -> Result<LoadedCheckpoint> {
     let archive_bytes = read_checkpoint_bytes(path)?;
     let source_sha256 = sha256_reader(&mut Cursor::new(&archive_bytes))?;
     let (root, storage_directory, mut archive) = read_pickle_root(archive_bytes)?;
-    let config_object = unique_dict_value(&root, "config")?
-        .ok_or_else(|| Error::Checkpoint("top-level 'config' mapping is missing".into()))?;
-    let config = extract_model_config(config_object)?;
-    let state_dict = unique_dict_value(&root, "state_dict")?
-        .ok_or_else(|| Error::Checkpoint("top-level 'state_dict' mapping is missing".into()))?;
+    // A Kumo-Tabular checkpoint is a bare state dict; a TabICLv2 one also has its config.
+    let has_config = unique_dict_value(&root, "config")?.is_some();
+    let kind = match kind {
+        Some(CheckpointKind::KumoTabular(_)) if has_config => {
+            return Err(Error::Checkpoint(
+                "not a Kumo-Tabular checkpoint: it has a config, as TabICLv2's do".into(),
+            ));
+        }
+        Some(CheckpointKind::TabIclV2) if !has_config => {
+            return Err(Error::Checkpoint(
+                "not a TabICLv2 checkpoint: it has no config".into(),
+            ));
+        }
+        Some(kind) => kind,
+        None if has_config => CheckpointKind::TabIclV2,
+        None => CheckpointKind::KumoTabular(None),
+    };
+    let (state_dict, config) = if matches!(kind, CheckpointKind::KumoTabular(_)) {
+        (&root, None)
+    } else {
+        let config_object = unique_dict_value(&root, "config")?
+            .ok_or_else(|| Error::Checkpoint("top-level 'config' mapping is missing".into()))?;
+        let state_dict = unique_dict_value(&root, "state_dict")?
+            .ok_or_else(|| Error::Checkpoint("top-level 'state_dict' mapping is missing".into()))?;
+        (state_dict, Some(extract_model_config(config_object)?))
+    };
     let tensors = tensor_metadata(state_dict, &storage_directory)?;
+    let kumo = match kind {
+        CheckpointKind::TabIclV2 => None,
+        CheckpointKind::KumoTabular(Some(release)) => {
+            check_kumo_manifest(release, &tensors)?;
+            Some(release)
+        }
+        CheckpointKind::KumoTabular(None) => Some(kumo_release(&tensors)?),
+    };
     let tensor_data = read_storage_entries(&mut archive, &tensors)?;
-    let summary = summarize_tensors(source_sha256, &tensors, Some(config))?;
+    let mut summary = summarize_tensors(source_sha256, &tensors, config)?;
+    if let Some(release) = kumo {
+        summary.profile = CheckpointProfile::KumoTabular(release);
+    }
     let tensors = tensors
         .into_iter()
         .map(|info| {
@@ -237,14 +305,77 @@ fn load_checkpoint(path: &Path) -> Result<LoadedCheckpoint> {
                 })?;
             let tensor_bytes = usize::try_from(tensor_bytes)
                 .map_err(|_| Error::Checkpoint(format!("tensor '{}' byte count exceeds usize", info.name)))?;
-            let data = storage
-                .get(..tensor_bytes)
-                .ok_or_else(|| Error::Checkpoint(format!("tensor '{}' storage is truncated", info.name)))?
-                .to_vec();
+            let truncated = || Error::Checkpoint(format!("tensor '{}' storage is truncated", info.name));
+            let data = if info.layout.is_contiguous() && info.layout.start_offset() == 0 {
+                storage.get(..tensor_bytes).ok_or_else(truncated)?.to_vec()
+            } else {
+                // Copy a strided view, such as a transposed weight, into row-major order.
+                let size = info.dtype.size_in_bytes();
+                let mut data = Vec::with_capacity(tensor_bytes);
+                for element in 0..tensor_bytes / size {
+                    let index = storage_index(&info.layout, element);
+                    data.extend_from_slice(
+                        storage
+                            .get(index * size..(index + 1) * size)
+                            .ok_or_else(truncated)?,
+                    );
+                }
+                data
+            };
             Ok(LoadedTensor { info, data })
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(LoadedCheckpoint { summary, tensors })
+}
+
+/// The storage index of a strided tensor's `element`th value in row-major order.
+fn storage_index(layout: &Layout, element: usize) -> usize {
+    let (mut rest, mut index) = (element, layout.start_offset());
+    for (dimension, stride) in layout.dims().iter().zip(layout.stride()).rev() {
+        index += rest % dimension * stride;
+        rest /= dimension;
+    }
+    index
+}
+
+/// The Kumo-Tabular release whose tensors a checkpoint holds.
+fn kumo_release(tensors: &[TensorInfo]) -> Result<Release> {
+    Release::ALL
+        .into_iter()
+        .find(|&release| check_kumo_manifest(release, tensors).is_ok())
+        .ok_or_else(|| {
+            Error::Checkpoint("not a Kumo-Tabular checkpoint: its tensors are no release's".into())
+        })
+}
+
+/// Check that a Kumo-Tabular checkpoint holds exactly its release's FP32 tensors.
+fn check_kumo_manifest(release: Release, tensors: &[TensorInfo]) -> Result<()> {
+    let mismatch = |detail: String| Err(Error::Checkpoint(format!("not a {release} checkpoint: {detail}")));
+    let expected = release.manifest();
+    for tensor in tensors {
+        let dimensions: Vec<u64> = tensor
+            .layout
+            .dims()
+            .iter()
+            .map(|&dimension| dimension as u64)
+            .collect();
+        match expected.get(&tensor.name) {
+            None => return mismatch(format!("unexpected tensor '{}'", tensor.name)),
+            Some(shape) if *shape != dimensions => {
+                return mismatch(format!("'{}' is {dimensions:?}, expected {shape:?}", tensor.name));
+            }
+            Some(_) if tensor.dtype != DType::F32 => {
+                return mismatch(format!("'{}' is not FP32", tensor.name));
+            }
+            Some(_) => {}
+        }
+    }
+    let found: BTreeSet<&str> = tensors.iter().map(|tensor| tensor.name.as_str()).collect();
+    match expected.keys().find(|name| !found.contains(name.as_str())) {
+        Some(name) => mismatch(format!("'{name}' is missing")),
+        None if found.len() < tensors.len() => mismatch("a tensor name repeats".into()),
+        None => Ok(()),
+    }
 }
 
 fn read_checkpoint_bytes(path: &Path) -> Result<Vec<u8>> {
@@ -655,13 +786,6 @@ fn validate_tensor(tensor: &TensorInfo) -> Result<()> {
             dimensions.len()
         )));
     }
-    if !tensor.layout.is_contiguous() || tensor.layout.start_offset() != 0 {
-        return Err(Error::Checkpoint(format!(
-            "tensor '{}' is not a zero-offset contiguous tensor",
-            tensor.name
-        )));
-    }
-
     let elements = checked_element_count(&tensor.name, dimensions)?;
     let tensor_bytes = elements
         .checked_mul(
@@ -682,6 +806,21 @@ fn validate_tensor(tensor: &TensorInfo) -> Result<()> {
     if tensor_bytes > storage_bytes {
         return Err(Error::Checkpoint(format!(
             "tensor '{}' requires {tensor_bytes} bytes but its storage declares {storage_bytes}",
+            tensor.name
+        )));
+    }
+    // A strided view, such as a transposed weight, must stay inside its storage.
+    let last = dimensions.iter().zip(tensor.layout.stride()).try_fold(
+        tensor.layout.start_offset(),
+        |last, (&dimension, &stride)| {
+            dimension
+                .checked_sub(1)
+                .map_or(Some(last), |steps| last.checked_add(steps.checked_mul(stride)?))
+        },
+    );
+    if elements > 0 && last.is_none_or(|last| last >= tensor.storage_size) {
+        return Err(Error::Checkpoint(format!(
+            "tensor '{}' reaches past its storage",
             tensor.name
         )));
     }
@@ -1363,6 +1502,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn strided_tensors_read_in_row_major_order() {
+        // A [2, 3] view of a [3, 2] buffer, transposed as torch saves `weight.T`.
+        let transposed = Layout::new(Shape::from_dims(&[2, 3]), vec![1, 2], 0);
+        let order: Vec<_> = (0..6)
+            .map(|element| storage_index(&transposed, element))
+            .collect();
+        assert_eq!(order, [0, 2, 4, 1, 3, 5]);
+        let offset = Layout::contiguous_with_offset(Shape::from_dims(&[2, 2]), 3);
+        assert_eq!(storage_index(&offset, 3), 6);
+    }
+
+    #[test]
     fn recognizes_classifier_metadata() {
         let tensors = classifier_tensor_manifest();
         let config = CheckpointModelConfig {
@@ -1406,16 +1557,18 @@ mod tests {
     }
 
     #[test]
-    fn rejects_non_contiguous_tensor() {
-        let tensor = TensorInfo {
+    fn strided_tensors_must_stay_inside_their_storage() {
+        let tensor = |layout, storage_size| TensorInfo {
             name: "weight".into(),
             dtype: DType::F32,
-            layout: Layout::new(vec![2, 2].into(), vec![1, 2], 0),
+            layout,
             path: "model/data/0".into(),
-            storage_size: 4,
+            storage_size,
         };
-
-        assert!(validate_tensor(&tensor).is_err());
+        let transposed = || Layout::new(vec![2, 2].into(), vec![1, 2], 0);
+        assert!(validate_tensor(&tensor(transposed(), 4)).is_ok());
+        assert!(validate_tensor(&tensor(Layout::new(vec![2, 2].into(), vec![1, 3], 0), 4)).is_err());
+        assert!(validate_tensor(&tensor(Layout::new(vec![2, 2].into(), vec![2, 1], 1), 4)).is_err());
     }
 
     #[test]

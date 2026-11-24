@@ -24,7 +24,8 @@ unless their source and hash are verified.
 PyTorch checkpoint conversion is a pure-Rust, offline operation. The importer
 uses Candle's pinned pickle object reader after a strict opcode and resource
 preflight. Ironicl enforces archive, pickle, opcode, memo, object-depth,
-tensor-count, tensor-size, rank, and contiguous-layout limits. It decodes tensor
+tensor-count, tensor-size, and rank limits, and keeps every strided view, such as a transposed
+weight, inside its storage before copying it into row-major order. It decodes tensor
 reductions with checked pattern matching, represents globals as data, and does
 not invoke Python callables. Inspection reads every tensor payload so the ZIP
 reader verifies its length and CRC.

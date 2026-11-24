@@ -10,6 +10,7 @@ records what each has verified.
 |---|---|
 | [goals.md](goals.md) | Scope, non-goals, and success criteria |
 | [model.md](model.md) | TabICLv2 architecture and exact row-streaming boundary |
+| [kumo-tabular.md](kumo-tabular.md) | Kumo-Tabular: its checkpoints, license, and the plan to run it |
 | [architecture.md](architecture.md) | Engine components and request lifecycle |
 | [source-layout.md](source-layout.md) | How `src/` is organized, planned moves, and CUDA build targets |
 | [cli.md](cli.md) | The `ironicl` commands, model directories, and the shared weights folder |

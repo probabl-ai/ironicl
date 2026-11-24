@@ -14,20 +14,24 @@ use crate::{
         ByteReader, CHECKSUM_BYTES, TENSOR_ALIGNMENT, align_up, artifact_error, encode_sha256,
         pad_to_alignment, sha256, u64_to_usize, usize_to_u32, usize_to_u64, write_u16, write_u32, write_u64,
     },
+    models::kumo_tabular::Release,
 };
 
 pub const MODEL_ARTIFACT_MAGIC: [u8; 8] = *b"IRMODEL\0";
 pub const MODEL_ARTIFACT_VERSION: u32 = 1;
 
-const MODEL_ARTIFACT_KIND: u32 = 1;
+/// The header's architecture IDs.
+const TABICL_V2: u32 = 1;
+const KUMO_TABULAR: u32 = 2;
 const HEADER_BYTES: usize = 144;
-const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+/// Kumo-Tabular large is about 860 MB.
+const MAX_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
 const MAX_DIRECTORY_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_TENSOR_COUNT: usize = 4096;
 const MAX_TENSOR_RANK: usize = 16;
 const MAX_TENSOR_NAME_BYTES: usize = 4096;
 const MAX_TENSOR_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_TOTAL_TENSOR_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_TOTAL_TENSOR_BYTES: u64 = 1000 * 1024 * 1024;
 const CLASSIFIER_SHA256: [u8; 32] = [
     0xbd, 0xc7, 0xdb, 0xd5, 0xe4, 0xff, 0x21, 0xf8, 0xf0, 0x45, 0x6f, 0xcf, 0x90, 0xc6, 0xb7, 0xcd, 0xf7,
     0x2d, 0xbe, 0xa9, 0x60, 0xf2, 0xd0, 0x5b, 0x19, 0xbe, 0xc1, 0x9f, 0x9b, 0x3d, 0x4e, 0xd0,
@@ -41,6 +45,7 @@ const REGRESSOR_SHA256: [u8; 32] = [
 pub enum ModelProfile {
     TabIclV2Classifier,
     TabIclV2Regressor,
+    KumoTabular(Release),
     Unknown,
 }
 
@@ -49,14 +54,94 @@ impl fmt::Display for ModelProfile {
         match self {
             Self::TabIclV2Classifier => f.write_str("TabICLv2 classifier"),
             Self::TabIclV2Regressor => f.write_str("TabICLv2 regressor"),
+            Self::KumoTabular(release) => release.fmt(f),
             Self::Unknown => f.write_str("unknown/custom"),
         }
     }
 }
 
-/// Architecture values stored in a portable model artifact.
+/// A model's architecture and its values, as the artifact header stores them.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelConfig {
+pub enum ModelConfig {
+    TabIclV2(TabIclV2Config),
+    /// A released checkpoint, whose size fixes every value.
+    KumoTabular(Release),
+}
+
+impl ModelConfig {
+    #[must_use]
+    pub fn task(&self) -> Option<TaskKind> {
+        match self {
+            Self::TabIclV2(config) => config.task(),
+            Self::KumoTabular(release) => Some(release.task),
+        }
+    }
+
+    /// The header's architecture ID and its seven values.
+    fn header(&self) -> Result<(u32, [u64; 7])> {
+        match self {
+            Self::TabIclV2(config) => Ok((TABICL_V2, config.required_values()?)),
+            Self::KumoTabular(release) => {
+                let config = release.size.config();
+                let (classes, quantiles) = match release.task {
+                    TaskKind::Classifier => (10, 0),
+                    TaskKind::Regressor => (0, 999),
+                };
+                Ok((
+                    KUMO_TABULAR,
+                    [
+                        classes,
+                        quantiles,
+                        config.cell_channels,
+                        config.embedding_layers,
+                        config.inducing_points,
+                        config.icl_channels,
+                        config.icl_layers,
+                    ],
+                ))
+            }
+        }
+    }
+
+    fn from_header(architecture: u32, values: [u64; 7]) -> Result<Self> {
+        match architecture {
+            TABICL_V2 => {
+                let [
+                    max_classes,
+                    num_quantiles,
+                    embed_dim,
+                    column_blocks,
+                    row_blocks,
+                    row_cls_tokens,
+                    icl_blocks,
+                ] = values.map(Some);
+                let config = TabIclV2Config {
+                    max_classes,
+                    num_quantiles,
+                    embed_dim,
+                    column_blocks,
+                    row_blocks,
+                    row_cls_tokens,
+                    icl_blocks,
+                };
+                config.validate()?;
+                Ok(Self::TabIclV2(config))
+            }
+            KUMO_TABULAR => Release::ALL
+                .into_iter()
+                .map(Self::KumoTabular)
+                .find(|config| config.header().is_ok_and(|(_, header)| header == values))
+                .ok_or_else(|| Error::Artifact("Kumo-Tabular values match no released size".into())),
+            _ => Err(Error::Artifact(format!(
+                "model architecture {architecture} is unknown"
+            ))),
+        }
+    }
+}
+
+/// `TabICLv2`'s architecture values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabIclV2Config {
     pub max_classes: Option<u64>,
     pub num_quantiles: Option<u64>,
     pub embed_dim: Option<u64>,
@@ -66,7 +151,7 @@ pub struct ModelConfig {
     pub icl_blocks: Option<u64>,
 }
 
-impl ModelConfig {
+impl TabIclV2Config {
     #[must_use]
     pub fn task(&self) -> Option<TaskKind> {
         self.max_classes.map(|classes| {
@@ -242,7 +327,7 @@ impl ModelArtifact {
         let task = match parsed.summary.profile {
             ModelProfile::TabIclV2Classifier => TaskKind::Classifier,
             ModelProfile::TabIclV2Regressor => TaskKind::Regressor,
-            ModelProfile::Unknown => {
+            ModelProfile::KumoTabular(_) | ModelProfile::Unknown => {
                 return Err(Error::Artifact(
                     "executable model must be an official TabICLv2 classifier or regressor".into(),
                 ));
@@ -379,7 +464,7 @@ pub(crate) fn write_model_artifact(path: &Path, model: &ModelArtifactData) -> Re
 }
 
 pub(crate) fn encode_model_artifact(model: &ModelArtifactData) -> Result<Vec<u8>> {
-    model.config.validate()?;
+    let (architecture, values) = model.config.header()?;
     if model.source_sha256 == [0; 32] {
         return Err(Error::Artifact("source checkpoint hash is empty".into()));
     }
@@ -454,12 +539,12 @@ pub(crate) fn encode_model_artifact(model: &ModelArtifactData) -> Result<Vec<u8>
     );
     bytes.extend_from_slice(&MODEL_ARTIFACT_MAGIC);
     write_u32(&mut bytes, MODEL_ARTIFACT_VERSION);
-    write_u32(&mut bytes, MODEL_ARTIFACT_KIND);
+    write_u32(&mut bytes, architecture);
     bytes.extend_from_slice(&model.source_sha256);
     write_u32(&mut bytes, usize_to_u32(model.tensors.len(), "tensor count")?);
     write_u64(&mut bytes, parameter_count);
     write_u64(&mut bytes, tensor_bytes);
-    for value in model.config.required_values()? {
+    for value in values {
         write_u64(&mut bytes, value);
     }
     write_u64(&mut bytes, usize_to_u64(directory.len(), "directory length")?);
@@ -508,12 +593,7 @@ fn parse_model_artifact_bytes(bytes: &[u8]) -> Result<ParsedModelArtifact> {
             "model artifact version {version} is unsupported; expected {MODEL_ARTIFACT_VERSION}"
         )));
     }
-    let kind = header.read_u32()?;
-    if kind != MODEL_ARTIFACT_KIND {
-        return Err(Error::Artifact(format!(
-            "artifact kind {kind} is not a portable model"
-        )));
-    }
+    let architecture = header.read_u32()?;
     let source_sha256 = header.read_array::<32>()?;
     if source_sha256 == [0; 32] {
         return Err(Error::Artifact("source checkpoint hash is empty".into()));
@@ -527,16 +607,11 @@ fn parse_model_artifact_bytes(bytes: &[u8]) -> Result<ParsedModelArtifact> {
     }
     let declared_parameters = header.read_u64()?;
     let declared_tensor_bytes = header.read_u64()?;
-    let config = ModelConfig {
-        max_classes: Some(header.read_u64()?),
-        num_quantiles: Some(header.read_u64()?),
-        embed_dim: Some(header.read_u64()?),
-        column_blocks: Some(header.read_u64()?),
-        row_blocks: Some(header.read_u64()?),
-        row_cls_tokens: Some(header.read_u64()?),
-        icl_blocks: Some(header.read_u64()?),
-    };
-    config.validate()?;
+    let mut values = [0; 7];
+    for value in &mut values {
+        *value = header.read_u64()?;
+    }
+    let config = ModelConfig::from_header(architecture, values)?;
     let directory_length = header.read_u64()?;
     let payload_length = header.read_u64()?;
     if header.read_u32()? != 0 || !header.is_empty() {
@@ -668,7 +743,7 @@ fn parse_model_artifact_bytes(bytes: &[u8]) -> Result<ParsedModelArtifact> {
 
     let profile = identify_profile(
         &source_sha256,
-        config.task(),
+        &config,
         tensor_count,
         parameter_count,
         tensor_bytes,
@@ -753,6 +828,9 @@ fn validate_manifest(tensors: &[ParsedTensor], task: TaskKind) -> Result<()> {
 }
 
 fn validate_config(config: &ModelConfig, task: TaskKind) -> Result<()> {
+    let ModelConfig::TabIclV2(config) = config else {
+        return Err(Error::Artifact("model is not TabICLv2".into()));
+    };
     let actual = config.required_values()?;
     let max_classes = match task {
         TaskKind::Classifier => 10,
@@ -868,12 +946,33 @@ fn insert_attention_manifest(
 
 fn identify_profile(
     source_sha256: &[u8; 32],
-    task: Option<TaskKind>,
+    config: &ModelConfig,
     tensor_count: usize,
     parameter_count: u64,
     tensor_bytes: u64,
 ) -> ModelProfile {
-    match (source_sha256, task, tensor_count, parameter_count, tensor_bytes) {
+    if let ModelConfig::KumoTabular(release) = config {
+        let manifest = release.manifest();
+        let elements: u64 = manifest
+            .values()
+            .map(|dimensions| dimensions.iter().product::<u64>())
+            .sum();
+        // Any weights of the release's exact tensors, NVIDIA's or fine-tuned.
+        let complete =
+            (tensor_count, parameter_count, tensor_bytes) == (manifest.len(), elements, 4 * elements);
+        return if complete {
+            ModelProfile::KumoTabular(*release)
+        } else {
+            ModelProfile::Unknown
+        };
+    }
+    match (
+        source_sha256,
+        config.task(),
+        tensor_count,
+        parameter_count,
+        tensor_bytes,
+    ) {
         (&CLASSIFIER_SHA256, Some(TaskKind::Classifier), 391, 27_552_258, 110_209_032) => {
             ModelProfile::TabIclV2Classifier
         }
@@ -1033,18 +1132,38 @@ mod tests {
 
     #[test]
     fn configuration_must_match_the_release() {
-        let mut config = fixture_model().config;
+        let ModelConfig::TabIclV2(mut config) = fixture_model().config else {
+            unreachable!("the fixture is TabICLv2")
+        };
         config.num_quantiles = Some(998);
-        assert!(validate_config(&config, TaskKind::Classifier).is_err());
+        let check =
+            |config: &TabIclV2Config, task| validate_config(&ModelConfig::TabIclV2(config.clone()), task);
+        assert!(check(&config, TaskKind::Classifier).is_err());
         config.num_quantiles = Some(999);
-        assert!(validate_config(&config, TaskKind::Classifier).is_ok());
-        assert!(validate_config(&config, TaskKind::Regressor).is_err());
+        assert!(check(&config, TaskKind::Classifier).is_ok());
+        assert!(check(&config, TaskKind::Regressor).is_err());
+        let kumo = ModelConfig::KumoTabular(Release::ALL[0]);
+        assert!(validate_config(&kumo, TaskKind::Classifier).is_err());
+    }
+
+    #[test]
+    fn kumo_tabular_configs_round_trip_through_the_header() {
+        for release in Release::ALL {
+            let config = ModelConfig::KumoTabular(release);
+            let (architecture, values) = config.header().expect("header");
+            assert_eq!(
+                ModelConfig::from_header(architecture, values).expect("config"),
+                config
+            );
+        }
+        assert!(ModelConfig::from_header(KUMO_TABULAR, [10, 0, 1, 2, 3, 4, 5]).is_err());
+        assert!(ModelConfig::from_header(3, [0; 7]).is_err());
     }
 
     fn fixture_model() -> ModelArtifactData {
         ModelArtifactData {
             source_sha256: [1; 32],
-            config: ModelConfig {
+            config: ModelConfig::TabIclV2(TabIclV2Config {
                 max_classes: Some(10),
                 num_quantiles: Some(999),
                 embed_dim: Some(128),
@@ -1052,7 +1171,7 @@ mod tests {
                 row_blocks: Some(3),
                 row_cls_tokens: Some(4),
                 icl_blocks: Some(12),
-            },
+            }),
             tensors: vec![
                 ModelTensor {
                     name: "b.bias".into(),

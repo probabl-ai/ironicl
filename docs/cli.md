@@ -7,8 +7,8 @@ Ironicl ships one binary. Each command takes its file or directory as the first 
 ```text
 ironicl help [COMMAND]
 ironicl platform
-ironicl inspect PATH [--weights DIR]
-ironicl import CHECKPOINT [-o FILE]
+ironicl inspect PATH [--model tabicl|kumo-tabular] [--weights DIR]
+ironicl import CHECKPOINT [--model tabicl|kumo-tabular] [-o FILE]
 ironicl prepare DIR [--weights DIR] [--optimize safe|auto|fast]
 ironicl serve DIR [--weights DIR] [--optimize safe|auto|fast] [--bind ADDR]
               [--max-request-rows N] [--max-body SIZE] [--max-batch-rows N] [--max-queue MS]
@@ -46,6 +46,8 @@ ironicl platform
 ```bash
 ironicl inspect my-model
 ironicl inspect tabicl-classifier-v2-20260212.ckpt
+ironicl inspect large-classifier.pt
+ironicl inspect large-classifier.pt --model kumo-tabular
 ironicl inspect ~/.cache/ironicl/models/v1/<sha256>.irmodel
 ```
 
@@ -56,14 +58,21 @@ ironicl inspect ~/.cache/ironicl/models/v1/<sha256>.irmodel
 - Ironicl weights (`IRMODEL`): full structural and checksum validation, then the source SHA-256,
   profile, tensor and parameter counts, dtypes, and configuration;
 - a PyTorch ZIP checkpoint (`.ckpt`, `.pt`, `.pth`), parsed without executing pickle code: the
-  same, with the source SHA-256 bound to the recognized official model.
+  same, with the source SHA-256 bound to the recognized official model for TabICLv2. A checkpoint
+  with a config is TabICLv2's; one without is [Kumo-Tabular](kumo-tabular.md)'s, whose size and
+  task are those of its tensors. `--model` makes `inspect` check that the checkpoint is that
+  model's instead.
 
 ## Import
 
 ```bash
 ironicl import tabicl-classifier-v2-20260212.ckpt
-ironicl import tabicl-classifier-v2-20260212.ckpt -o classifier.irmodel
+ironicl import tabicl-classifier-v2-20260212.ckpt --model tabicl -o classifier.irmodel
+ironicl import large-classifier.pt --model kumo-tabular
 ```
+
+`import` defaults to `tabicl`. For Kumo-Tabular, pass `--model kumo-tabular`; the checkpoint's
+tensors must match one release and determine its size and task.
 
 `import` validates the checkpoint, keeps its source identity, copies the tensors into a
 deterministic, 64-byte-aligned portable layout, writes atomically, and verifies the complete

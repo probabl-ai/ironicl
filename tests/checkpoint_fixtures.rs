@@ -1,9 +1,10 @@
 use std::path::{Path, PathBuf};
 
+use ironicl::models::kumo_tabular::Release;
 use ironicl::{
-    CheckpointCacheOptions, CheckpointProfile, Executor, Optimize, PreparedCheckpoint, QueryRequest, Request,
-    TaskKind, import_checkpoint, inspect_checkpoint, inspect_model_artifact, load_model_artifact,
-    prepare_checkpoint,
+    CheckpointCacheOptions, CheckpointKind, CheckpointProfile, Executor, Optimize, PreparedCheckpoint,
+    QueryRequest, Request, TaskKind, import_checkpoint, inspect_checkpoint, inspect_model_artifact,
+    load_model_artifact, prepare_checkpoint,
 };
 use tempfile::tempdir;
 
@@ -16,10 +17,13 @@ fn inspects_official_classifier_when_fixture_is_available() {
     let Some(path) = fixture("tabicl-classifier-v2-20260212.ckpt") else {
         panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
-    let summary = inspect_checkpoint(&path).expect("official classifier checkpoint");
+    let summary =
+        inspect_checkpoint(&path, Some(CheckpointKind::TabIclV2)).expect("official classifier checkpoint");
 
     assert_eq!(summary.source_sha256, CLASSIFIER_SHA256);
     assert_eq!(summary.profile, CheckpointProfile::TabIclV2Classifier);
+    assert_eq!(inspect_checkpoint(&path, None).expect("detect"), summary);
+    assert!(inspect_checkpoint(&path, Some(CheckpointKind::KumoTabular(None))).is_err());
     assert_eq!(summary.tensor_count, 391);
     assert_eq!(summary.parameter_count, 27_552_258);
     assert_eq!(summary.tensor_bytes, 110_209_032);
@@ -36,7 +40,8 @@ fn inspects_official_regressor_when_fixture_is_available() {
     let Some(path) = fixture("tabicl-regressor-v2-20260212.ckpt") else {
         panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
-    let summary = inspect_checkpoint(&path).expect("official regressor checkpoint");
+    let summary =
+        inspect_checkpoint(&path, Some(CheckpointKind::TabIclV2)).expect("official regressor checkpoint");
 
     assert_eq!(summary.source_sha256, REGRESSOR_SHA256);
     assert_eq!(summary.profile, CheckpointProfile::TabIclV2Regressor);
@@ -58,7 +63,8 @@ fn imports_official_classifier_and_reuses_automatic_cache() {
     };
     let directory = tempdir().expect("temporary cache directory");
     let explicit_model = directory.path().join("classifier.irmodel");
-    let imported = import_checkpoint(&checkpoint, &explicit_model).expect("import classifier");
+    let imported =
+        import_checkpoint(&checkpoint, CheckpointKind::TabIclV2, &explicit_model).expect("import classifier");
     assert_eq!(imported.source_sha256, CLASSIFIER_SHA256);
     assert_eq!(imported.profile, ironicl::ModelProfile::TabIclV2Classifier);
     assert_eq!(
@@ -70,11 +76,13 @@ fn imports_official_classifier_and_reuses_automatic_cache() {
         cache_dir: Some(directory.path().join("cache")),
         ..CheckpointCacheOptions::default()
     };
-    let created = prepare_checkpoint(&checkpoint, &options).expect("create model cache");
+    let created =
+        prepare_checkpoint(&checkpoint, CheckpointKind::TabIclV2, &options).expect("create model cache");
     assert!(created.created, "expected a newly created cache entry");
     assert_eq!(created.summary.source_sha256, CLASSIFIER_SHA256);
 
-    let reused = prepare_checkpoint(&checkpoint, &options).expect("reuse model cache");
+    let reused =
+        prepare_checkpoint(&checkpoint, CheckpointKind::TabIclV2, &options).expect("reuse model cache");
     assert_eq!(
         reused,
         PreparedCheckpoint {
@@ -303,6 +311,44 @@ fn reduced_precision_context_predicts_all_missing_rows() {
             "logit {index}: auto {auto}, safe {safe}"
         );
     }
+}
+
+#[test]
+#[ignore = "needs Kumo-Tabular checkpoints as kumo-tabular-<size>-<task>.pt in IRONICL_CHECKPOINT_FIXTURES"]
+fn imports_the_kumo_tabular_checkpoints_that_are_available() {
+    let directory = std::env::var_os("IRONICL_CHECKPOINT_FIXTURES").expect("IRONICL_CHECKPOINT_FIXTURES");
+    let output = tempdir().expect("temporary directory");
+    let mut found = 0;
+    for release in Release::ALL {
+        let checkpoint =
+            Path::new(&directory).join(format!("kumo-tabular-{}-{}.pt", release.size, release.task));
+        if !checkpoint.is_file() {
+            continue;
+        }
+        found += 1;
+        let kind = CheckpointKind::KumoTabular(Some(release));
+        let summary = inspect_checkpoint(&checkpoint, Some(kind)).expect("Kumo-Tabular checkpoint");
+        assert_eq!(summary.profile, CheckpointProfile::KumoTabular(release));
+        // Its tensors are its release's alone, so the family or nothing finds it.
+        for kind in [Some(CheckpointKind::KumoTabular(None)), None] {
+            assert_eq!(
+                inspect_checkpoint(&checkpoint, kind).expect("detect").profile,
+                summary.profile
+            );
+        }
+        for other in Release::ALL.into_iter().filter(|other| *other != release) {
+            assert!(inspect_checkpoint(&checkpoint, Some(CheckpointKind::KumoTabular(Some(other)))).is_err());
+        }
+        assert!(inspect_checkpoint(&checkpoint, Some(CheckpointKind::TabIclV2)).is_err());
+        let model = output.path().join("model.irmodel");
+        let imported = import_checkpoint(&checkpoint, kind, &model).expect("import");
+        assert_eq!(imported.profile, ironicl::ModelProfile::KumoTabular(release));
+        assert_eq!(inspect_model_artifact(&model).expect("inspect"), imported);
+    }
+    assert!(
+        found > 0,
+        "no Kumo-Tabular checkpoint in IRONICL_CHECKPOINT_FIXTURES"
+    );
 }
 
 fn fixture(name: &str) -> Option<PathBuf> {

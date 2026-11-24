@@ -3,5 +3,6 @@
 pub mod checkpoint;
 pub mod checkpoint_cache;
 pub mod directory;
+pub mod kumo_tabular;
 pub mod quantiles;
 pub mod tabicl_v2;

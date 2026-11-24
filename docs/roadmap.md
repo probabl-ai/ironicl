@@ -173,3 +173,12 @@ Python; a memory planner that sizes batches from the KV cache and
 the GPU, so a cache streamed from host memory gets large batches; `/metrics` in
 Prometheus format (queue depth, batch size and time, refusals, GPU memory); and
 a binary or gRPC interface.
+
+## Phase 11: Kumo-Tabular
+
+NVIDIA's Kumo-Tabular as a second model ([kumo-tabular.md](kumo-tabular.md)). Done: importing
+and inspecting its six checkpoints. Next: the classifier on the CPU, then the regressor, Metal,
+and CUDA.
+
+Exit gate: predictions match NVIDIA's `structured-data-models` on the same random draws, and the
+GPU paths match the CPU within their gates.

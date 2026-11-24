@@ -7,7 +7,7 @@ use crate::{
     ModelArtifact, ModelArtifactSummary,
     error::{Error, Result},
     import_checkpoint, inspect_model_artifact, load_model_artifact,
-    models::checkpoint::{checkpoint_sha256, model_from_checkpoint},
+    models::checkpoint::{CheckpointKind, checkpoint_sha256, model_from_checkpoint},
 };
 
 /// Controls where and whether [`prepare_checkpoint`] reuses an imported model.
@@ -25,19 +25,24 @@ pub struct PreparedCheckpoint {
     pub summary: ModelArtifactSummary,
 }
 
-/// Validate a checkpoint and prepare its content-addressed model cache.
+/// Validate a checkpoint of `kind` and prepare its content-addressed model
+/// cache.
 ///
 /// # Errors
 ///
 /// Returns an error when checkpoint validation, cache path resolution, import,
 /// or cached artifact verification fails.
-pub fn prepare_checkpoint(path: &Path, options: &CheckpointCacheOptions) -> Result<PreparedCheckpoint> {
+pub fn prepare_checkpoint(
+    path: &Path,
+    kind: CheckpointKind,
+    options: &CheckpointCacheOptions,
+) -> Result<PreparedCheckpoint> {
     let source_sha256 = checkpoint_sha256(path)?;
     let cache_root = options.cache_dir.clone().map_or_else(default_cache_dir, Ok)?;
     let cache_path = cache_model_path(&cache_root, &source_sha256)?;
     if !options.rebuild_cache {
         match inspect_model_artifact(&cache_path) {
-            Ok(summary) if summary.source_sha256 == source_sha256 => {
+            Ok(summary) if summary.source_sha256 == source_sha256 && kind.holds(summary.profile) => {
                 return Ok(PreparedCheckpoint {
                     path: cache_path,
                     created: false,
@@ -49,7 +54,7 @@ pub fn prepare_checkpoint(path: &Path, options: &CheckpointCacheOptions) -> Resu
         }
     }
 
-    let summary = import_checkpoint(path, &cache_path)?;
+    let summary = import_checkpoint(path, kind, &cache_path)?;
     if summary.source_sha256 != source_sha256 {
         return Err(Error::Cache(
             "imported model source hash does not match the checkpoint".into(),
@@ -62,7 +67,8 @@ pub fn prepare_checkpoint(path: &Path, options: &CheckpointCacheOptions) -> Resu
     })
 }
 
-/// Load a checkpoint's executable model through the default model cache. When
+/// Load the executable model of a checkpoint of `kind` through the default
+/// model cache. When
 /// the cache cannot be written or read, as in a read-only home directory, the
 /// checkpoint is converted in memory instead, on every load.
 ///
@@ -70,12 +76,12 @@ pub fn prepare_checkpoint(path: &Path, options: &CheckpointCacheOptions) -> Resu
 ///
 /// Returns [`Error::Checkpoint`] when the checkpoint is invalid and
 /// [`Error::Artifact`] when it is not an official model.
-pub fn load_checkpoint_model(path: &Path) -> Result<ModelArtifact> {
-    let cached = prepare_checkpoint(path, &CheckpointCacheOptions::default())
+pub fn load_checkpoint_model(path: &Path, kind: CheckpointKind) -> Result<ModelArtifact> {
+    let cached = prepare_checkpoint(path, kind, &CheckpointCacheOptions::default())
         .and_then(|prepared| load_model_artifact(&prepared.path));
     match cached {
         Err(Error::Checkpoint(message)) => Err(Error::Checkpoint(message)),
-        Err(_) => model_from_checkpoint(path),
+        Err(_) => model_from_checkpoint(path, kind),
         model => model,
     }
 }

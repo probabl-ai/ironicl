@@ -7,11 +7,11 @@
 
 use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
-use clap::{Args, Parser, Subcommand, builder::RangedU64ValueParser};
+use clap::{Args, Parser, Subcommand, ValueEnum, builder::RangedU64ValueParser};
 
-use crate::Optimize;
+use crate::{CheckpointKind, Optimize};
 
-/// Ironicl: TabICLv2 inference without Python.
+/// Ironicl: TabICLv2 and Kumo-Tabular inference without Python.
 #[derive(Debug, Parser)]
 #[command(name = "ironicl", version, arg_required_else_help = true)]
 pub struct Cli {
@@ -29,12 +29,35 @@ pub enum Command {
     Serve(ServeArgs),
 }
 
+/// The model a checkpoint is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum Model {
+    /// TabICLv2
+    Tabicl,
+    /// Kumo-Tabular, any size and task
+    KumoTabular,
+}
+
+impl Model {
+    /// A Kumo-Tabular checkpoint's size and task are those of its tensors.
+    #[must_use]
+    pub fn checkpoint_kind(self) -> CheckpointKind {
+        match self {
+            Self::Tabicl => CheckpointKind::TabIclV2,
+            Self::KumoTabular => CheckpointKind::KumoTabular(None),
+        }
+    }
+}
+
 /// Inspect a model directory, Ironicl weights (.irmodel), or a PyTorch
 /// checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct InspectArgs {
     /// A model directory, an .irmodel file, or a checkpoint.
     pub path: PathBuf,
+    /// The model the checkpoint is [default: found from its contents]
+    #[arg(long)]
+    pub model: Option<Model>,
     /// The folder a model directory's weights are looked for in [default: the
     /// shared one]
     #[arg(long, value_name = "DIR")]
@@ -50,6 +73,9 @@ pub struct InspectArgs {
 pub struct ImportArgs {
     /// The checkpoint file.
     pub checkpoint: PathBuf,
+    /// The model the checkpoint is.
+    #[arg(long, value_enum, default_value_t = Model::Tabicl)]
+    pub model: Model,
     /// Write the weights to FILE instead.
     #[arg(short, long, value_name = "FILE")]
     pub output: Option<PathBuf>,
@@ -149,22 +175,38 @@ mod tests {
             parse(&["inspect", "my-model", "--weights", "w"]).unwrap(),
             Command::Inspect(InspectArgs {
                 path: PathBuf::from("my-model"),
+                model: None,
                 weights: Some(PathBuf::from("w")),
             })
         );
         assert_eq!(
-            parse(&["import", "model.ckpt", "-o", "model.irmodel"]).unwrap(),
+            parse(&["inspect", "large-classifier.pt", "--model", "kumo-tabular"]).unwrap(),
+            Command::Inspect(InspectArgs {
+                path: PathBuf::from("large-classifier.pt"),
+                model: Some(Model::KumoTabular),
+                weights: None,
+            })
+        );
+        assert_eq!(
+            parse(&["import", "model.ckpt", "--model", "tabicl", "-o", "model.irmodel"]).unwrap(),
             Command::Import(ImportArgs {
                 checkpoint: PathBuf::from("model.ckpt"),
+                model: Model::Tabicl,
                 output: Some(PathBuf::from("model.irmodel")),
             })
+        );
+        assert_eq!(
+            parse(&["import", "model.ckpt"]).unwrap(),
+            parse(&["import", "model.ckpt", "--model", "tabicl"]).unwrap()
         );
         for bad in [
             &["inspect"][..],
             &["inspect", "--checkpoint", "model.ckpt"],
-            &["import", "model.ckpt", "-o"],
-            &["import", "model.ckpt", "-o", "a", "-o", "b"],
-            &["import", "model.ckpt", "extra"],
+            &["import", "model.ckpt", "--model", "tabicl", "-o"],
+            &["import", "model.ckpt", "--model", "tabicl", "-o", "a", "-o", "b"],
+            &["import", "model.ckpt", "--model", "tabicl", "extra"],
+            &["import", "model.pt", "--model", "kumo-tabular/large-classifier"],
+            &["import", "model.pt", "--kumo-tabular", "large-classifier"],
             &["plan"],
         ] {
             assert!(parse(bad).is_err(), "{bad:?}");

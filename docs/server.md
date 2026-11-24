@@ -22,7 +22,7 @@ cargo build --release --features server          # add metal on Apple Silicon, c
    ([cli.md](cli.md#prepare)):
 
    ```bash
-   ironicl import tabicl-classifier-v2-20260212.ckpt
+   ironicl import tabicl-classifier-v2-20260212.ckpt --model tabicl
    ironicl prepare my-model --optimize auto
    ```
 
