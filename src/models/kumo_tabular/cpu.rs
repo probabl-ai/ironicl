@@ -17,7 +17,7 @@ use crate::kernels::reference::{
     OnlineAttentionScratch, affine_f32, gelu_f32, rope_non_interleaved_f32,
     tiled_online_scaled_dot_product_attention_f32,
 };
-use crate::{Error, ModelArtifact, Result, format::model::ModelProfile};
+use crate::{Error, ModelArtifact, Result, TaskKind, format::model::ModelProfile};
 
 /// `torch.finfo(torch.float32).eps`, the block norms' epsilon.
 const NORM_EPS: f32 = f32::EPSILON;
@@ -420,23 +420,30 @@ impl Model {
 
     /// Fit a member's context on its preprocessed `[rows, columns]` training
     /// rows `x`, whose `categorical` columns hold category codes, and their
-    /// class `codes`, and return it.
+    /// `targets`, and return it.
     ///
     /// # Errors
     ///
-    /// When the shapes disagree or a code is not below 10.
-    pub fn fit(&self, x: &[f32], categorical: &[bool], codes: &[usize]) -> Result<Context> {
+    /// When the shapes disagree, or the targets do not fit the model's task.
+    pub fn fit(&self, x: &[f32], categorical: &[bool], targets: Targets<'_>) -> Result<Context> {
         let columns = categorical.len();
         if columns == 0 {
             return Err(invalid(
                 "no feature varies in the training data: every column is constant or missing",
             ));
         }
-        if x.len() != codes.len() * columns || codes.is_empty() {
+        let rows = match targets {
+            Targets::Classes(codes) if self.release.task == TaskKind::Classifier => {
+                if codes.iter().any(|&code| code >= 10) {
+                    return Err(invalid("a class code is not below 10"));
+                }
+                codes.len()
+            }
+            Targets::Values(values) if self.release.task == TaskKind::Regressor => values.len(),
+            _ => return Err(invalid("the targets do not fit the model's task")),
+        };
+        if rows == 0 || x.len() != rows * columns {
             return Err(invalid("the training rows do not match their targets"));
-        }
-        if codes.iter().any(|&code| code >= 10) {
-            return Err(invalid("a class code is not below 10"));
         }
         let means = (0..columns)
             .map(|column| {
@@ -460,15 +467,14 @@ impl Model {
             icl: Vec::new(),
         };
         let mut recorded = Vec::new();
-        let mut rows = self.row_embedding(x, &context, Columns::Record(&mut recorded, codes))?;
+        let mut rows = self.row_embedding(x, &context, Columns::Record(&mut recorded, targets))?;
         context.columns = recorded;
-        let icl = Self::dim(self.config.icl_channels);
-        let embedding = self.tensor("icl_block.y_emb.weight");
-        for (row, &code) in rows.chunks_mut(icl).zip(codes) {
-            for (value, label) in row.iter_mut().zip(&embedding[code * icl..][..icl]) {
-                *value += label;
-            }
-        }
+        self.add_labels(
+            "icl_block",
+            &mut rows,
+            Self::dim(self.config.icl_channels),
+            targets,
+        );
         let query_heads = self
             .config
             .query_key_value_heads
@@ -484,7 +490,8 @@ impl Model {
         Ok(context)
     }
 
-    /// The 10 logits of each of the `[rows, columns]` preprocessed query rows `x`.
+    /// The outputs, 10 logits or 999 quantiles, of each of the `[rows, columns]`
+    /// preprocessed query rows `x`.
     ///
     /// # Errors
     ///
@@ -506,6 +513,29 @@ impl Model {
             out.extend(self.head(&rows)?);
         }
         Ok(out)
+    }
+
+    /// Add each training row's label embedding at `stage`, a class's `y_emb`
+    /// row or the value times `y_lin`, to its `width` values in `rows`.
+    fn add_labels(&self, stage: &str, rows: &mut [f32], width: usize, targets: Targets<'_>) {
+        match targets {
+            Targets::Classes(codes) => {
+                let embedding = self.tensor(&format!("{stage}.y_emb.weight"));
+                for (row, &code) in rows.chunks_mut(width).zip(codes) {
+                    for (value, label) in row.iter_mut().zip(&embedding[code * width..][..width]) {
+                        *value += label;
+                    }
+                }
+            }
+            Targets::Values(values) => {
+                let weight = self.tensor(&format!("{stage}.y_lin.weight"));
+                for (row, &target) in rows.chunks_mut(width).zip(values) {
+                    for (value, w) in row.iter_mut().zip(weight) {
+                        *value += w * target;
+                    }
+                }
+            }
+        }
     }
 
     /// `head(norm(x))`: the ICL stage's output layers.
@@ -532,23 +562,18 @@ impl Model {
     /// Each of the `[rows, columns]` rows `x` as the ICL stage's input:
     /// `[rows, icl_channels]`.
     fn row_embedding(&self, x: &[f32], context: &Context, mut kvs: Columns<'_>) -> Result<Vec<f32>> {
-        let codes = match &kvs {
-            Columns::Record(_, codes) => Some(*codes),
+        let targets = match &kvs {
+            Columns::Record(_, targets) => Some(*targets),
             Columns::Read(_) => None,
         };
         let columns = context.categorical.len();
         let rows = x.len() / columns;
         let (cell, readout) = (self.cell(), Self::dim(self.config.readout_tokens));
         let mut cells = self.cell_embedding(x, context)?; // [columns, rows, cell]
-        if let Some(codes) = codes {
-            let embedding = self.tensor("row_embedding.y_emb.weight");
-            cells.par_chunks_mut(rows * cell).for_each(|column| {
-                for (value, &code) in column.chunks_mut(cell).zip(codes) {
-                    for (v, label) in value.iter_mut().zip(&embedding[code * cell..][..cell]) {
-                        *v += label;
-                    }
-                }
-            });
+        if let Some(targets) = targets {
+            cells
+                .par_chunks_mut(rows * cell)
+                .for_each(|column| self.add_labels("row_embedding", column, cell, targets));
         }
         let readout_token = self.tensor("row_embedding.readout_token");
         let mut readouts: Vec<f32> = readout_token.repeat(rows); // [rows, readout, cell]
@@ -721,10 +746,18 @@ impl Model {
 }
 
 /// The column stage's keys and values: recorded from the training rows and
-/// their class codes, or read from a context.
+/// their targets, or read from a context.
 enum Columns<'a> {
-    Record(&'a mut Vec<Kv>, &'a [usize]),
+    Record(&'a mut Vec<Kv>, Targets<'a>),
     Read(&'a [Kv]),
+}
+
+/// A member's training targets: a classifier's class codes, below 10, or a
+/// regressor's standardized values.
+#[derive(Clone, Copy, Debug)]
+pub enum Targets<'a> {
+    Classes(&'a [usize]),
+    Values(&'a [f32]),
 }
 
 impl Block<'_> {
@@ -944,15 +977,19 @@ pub(crate) mod tests {
 
     #[test]
     #[ignore = "needs IRONICL_CHECKPOINT_FIXTURES with the Kumo-Tabular checkpoints"]
-    fn members_predict_nvidias_logits() {
+    fn members_predict_nvidias_outputs() {
         for (name, size) in [
             ("numeric", "small"),
             ("mixed", "small"),
             ("mixed_medium", "medium"),
             ("mixed_large", "large"),
+            ("numeric_regression", "small"),
+            ("mixed_regression_large", "large"),
         ] {
             let case = case(name);
-            let model = model(size, "classifier");
+            let regressor = case.json["task"] == "regression";
+            let model = model(size, if regressor { "regressor" } else { "classifier" });
+            let outputs = if regressor { 999 } else { 10 };
             let categorical: Vec<&str> = case.json["columns"]
                 .as_array()
                 .unwrap()
@@ -967,25 +1004,29 @@ pub(crate) mod tests {
                     .iter()
                     .map(|n| categorical.contains(&n.as_str().unwrap()))
                     .collect();
-                let codes: Vec<usize> = member["y"]
-                    .as_array()
-                    .unwrap()
+                let y = member["y"].as_array().unwrap();
+                let codes: Vec<usize> = y
                     .iter()
-                    .map(|c| usize::try_from(c.as_u64().unwrap()).unwrap())
+                    .filter_map(serde_json::Value::as_u64)
+                    .map(|c| usize::try_from(c).unwrap())
                     .collect();
-                let context = model.fit(&flat(&member["x"]), &mask, &codes).unwrap();
-                let logits = model.predict(&context, &flat(&member["query"])).unwrap();
-                let expected = rows(&member["output"]["values"]);
-                let classes = expected[0].len();
+                #[expect(clippy::cast_possible_truncation, reason = "The model reads FP32")]
+                let values: Vec<f32> = y.iter().map(|v| v.as_f64().unwrap() as f32).collect();
+                let targets = if regressor {
+                    super::Targets::Values(&values)
+                } else {
+                    super::Targets::Classes(&codes)
+                };
+                let context = model.fit(&flat(&member["x"]), &mask, targets).unwrap();
+                let predicted = model.predict(&context, &flat(&member["query"])).unwrap();
                 let mut worst = 0.0_f64;
-                for (row, values) in expected.iter().enumerate() {
-                    for (class, value) in values.iter().enumerate() {
-                        worst = worst.max((f64::from(logits[row * 10 + class]) - value).abs());
+                for (row, values) in rows(&member["output"]["values"]).iter().enumerate() {
+                    for (column, value) in values.iter().enumerate() {
+                        worst = worst.max((f64::from(predicted[row * outputs + column]) - value).abs());
                     }
                 }
-                println!("{name} member {index}: max |logit error| {worst:.2e}");
+                println!("{name} member {index}: max |output error| {worst:.2e}");
                 assert!(worst < 1e-4, "{name} member {index}: {worst}");
-                let _ = classes;
             }
         }
     }

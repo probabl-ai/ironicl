@@ -1,5 +1,6 @@
-//! A fitted Kumo-Tabular classifier: its preprocessing, each member's context,
-//! and what turns the members' logits into probabilities.
+//! A fitted Kumo-Tabular classifier or regressor: its preprocessing, each
+//! member's context, and what turns the members' outputs into probabilities
+//! or the regressor's outputs.
 //!
 //! It saves as its training data in `IRPREP` (architecture 2) and, optionally,
 //! its contexts in `IRCNTXT` (kind 2). Loading fits the preprocessing again,
@@ -8,19 +9,23 @@
 
 use std::sync::Arc;
 
-use super::cpu::{Context, Model};
+use super::cpu::{Context, Model, Targets};
 use super::preprocess::{MAX_CLASSES, Preprocessor};
 use crate::format::static_context::{ContextArchitecture, StaticContextArtifact, StaticContextMetadata};
 use crate::preprocess::labels::Labels;
 use crate::progress::{self, Stage};
-use crate::{Error, Optimize, Result, format::preprocessor};
+use crate::{
+    DecoderOutputs, Error, Optimize, RegressionOutput, Result, TaskKind, format::preprocessor,
+    models::quantiles::summarize,
+};
 
 /// Query rows preprocessed at once.
 const PREDICT_CHUNK_ROWS: usize = 4096;
 
 /// What a fit starts from, and all that saving keeps: the encoded
 /// `[rows, features]` training matrix, each feature's categories (`None` for
-/// a numeric one), the labels, the members, and the seed.
+/// a numeric one), the labels (a regressor's targets as floats), the members,
+/// and the seed.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Training {
     pub x: Vec<f64>,
@@ -31,8 +36,8 @@ pub struct Training {
     pub feature_names: Option<Vec<String>>,
 }
 
-/// A fitted classifier: per member, one context, or with more than 10
-/// classes one per codebook task.
+/// A fitted model: per member, one context, or for a classifier of more than
+/// 10 classes one per codebook task.
 pub struct Fitted {
     model: Arc<Model>,
     pool: rayon::ThreadPool,
@@ -57,7 +62,9 @@ impl Fitted {
     pub fn fit(model: Arc<Model>, training: Training, threads: Option<usize>) -> Result<Self> {
         let categorical: Vec<bool> = training.categories.iter().map(Option::is_some).collect();
         let (members, seed) = (training.members, training.seed);
-        let preprocessor = Preprocessor::fit(&training.x, &categorical, &training.labels, members, seed)?;
+        let task = model.release.task;
+        let preprocessor =
+            Preprocessor::fit(&training.x, &categorical, &training.labels, task, members, seed)?;
         Self::with_preprocessor(model, training, preprocessor, threads)
     }
 
@@ -73,6 +80,7 @@ impl Fitted {
             &training.x,
             &categorical,
             &training.labels,
+            model.release.task,
             training.members,
             |_, _, _| draws,
         )?;
@@ -86,15 +94,18 @@ impl Fitted {
         threads: Option<usize>,
     ) -> Result<Self> {
         let pool = pool(threads)?;
-        if model.release.task != crate::TaskKind::Classifier {
-            return Err(Error::InvalidArgument(
-                "the checkpoint is not a classifier".into(),
-            ));
-        }
         let members = preprocessor.members();
         let mut contexts = Vec::with_capacity(members);
         for member in 0..members {
             let rows = preprocessor.transform(&training.x, member)?;
+            if model.release.task == TaskKind::Regressor {
+                let values = preprocessor.target_values(&training.labels, member)?;
+                let context =
+                    pool.install(|| model.fit(&rows.x, &rows.categorical, Targets::Values(&values)))?;
+                contexts.push(vec![context]);
+                progress::report(Stage::Build, member + 1, members)?;
+                continue;
+            }
             let codes = preprocessor.class_codes(&training.labels, member)?;
             let codebook = &preprocessor.draws.codebooks[member];
             let tasks: Vec<Vec<usize>> = if codebook.is_empty() {
@@ -108,7 +119,9 @@ impl Fitted {
             contexts.push(
                 tasks
                     .iter()
-                    .map(|codes| pool.install(|| model.fit(&rows.x, &rows.categorical, codes)))
+                    .map(|codes| {
+                        pool.install(|| model.fit(&rows.x, &rows.categorical, Targets::Classes(codes)))
+                    })
                     .collect::<Result<_>>()?,
             );
             progress::report(Stage::Build, member + 1, members)?;
@@ -122,10 +135,15 @@ impl Fitted {
         })
     }
 
-    /// The classes, sorted.
     #[must_use]
-    pub fn classes(&self) -> &Labels {
-        &self.preprocessor.classes
+    pub fn task(&self) -> TaskKind {
+        self.model.release.task
+    }
+
+    /// A classifier's classes, sorted.
+    #[must_use]
+    pub fn classes(&self) -> Option<&Labels> {
+        self.preprocessor.classes.as_ref()
     }
 
     /// The SHA-256 of the checkpoint this model was fitted with.
@@ -146,34 +164,126 @@ impl Fitted {
     ///
     /// When `x` does not have the training features.
     pub fn predict_proba(&self, x: &[f64]) -> Result<Vec<f32>> {
+        if self.classes().is_none() {
+            return Err(Error::InvalidArgument(
+                "a regressor has no class probabilities".into(),
+            ));
+        }
+        Ok(self.chunks(x, |x| self.probabilities(x))?.concat())
+    }
+
+    /// A regressor's `outputs` for each of the encoded `[rows, features]` rows
+    /// `x`, each row-major `[rows, columns]` with its columns, in the targets'
+    /// units, reporting rows predicted. The members' quantiles are combined
+    /// first, as NVIDIA's code does, then summarized as `TabICLRegressor`'s
+    /// are.
+    ///
+    /// # Errors
+    ///
+    /// For a classifier, or when `x` does not have the training features.
+    pub fn predict_regression(
+        &self,
+        x: &[f64],
+        outputs: &[RegressionOutput],
+    ) -> Result<Vec<(Vec<f32>, usize)>> {
+        if self.preprocessor.target_scale.is_none() {
+            return Err(Error::InvalidArgument(
+                "a classifier has no regression outputs".into(),
+            ));
+        }
+        let chunks = self.chunks(x, |x| {
+            let quantiles = self.quantiles(x)?;
+            let rows = quantiles.len() / 999;
+            summarize(&DecoderOutputs::new([1, rows, 999], quantiles)?, outputs)
+        })?;
+        Ok((0..outputs.len())
+            .map(|index| {
+                let values = chunks
+                    .iter()
+                    .flat_map(|chunk| chunk[index].0.iter().copied())
+                    .collect();
+                (values, chunks[0][index].1)
+            })
+            .collect())
+    }
+
+    /// `predict` on each chunk of the `[rows, features]` rows `x`, reporting rows done.
+    fn chunks<T>(&self, x: &[f64], predict: impl Fn(&[f64]) -> Result<T>) -> Result<Vec<T>> {
         let features = self.training.categories.len();
         if x.is_empty() || !x.len().is_multiple_of(features) {
             return Err(Error::InvalidArgument("X must have the training features".into()));
         }
         let rows = x.len() / features;
-        let mut out = Vec::with_capacity(rows * self.classes().len());
+        let mut out = Vec::new();
         for start in (0..rows).step_by(PREDICT_CHUNK_ROWS) {
             let end = (start + PREDICT_CHUNK_ROWS).min(rows);
-            out.extend(progress::with_offset(start, rows, || {
-                self.predict_chunk(&x[start * features..end * features])
+            out.push(progress::with_offset(start, rows, || {
+                predict(&x[start * features..end * features])
             })?);
             progress::report(Stage::Predict, end, rows)?;
         }
         Ok(out)
     }
 
+    /// Each member's outputs of the rows `x`, per context.
+    fn outputs(&self, x: &[f64], member: usize) -> Result<Vec<Vec<f32>>> {
+        let query = self.preprocessor.transform(x, member)?;
+        self.contexts[member]
+            .iter()
+            .map(|context| self.pool.install(|| self.model.predict(context, &query.x)))
+            .collect()
+    }
+
+    /// The members' 999 quantiles, in the targets' units and sorted, with the
+    /// lowest and highest fifth of the members dropped per quantile, then
+    /// averaged.
+    ///
+    /// Port of <https://github.com/NVIDIA/structured-data-models/blob/3fdf108a1f1b719b1b983373b71bbba79fcab7e6/sdm/processing/output/reduce.py#L38-L66>.
+    #[expect(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "Member counts are small; the output is FP32"
+    )]
+    fn quantiles(&self, x: &[f64]) -> Result<Vec<f32>> {
+        let (mean, scale) = self.preprocessor.target_scale.expect("a regressor");
+        let members = self.contexts.len();
+        let mut all = Vec::with_capacity(members);
+        for member in 0..members {
+            let sign = self.preprocessor.draws.target_signs[member];
+            let mut values: Vec<f64> = self
+                .outputs(x, member)?
+                .remove(0)
+                .into_iter()
+                .map(|q| f64::from(q) * sign * scale + mean)
+                .collect();
+            for row in values.chunks_mut(999) {
+                row.sort_by(f64::total_cmp);
+            }
+            all.push(values);
+        }
+        let cut = (0.2 * members as f64) as usize;
+        let mut column = vec![0.0; members];
+        Ok((0..all[0].len())
+            .map(|index| {
+                for (value, member) in column.iter_mut().zip(&all) {
+                    *value = member[index];
+                }
+                column.sort_by(f64::total_cmp);
+                let kept = &column[cut..members - cut];
+                (kept.iter().sum::<f64>() / kept.len() as f64) as f32
+            })
+            .collect())
+    }
+
     /// The mean of the members' class scores, softmaxed.
     #[expect(clippy::cast_precision_loss, reason = "Member counts are small")]
-    fn predict_chunk(&self, x: &[f64]) -> Result<Vec<f32>> {
-        let classes = self.classes().len();
+    fn probabilities(&self, x: &[f64]) -> Result<Vec<f32>> {
+        let classes = self.classes().map_or(0, Labels::len);
         let rows = x.len() / self.training.categories.len();
         let mut sums = vec![0.0_f32; rows * classes];
-        for (member, contexts) in self.contexts.iter().enumerate() {
-            let query = self.preprocessor.transform(x, member)?;
-            let logits: Vec<Vec<f32>> = contexts
-                .iter()
-                .map(|context| self.pool.install(|| self.model.predict(context, &query.x)))
-                .collect::<Result<_>>()?;
+        for member in 0..self.contexts.len() {
+            let logits = self.outputs(x, member)?;
             let scores = if logits.len() == 1 {
                 logits[0]
                     .chunks(MAX_CLASSES)
@@ -280,7 +390,9 @@ impl Fitted {
         };
         let categorical: Vec<bool> = training.categories.iter().map(Option::is_some).collect();
         let (members, seed) = (training.members, training.seed);
-        let preprocessor = Preprocessor::fit(&training.x, &categorical, &training.labels, members, seed)?;
+        let task = model.release.task;
+        let preprocessor =
+            Preprocessor::fit(&training.x, &categorical, &training.labels, task, members, seed)?;
         let artifact = StaticContextArtifact::from_bytes(contexts)?;
         let mut fitted = Self {
             pool: pool(threads)?,
@@ -459,6 +571,22 @@ mod tests {
 
     #[test]
     #[ignore = "needs IRONICL_CHECKPOINT_FIXTURES with the Kumo-Tabular checkpoints"]
+    fn saved_regression_contexts_load_the_same_model() {
+        let model = Arc::new(model("small", "regressor"));
+        let (case, training) = training("numeric_regression");
+        let queries = &case.x[case.context * case.features..];
+        let outputs = [crate::RegressionOutput::RawQuantiles];
+        let fitted = Fitted::fit(Arc::clone(&model), training, None).unwrap();
+        let (bytes, contexts) = (fitted.to_bytes().unwrap(), fitted.context_bytes().unwrap());
+        let loaded = Fitted::from_bytes(model, &bytes, Some(&contexts), None).unwrap();
+        assert_eq!(
+            loaded.predict_regression(queries, &outputs).unwrap(),
+            fitted.predict_regression(queries, &outputs).unwrap()
+        );
+    }
+
+    #[test]
+    #[ignore = "needs IRONICL_CHECKPOINT_FIXTURES with the Kumo-Tabular checkpoints"]
     fn probabilities_match_nvidias() {
         for (name, size) in [
             ("numeric", "small"),
@@ -478,7 +606,7 @@ mod tests {
                 .iter()
                 .map(|c| c.as_str().unwrap().into())
                 .collect();
-            let classes = match fitted.classes() {
+            let classes = match fitted.classes().unwrap() {
                 crate::Labels::Text(names) => names.clone(),
                 crate::Labels::Int(values) => values.iter().map(ToString::to_string).collect(),
                 _ => unreachable!(),
@@ -492,6 +620,41 @@ mod tests {
                 }
             }
             println!("{name}: max |probability error| {worst:.2e}");
+            assert!(worst < 1e-5, "{name}: {worst}");
+        }
+    }
+
+    #[test]
+    #[ignore = "needs IRONICL_CHECKPOINT_FIXTURES with the Kumo-Tabular checkpoints"]
+    fn quantiles_match_nvidias() {
+        for (name, size) in [
+            ("numeric_regression", "small"),
+            ("mixed_regression_large", "large"),
+        ] {
+            let (case, training) = training(name);
+            let fitted =
+                Fitted::fit_with(Arc::new(model(size, "regressor")), training, case.draws.clone()).unwrap();
+            let x = &case.x[case.context * case.features..];
+            let outputs = [
+                crate::RegressionOutput::RawQuantiles,
+                crate::RegressionOutput::Mean,
+            ];
+            let results = fitted.predict_regression(x, &outputs).unwrap();
+            let expected = rows(&case.json["prediction"]["values"]);
+            let mut worst = 0.0_f64;
+            for (row, values) in expected.iter().enumerate() {
+                for (index, value) in values.iter().enumerate() {
+                    let error =
+                        (f64::from(results[0].0[row * 999 + index]) - value).abs() / (1.0 + value.abs());
+                    worst = worst.max(error);
+                }
+                let mean = values.iter().sum::<f64>() / 999.0;
+                assert!(
+                    (f64::from(results[1].0[row]) - mean).abs() < 1e-4 * (1.0 + mean.abs()),
+                    "{name} mean"
+                );
+            }
+            println!("{name}: max relative quantile error {worst:.2e}");
             assert!(worst < 1e-5, "{name}: {worst}");
         }
     }

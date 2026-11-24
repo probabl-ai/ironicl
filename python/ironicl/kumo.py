@@ -12,8 +12,8 @@ from numbers import Integral
 from pathlib import Path
 
 import numpy as np
-from sklearn.base import BaseEstimator, ClassifierMixin
-from sklearn.utils.validation import check_is_fitted
+from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
+from sklearn.utils.validation import check_array, check_is_fitted, column_or_1d
 
 from ironicl import _core
 from ironicl.base import SavedEstimator, _array, _features, _label_values, _labels, _progress, _threads
@@ -40,23 +40,8 @@ def _model(checkpoint: Path, release: str) -> _core.KumoTabular:
     return _core.KumoTabular(checkpoint, release)
 
 
-class KumoTabularClassifier(ClassifierMixin, SavedEstimator, BaseEstimator):
-    """Kumo-Tabular classifier with Ironicl's Rust inference engine, on the CPU.
-
-    ``size`` is ``"small"``, ``"medium"``, or ``"large"``. ``n_estimators``
-    ensemble members each preprocess the data differently; ``None`` uses
-    NVIDIA's benchmark defaults, 16 for ``"large"`` and 8 otherwise.
-    ``random_state`` seeds the members' random draws: Ironicl draws them
-    itself, so a seed gives the same model on every machine. ``n_jobs`` sets
-    the worker threads (``None`` uses every core; negative values count back
-    from all cores). ``verbose=True`` shows progress.
-
-    The checkpoint is downloaded from Hugging Face's ``nvidia/Kumo-Tabular``
-    at a pinned revision into Ironicl's cache folder, unless ``model_path``
-    names it. Its weights are under NVIDIA's OpenMDW-1.1 license. ``save``,
-    ``load``, and pickling work as for ``TabICLClassifier``; the training data
-    is always saved, since loading fits the preprocessing again from it.
-    """
+class _KumoTabular(SavedEstimator, BaseEstimator):
+    """What the classifier and the regressor share; subclasses set ``_task``."""
 
     def __init__(
         self,
@@ -76,53 +61,45 @@ class KumoTabularClassifier(ClassifierMixin, SavedEstimator, BaseEstimator):
         self.model_path = model_path
         self.allow_auto_download = allow_auto_download
 
-    _task = "classifier"
+    _task: str
     _needs_training_data = True
 
-    def fit(self, X, y) -> KumoTabularClassifier:
-        """Fit the members' preprocessing and contexts in Rust."""
-        if y is None:
-            raise ValueError("This classifier requires y to be passed, but the target y is None.")
+    def _fit(self, X, targets: dict) -> None:
+        """Fit the members' preprocessing and contexts in Rust on ``X`` and
+        ``targets``, as ``_core.KumoTabular.fit`` takes them."""
         self._validate()
-        labels = _labels(y)
         x, names = _features(X)
         checkpoint = self._checkpoint()
         with self._progress("Building context", "estimator") as progress:
             self.fitted_ = _model(checkpoint, self._release()).fit(
                 x,
-                _label_values(labels),
-                self._estimators(),
-                self.random_state,
+                **targets,
+                n_estimators=self._estimators(),
+                random_state=self.random_state,
                 threads=self._threads(),
                 feature_names=None if names is None else list(names),
                 progress=progress,
             )
         self.checkpoint_path_ = checkpoint
-        self.classes_ = np.unique(labels)  # Rust sorts the classes as NumPy does.
-        self.n_classes_ = len(self.classes_)
         self.n_features_in_ = len(x) if isinstance(x, list) else x.shape[1]
         if names is not None:
             self.feature_names_in_ = np.asarray(names, dtype=object)
         elif hasattr(self, "feature_names_in_"):
             del self.feature_names_in_  # Left by an earlier fit on named data.
-        return self
 
-    def predict_proba(self, X) -> np.ndarray:
-        """Return class probabilities with shape ``(n_samples, n_classes)``."""
+    def _query(self, X):
+        """``X`` as Rust predicts from it, checked against the training data."""
         check_is_fitted(self)
         expected = tuple(self.feature_names_in_) if hasattr(self, "feature_names_in_") else None
         if hasattr(X, "columns") and len(X.columns) == self.n_features_in_ and tuple(X.columns) != expected:
             raise ValueError("X must have the same feature names and order as the training data")
         x, names = _features(X, self.fitted_.categorical)
+        width = len(x) if isinstance(x, list) else x.shape[1]
+        if width != self.n_features_in_:
+            raise ValueError(f"X has {width} features; expected {self.n_features_in_}")
         if names != expected:
             raise ValueError("X must have the same feature names and order as the training data")
-        with self._progress("Predicting", "row") as progress:
-            values, shape = self.fitted_.predict_proba(x, progress)
-        return _array(values, shape).copy()
-
-    def predict(self, X) -> np.ndarray:
-        """Return the most probable class label for each sample."""
-        return self.classes_[np.argmax(self.predict_proba(X), axis=1)]
+        return x
 
     def export(self, path: str | Path, kv_cache: bool = True) -> None:
         """Export the fitted model to the directory ``path`` for ``ironicl serve``,
@@ -182,3 +159,88 @@ class KumoTabularClassifier(ClassifierMixin, SavedEstimator, BaseEstimator):
         path = Path(self.model_path) if self.model_path is not None else _checkpoints_dir("kumo-tabular") / f"{name}.pt"
         url = CHECKPOINT_URL.format(revision=REVISION, size=self.size, task=self._task)
         return fetch(path, url, SHA256.get(name), allow_download=self.allow_auto_download, data=data)
+
+
+class KumoTabularClassifier(ClassifierMixin, _KumoTabular):
+    """Kumo-Tabular classifier with Ironicl's Rust inference engine, on the CPU.
+
+    ``size`` is ``"small"``, ``"medium"``, or ``"large"``. ``n_estimators``
+    ensemble members each preprocess the data differently; ``None`` uses
+    NVIDIA's benchmark defaults, 16 for ``"large"`` and 8 otherwise.
+    ``random_state`` seeds the members' random draws: Ironicl draws them
+    itself, so a seed gives the same model on every machine. ``n_jobs`` sets
+    the worker threads (``None`` uses every core; negative values count back
+    from all cores). ``verbose=True`` shows progress.
+
+    The checkpoint is downloaded from Hugging Face's ``nvidia/Kumo-Tabular``
+    at a pinned revision into Ironicl's cache folder, unless ``model_path``
+    names it. Its weights are under NVIDIA's OpenMDW-1.1 license. ``save``,
+    ``load``, and pickling work as for ``TabICLClassifier``; the training data
+    is always saved, since loading fits the preprocessing again from it.
+    """
+
+    _task = "classifier"
+
+    def fit(self, X, y) -> KumoTabularClassifier:
+        """Fit the members' preprocessing and contexts in Rust."""
+        if y is None:
+            raise ValueError("This classifier requires y to be passed, but the target y is None.")
+        labels = _labels(y)
+        self._fit(X, {"labels": _label_values(labels)})
+        self.classes_ = np.unique(labels)  # Rust sorts the classes as NumPy does.
+        self.n_classes_ = len(self.classes_)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        """Return class probabilities with shape ``(n_samples, n_classes)``."""
+        x = self._query(X)
+        with self._progress("Predicting", "row") as progress:
+            values, shape = self.fitted_.predict_proba(x, progress)
+        return _array(values, shape).copy()
+
+    def predict(self, X) -> np.ndarray:
+        """Return the most probable class label for each sample."""
+        return self.classes_[np.argmax(self.predict_proba(X), axis=1)]
+
+
+class KumoTabularRegressor(RegressorMixin, _KumoTabular):
+    """Kumo-Tabular regressor with Ironicl's Rust inference engine, on the CPU.
+
+    Each member predicts 999 quantiles; their sorted values are averaged over
+    the members after dropping the lowest and highest fifth, as NVIDIA's code
+    does. ``predict`` summarizes them as ``TabICLRegressor.predict`` does.
+    The parameters are ``KumoTabularClassifier``'s.
+    """
+
+    _task = "regressor"
+
+    def fit(self, X, y) -> KumoTabularRegressor:
+        """Fit the members' preprocessing and contexts in Rust."""
+        if y is None:
+            raise ValueError("This regressor requires y to be passed, but the target y is None.")
+        # A column vector becomes one-dimensional, with scikit-learn's warning.
+        y = column_or_1d(check_array(y, ensure_2d=False, dtype=np.float32), warn=True)
+        if not np.isfinite(y).all():
+            raise ValueError("y must be a one-dimensional array of finite numbers")
+        self._fit(X, {"values": np.ascontiguousarray(y)})
+        return self
+
+    def predict(self, X, output_type: str | list[str] = "mean", alphas: list[float] | None = None):
+        """Predict target statistics for each sample.
+
+        ``output_type`` is ``"mean"`` (the mean of the 999 quantiles, as
+        NVIDIA's benchmark predicts), ``"median"``, or ``"variance"`` (shape
+        ``(n_samples,)``), ``"quantiles"`` at ``alphas`` (default 0.1 to 0.9),
+        ``"raw_quantiles"`` (the 999 combined quantiles), or a list of these,
+        which returns a dict.
+        """
+        x = self._query(X)
+        types = [output_type] if isinstance(output_type, str) else list(output_type)
+        alphas = None if alphas is None else list(alphas)
+        with self._progress("Predicting", "row") as progress:
+            results = self.fitted_.predict_regression(x, types, alphas, progress)
+        final = {}
+        for name, (values, shape) in zip(types, results):
+            values = _array(values, shape).copy()
+            final[name] = values.ravel() if name in ("mean", "variance", "median") else values
+        return final[types[0]] if len(types) == 1 else final
