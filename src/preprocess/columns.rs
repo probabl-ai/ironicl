@@ -3,7 +3,7 @@
 //! sorted distinct values its training rows use, and a value's code is its
 //! category's index, or -1 when it is missing or not a category.
 
-use super::labels::{Label, Labels};
+use super::labels::{Labels, Value};
 use crate::{Error, Result};
 
 /// The code of a missing value or of one that is not a category:
@@ -94,16 +94,16 @@ pub fn categories(columns: &[Column]) -> Result<Vec<Option<Labels>>> {
 /// When the value's type does not fit the feature, with what the feature
 /// takes: "a number", "a string", or "a boolean".
 pub fn encode_value(
-    value: Option<Label<'_>>,
+    value: Option<Value<'_>>,
     categories: Option<&Labels>,
 ) -> std::result::Result<f64, &'static str> {
     let Some(categories) = categories else {
         #[expect(clippy::cast_precision_loss, reason = "Numbers become float64, as in pandas")]
         return match value {
             None => Ok(f64::NAN),
-            Some(Label::Int(value)) => Ok(value as f64),
-            Some(Label::Float(value)) => Ok(value),
-            Some(Label::Bool(_) | Label::Text(_)) => Err("a number"),
+            Some(Value::Int(value)) => Ok(value as f64),
+            Some(Value::Float(value)) => Ok(value),
+            Some(Value::Bool(_) | Value::Text(_)) => Err("a number"),
         };
     };
     let Some(value) = value else { return Ok(MISSING) };
@@ -174,21 +174,21 @@ pub fn encode(columns: &[Column], categories: &[Option<Labels>]) -> Result<Vec<f
 #[cfg(test)]
 mod tests {
     use super::{Column, MISSING, categories, encode, encode_value};
-    use crate::preprocess::labels::{Label, Labels};
+    use crate::preprocess::labels::{Labels, Value};
 
     #[test]
     fn a_value_is_a_number_or_a_category_index() {
         let text = Labels::Text(vec!["a".into(), "b".into()]);
         for (value, categories, expected) in [
             (None, None, Ok(f64::NAN)),
-            (Some(Label::Int(3)), None, Ok(3.0)),
-            (Some(Label::Float(0.5)), None, Ok(0.5)),
-            (Some(Label::Text("a")), None, Err("a number")),
-            (Some(Label::Bool(true)), None, Err("a number")),
+            (Some(Value::Int(3)), None, Ok(3.0)),
+            (Some(Value::Float(0.5)), None, Ok(0.5)),
+            (Some(Value::Text("a")), None, Err("a number")),
+            (Some(Value::Bool(true)), None, Err("a number")),
             (None, Some(&text), Ok(MISSING)),
-            (Some(Label::Text("b")), Some(&text), Ok(1.0)),
-            (Some(Label::Text("c")), Some(&text), Ok(MISSING)),
-            (Some(Label::Int(1)), Some(&text), Err("a string")),
+            (Some(Value::Text("b")), Some(&text), Ok(1.0)),
+            (Some(Value::Text("c")), Some(&text), Ok(MISSING)),
+            (Some(Value::Int(1)), Some(&text), Err("a string")),
         ] {
             let got = encode_value(value, categories);
             let same = match (got, expected) {

@@ -15,7 +15,7 @@ use super::{
     Server,
     worker::{Answer, Outputs, Query},
 };
-use crate::preprocess::{columns::encode_value, labels::Label};
+use crate::preprocess::{columns::encode_value, labels::Value};
 use crate::{Error, Labels, RegressionOutput, TaskKind};
 
 /// `TabICLRegressor.predict`'s default quantile levels.
@@ -24,8 +24,9 @@ const DEFAULT_ALPHAS: [f32; 9] = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
 /// quantiles. Each level costs a value per row of the whole batch.
 const MAX_ALPHAS: usize = 999;
 
-/// What a request is checked against.
-pub(super) struct Limits {
+/// What a request is checked against: the model's task and features, and
+/// the request size it allows.
+pub(super) struct Schema {
     pub task: TaskKind,
     pub features: usize,
     /// Each feature's categories, or `None` for a numeric feature.
@@ -36,7 +37,7 @@ pub(super) struct Limits {
     pub max_request_rows: usize,
 }
 
-impl Limits {
+impl Schema {
     pub fn new(
         task: TaskKind,
         categories: Vec<Option<Labels>>,
@@ -63,11 +64,10 @@ impl Limits {
     }
 }
 
-/// One value in a row: `null`, pandas' missing value, a number, a boolean,
-/// or text.
+/// One value in a row: a number, a boolean, or text. `null`, which is
+/// pandas' missing value, is `None` in its place.
 #[derive(Clone, Debug, PartialEq)]
 enum Cell {
-    Missing,
     Int(i64),
     Float(f64),
     Bool(bool),
@@ -81,9 +81,6 @@ impl<'de> Deserialize<'de> for Cell {
             type Value = Cell;
             fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 formatter.write_str("null, a number, a boolean, or a string")
-            }
-            fn visit_unit<E>(self) -> Result<Cell, E> {
-                Ok(Cell::Missing)
             }
             fn visit_bool<E>(self, value: bool) -> Result<Cell, E> {
                 Ok(Cell::Bool(value))
@@ -113,14 +110,12 @@ impl<'de> Deserialize<'de> for Cell {
 }
 
 impl Cell {
-    /// The value, `None` when it is missing.
-    fn label(&self) -> Option<Label<'_>> {
+    fn value(&self) -> Value<'_> {
         match self {
-            Self::Missing => None,
-            Self::Int(value) => Some(Label::Int(*value)),
-            Self::Float(value) => Some(Label::Float(*value)),
-            Self::Bool(value) => Some(Label::Bool(*value)),
-            Self::Text(value) => Some(Label::Text(value)),
+            Self::Int(value) => Value::Int(*value),
+            Self::Float(value) => Value::Float(*value),
+            Self::Bool(value) => Value::Bool(*value),
+            Self::Text(value) => Value::Text(value),
         }
     }
 }
@@ -130,7 +125,7 @@ impl Cell {
 /// `TabICL`'s predict arguments.
 #[derive(Deserialize, Validate)]
 #[serde(deny_unknown_fields)]
-#[garde(context(Limits))]
+#[garde(context(Schema))]
 struct PredictRequest {
     /// The column names, in the order of each row's values. Without them,
     /// the values are in the training data's order.
@@ -141,7 +136,7 @@ struct PredictRequest {
     /// replaced by its feature's training mean, or for a categorical feature
     /// encoded as a category training never saw.
     #[garde(custom(fit_the_model))]
-    data: Vec<Vec<Cell>>,
+    data: Vec<Vec<Option<Cell>>>,
     #[garde(length(min = 1), custom(for_the_task_once))]
     output_type: Option<Vec<Output>>,
     #[garde(custom(for_a_regressor), length(min = 1, max = MAX_ALPHAS), inner(inner(custom(between_0_and_1))))]
@@ -171,14 +166,14 @@ impl Output {
 }
 
 #[expect(clippy::ref_option, reason = "garde passes the field as it is")]
-fn match_the_model(columns: &Option<Vec<String>>, limits: &Limits) -> garde::Result {
+fn match_the_model(columns: &Option<Vec<String>>, schema: &Schema) -> garde::Result {
     let Some(columns) = columns else { return Ok(()) };
-    let Some(positions) = &limits.columns else {
+    let Some(positions) = &schema.columns else {
         return Err(garde::Error::new(
             "the model was fit without column names; leave columns out",
         ));
     };
-    let mut seen = vec![false; limits.features];
+    let mut seen = vec![false; schema.features];
     for column in columns {
         let Some(&i) = positions.get(column) else {
             return Err(garde::Error::new(format!("unknown column {column:?}")));
@@ -193,23 +188,23 @@ fn match_the_model(columns: &Option<Vec<String>>, limits: &Limits) -> garde::Res
     Ok(())
 }
 
-fn fit_the_model(data: &[Vec<Cell>], limits: &Limits) -> garde::Result {
+fn fit_the_model(data: &[Vec<Option<Cell>>], schema: &Schema) -> garde::Result {
     if data.is_empty() {
         return Err(garde::Error::new("has no rows"));
     }
-    if data.len() > limits.max_request_rows {
+    if data.len() > schema.max_request_rows {
         return Err(garde::Error::new(format!(
             "{} rows; the limit is {}",
             data.len(),
-            limits.max_request_rows
+            schema.max_request_rows
         )));
     }
     for (i, row) in data.iter().enumerate() {
-        if row.len() != limits.features {
+        if row.len() != schema.features {
             return Err(garde::Error::new(format!(
                 "row {i} has {} values; the model expects {}",
                 row.len(),
-                limits.features
+                schema.features
             )));
         }
     }
@@ -217,12 +212,12 @@ fn fit_the_model(data: &[Vec<Cell>], limits: &Limits) -> garde::Result {
 }
 
 #[expect(clippy::ref_option, reason = "garde passes the field as it is")]
-fn for_the_task_once(outputs: &Option<Vec<Output>>, limits: &Limits) -> garde::Result {
+fn for_the_task_once(outputs: &Option<Vec<Output>>, schema: &Schema) -> garde::Result {
     let Some(outputs) = outputs else { return Ok(()) };
-    if let Some(output) = outputs.iter().find(|output| output.task() != limits.task) {
+    if let Some(output) = outputs.iter().find(|output| output.task() != schema.task) {
         return Err(garde::Error::new(format!(
             "a {} has no output {}",
-            limits.task,
+            schema.task,
             serde_json::json!(output)
         )));
     }
@@ -233,8 +228,8 @@ fn for_the_task_once(outputs: &Option<Vec<Output>>, limits: &Limits) -> garde::R
 }
 
 #[expect(clippy::ref_option, reason = "garde passes the field as it is")]
-fn for_a_regressor(alphas: &Option<Vec<f32>>, limits: &Limits) -> garde::Result {
-    match (alphas, limits.task) {
+fn for_a_regressor(alphas: &Option<Vec<f32>>, schema: &Schema) -> garde::Result {
+    match (alphas, schema.task) {
         (Some(_), TaskKind::Classifier) => Err(garde::Error::new("only a regressor takes alphas")),
         _ => Ok(()),
     }
@@ -244,7 +239,7 @@ fn for_a_regressor(alphas: &Option<Vec<f32>>, limits: &Limits) -> garde::Result 
     clippy::trivially_copy_pass_by_ref,
     reason = "garde passes each value by reference"
 )]
-fn between_0_and_1(alpha: &f32, _: &Limits) -> garde::Result {
+fn between_0_and_1(alpha: &f32, _: &Schema) -> garde::Result {
     if *alpha > 0.0 && *alpha < 1.0 {
         Ok(())
     } else {
@@ -253,10 +248,10 @@ fn between_0_and_1(alpha: &f32, _: &Limits) -> garde::Result {
 }
 
 impl PredictRequest {
-    /// Check the request against `limits`.
-    fn check(self, limits: &Limits) -> Result<Valid<Self>, ApiError> {
+    /// Check the request against `schema`.
+    fn check(self, schema: &Schema) -> Result<Valid<Self>, ApiError> {
         Unvalidated::new(self)
-            .validate_with(limits)
+            .validate_with(schema)
             .map_err(|report| ApiError::invalid(report.to_string().trim_end()))
     }
 
@@ -265,27 +260,29 @@ impl PredictRequest {
     /// # Errors
     ///
     /// When a value's type does not fit its feature.
-    fn into_query(request: Valid<Self>, limits: &Limits) -> Result<Query, ApiError> {
+    fn into_query(request: Valid<Self>, schema: &Schema) -> Result<Query, ApiError> {
         let request = request.into_inner();
         // Where each of the model's features is in a row.
-        let mut order: Vec<usize> = (0..limits.features).collect();
-        if let (Some(columns), Some(positions)) = (&request.columns, &limits.columns) {
+        let mut order: Vec<usize> = (0..schema.features).collect();
+        if let (Some(columns), Some(positions)) = (&request.columns, &schema.columns) {
             for (i, column) in columns.iter().enumerate() {
                 order[positions[column]] = i;
             }
         }
-        let mut values = Vec::with_capacity(request.data.len() * limits.features);
+        let mut values = Vec::with_capacity(request.data.len() * schema.features);
         for (r, row) in request.data.iter().enumerate() {
-            for (&i, categories) in order.iter().zip(&limits.categories) {
-                let value = encode_value(row[i].label(), categories.as_ref()).map_err(|expected| {
-                    let column = request
-                        .columns
-                        .as_ref()
-                        .map_or_else(|| i.to_string(), |names| format!("{:?}", names[i]));
-                    ApiError::invalid(format!(
-                        "data: row {r}, column {column} must be {expected} or null"
-                    ))
-                })?;
+            for (&i, categories) in order.iter().zip(&schema.categories) {
+                let value = encode_value(row[i].as_ref().map(Cell::value), categories.as_ref()).map_err(
+                    |expected| {
+                        let column = request
+                            .columns
+                            .as_ref()
+                            .map_or_else(|| i.to_string(), |names| format!("{:?}", names[i]));
+                        ApiError::invalid(format!(
+                            "data: row {r}, column {column} must be {expected} or null"
+                        ))
+                    },
+                )?;
                 values.push(value);
             }
         }
@@ -293,7 +290,7 @@ impl PredictRequest {
             values,
             count: request.data.len(),
         };
-        let outputs = match limits.task {
+        let outputs = match schema.task {
             TaskKind::Classifier => {
                 let names = request
                     .output_type
@@ -332,14 +329,14 @@ pub(super) fn missing_rows(
     count: usize,
 ) -> Result<Query, ApiError> {
     let features = categories.len();
-    let limits = Limits::new(task, categories, None, count);
+    let schema = Schema::new(task, categories, None, count);
     let request = PredictRequest {
         columns: None,
-        data: vec![vec![Cell::Missing; features]; count],
+        data: vec![vec![None; features]; count],
         output_type: None,
         alphas: None,
     };
-    PredictRequest::into_query(request.check(&limits)?, &limits)
+    PredictRequest::into_query(request.check(&schema)?, &schema)
 }
 
 /// A query's rows, flattened in the training data's column order.
@@ -539,9 +536,9 @@ pub(super) async fn predict(
     }
     let request: PredictRequest =
         serde_json::from_slice(&body).map_err(|error| ApiError::invalid(error.to_string()))?;
-    let request = request.check(&server.limits)?;
+    let request = request.check(&server.schema)?;
     server
-        .submit(PredictRequest::into_query(request, &server.limits)?)
+        .submit(PredictRequest::into_query(request, &server.schema)?)
         .await
 }
 
@@ -552,32 +549,32 @@ pub(super) async fn health() -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{Limits, MAX_ALPHAS, PredictRequest};
+    use super::{MAX_ALPHAS, PredictRequest, Schema};
     use crate::{Labels, TaskKind};
 
-    /// Limits for a `task` model with the numeric columns `a` and `b`.
-    fn limits(task: TaskKind) -> Limits {
-        Limits::new(task, vec![None; 2], Some(vec!["a".into(), "b".into()]), 3)
+    /// The schema of a `task` model with the numeric columns `a` and `b`.
+    fn schema(task: TaskKind) -> Schema {
+        Schema::new(task, vec![None; 2], Some(vec!["a".into(), "b".into()]), 3)
     }
 
-    /// The error that parsing, checking, and reading `json` against `limits`
+    /// The error that parsing, checking, and reading `json` against `schema`
     /// gives, or `""`.
-    fn error(limits: &Limits, json: &str) -> String {
+    fn error(schema: &Schema, json: &str) -> String {
         let query = serde_json::from_str::<PredictRequest>(json)
             .map_err(|error| error.to_string())
             .and_then(|request| {
                 let request = request
-                    .check(limits)
+                    .check(schema)
                     .map_err(|error| error.message().to_owned())?;
-                PredictRequest::into_query(request, limits).map_err(|error| error.message().to_owned())
+                PredictRequest::into_query(request, schema).map_err(|error| error.message().to_owned())
             });
         query.err().unwrap_or_default()
     }
 
     /// The values that `json`'s rows become.
-    fn values(limits: &Limits, json: &str) -> Vec<f64> {
+    fn values(schema: &Schema, json: &str) -> Vec<f64> {
         let request: PredictRequest = serde_json::from_str(json).unwrap();
-        PredictRequest::into_query(request.check(limits).unwrap(), limits)
+        PredictRequest::into_query(request.check(schema).unwrap(), schema)
             .unwrap()
             .rows
             .values
@@ -591,9 +588,9 @@ mod tests {
             Some(Labels::Int(vec![2, 10])),
         ];
         let names = ["c", "n", "i"].map(String::from).to_vec();
-        let limits = Limits::new(TaskKind::Classifier, categories, Some(names), 3);
+        let schema = Schema::new(TaskKind::Classifier, categories, Some(names), 3);
         let got = values(
-            &limits,
+            &schema,
             r#"{"data": [["y", 1.5, 10], ["z", null, 2.0], [null, 3, 7]]}"#,
         );
         let expected = [1.0, 1.5, 1.0, -1.0, f64::NAN, 0.0, -1.0, 3.0, -1.0];
@@ -602,7 +599,7 @@ mod tests {
             "{got:?}"
         );
         assert_eq!(
-            values(&limits, r#"{"columns": ["n", "i", "c"], "data": [[1, 2, "x"]]}"#),
+            values(&schema, r#"{"columns": ["n", "i", "c"], "data": [[1, 2, "x"]]}"#),
             [0.0, 1.0, 0.0]
         );
         for (json, message) in [
@@ -620,16 +617,16 @@ mod tests {
             ),
         ] {
             assert!(
-                error(&limits, json).contains(message),
+                error(&schema, json).contains(message),
                 "{json}: {}",
-                error(&limits, json)
+                error(&schema, json)
             );
         }
     }
 
     #[test]
     fn columns_put_the_values_in_the_training_order() {
-        let limits = limits(TaskKind::Classifier);
+        let schema = schema(TaskKind::Classifier);
         for (json, values) in [
             (r#"{"data": [[1, 2], [3, 4]]}"#, [1.0, 2.0, 3.0, 4.0]),
             (
@@ -641,7 +638,7 @@ mod tests {
                 [2.0, 1.0, 4.0, 3.0],
             ),
         ] {
-            assert_eq!(super::tests::values(&limits, json), values.to_vec(), "{json}");
+            assert_eq!(super::tests::values(&schema, json), values.to_vec(), "{json}");
         }
     }
 
@@ -728,7 +725,7 @@ mod tests {
             ),
             (Regressor, &too_many_alphas, "alphas: length is greater than 999"),
         ] {
-            let got = error(&limits(task), json);
+            let got = error(&schema(task), json);
             if message.is_empty() {
                 assert_eq!(got, "", "{json}");
             } else {
@@ -736,9 +733,9 @@ mod tests {
             }
         }
         // Names that are not one per column are no names at all.
-        let repeated = Limits::new(Classifier, vec![None; 2], Some(vec!["a".into(), "a".into()]), 3);
+        let repeated = Schema::new(Classifier, vec![None; 2], Some(vec!["a".into(), "a".into()]), 3);
         assert!(repeated.columns.is_none());
-        let unnamed = Limits::new(Classifier, vec![None; 2], None, 3);
+        let unnamed = Schema::new(Classifier, vec![None; 2], None, 3);
         assert!(
             error(&unnamed, r#"{"columns": ["a", "b"], "data": [[1, 2]]}"#)
                 .contains("fit without column names")
