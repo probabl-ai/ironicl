@@ -49,7 +49,112 @@ def _model(checkpoint: Path) -> Model:
     return Model(checkpoint)
 
 
-class TabICLBase(BaseEstimator):
+class SavedEstimator:
+    """``save``, ``load``, and pickling, the same for every Ironicl estimator.
+
+    A pickle holds the estimator's parameters, the fitted model as Rust's bytes,
+    and on request its context and checkpoint. Subclasses give the fitted
+    model's bytes (``_fitted_state``) and load them (``_load_fitted``).
+    """
+
+    # Whether loading always needs the training data, even with the context.
+    _needs_training_data = False
+
+    def save(
+        self,
+        path: str | Path,
+        save_model_weights: bool = False,
+        save_training_data: bool = True,
+        save_kv_cache: bool = True,
+    ) -> None:
+        """Save the fitted estimator to ``path``, for ``load``, ``pickle.load``, or ``joblib.load``.
+
+        ``save_model_weights`` includes the checkpoint, so loading needs no
+        file or download. ``save_kv_cache`` includes the fitted context; without
+        it, loading rebuilds the context from the training data. ``save_training_data``
+        includes the training data, which a load without the context needs. The
+        fitted model is saved in Rust's formats, not as Python objects.
+        """
+        check_is_fitted(self)
+        if not (save_training_data or save_kv_cache):
+            raise ValueError(
+                "Cannot exclude both the training data and the KV cache: loading needs one of them."
+            )
+        if not save_training_data and self._needs_training_data:
+            raise ValueError(f"{type(self).__name__} needs its training data to load; keep save_training_data=True")
+        self._save_options = (save_model_weights, save_training_data, save_kv_cache)
+        try:
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "wb") as file:
+                pickle.dump(self, file, protocol=5)
+        finally:
+            del self._save_options
+
+    @classmethod
+    def load(cls, path: str | Path, device: str | None = None):
+        """Load an estimator that ``save`` wrote. ``device`` accepts what the
+        constructor does, for an estimator that has a ``device`` parameter."""
+        with open(path, "rb") as file:
+            estimator = pickle.load(file)
+        if not isinstance(estimator, cls):
+            raise TypeError(f"{path} holds a {type(estimator).__name__}, not a {cls.__name__}")
+        if device is not None:
+            if "device" not in estimator.get_params():
+                raise TypeError(f"{cls.__name__} has no device parameter; it runs where the model fits")
+            if device != "cpu":
+                raise NotImplementedError(f"device={device!r} is not supported")
+            estimator.device = device
+        return estimator
+
+    def __getstate__(self):
+        """The pickled state: by default self-contained, with the fitted model as bytes."""
+        state = dict(super().__getstate__())  # May be this estimator's own __dict__.
+        weights, training, context = state.pop("_save_options", (False, True, True))
+        state["_ironicl_version"] = _version()
+        if "fitted_" in state:
+            state["fitted_"], state["_context"] = self._fitted_state(training, context)
+            if weights:
+                state["_checkpoint_bytes"] = Path(self.checkpoint_path_).read_bytes()
+        return state
+
+    def __setstate__(self, state):
+        """Load the fitted model from its saved bytes, with its context when it
+        was saved with one, else building it, and the checkpoint, from the
+        pickle when it holds it, else from the cache or a download."""
+        state = dict(state)
+        version = state.pop("_ironicl_version", None)
+        if version != _version():
+            warnings.warn(
+                f"This estimator was saved with Ironicl {version} and is loaded with {_version()}",
+                UserWarning,
+                stacklevel=2,
+            )
+        checkpoint = state.pop("_checkpoint_bytes", None)
+        context = state.pop("_context", None)
+        super().__setstate__(state)
+        if "fitted_" not in state:
+            return  # Not fitted.
+        self._load_fitted(checkpoint, context)
+
+    def _restore_checkpoint(self, data: bytes | None) -> None:
+        """Point ``checkpoint_path_`` at the checkpoint: the saved path when it
+        exists, else the cache, written from ``data`` when the pickle holds it."""
+        if not Path(self.checkpoint_path_).exists():
+            self.checkpoint_path_ = self._checkpoint(data)
+
+    def _fitted_state(self, training: bool, context: bool) -> tuple[bytes, bytes | None]:
+        """The fitted model's bytes, with or without its training data, and its
+        context's bytes when ``context``."""
+        raise NotImplementedError
+
+    def _load_fitted(self, checkpoint: bytes | None, context: bytes | None) -> None:
+        """Replace ``fitted_``, the saved bytes, with the loaded model, after
+        ``_restore_checkpoint(checkpoint)``."""
+        raise NotImplementedError
+
+
+class TabICLBase(SavedEstimator, BaseEstimator):
     """Shared fit machinery. Subclasses set ``_task`` and ``_checkpoint_version``."""
 
     _task: str
@@ -143,36 +248,6 @@ class TabICLBase(BaseEstimator):
             raise ValueError("X must have the same feature names and order as the training data")
         return x
 
-    def save(
-        self,
-        path: str | Path,
-        save_model_weights: bool = False,
-        save_training_data: bool = True,
-        save_kv_cache: bool = True,
-    ) -> None:
-        """Save the fitted estimator to ``path``, for ``load``, ``pickle.load``, or ``joblib.load``.
-
-        ``save_model_weights`` includes the checkpoint, so loading needs no
-        file or download. ``save_kv_cache`` includes the fitted context; without
-        it, loading rebuilds the context from the training data, through
-        ``cache_dir`` when set. ``save_training_data`` includes the training
-        data, which only a load without the context needs. The fitted model is
-        saved in Rust's formats, not as Python objects.
-        """
-        check_is_fitted(self)
-        if not (save_training_data or save_kv_cache):
-            raise ValueError(
-                "Cannot exclude both the training data and the KV cache: loading needs one of them."
-            )
-        self._save_options = (save_model_weights, save_training_data, save_kv_cache)
-        try:
-            path = Path(path)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "wb") as file:
-                pickle.dump(self, file, protocol=5)
-        finally:
-            del self._save_options
-
     def export(self, path: str | Path, kv_cache: bool = True) -> None:
         """Export the fitted model to the directory ``path`` for ``ironicl serve``.
 
@@ -192,57 +267,19 @@ class TabICLBase(BaseEstimator):
             )
         self.fitted_.export(Path(path), Path(self.checkpoint_path_), kv_cache)
 
-    @classmethod
-    def load(cls, path: str | Path, device: str | None = None):
-        """Load an estimator that ``save`` wrote. ``device`` accepts what the constructor does."""
-        with open(path, "rb") as file:
-            estimator = pickle.load(file)
-        if not isinstance(estimator, cls):
-            raise TypeError(f"{path} holds a {type(estimator).__name__}, not a {cls.__name__}")
-        if device is not None:
-            if device != "cpu":
-                raise NotImplementedError(f"device={device!r} is not supported")
-            estimator.device = device
-        return estimator
+    def _fitted_state(self, training: bool, context: bool) -> tuple[bytes, bytes | None]:
+        return self.fitted_.preprocessor_bytes(training=training), self.fitted_.context_bytes() if context else None
 
-    def __getstate__(self):
-        """The pickled state: by default self-contained, with the fitted model as bytes."""
-        state = dict(super().__getstate__())  # May be this estimator's own __dict__.
-        weights, training, context = state.pop("_save_options", (False, True, True))
-        state["_ironicl_version"] = _version()
-        if "fitted_" in state:
-            state["fitted_"] = self.fitted_.preprocessor_bytes(training=training)
-            state["_context"] = self.fitted_.context_bytes() if context else None
-            if weights:
-                state["_checkpoint_bytes"] = Path(self.checkpoint_path_).read_bytes()
-        return state
-
-    def __setstate__(self, state):
-        """Load the fitted model, building its context if it was saved without one,
-        with this machine's threads and memory limits.
-
-        Loading plans its memory as ``fit`` does and follows ``memory_overflow``;
-        ``memory_plan_`` becomes this machine's plan."""
-        state = dict(state)
-        version = state.pop("_ironicl_version", None)
-        if version != _version():
-            warnings.warn(
-                f"This estimator was saved with Ironicl {version} and is loaded with {_version()}",
-                UserWarning,
-                stacklevel=2,
-            )
-        checkpoint = state.pop("_checkpoint_bytes", None)
-        context = state.pop("_context", None)
-        super().__setstate__(state)
-        if "fitted_" not in state:
-            return  # Not fitted.
+    def _load_fitted(self, checkpoint: bytes | None, context: bytes | None) -> None:
+        """Load with this machine's threads and memory limits, planning the
+        memory as ``fit`` does and following ``memory_overflow`` before the
+        checkpoint is restored; ``memory_plan_`` becomes this machine's plan."""
         saved_plan, limits = self.memory_plan_, self._limits()
         shape = (saved_plan.estimators, saved_plan.rows, saved_plan.features)
         plan = _plan(self._task, *shape, saved_plan.optimize, *limits, context is not None)
-        _enforce(plan, _overflow_policy(self.memory_overflow), stacklevel=2, action="load")
+        _enforce(plan, _overflow_policy(self.memory_overflow), stacklevel=4, action="load")
         self.memory_plan_ = plan
-        if not Path(self.checkpoint_path_).exists():
-            self.checkpoint_path_ = self._checkpoint(checkpoint)
+        self._restore_checkpoint(checkpoint)
         self.fitted_ = self._load(self.checkpoint_path_, self.fitted_, context, plan.optimize, limits)
 
     def _limits(self) -> tuple[str | None, str | None]:
