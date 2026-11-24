@@ -148,7 +148,7 @@ impl Fitted {
         self.model.release.task
     }
 
-    /// Where the model runs: `"cuda"` or `"cpu"`.
+    /// Where the model runs: `"metal"`, `"cuda"`, or `"cpu"`.
     #[must_use]
     pub fn device(&self) -> &'static str {
         self.model.device()

@@ -8,6 +8,7 @@ import pickle
 import subprocess
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -120,6 +121,13 @@ class FitTest(unittest.TestCase):
                         self.assertNotEqual(result.returncode, 0)
                         self.assertIn("Kumo-Tabular does not support memory limits", result.stderr)
                         self.assertIn(variable, result.stderr)
+
+    def test_concurrent_predictions_agree(self):
+        expected = self.model.predict_proba(self.x[70:])
+        with ThreadPoolExecutor(4) as pool:
+            results = list(pool.map(lambda _: self.model.predict_proba(self.x[70:]), range(8)))
+        for result in results:
+            np.testing.assert_array_equal(result, expected)
 
     def test_a_failed_refit_leaves_the_estimator_unfitted(self):
         for y in (None, self.y[:60]):  # Failure in Python validation or in the native fit.

@@ -36,6 +36,9 @@ pub struct Model {
     /// The NVIDIA GPU that fits and predicts, when there is one.
     #[cfg(feature = "cuda")]
     cuda: Option<super::cuda::Cuda>,
+    /// The Apple Silicon GPU that fits and predicts, when there is one.
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    metal: Option<super::metal::Metal>,
 }
 
 /// Keys and values for `groups` independent attentions, each over `rows`
@@ -77,6 +80,19 @@ pub struct Context {
     icl: Vec<Kv>,
     #[cfg(feature = "cuda")]
     cuda: Option<super::cuda::Context>,
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    metal: Option<super::metal::Context>,
+}
+
+impl Context {
+    /// Each column's kind: 1 for category codes, else 0.
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+    fn kinds(&self) -> Vec<f32> {
+        self.categorical
+            .iter()
+            .map(|&categorical| f32::from(u8::from(categorical)))
+            .collect()
+    }
 }
 
 /// How a block scales its queries by the key count `n`: not, by
@@ -165,7 +181,10 @@ fn unstack(artifact: &StaticContextArtifact, name: &str, layers: usize) -> Resul
 
 impl Context {
     /// The column and ICL layers' keys and values on the host.
-    #[cfg(feature = "cuda")]
+    #[cfg(any(
+        feature = "cuda",
+        all(feature = "metal", target_os = "macos", target_arch = "aarch64")
+    ))]
     pub(super) fn kvs(&self) -> (&[Kv], &[Kv]) {
         (&self.columns, &self.icl)
     }
@@ -218,8 +237,25 @@ impl Context {
             icl: unstack(artifact, &format!("{prefix}.icl"), icl_layers)?,
             #[cfg(feature = "cuda")]
             cuda: None,
+            #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+            metal: None,
         })
     }
+}
+
+/// Whether every row block's query and key `RoPE` frequencies are equal.
+#[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+fn rope_shared(artifact: &ModelArtifact, config: Config) -> bool {
+    let frequencies = |layer: u64, transform: &str| {
+        artifact
+            .tensor_f32(&format!(
+                "row_embedding.row_blocks.{layer}.attn.{transform}.0.inv_freq"
+            ))
+            .ok()
+            .map(|tensor| tensor.values().to_vec())
+    };
+    (0..config.embedding_layers)
+        .all(|layer| frequencies(layer, "query_transform") == frequencies(layer, "key_transform"))
 }
 
 fn invalid(message: &str) -> Error {
@@ -329,18 +365,30 @@ impl Model {
                 .map(crate::format::model::ModelTensorF32::values)
                 .expect("the manifest has every tensor")
         });
+        // The Metal graphs rotate queries and keys with one table: the checkpoint's two must
+        // be equal, or the model runs on the CPU, which applies each.
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        let metal = rope_shared(&artifact, config)
+            .then(|| super::metal::Metal::new(config, Self::dim(release.outputs())))
+            .flatten();
         Ok(Self {
             release,
             config,
             artifact,
             #[cfg(feature = "cuda")]
             cuda,
+            #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+            metal,
         })
     }
 
-    /// Where the model runs: `"cuda"` or `"cpu"`.
+    /// Where the model runs: `"cuda"`, `"metal"`, or `"cpu"`.
     #[must_use]
     pub fn device(&self) -> &'static str {
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        if self.metal.is_some() {
+            return "metal";
+        }
         #[cfg(feature = "cuda")]
         if self.cuda.is_some() {
             return "cuda";
@@ -509,7 +557,21 @@ impl Model {
             icl: Vec::new(),
             #[cfg(feature = "cuda")]
             cuda: None,
+            #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+            metal: None,
         };
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        if let Some(metal) = &self.metal {
+            let (cell, icl) = (self.cell(), Self::dim(self.config.icl_channels));
+            let (mut cell_labels, mut icl_labels) = (vec![0.0; rows * cell], vec![0.0; rows * icl]);
+            self.add_labels("row_embedding", &mut cell_labels, cell, targets);
+            self.add_labels("icl_block", &mut icl_labels, icl, targets);
+            let weights = |name: &str| -> Result<&[f32]> { Ok(self.tensor(name)) };
+            let kinds = context.kinds();
+            context.metal =
+                Some(metal.fit(&weights, (x, &context.means, &kinds), (&cell_labels, &icl_labels))?);
+            return Ok(context);
+        }
         #[cfg(feature = "cuda")]
         if let Some(cuda) = &self.cuda {
             let (cell, icl) = (self.cell(), Self::dim(self.config.icl_channels));
@@ -557,12 +619,15 @@ impl Model {
     ///
     /// When the copy from the GPU fails.
     #[cfg_attr(
+        not(any(
+            feature = "cuda",
+            all(feature = "metal", target_os = "macos", target_arch = "aarch64")
+        )),
+        expect(clippy::unused_self, reason = "The GPU paths read it")
+    )]
+    #[cfg_attr(
         not(feature = "cuda"),
-        expect(
-            clippy::unused_self,
-            clippy::unnecessary_wraps,
-            reason = "The GPU path reads it and can fail"
-        )
+        expect(clippy::unnecessary_wraps, reason = "The CUDA path can fail")
     )]
     pub(crate) fn context_tensors(
         &self,
@@ -578,6 +643,22 @@ impl Model {
                 columns,
                 icl,
                 cuda: None,
+                #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+                metal: None,
+            };
+            return Ok(host.tensors(prefix));
+        }
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        if let (Some(metal), Some(fitted)) = (&self.metal, &context.metal) {
+            let (columns, icl) = metal.download(fitted, context.categorical.len());
+            let host = Context {
+                categorical: context.categorical.clone(),
+                means: context.means.clone(),
+                columns,
+                icl,
+                #[cfg(feature = "cuda")]
+                cuda: None,
+                metal: None,
             };
             return Ok(host.tensors(prefix));
         }
@@ -591,7 +672,10 @@ impl Model {
     ///
     /// When the copy to the GPU fails for another reason.
     #[cfg_attr(
-        not(feature = "cuda"),
+        not(any(
+            feature = "cuda",
+            all(feature = "metal", target_os = "macos", target_arch = "aarch64")
+        )),
         expect(
             unused_mut,
             clippy::unused_self,
@@ -612,6 +696,15 @@ impl Model {
                 Err(Error::UnsupportedBackend(message)) if message == super::cuda::OUT_OF_MEMORY => {}
                 Err(error) => return Err(error),
             }
+        }
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        if let Some(metal) = &self.metal
+            && context.metal.is_none()
+        {
+            let training_rows = context.icl.first().map_or(0, |kv| kv.rows);
+            context.metal = Some(metal.upload_context(&context, training_rows)?);
+            context.columns = Vec::new();
+            context.icl = Vec::new();
         }
         Ok(context)
     }
@@ -698,6 +791,10 @@ impl Model {
         if self.cuda.is_some() && context.cuda.is_some() {
             return true;
         }
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        if self.metal.is_some() && context.metal.is_some() {
+            return true;
+        }
         let _ = context;
         false
     }
@@ -716,6 +813,11 @@ impl Model {
         #[cfg(feature = "cuda")]
         if let (Some(cuda), Some(fitted)) = (&self.cuda, &context.cuda) {
             return cuda.predict(fitted, x);
+        }
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        if let (Some(metal), Some(fitted)) = (&self.metal, &context.metal) {
+            let weights = |name: &str| -> Result<&[f32]> { Ok(self.tensor(name)) };
+            return metal.predict(&weights, fitted, (x, &context.means, &context.kinds()));
         }
         let mut out = Vec::new();
         for chunk in x.chunks(CHUNK_ROWS * columns) {
