@@ -27,10 +27,11 @@ parameter names and defaults. A live parity test checks this.
 
 - Without `model_path`, `fit` downloads the released checkpoint from Hugging Face
   to a folder per model in `$XDG_CACHE_HOME/ironicl/checkpoints` (default `~/.cache`),
-  such as `tabicl/tabicl-classifier-v2-20260212.ckpt`. The Rust
-  importer verifies its SHA-256 and caches the converted model under
-  `$XDG_CACHE_HOME/ironicl/models`. When that directory is not writable, as in a
-  read-only container, it converts the checkpoint in memory on every load.
+  such as `tabicl/tabicl-classifier-v2-20260212.ckpt`; see
+  [Downloading checkpoints](#downloading-checkpoints). Rust caches the converted
+  model under `$XDG_CACHE_HOME/ironicl/models`. When that directory is not
+  writable, as in a read-only container, it converts the checkpoint in memory on
+  every load.
 - These values raise `NotImplementedError`: a `feat_shuffle_method` other than
   `latin`, a `class_shuffle_method` other than `shift`, a `device` other than
   `cpu`, any `inference_config`, and `random_state=None`.
@@ -203,6 +204,29 @@ version and dependencies, the GPU and its Metal working set, CPU threads and BF1
 support, memory, the ICL cache storage each `optimize` level gives, the
 downloaded checkpoints, the context cache, and the `IRONICL_*` environment
 variables that are set. Include it in bug reports.
+
+### Downloading checkpoints
+
+Ironicl downloads each checkpoint from a pinned Hugging Face revision, once, into
+`checkpoints/<model>/` in its cache folder. A download goes to a temporary file
+of its own and is renamed into place, so concurrent fits each leave a whole file.
+When a downloaded file's SHA-256 is not the one Ironicl expects, it warns and
+uses the file anyway. To download without Python, for example on a machine
+without internet access for Python, put the files where Ironicl looks:
+
+```bash
+D=${XDG_CACHE_HOME:-~/.cache}/ironicl/checkpoints
+R=https://huggingface.co/jingang/TabICL/resolve/4dcd344ece2c00be9e831fdd35bed57b5ad83e19
+for f in tabicl-classifier-v2-20260212.ckpt tabicl-regressor-v2-20260212.ckpt; do
+  curl -fL --create-dirs -o "$D/tabicl/$f" "$R/$f"
+done
+shasum -a 256 "$D"/tabicl/*.ckpt
+```
+
+| File | SHA-256 |
+|---|---|
+| `tabicl/tabicl-classifier-v2-20260212.ckpt` | `bdc7dbd5e4ff21f8f0456fcf90c6b7cdf72dbea960f2d05b19bec19f9b3d4ed0` |
+| `tabicl/tabicl-regressor-v2-20260212.ckpt` | `0db9cb538f114e79026bf08f45f41ad8dd7ad2de2aaca9a5ca8cd3bd9748ae7a` |
 
 ## Regressor
 

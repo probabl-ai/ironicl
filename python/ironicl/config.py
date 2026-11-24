@@ -7,7 +7,8 @@ import platform
 from importlib.metadata import PackageNotFoundError, version
 
 from ironicl import _core
-from ironicl.cache import _checkpoints_dir, cache_info
+from ironicl.cache import cache_info
+from ironicl.checkpoints import _checkpoints_dir
 from ironicl.memory import _plan
 
 PACKAGES = ("numpy", "scikit-learn", "scipy", "tqdm")

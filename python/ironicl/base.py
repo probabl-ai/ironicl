@@ -11,7 +11,6 @@ import contextlib
 import os
 import pickle
 import sys
-import urllib.request
 import warnings
 from functools import cache
 from importlib.metadata import version
@@ -25,11 +24,20 @@ from sklearn.utils.validation import check_array, check_is_fitted
 
 from ironicl import _core
 from ironicl._core import Model
-from ironicl.cache import _cache_dir, _checkpoints_dir
+from ironicl.cache import _cache_dir
+from ironicl.checkpoints import _checkpoints_dir, fetch
 from ironicl.memory import _enforce, _limit_text, _overflow_policy, _plan
 from ironicl.progress import Progress
 
-CHECKPOINT_URL = "https://huggingface.co/jingang/TabICL/resolve/main/{}"
+# TabICL's checkpoints at a pinned revision of `jingang/TabICL`, with their SHA-256.
+REVISION = "4dcd344ece2c00be9e831fdd35bed57b5ad83e19"
+CHECKPOINT_URL = "https://huggingface.co/jingang/TabICL/resolve/{revision}/{name}"
+SHA256 = {
+    "tabicl-classifier-v1-20250208.ckpt": "04c5c1d261c1f782dc9b263990dcfa5152b1949ed8451ad16c010cdafbea07e0",
+    "tabicl-classifier-v1.1-20250506.ckpt": "bb42d1733b49fab3a7a9e42db648c8ff64d8d5705d93c039179add3bfb2db32b",
+    "tabicl-classifier-v2-20260212.ckpt": "bdc7dbd5e4ff21f8f0456fcf90c6b7cdf72dbea960f2d05b19bec19f9b3d4ed0",
+    "tabicl-regressor-v2-20260212.ckpt": "0db9cb538f114e79026bf08f45f41ad8dd7ad2de2aaca9a5ca8cd3bd9748ae7a",
+}
 
 
 def _version() -> str:
@@ -307,23 +315,10 @@ class TabICLBase(BaseEstimator):
 
     def _checkpoint(self, data: bytes | None = None) -> Path:
         """The checkpoint path, downloaded if missing, or written from ``data`` when given."""
-        if self.model_path is not None:
-            path = Path(self.model_path)
-        else:
-            path = _checkpoints_dir("tabicl") / self.checkpoint_version
-        if path.exists():
-            return path
-        if data is None and not self.allow_auto_download:
-            raise FileNotFoundError(f"Checkpoint {path} not found and allow_auto_download=False")
-        # The Rust importer verifies the checkpoint's SHA-256 before use.
-        path.parent.mkdir(parents=True, exist_ok=True)
-        partial = path.with_name(path.name + ".partial")
-        if data is None:
-            urllib.request.urlretrieve(CHECKPOINT_URL.format(self.checkpoint_version), partial)
-        else:
-            partial.write_bytes(data)
-        partial.replace(path)
-        return path
+        name = self.checkpoint_version
+        path = Path(self.model_path) if self.model_path is not None else _checkpoints_dir("tabicl") / name
+        url = CHECKPOINT_URL.format(revision=REVISION, name=name)
+        return fetch(path, url, SHA256.get(name), allow_download=self.allow_auto_download, data=data)
 
 
 def _features(X, categorical=None) -> tuple[np.ndarray | list, tuple[str, ...] | None]:
