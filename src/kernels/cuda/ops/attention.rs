@@ -71,6 +71,7 @@ pub(crate) fn fast_body<const KW: usize, const DECODE: bool, const HALF: bool, c
     chunk_tiles: u32,
     splits: u32,
     scale_log2: f32,
+    kv_share: u32,
 ) {
     static mut QS: SharedArray<u32, { 64 * 32 }, 128> = SharedArray::UNINIT;
     static mut KS: SharedArray<u32, { 2 * 64 * 32 }, 128> = SharedArray::UNINIT;
@@ -85,6 +86,8 @@ pub(crate) fn fast_body<const KW: usize, const DECODE: bool, const HALF: bool, c
     // together and share them in L2.
     let block = thread::blockIdx_y() as usize;
     let (bh, chunk) = (block / splits as usize, block % splits as usize);
+    // Query heads share key and value heads in groups of `kv_share`.
+    let kv = bh / kv_share as usize;
     let q0 = thread::blockIdx_x() as usize * rows_per_block;
     let (qp, np) = (qp as usize, np as usize);
     let first_tile = chunk * chunk_tiles as usize;
@@ -114,12 +117,12 @@ pub(crate) fn fast_body<const KW: usize, const DECODE: bool, const HALF: bool, c
         cp_async_commit_group();
     }
     // FP16: two async 16-byte copies per thread and tensor.
-    // SAFETY: `tile < np / 64` (see `tiles` below) and `bh < pairs`, so the 16 bytes at byte `off`
-    // lie in the FP16 `[pairs, np, 64]` caches, 16-byte aligned; `dst + 4 <= (buf + 1) * 2048` with
+    // SAFETY: `tile < np / 64` (see `tiles` below) and `kv = bh / kv_share < pairs / kv_share`, so
+    // the 16 bytes at byte `off` lie in the FP16 `[pairs / kv_share, np, 64]` caches, 16-byte aligned; `dst + 4 <= (buf + 1) * 2048` with
     // `buf < 2`. The stage's previous readers passed the barrier that ends their stage, and it is
     // read only after a wait and a barrier.
     let load_stage = |tile: usize, buf: usize| unsafe {
-        let base = (bh * np + tile * 64) * 64;
+        let base = (kv * np + tile * 64) * 64;
         let mut i = tid;
         while i < 64 * 8 {
             let (row, c) = (i / 8, i % 8);
@@ -135,14 +138,15 @@ pub(crate) fn fast_body<const KW: usize, const DECODE: bool, const HALF: bool, c
     // tensor, `[K0, K1, V0, V1]`, as chunk index i = tid + 128 j: row i / 4,
     // dims (i % 4) * 16 on.
     let fetch8 = |tile: usize| -> [[u32; 4]; 4] {
-        let base = (bh * np + tile * 64) * 64;
+        let base = (kv * np + tile * 64) * 64;
         let mut out = [[0u32; 4]; 4];
         #[unroll]
         for j in 0..2 {
             let i = tid + 128 * j;
             let off = base + (i / 4) * 64 + (i % 4) * 16;
             // SAFETY: `i < 256`: row `i / 4 < 64` of tile `tile < np / 64`, bytes `(i % 4) *
-            // 16..+16` of 64, so 16 aligned bytes inside the FP8 `[pairs, np, 64]` caches.
+            // 16..+16` of 64, so 16 aligned bytes inside the FP8 `[pairs, np, 64]` caches (FP8 caches
+            // are never shared: the launcher asserts `kv_share == 1`).
             unsafe {
                 out[j] = (*k.as_ptr().add(off).cast::<F32x4>()).0.map(f32::to_bits);
                 out[2 + j] = (*v.as_ptr().add(off).cast::<F32x4>()).0.map(f32::to_bits);

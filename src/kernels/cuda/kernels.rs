@@ -50,8 +50,8 @@ pub(crate) mod device {
 
     use crate::kernels::cuda::ops::{
         D, attend16_f32, attention16_tc_body, block_head_body, block_tail_body, block_tail_core_f32,
-        column_block_body, e4m3, fast_body, linear16_body, load_normed_f32, max16, product4x4,
-        store_activation, sum16,
+        column_block_body, e4m3, fast_body, linear16_body, load_normed_f32, max16, norm_rows,
+        pack_heads_body, product4x4, store_activation, sum16,
     };
 
     /// Tensor-core partial attention over FP16 keys and values, 64 queries per
@@ -69,6 +69,7 @@ pub(crate) mod device {
         chunk_tiles: u32,
         splits: u32,
         scale_log2: f32,
+        kv_share: u32,
     ) {
         fast_body::<64, false, false, false>(
             q,
@@ -82,6 +83,7 @@ pub(crate) mod device {
             chunk_tiles,
             splits,
             scale_log2,
+            kv_share,
         );
     }
 
@@ -100,6 +102,7 @@ pub(crate) mod device {
         chunk_tiles: u32,
         splits: u32,
         scale_log2: f32,
+        kv_share: u32,
     ) {
         fast_body::<16, true, false, false>(
             q,
@@ -113,6 +116,7 @@ pub(crate) mod device {
             chunk_tiles,
             splits,
             scale_log2,
+            kv_share,
         );
     }
 
@@ -131,6 +135,7 @@ pub(crate) mod device {
         chunk_tiles: u32,
         splits: u32,
         scale_log2: f32,
+        kv_share: u32,
     ) {
         fast_body::<64, false, true, true>(
             q,
@@ -144,6 +149,7 @@ pub(crate) mod device {
             chunk_tiles,
             splits,
             scale_log2,
+            kv_share,
         );
     }
 
@@ -161,6 +167,7 @@ pub(crate) mod device {
         chunk_tiles: u32,
         splits: u32,
         scale_log2: f32,
+        kv_share: u32,
     ) {
         fast_body::<16, true, false, true>(
             q,
@@ -174,6 +181,7 @@ pub(crate) mod device {
             chunk_tiles,
             splits,
             scale_log2,
+            kv_share,
         );
     }
 
@@ -236,47 +244,9 @@ pub(crate) mod device {
         ldy: u32,
         format: u32,
     ) {
-        let global =
-            thread::blockIdx_x() as usize * thread::blockDim_x() as usize + thread::threadIdx_x() as usize;
-        let (row, lane) = (global / 32, global % 32);
-        let (width, ldx, ldy) = (width as usize, ldx as usize, ldy as usize);
-        if row >= rows as usize {
-            return;
-        }
-        let mut values = [0.0f32; 16];
-        let mut sum = 0.0f32;
-        #[unroll]
-        for j in 0..16 {
-            let i = lane + 32 * j;
-            if i < width {
-                // SAFETY: `row < rows` (returned above, warp-uniformly) and `i < width = ldx`; the
-                // launcher passes `x` as `[rows, width]`.
-                values[j] = unsafe { *x.get_unchecked(row * ldx + i) };
-                sum += values[j];
-            }
-        }
-        #[allow(clippy::cast_precision_loss, reason = "At most 512")]
-        let count = width as f32;
-        let mean = warp::reduce_sum_f32(sum) / count;
-        let mut squares = 0.0f32;
-        #[unroll]
-        for j in 0..16 {
-            if lane + 32 * j < width {
-                let d = values[j] - mean;
-                squares += d * d;
-            }
-        }
-        let inverse = 1.0 / libm::sqrtf(warp::reduce_sum_f32(squares) / count + 1e-5);
-        #[unroll]
-        for j in 0..16 {
-            let i = lane + 32 * j;
-            if i < width {
-                let value = (values[j] - mean) * inverse * gamma[i] + beta[i];
-                // SAFETY: `row < rows` and `i < width = ldy`; the launcher sizes the buffers
-                // `format` names to `[rows, width]`, and each (row, i) is one lane's.
-                unsafe { store_activation((&mut y, &mut y_hi, &mut y_lo), format, row * ldy + i, value) };
-            }
-        }
+        norm_rows::<16, false>(
+            x, gamma, beta, &mut y, &mut y_hi, &mut y_lo, rows, width, ldx, ldy, format, 1e-5,
+        );
     }
 
     /// `x wᵀ` for 64 x 64 output tiles over one split of k, double-buffered in
@@ -559,49 +529,48 @@ pub(crate) mod device {
         unsafe { *cls.get_unchecked_mut(i) = rows[(seq * len as usize + token) * 128 + c] };
     }
 
-    /// `QASSMax` and packing for ICL attention: for token `t = b * Q + q` and head
-    /// `j`, `q * base[j] * (1 + tanh(modulation)) * key_scale[b * 8 + j]` at
-    /// `[(b * 8 + j) * qp + q, 64]`, in FP32 into `packed` (`format` 0) or in
-    /// FP16 into `packed_hi` (1); `key_scale` is the FP8 keys' scale per dim, or
-    /// ones.
+    /// Token rows packed into heads for attention: `QASSMax` (`TabICLv2`), or
+    /// `RoPE`, the per-head norm, and log scaling (Kumo-Tabular); see
+    /// [`pack_heads_body`]. 256 threads per block, one warp per (token, head).
     #[kernel]
-    pub fn qass_pack(
-        query: &[f32],
-        modulation: &[f32],
+    pub fn pack_heads(
+        x: &[f32],
+        gate: &[f32],
         base: &[f32],
         key_scale: &[f32],
+        frequencies: &[f32],
         mut packed: DisjointSlice<f32>,
         mut packed_hi: DisjointSlice<u16>,
-        ensembles: u32,
-        queries: u32,
-        qp: u32,
+        sequences: u32,
+        len: u32,
+        padded: u32,
+        heads: u32,
+        dim: u32,
+        norm: u32,
         format: u32,
     ) {
-        let i = thread::index_1d().get();
-        let q = queries as usize;
-        if i >= ensembles as usize * q * 512 {
-            return;
-        }
-        let (d, head, token) = (i % 64, (i / 64) % 8, i / 512);
-        let (b, row) = (token / q, token % q);
-        let gate = 1.0 + modulation[(token * 8 + head) * 64 + d].tanh();
-        let value = query[i] * base[head * 64 + d] * gate * key_scale[(b * 8 + head) * 64 + d];
-        let at = ((b * 8 + head) * qp as usize + row) * 64 + d;
-        // SAFETY: `b < ensembles`, `head < 8`, `row < q <= qp`, `d < 64`: `at` lies in `[B * 8, qp,
-        // 64]` and is this thread's alone. `format` selects the buffer the launcher sized
-        // (`Unused::outputs`); the other may be empty and is not touched.
-        unsafe {
-            if format == 0 {
-                *packed.get_unchecked_mut(at) = value;
-            } else {
-                *packed_hi.get_unchecked_mut(at) = (value as f16).to_bits();
-            }
-        }
+        pack_heads_body(
+            x,
+            gate,
+            base,
+            key_scale,
+            frequencies,
+            &mut packed,
+            &mut packed_hi,
+            sequences,
+            len,
+            padded,
+            heads,
+            dim,
+            norm,
+            format,
+        );
     }
 
-    /// Attention outputs `[(b * 8 + j) * qp + q, 64]` back to tokens `[B * Q, 512]`,
-    /// times `value_scale[b * 8 + j]`, the FP8 values' scale per dim, or ones;
-    /// written as [`store_activation`] does with `format`.
+    /// Attention outputs `[(b * heads + j) * qp + q, 64]` back to tokens
+    /// `[B * Q, heads * dim]`, times `value_scale[b * heads + j]`, the FP8
+    /// values' scale per dim, or ones; written as [`store_activation`] does
+    /// with `format`.
     #[kernel]
     pub fn heads_to_tokens(
         attended: &[f32],
@@ -612,19 +581,21 @@ pub(crate) mod device {
         ensembles: u32,
         queries: u32,
         qp: u32,
+        heads: u32,
+        dim: u32,
         format: u32,
     ) {
         let i = thread::index_1d().get();
-        let q = queries as usize;
-        if i >= ensembles as usize * q * 512 {
+        let (q, heads, dim) = (queries as usize, heads as usize, dim as usize);
+        if i >= ensembles as usize * q * heads * dim {
             return;
         }
-        let (d, head, token) = (i % 64, (i / 64) % 8, i / 512);
+        let (d, head, token) = (i % dim, (i / dim) % heads, i / (heads * dim));
         let (b, row) = (token / q, token % q);
-        let pair = b * 8 + head;
+        let pair = b * heads + head;
         let value = attended[(pair * qp as usize + row) * 64 + d] * value_scale[pair * 64 + d];
-        // SAFETY: `i < B * q * 512` (returned above), within the buffers `format` names, which the
-        // launcher sizes to at least `[B q, 512]`; one thread per `i`.
+        // SAFETY: `i < B * q * heads * dim` (returned above), within the buffers `format` names,
+        // which the launcher sizes to at least `[B q, heads * dim]`; one thread per `i`.
         unsafe { store_activation((&mut tokens, &mut tokens_hi, &mut tokens_lo), format, i, value) };
     }
 
@@ -1512,7 +1483,7 @@ pub(crate) mod device {
     }
 
     /// Partial ICL attention in FP32 on the CUDA cores over FP32 keys and
-    /// values (bytes of `[pairs, np, 64]`), with [`fast_body`]'s split of the
+    /// values (bytes of `[pairs / kv_share, np, 64]`), with [`fast_body`]'s split of the
     /// keys into chunks and its outputs: 32 queries per block, keys in 32-key
     /// steps through shared memory. Thread `(y, x)` = `(t / 16, t % 16)`
     /// scores rows `y + 8i` against keys `x + 16j` and accumulates dims
@@ -1532,6 +1503,7 @@ pub(crate) mod device {
         chunk_tiles: u32,
         splits: u32,
         scale_log2: f32,
+        kv_share: u32,
     ) {
         // Q and K rows padded to 68 values, so that rows four apart and keys
         // one apart start in different banks.
@@ -1553,6 +1525,8 @@ pub(crate) mod device {
         let (ty, tx) = (tid / 16, tid % 16);
         let block = thread::blockIdx_y() as usize;
         let (bh, chunk) = (block / splits as usize, block % splits as usize);
+        // Query heads share key and value heads in groups of `kv_share`.
+        let kv = bh / kv_share as usize;
         let q0 = thread::blockIdx_x() as usize * 32;
         let (qp, np) = (qp as usize, np as usize);
         let first_tile = chunk * chunk_tiles as usize;
@@ -1589,10 +1563,10 @@ pub(crate) mod device {
             for i in 0..4 {
                 let index = tid + i * 128;
                 let (key, c) = (index / 16, (index % 16) * 4);
-                let at = (bh * np + key0 + key) * 64 + c;
+                let at = (kv * np + key0 + key) * 64 + c;
                 // SAFETY: `first_tile < np / 64` (the launcher's chunks), so `key0 + key <
-                // (first_tile + tiles) * 64 <= np` and, with `bh < pairs`, 16 aligned bytes lie in
-                // the FP32 `[pairs, np, 64]` caches; the shared indices stay in `KS` and `VS`,
+                // (first_tile + tiles) * 64 <= np` and, with `kv = bh / kv_share < pairs / kv_share`,
+                // 16 aligned bytes lie in the FP32 `[pairs / kv_share, np, 64]` caches; the shared indices stay in `KS` and `VS`,
                 // whose readers the barrier above retired.
                 unsafe {
                     *ks.add(key * 68 + c).cast::<F32x4>() = *kp.add(at).cast::<F32x4>();
