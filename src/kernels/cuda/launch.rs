@@ -680,7 +680,8 @@ impl Device {
     }
 
     /// Attention outputs `[ensembles * heads, qp, 64]` back to tokens
-    /// `[ensembles * q, heads * dim]`, times the values' scales, into `out`.
+    /// `[ensembles * q, heads * dim]`, times the values' scales unless
+    /// `value_scale` is empty, into `out`.
     pub(crate) fn heads_to_tokens(
         &self,
         (attended, value_scale): (&DeviceBuffer<f32>, &DeviceBuffer<f32>),
@@ -693,7 +694,7 @@ impl Device {
         let config = config(threads(ensembles * q * heads * dim), 256);
         // SAFETY: one thread per token value, writing `i < ensembles * q * heads * dim` to the
         // buffers `format` names; callers' `out` holds `[ensembles * q, heads * dim]`, `attended`
-        // `[ensembles * heads, qp, 64]`, and `value_scale` `[ensembles * heads, 64]`.
+        // `[ensembles * heads, qp, 64]`, and `value_scale` is empty or `[ensembles * heads, 64]`.
         let launch = unsafe {
             self.kernels.heads_to_tokens(
                 self.stream(),

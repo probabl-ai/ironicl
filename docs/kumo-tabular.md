@@ -79,7 +79,9 @@ embeddings are saved transposed; import copies them into row-major order.
   norm, and query scaling, and split attention over the cached keys and values, which test rows
   of medium and large read through 2 heads. The small model's 32-wide heads are zero-padded to
   the kernels' 64. Kumo-Tabular's own kernels build the cell embedding's features and the row
-  stage's sequences. The weights upload once per process. A context that does not fit in device
+  stage's sequences. The weights upload once per process. Buffers are allocated and freed in
+  stream order, so the CPU queues work without waiting for the GPU; it waits once 1 GiB has
+  been allocated since it last did, which bounds the memory of queued work. A context that does not fit in device
   memory is built on the CPU, and `IRONICL_NO_CUDA` keeps everything there.
 - `metal.rs`: on an Apple Silicon GPU, with the `metal` feature, a member's whole forward pass
   runs as one `MPSGraph` executable in FP32: one per training shape to fit, which outputs the
@@ -134,12 +136,13 @@ uploads the weights (1.8 s):
 
 | Training rows | CPU fit | CUDA fit | CPU predict | CUDA predict |
 |---|---|---|---|---|
-| 1,000 | 5.3 s | 0.44 s | 2.1 s | 0.22 s |
-| 5,000 | 39.3 s | 2.1 s | 3.3 s | 0.28 s |
+| 1,000 | 5.3 s | 0.28 s | 2.1 s | 0.13 s |
+| 5,000 | 39.3 s | 1.80 s | 3.3 s | 0.18 s |
 
 NVIDIA's code on the same GPU, in FP32 and in FP16, fits in 0.24 s and 0.09 s and predicts in 0.10 s
 and 0.04 s at 1,000 rows; at 5,000 rows it fits in 1.51 s and 0.42 s and predicts in 0.17 s and
-0.05 s. Tensor cores and fewer allocations are the follow-ups.
+0.05 s. In FP32 the remaining gap is the matrix product, about 1.4 times slower than cuBLAS's;
+tensor cores are the follow-up for FP16.
 
 On an Apple M1 Max, medium with 4 members on 20 features and 500 query rows, after a first fit
 that compiles the graphs (about 1.4 s), against NVIDIA's code on the GPU through PyTorch's MPS

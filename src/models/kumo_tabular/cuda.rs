@@ -14,6 +14,10 @@
 
 #![expect(unsafe_code, reason = "Launches of kernels that trust their grid and shapes")]
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+
 use cuda_core::{DeviceBuffer, DeviceCopy};
 
 use super::Config;
@@ -26,9 +30,31 @@ use crate::{Error, Result};
 
 type Buffer = DeviceBuffer<f32>;
 type Bytes = DeviceBuffer<u8>;
-/// What fitting records the column keys and values into, and the training
-/// rows' label vectors.
-type Recording<'a> = (&'a mut Vec<(Bytes, Bytes)>, &'a [f32]);
+/// What fitting records the column keys and values with: the training rows'
+/// label vectors on the device, and [`Cuda::kept`] buffers for the keys and
+/// values, filled in order.
+struct Recording<'a> {
+    labels: &'a Buffer,
+    slots: std::vec::IntoIter<Buffer>,
+    recorded: Vec<(Bytes, Bytes)>,
+}
+
+impl Recording<'_> {
+    /// `keys` and `values` copied into the next two buffers and recorded.
+    fn record(&mut self, device: &Device, keys: &Buffer, values: &Buffer) -> Result<()> {
+        let mut next = |source: &Buffer| -> Result<Bytes> {
+            let mut kept = self
+                .slots
+                .next()
+                .expect("fit allocates two buffers per column layer");
+            device.copy_into(source, &mut kept, (0, source.len()))?;
+            Cuda::bytes(kept)
+        };
+        let pair = (next(keys)?, next(values)?);
+        self.recorded.push(pair);
+        Ok(())
+    }
+}
 
 /// What an allocation that does not fit in device memory fails with; a fit
 /// that hits it falls back to the CPU.
@@ -40,6 +66,12 @@ const NORM_EPS: f32 = f32::EPSILON;
 const FEATURES: usize = 208;
 /// Values a row-stage chunk's sequences hold at most.
 const CHUNK_VALUES: usize = 1 << 25;
+/// Bytes of buffers allocated ahead of the GPU before [`Cuda`] waits for it.
+/// A buffer is freed only once the work using it completes, so this bounds
+/// the memory of queued work.
+const QUEUED_BYTES: usize = 1 << 30;
+/// Query scales [`Cuda`] keeps before it drops them all.
+const MAX_SCALES: usize = 1024;
 
 /// One transformer block's weights on the device.
 struct Block {
@@ -107,6 +139,11 @@ pub(crate) struct Cuda {
     config: Config,
     outputs: usize,
     weights: Weights,
+    /// Each block's query scale per key count, uploaded on first use: an
+    /// upload waits for the GPU.
+    scales: Mutex<HashMap<(usize, usize), Arc<Buffer>>>,
+    /// Bytes allocated since the last wait for the GPU.
+    queued: AtomicUsize,
 }
 
 fn dim(value: u64) -> usize {
@@ -136,15 +173,31 @@ impl Cuda {
             config,
             outputs,
             weights,
+            scales: Mutex::default(),
+            queued: AtomicUsize::new(0),
         })
     }
 
+    /// `len` zeros, allocated in stream order without waiting for the GPU,
+    /// unless [`QUEUED_BYTES`] have been allocated since it last did.
     fn zeros(&self, len: usize) -> Result<Buffer> {
-        self.device.zeroed(len).map_err(device_error)
+        let bytes = len * size_of::<f32>();
+        if self.queued.fetch_add(bytes, Ordering::Relaxed) + bytes > QUEUED_BYTES {
+            self.queued.store(0, Ordering::Relaxed);
+            self.device.stream().synchronize().map_err(gpu_error)?;
+        }
+        self.device.zeroed_async(len).map_err(device_error)
     }
 
     fn upload<T: DeviceCopy>(&self, values: &[T]) -> Result<DeviceBuffer<T>> {
         DeviceBuffer::from_host(self.device.stream(), values).map_err(device_error)
+    }
+
+    /// `len` zeros for a context, outside the stream-ordered pool: a long-lived
+    /// buffer there would keep the pool from reusing its memory. Unlike
+    /// [`Self::zeros`], it waits for the GPU.
+    fn kept(&self, len: usize) -> Result<Buffer> {
+        self.device.zeroed(len).map_err(device_error)
     }
 
     fn bytes(buffer: Buffer) -> Result<Bytes> {
@@ -252,21 +305,7 @@ impl Cuda {
         let (pairs, padded, tokens) = (groups * heads, padded_query_rows(rows), groups * rows);
         let normed = self.rms(query, &block.query_norm, tokens)?;
         let projected = self.product(&normed, &block.query, None, (tokens, width, width), false)?;
-        // The attention divides by sqrt(64): queries of narrower heads make up for it.
-        #[expect(clippy::cast_precision_loss, reason = "Head widths and key counts are small")]
-        let (factor, log) = (
-            (HEAD_DIM as f32 / dim as f32).sqrt(),
-            (key_rows.max(1) as f32).ln(),
-        );
-        let base: Vec<f32> = match block.scaling {
-            Scaling::None => vec![factor; heads * dim],
-            Scaling::Log | Scaling::Gated => block
-                .head_scale
-                .iter()
-                .flat_map(|a| std::iter::repeat_n(a * log * factor, dim))
-                .collect(),
-        };
-        let base = self.upload(&base)?;
+        let base = self.query_scale(block, key_rows)?;
         let rope = block.rope.as_ref();
         let packed = if let Some((first, second)) = &block.gate {
             // The gate reads each head's query before scaling.
@@ -300,7 +339,7 @@ impl Cuda {
         } else {
             self.pack(
                 &projected,
-                (Some(&base), rope),
+                (Some(&*base), rope),
                 (groups, rows, padded),
                 (heads, dim),
                 true,
@@ -320,10 +359,9 @@ impl Cuda {
             (pairs, padded, key_rows),
             heads / key_heads,
         )?;
-        let ones = self.upload(&vec![1.0_f32; pairs * HEAD_DIM])?;
         let mut merged = self.zeros(tokens * width)?;
         self.device.heads_to_tokens(
-            (&attended, &ones),
+            (&attended, &self.zeros(0)?),
             Output::F32(&mut merged),
             (groups, rows, padded),
             (heads, dim),
@@ -338,6 +376,41 @@ impl Cuda {
             (tokens, width, 2 * width),
             false,
         )
+    }
+
+    /// `block`'s query scale for `key_rows` keys, `[heads, dim]`. The attention
+    /// divides by sqrt(64): queries of narrower heads make up for it.
+    fn query_scale(&self, block: &Block, key_rows: usize) -> Result<Arc<Buffer>> {
+        let key_rows = if block.scaling == Scaling::None {
+            0
+        } else {
+            key_rows
+        };
+        let key = (std::ptr::from_ref(block) as usize, key_rows);
+        let mut scales = self.scales.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(scale) = scales.get(&key) {
+            return Ok(Arc::clone(scale));
+        }
+        let (heads, dim) = (block.heads, block.dim());
+        #[expect(clippy::cast_precision_loss, reason = "Head widths and key counts are small")]
+        let (factor, log) = (
+            (HEAD_DIM as f32 / dim as f32).sqrt(),
+            (key_rows.max(1) as f32).ln(),
+        );
+        let base: Vec<f32> = match block.scaling {
+            Scaling::None => vec![factor; heads * dim],
+            Scaling::Log | Scaling::Gated => block
+                .head_scale
+                .iter()
+                .flat_map(|a| std::iter::repeat_n(a * log * factor, dim))
+                .collect(),
+        };
+        if scales.len() >= MAX_SCALES {
+            scales.clear();
+        }
+        let scale = Arc::new(self.upload(&base)?);
+        scales.insert(key, Arc::clone(&scale));
+        Ok(scale)
     }
 
     /// Fit a member's context on its `[rows, columns]` training rows `x` and
@@ -370,20 +443,28 @@ impl Cuda {
             columns: Vec::new(),
             icl: Vec::new(),
         };
-        let mut recorded = Vec::new();
-        let mut hidden = self.row_embedding(x, &context, Some((&mut recorded, labels.0)))?;
-        context.columns = recorded;
-        let icl_width = dim(self.config.icl_channels);
-        let label_rows = self.upload(labels.1)?;
+        let config = self.config;
+        let key_heads = config.query_key_value_heads.map_or(dim(config.icl_heads), dim);
+        // Uploads and the context's buffers wait for the GPU: they come before any work is queued.
+        let (cell_labels, label_rows) = (self.upload(labels.0)?, self.upload(labels.1)?);
+        let kept = |count: usize, len: usize| (0..count).map(|_| self.kept(len)).collect::<Result<Vec<_>>>();
+        let column_len =
+            columns * dim(config.embedding_heads) * padded_rows(dim(config.inducing_points)) * HEAD_DIM;
+        let prefix = key_heads * padded_rows(rows) * HEAD_DIM;
+        let mut recording = Recording {
+            labels: &cell_labels,
+            slots: kept(2 * self.weights.columns.len(), column_len)?.into_iter(),
+            recorded: Vec::new(),
+        };
+        let mut icl_slots = kept(2 * self.weights.icl.len(), prefix)?.into_iter();
+        let mut hidden = self.row_embedding(x, &context, Some(&mut recording))?;
+        context.columns = recording.recorded;
+        let icl_width = dim(config.icl_channels);
         self.add_rows(&mut hidden, &label_rows, (rows, icl_width))?;
-        let key_heads = self
-            .config
-            .query_key_value_heads
-            .map_or(dim(self.config.icl_heads), dim);
         for (layer, block) in self.weights.icl.iter().enumerate() {
             let (keys, values) = self.key_value(block, &hidden, (1, rows))?;
-            let prefix = key_heads * padded_rows(rows) * HEAD_DIM;
-            let (mut kept_keys, mut kept_values) = (self.zeros(prefix)?, self.zeros(prefix)?);
+            let mut slot = || icl_slots.next().expect("fit allocates two buffers per ICL layer");
+            let (mut kept_keys, mut kept_values) = (slot(), slot());
             self.device.copy_into(&keys, &mut kept_keys, (0, prefix))?;
             self.device.copy_into(&values, &mut kept_values, (0, prefix))?;
             if layer + 1 < self.weights.icl.len() {
@@ -452,16 +533,15 @@ impl Cuda {
         &self,
         x: &[f32],
         context: &Context,
-        mut training: Option<Recording<'_>>,
+        mut training: Option<&mut Recording<'_>>,
     ) -> Result<Buffer> {
         let config = self.config;
         let columns = context.categorical.len();
         let rows = x.len() / columns;
         let (cell, readout) = (dim(config.cell_channels), dim(config.readout_tokens));
         let mut cells = self.cells(x, context)?;
-        if let Some((_, labels)) = &training {
-            let labels = self.upload(labels)?;
-            self.add_rows(&mut cells, &labels, (rows, cell))?;
+        if let Some(recording) = &training {
+            self.add_rows(&mut cells, recording.labels, (rows, cell))?;
         }
         let mut readouts = self.zeros(rows * readout * cell)?;
         self.device.repeat(
@@ -470,7 +550,7 @@ impl Cuda {
             (readout * cell, rows * readout * cell),
         )?;
         for (layer, (inducing, output)) in self.weights.columns.iter().enumerate() {
-            if let Some((recorded, _)) = &mut training {
+            if let Some(recording) = &mut training {
                 let points = dim(config.inducing_points);
                 let mut queries = self.zeros(columns * points * cell)?;
                 self.device.repeat(
@@ -487,10 +567,10 @@ impl Cuda {
                     (&keys, &values, inducing.heads, rows),
                 )?;
                 let (keys, values) = self.key_value(output, &summaries, (columns, points))?;
-                recorded.push((Self::bytes(keys)?, Self::bytes(values)?));
+                recording.record(&self.device, &keys, &values)?;
             }
             let (keys, values) = match &training {
-                Some((recorded, _)) => &recorded[layer],
+                Some(recording) => &recording.recorded[layer],
                 None => &context.columns[layer],
             };
             let points = dim(config.inducing_points);

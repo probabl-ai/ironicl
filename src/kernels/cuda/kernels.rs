@@ -569,8 +569,8 @@ pub(crate) mod device {
 
     /// Attention outputs `[(b * heads + j) * qp + q, 64]` back to tokens
     /// `[B * Q, heads * dim]`, times `value_scale[b * heads + j]`, the FP8
-    /// values' scale per dim, or ones; written as [`store_activation`] does
-    /// with `format`.
+    /// values' scale per dim, unless `value_scale` is empty; written as
+    /// [`store_activation`] does with `format`.
     #[kernel]
     pub fn heads_to_tokens(
         attended: &[f32],
@@ -593,7 +593,10 @@ pub(crate) mod device {
         let (d, head, token) = (i % dim, (i / dim) % heads, i / (heads * dim));
         let (b, row) = (token / q, token % q);
         let pair = b * heads + head;
-        let value = attended[(pair * qp as usize + row) * 64 + d] * value_scale[pair * 64 + d];
+        let mut value = attended[(pair * qp as usize + row) * 64 + d];
+        if !value_scale.is_empty() {
+            value *= value_scale[pair * 64 + d];
+        }
         // SAFETY: `i < B * q * heads * dim` (returned above), within the buffers `format` names,
         // which the launcher sizes to at least `[B q, heads * dim]`; one thread per `i`.
         unsafe { store_activation((&mut tokens, &mut tokens_hi, &mut tokens_lo), format, i, value) };
