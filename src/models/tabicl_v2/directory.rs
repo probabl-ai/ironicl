@@ -97,10 +97,10 @@ pub fn write_kumo_tabular(dir: &Path, model: &kumo_tabular::fitted::Fitted) -> R
         format: FORMAT.to_owned(),
         version: VERSION,
         ironicl: env!("CARGO_PKG_VERSION").to_owned(),
-        task: TaskKind::Classifier,
+        task: model.task(),
         n_features: training.categories.len(),
         feature_names: training.feature_names.clone(),
-        classes: Some(model.classes().clone()),
+        classes: model.classes().cloned(),
         weights: encode_sha256(&model.checkpoint_sha256()),
     };
     write_files(
@@ -236,7 +236,7 @@ impl Fitted {
     pub fn task(&self) -> TaskKind {
         match self {
             Self::TabIclV2(model) => model.task(),
-            Self::KumoTabular(_) => TaskKind::Classifier,
+            Self::KumoTabular(model) => model.task(),
         }
     }
 
@@ -261,7 +261,7 @@ impl Fitted {
     pub fn classes(&self) -> Option<&Labels> {
         match self {
             Self::TabIclV2(model) => model.preprocessed().preprocessor().classes(),
-            Self::KumoTabular(model) => Some(model.classes()),
+            Self::KumoTabular(model) => model.classes(),
         }
     }
 
@@ -310,9 +310,7 @@ impl Fitted {
             Self::TabIclV2(model) => {
                 model.predict_regression(Features::F64(x), self.categories().len(), outputs)
             }
-            Self::KumoTabular(_) => Err(Error::InvalidArgument(
-                "a classifier has no regression outputs".into(),
-            )),
+            Self::KumoTabular(model) => model.predict_regression(x, outputs),
         }
     }
 }

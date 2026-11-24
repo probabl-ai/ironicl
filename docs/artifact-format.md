@@ -52,7 +52,7 @@ fitting does, so the same context.
 For Kumo-Tabular (2), `IRPREP` holds the checkpoint's SHA-256, the members and the seed, the
 feature names, each input feature's categories, and the training data: the encoded `[rows,
 features]` matrix as `f64` (NaN for a missing number, -1 for a missing category) and each row's
-label. Loading fits again from them, which gives the same model; Kumo-Tabular has no `IRCNTXT`.
+label, a regressor's as a float. Loading fits again from them, which gives the same model; Kumo-Tabular has no `IRCNTXT`.
 Decoding checks every length against the bytes left, and that each category code is -1 or one of
 its feature's categories.
 

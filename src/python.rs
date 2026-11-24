@@ -786,16 +786,20 @@ impl KumoTabular {
         self.0.release.task.to_string()
     }
 
-    /// Fit on `x`, as `preprocess` reads it, and the class `labels`
-    /// (`(kind, values)`). `threads` sets the worker threads, `None` all.
-    /// `progress` receives `("build", members built, members)`.
+    /// Fit on `x`, as `preprocess` reads it, and a classifier's `labels`
+    /// (`(kind, values)`) or a regressor's float32 `values`. `threads` sets
+    /// the worker threads, `None` all. `progress` receives `("build", members
+    /// built, members)`.
     #[expect(clippy::too_many_arguments, reason = "mirrors the Python call's parameters")]
-    #[pyo3(signature = (x, labels, n_estimators, random_state, threads=None, feature_names=None, progress=None))]
+    #[pyo3(signature = (
+        x, *, labels=None, values=None, n_estimators, random_state, threads=None, feature_names=None, progress=None,
+    ))]
     fn fit(
         &self,
         py: Python<'_>,
         x: Bound<'_, PyAny>,
-        labels: (String, Bound<'_, PyAny>),
+        labels: Option<(String, Bound<'_, PyAny>)>,
+        values: Option<PyBuffer<f32>>,
         n_estimators: usize,
         random_state: i128,
         threads: Option<usize>,
@@ -803,7 +807,11 @@ impl KumoTabular {
         progress: Option<Py<PyAny>>,
     ) -> PyResult<KumoFitted> {
         let raw = RawFeatures::read(py, &x)?;
-        let labels = read_labels(py, labels)?;
+        // A regressor's targets travel as floats, exactly.
+        let labels = match read_targets(py, labels, values)? {
+            Targets::Labels(labels) => labels,
+            Targets::Values(values) => Labels::Float(values.into_iter().map(f64::from).collect()),
+        };
         let model = Arc::clone(&self.0);
         run(py, progress, move || {
             let (matrix, categories) = raw.fit()?;
@@ -856,7 +864,7 @@ impl KumoFitted {
     ) -> PyResult<(Bound<'py, PyBytes>, [usize; 2])> {
         let raw = RawFeatures::read(py, &x)?;
         let categories = &self.0.training().categories;
-        let classes = self.0.classes().len();
+        let classes = self.0.classes().map_or(0, Labels::len);
         let values = run(py, progress, || {
             let matrix = raw.encode(categories)?;
             if matrix.columns() != categories.len() {
@@ -880,6 +888,34 @@ impl KumoFitted {
             crate::models::tabicl_v2::directory::write_kumo_tabular(&path, &self.0)
         })
         .map_err(py_error)
+    }
+
+    /// A regressor's `output_types` for `x`, as `FittedModel.predict_regression` gives them.
+    #[pyo3(signature = (x, output_types, alphas=None, progress=None))]
+    fn predict_regression<'py>(
+        &self,
+        py: Python<'py>,
+        x: Bound<'_, PyAny>,
+        output_types: Vec<String>,
+        alphas: Option<Vec<f32>>,
+        progress: Option<Py<PyAny>>,
+    ) -> PyResult<Vec<(Bound<'py, PyBytes>, [usize; 2])>> {
+        let raw = RawFeatures::read(py, &x)?;
+        let outputs = output_types
+            .iter()
+            .map(|name| RegressionOutput::parse(name, alphas.as_deref().unwrap_or(&DEFAULT_ALPHAS)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(py_error)?;
+        let categories = &self.0.training().categories;
+        let (results, rows) = run(py, progress, || {
+            let matrix = raw.encode(categories)?;
+            let rows = matrix.features().len() / matrix.columns().max(1);
+            Ok((self.0.predict_regression(&matrix.into_f64(), &outputs)?, rows))
+        })?;
+        Ok(results
+            .into_iter()
+            .map(|(values, width)| (f32_bytes(py, &values), [rows, width]))
+            .collect())
     }
 
     /// The `IRPREP` bytes `KumoTabular.load` loads.

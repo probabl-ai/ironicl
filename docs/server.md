@@ -17,7 +17,7 @@ cargo build --release --features server          # add metal on Apple Silicon, c
    clf.export("my-model")
    ```
 
-   A `KumoTabularClassifier` exports the same way; its directory holds the training data, and
+   A `KumoTabularClassifier` or `KumoTabularRegressor` exports the same way; its directory holds the training data, and
    the server fits the model again when it starts ([kumo-tabular.md](kumo-tabular.md#how-it-runs)).
 
 2. On the serving machine, make sure the weights are in the weights folder (`export` already put
