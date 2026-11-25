@@ -792,6 +792,11 @@ impl KumoTabular {
         self.0.release.task.to_string()
     }
 
+    #[getter]
+    fn sha256(&self) -> String {
+        crate::format::encode_sha256(&self.0.sha256())
+    }
+
     /// Fit on `x`, as `preprocess` reads it, and a classifier's `labels`
     /// (`(kind, values)`) or a regressor's float32 `values`. `threads` sets
     /// the worker threads, `None` all. `progress` receives `("build", members

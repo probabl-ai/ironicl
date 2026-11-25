@@ -38,7 +38,16 @@ DEFAULT_ESTIMATORS = {"small": 8, "medium": 8, "large": 16}
 
 @cache  # One resident model per checkpoint for the process lifetime.
 def _model(checkpoint: Path, release: str) -> _core.KumoTabular:
-    return _core.KumoTabular(checkpoint, release)
+    model = _core.KumoTabular(checkpoint, release)
+    expected = SHA256.get(release)
+    if expected is not None and model.sha256 != expected:
+        warnings.warn(
+            f"{checkpoint} has SHA-256 {model.sha256}, not {expected} as Ironicl expects; "
+            "using custom weights",
+            UserWarning,
+            stacklevel=3,
+        )
+    return model
 
 
 class _KumoTabular(SavedEstimator, BaseEstimator):

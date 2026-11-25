@@ -36,9 +36,21 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(fetch(self.path, self.url, self.sha256, allow_download=True), self.path)
         self.assertEqual(self.leftovers(), [])
 
-    def test_warns_when_the_file_is_not_the_expected_one(self):
-        with self.assertWarnsRegex(UserWarning, "not 0+ as Ironicl expects"):
+    def test_rejects_a_downloaded_file_with_wrong_hash(self):
+        with self.assertRaisesRegex(ValueError, "not 0+ as Ironicl expects"):
             fetch(self.path, self.url, "0" * 64, allow_download=True)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.leftovers(), [])
+
+    def test_rejects_an_oversized_download(self):
+        with self.assertRaisesRegex(ValueError, "exceeds the 1024-byte limit"):
+            fetch(self.path, self.url, self.sha256, allow_download=True, max_bytes=1024)
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.leftovers(), [])
+
+    def test_warns_when_given_bytes_do_not_match_the_expected_hash(self):
+        with self.assertWarnsRegex(UserWarning, "not 0+ as Ironicl expects"):
+            fetch(self.path, "file:///missing", "0" * 64, allow_download=False, data=DATA)
         self.assertEqual(self.path.read_bytes(), DATA)
 
     def test_writes_given_bytes_without_downloading(self):
