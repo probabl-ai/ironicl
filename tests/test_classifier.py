@@ -64,6 +64,11 @@ class ResolveThreadsTest(unittest.TestCase):
         self.assertEqual(TabICLClassifier(n_jobs=-1)._resolve_threads(), max(1, cores))
         self.assertEqual(TabICLClassifier(n_jobs=-(cores * 2))._resolve_threads(), 1)
 
+    def test_zero_and_non_integer_n_jobs_raise(self):
+        for bad in (0, True, 1.5, "all"):
+            with self.subTest(n_jobs=bad), self.assertRaises(ValueError):
+                TabICLClassifier(n_jobs=bad)._resolve_threads()
+
 
 class CacheDirTest(unittest.TestCase):
     def test_default_is_off(self):

@@ -7,6 +7,7 @@ import json
 import os
 import pickle
 import shutil
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -68,6 +69,8 @@ class PickleTest(unittest.TestCase):
                 with self.subTest(estimator=estimator.__name__, training=training, context=context):
                     path = self.directory / f"{training}-{context}.pkl"
                     model.save(path, save_training_data=training, save_kv_cache=context)
+                    if os.name == "posix":
+                        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
                     sizes[training, context] = path.stat().st_size
                     loaded = estimator.load(path)
                     self.assertEqual(loaded.fitted_.preprocessed.has_training, training)
