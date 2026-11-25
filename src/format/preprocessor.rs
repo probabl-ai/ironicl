@@ -556,6 +556,16 @@ mod tests {
         let mut inconsistent = classifier.preprocessor.clone();
         inconsistent.target_scale = Some((0.0, 1.0));
         assert!(decode(&encode(&inconsistent, None, &sha).unwrap()).is_err());
+        // Zero scale, inverted bounds, and a single-element NaN category must all fail validation.
+        let mut zero_scale = classifier.preprocessor.clone();
+        zero_scale.normalizations[0].scale[0] = 0.0;
+        assert!(decode(&encode(&zero_scale, None, &sha).unwrap()).is_err());
+        let mut inverted = classifier.preprocessor.clone();
+        inverted.normalizations[0].lower[0] = inverted.normalizations[0].upper[0] + 1.0;
+        assert!(decode(&encode(&inverted, None, &sha).unwrap()).is_err());
+        let mut nan_category = classifier.preprocessor.clone();
+        nan_category.categories[0] = Some(Labels::Float(vec![f64::NAN]));
+        assert!(decode(&encode(&nan_category, None, &sha).unwrap()).is_err());
         // Training targets that are not classes, or values that are not finite.
         let mut training = classifier.training.clone().unwrap();
         training.targets[0] = 3.0;
@@ -582,6 +592,7 @@ mod tests {
         for bad in [
             Labels::Text(vec!["b".into(), "a".into()]),
             Labels::Text(vec!["a".into(), "a".into()]),
+            Labels::Float(vec![f64::NAN]),
         ] {
             let bytes = super::encode_kumo_tabular(&training(bad), &sha).unwrap();
             assert!(super::decode_kumo_tabular(&bytes).is_err());

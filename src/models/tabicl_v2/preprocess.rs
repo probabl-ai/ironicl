@@ -559,7 +559,7 @@ impl Preprocessor {
     /// output, stacked as FP32 `[B, rows, H]`, and that shape.
     ///
     /// Port of <https://github.com/soda-inria/tabicl/blob/bd030d47ff7d9f987f0f33431d743a3003bfe0d3/src/tabicl/_sklearn/preprocessing.py#L1130-L1259>.
-    pub(crate) fn ensemble_rows(&self, group_rows: &[Vec<f32>]) -> (Vec<f32>, [usize; 3]) {
+    pub(crate) fn ensemble_rows(&self, group_rows: &[Vec<f32>]) -> Result<(Vec<f32>, [usize; 3])> {
         let features = self.n_features_out();
         let rows = group_rows[0].len() / features;
         debug_assert!(
@@ -568,7 +568,11 @@ impl Preprocessor {
             "group rows are not transform's shapes"
         );
         let shape = [self.member_count(), rows, features];
-        let mut stacked = vec![0.0; shape.iter().product()];
+        let total = shape.iter().try_fold(1_usize, |acc, &dim| {
+            acc.checked_mul(dim)
+                .ok_or(Error::ArithmeticOverflow("ensemble rows"))
+        })?;
+        let mut stacked = vec![0.0; total];
         if rows > 0 {
             stacked
                 .par_chunks_mut(rows * features)
@@ -584,7 +588,7 @@ impl Preprocessor {
                     }
                 });
         }
-        (stacked, shape)
+        Ok((stacked, shape))
     }
 
     /// Each label's class index.
@@ -725,6 +729,21 @@ impl Preprocessor {
                 .statistics()
                 .iter()
                 .all(|values| values.len() == features && values.iter().all(|value| value.is_finite()))
+                && normalization.scale.iter().all(|&scale| scale > 0.0)
+                && normalization
+                    .minimum
+                    .iter()
+                    .zip(&normalization.maximum)
+                    .all(|(low, high)| low <= high)
+                && normalization
+                    .lower
+                    .iter()
+                    .zip(&normalization.upper)
+                    .all(|(low, high)| low <= high)
+                && normalization
+                    .power
+                    .as_ref()
+                    .is_none_or(|power| power.scale.iter().all(|&scale| scale > 0.0))
         }) {
             return fail("a group's statistics are invalid");
         }
