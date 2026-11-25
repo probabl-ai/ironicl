@@ -299,6 +299,17 @@ fn system_info(py: Python<'_>) -> PyResult<Bound<'_, PyDict>> {
     for key in ["gpu", "gpu_working_set", "gpu_min_build_rows"] {
         dict.set_item(key, py.None())?;
     }
+    dict.set_item("cuda", cfg!(feature = "cuda"))?;
+    #[cfg(feature = "cuda")]
+    {
+        let arch = crate::kernels::cuda::Device::new()
+            .ok()
+            .flatten()
+            .map(|device| device.arch().name());
+        dict.set_item("cuda_arch", arch)?;
+    }
+    #[cfg(not(feature = "cuda"))]
+    dict.set_item("cuda_arch", py.None())?;
     let cpu = crate::kernels::cpu::CpuCapabilities::detect();
     dict.set_item("architecture", cpu.architecture)?;
     dict.set_item("operating_system", cpu.operating_system)?;
@@ -523,6 +534,15 @@ fn preprocess(
         .map_err(py_error)?;
     // Saved for serving; Python passes its own settings to every prediction.
     let preprocessor = &mut preprocessed.preprocessor;
+    if let Some(names) = &feature_names
+        && names.len() != preprocessor.n_features_in()
+    {
+        return Err(PyValueError::new_err(format!(
+            "feature_names has {} entries; expected {}",
+            names.len(),
+            preprocessor.n_features_in()
+        )));
+    }
     preprocessor.feature_names = feature_names;
     if let Some(aggregation) = &mut preprocessor.aggregation {
         *aggregation = ClassifierAggregation {
@@ -845,16 +865,13 @@ impl KumoTabular {
     fn load(
         &self,
         py: Python<'_>,
-        data: Vec<u8>,
+        data: &[u8],
         threads: Option<usize>,
         progress: Option<Py<PyAny>>,
-        context: Option<Vec<u8>>,
+        context: Option<&[u8]>,
     ) -> PyResult<KumoFitted> {
         let model = Arc::clone(&self.0);
-        run(py, progress, move || {
-            Fitted::from_bytes(model, &data, context.as_deref(), threads)
-        })
-        .map(KumoFitted)
+        run(py, progress, || Fitted::from_bytes(model, data, context, threads)).map(KumoFitted)
     }
 }
 
@@ -923,10 +940,21 @@ impl KumoFitted {
         .map_err(py_error)
     }
 
-    /// The `IRCNTXT` bytes of the contexts `KumoTabular.load` loads.
+    /// The `IRCNTXT` bytes of the contexts `KumoTabular.load` loads, streamed
+    /// straight into Python bytes without an intermediate copy.
     fn context_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = py.detach(|| self.0.context_bytes()).map_err(py_error)?;
-        Ok(PyBytes::new(py, &bytes))
+        let artifact = py.detach(|| self.0.context_artifact()).map_err(py_error)?;
+        let length = artifact.encoded_len().map_err(py_error)?;
+        PyBytes::new_with(py, length, |mut buffer: &mut [u8]| {
+            py.detach(|| artifact.encode(&mut buffer)).map_err(py_error)?;
+            if buffer.is_empty() {
+                Ok(())
+            } else {
+                Err(PyRuntimeError::new_err(
+                    "the encoded context is shorter than its length",
+                ))
+            }
+        })
     }
 
     /// A regressor's `output_types` for `x`, as `FittedModel.predict_regression` gives them.
@@ -948,6 +976,13 @@ impl KumoFitted {
         let categories = &self.0.training().categories;
         let (results, rows) = run(py, progress, || {
             let matrix = raw.encode(categories)?;
+            if matrix.columns() != categories.len() {
+                return Err(Error::InvalidArgument(format!(
+                    "X has {} features; expected {}",
+                    matrix.columns(),
+                    categories.len()
+                )));
+            }
             let rows = matrix.features().len() / matrix.columns().max(1);
             Ok((self.0.predict_regression(&matrix.into_f64(), &outputs)?, rows))
         })?;
