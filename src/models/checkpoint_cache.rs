@@ -6,8 +6,11 @@ use std::{
 use crate::{
     ModelArtifact, ModelArtifactSummary,
     error::{Error, Result},
-    import_checkpoint, inspect_model_artifact, load_model_artifact,
-    models::checkpoint::{CheckpointKind, checkpoint_sha256, model_from_checkpoint},
+    format::{encode_sha256, model::write_model_artifact},
+    inspect_model_artifact, load_model_artifact,
+    models::checkpoint::{
+        CheckpointKind, checkpoint_sha256, model_data, model_from_checkpoint, same_file_path,
+    },
 };
 
 /// Controls where and whether [`prepare_checkpoint`] reuses an imported model.
@@ -54,12 +57,18 @@ pub fn prepare_checkpoint(
         }
     }
 
-    let summary = import_checkpoint(path, kind, &cache_path)?;
-    if summary.source_sha256 != source_sha256 {
+    if same_file_path(path, &cache_path)? {
+        return Err(Error::InvalidArgument(
+            "checkpoint input and model output must be different files".into(),
+        ));
+    }
+    let data = model_data(path, kind)?;
+    if encode_sha256(&data.source_sha256) != source_sha256 {
         return Err(Error::Cache(
             "imported model source hash does not match the checkpoint".into(),
         ));
     }
+    let summary = write_model_artifact(&cache_path, &data)?;
     Ok(PreparedCheckpoint {
         path: cache_path,
         created: true,
@@ -77,12 +86,10 @@ pub fn prepare_checkpoint(
 /// Returns [`Error::Checkpoint`] when the checkpoint is invalid and
 /// [`Error::Artifact`] when it is not an official model.
 pub fn load_checkpoint_model(path: &Path, kind: CheckpointKind) -> Result<ModelArtifact> {
-    let cached = prepare_checkpoint(path, kind, &CheckpointCacheOptions::default())
-        .and_then(|prepared| load_model_artifact(&prepared.path));
-    match cached {
+    match prepare_checkpoint(path, kind, &CheckpointCacheOptions::default()) {
+        Ok(prepared) => load_model_artifact(&prepared.path),
         Err(Error::Checkpoint(message)) => Err(Error::Checkpoint(message)),
         Err(_) => model_from_checkpoint(path, kind),
-        model => model,
     }
 }
 
