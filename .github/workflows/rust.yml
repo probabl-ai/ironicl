@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -32,15 +32,30 @@ jobs:
         run: rustup toolchain install --no-self-update
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Explain validation scope
+        shell: bash
         run: |
           echo '## Rust validation scope' >> "$GITHUB_STEP_SUMMARY"
           echo 'This job runs formatting, Clippy, and tests, including the python and metal feature set.' >> "$GITHUB_STEP_SUMMARY"
           echo 'Model and oracle fixtures are not provisioned; fixture-backed tests return early when files are absent.' >> "$GITHUB_STEP_SUMMARY"
           echo 'Hardware-gated kernels may also be skipped. This is not upstream model parity or Zen 5 validation.' >> "$GITHUB_STEP_SUMMARY"
       - name: Check formatting and Clippy
-        run: make lint-rust
+        shell: bash
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cargo clippy --locked --all-targets --features server -- -D warnings
+          else
+            cargo clippy --locked --all-targets --features python,metal,server -- -D warnings
+          fi
       - name: Run unit and integration tests
-        run: make test-rust
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            cargo test --locked --features metal,server
+          else
+            cargo test --locked --features server
+          fi
 
   audit:
     name: Dependency audit
