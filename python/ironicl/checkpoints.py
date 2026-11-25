@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import hashlib
 import os
-import tempfile
+import secrets
 import time
 import urllib.request
 import warnings
@@ -39,11 +39,16 @@ def fetch(path: Path, url: str, sha256: str | None, *, allow_download: bool, dat
         raise FileNotFoundError(f"Checkpoint {path} not found and allow_auto_download=False")
     path.parent.mkdir(parents=True, exist_ok=True)
     _remove_stale(path)
-    descriptor, temporary = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".partial")
-    os.chmod(temporary, 0o666 & ~_umask())
     digest = hashlib.sha256()
+    while True:
+        temporary = path.with_name(f".{path.name}.{secrets.token_hex(16)}.partial")
+        try:
+            file = temporary.open("xb")  # The OS applies the umask at creation.
+            break
+        except FileExistsError:
+            continue
     try:
-        with os.fdopen(descriptor, "wb") as file:
+        with file:
             if data is None:
                 with urllib.request.urlopen(url) as response:
                     while chunk := response.read(CHUNK_BYTES):
@@ -54,7 +59,7 @@ def fetch(path: Path, url: str, sha256: str | None, *, allow_download: bool, dat
                 file.write(data)
         os.replace(temporary, path)
     except BaseException:
-        Path(temporary).unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
         raise
     if sha256 is not None and digest.hexdigest() != sha256:
         warnings.warn(
@@ -64,13 +69,6 @@ def fetch(path: Path, url: str, sha256: str | None, *, allow_download: bool, dat
             stacklevel=3,
         )
     return path
-
-
-def _umask() -> int:
-    """The process's umask: setting it returns the old one, which is set back."""
-    mask = os.umask(0o022)
-    os.umask(mask)
-    return mask
 
 
 def _remove_stale(path: Path) -> None:

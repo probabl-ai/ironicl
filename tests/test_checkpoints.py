@@ -8,6 +8,7 @@ import unittest
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 from ironicl.checkpoints import fetch
 
@@ -55,13 +56,18 @@ class FetchTest(unittest.TestCase):
         self.assertFalse(self.path.exists())
         self.assertEqual(self.leftovers(), [])
 
-    def test_downloads_follow_the_umask(self):
-        previous = os.umask(0o022)
-        try:
-            fetch(self.path, self.url, self.sha256, allow_download=True)
-        finally:
-            os.umask(previous)
-        self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o644)
+    @unittest.skipUnless(os.name == "posix", "requires POSIX permission bits")
+    def test_downloads_follow_the_umask_without_changing_it(self):
+        for mask in (0o022, 0o077):
+            with self.subTest(mask=mask):
+                previous = os.umask(mask)
+                try:
+                    with patch("os.umask", side_effect=AssertionError("fetch changed the process umask")):
+                        fetch(self.path, self.url, self.sha256, allow_download=True)
+                finally:
+                    os.umask(previous)
+                self.assertEqual(stat.S_IMODE(self.path.stat().st_mode), 0o666 & ~mask)
+                self.path.unlink()
 
     def test_removes_stale_temporary_files(self):
         self.path.parent.mkdir(parents=True)
