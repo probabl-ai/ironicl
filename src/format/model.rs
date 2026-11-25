@@ -1,10 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{Read, Write},
-    path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    path::Path,
 };
 
 use crate::{
@@ -344,12 +343,18 @@ impl ModelArtifact {
             let payload = bytes
                 .get(tensor.payload_range)
                 .ok_or_else(|| Error::Artifact(format!("tensor '{}' payload is missing", tensor.name)))?;
-            let values = payload
+            let values: Vec<f32> = payload
                 .as_chunks()
                 .0
                 .iter()
                 .map(|&chunk| f32::from_le_bytes(chunk))
                 .collect();
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(Error::Artifact(format!(
+                    "tensor '{}' contains a non-finite value",
+                    tensor.name
+                )));
+            }
             tensors.insert(
                 tensor.name,
                 ModelTensorF32 {
@@ -436,34 +441,26 @@ pub(crate) fn write_model_artifact(path: &Path, model: &ModelArtifactData) -> Re
     let expected = parse_model_artifact_bytes(&bytes)?.summary;
     let parent = usable_parent(path);
     fs::create_dir_all(parent).map_err(artifact_error)?;
-    let temporary = create_temporary_path(path)?;
-
-    let write_result = (|| {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-            .map_err(artifact_error)?;
-        file.write_all(&bytes).map_err(artifact_error)?;
-        file.sync_all().map_err(artifact_error)?;
-        drop(file);
-        let actual = inspect_model_artifact(&temporary)?;
-        if actual != expected {
-            return Err(Error::Artifact(
-                "temporary artifact verification changed metadata".into(),
-            ));
-        }
-        fs::rename(&temporary, path).map_err(artifact_error)?;
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
-            .map_err(artifact_error)?;
-        inspect_model_artifact(path)
-    })();
-
-    if write_result.is_err() {
-        let _ = fs::remove_file(&temporary);
+    let mut file = tempfile::Builder::new()
+        .prefix(".ironicl-")
+        .suffix(".tmp")
+        .tempfile_in(parent)
+        .map_err(artifact_error)?;
+    file.write_all(&bytes).map_err(artifact_error)?;
+    file.as_file().sync_all().map_err(artifact_error)?;
+    let actual = inspect_model_artifact(file.path())?;
+    if actual != expected {
+        return Err(Error::Artifact(
+            "temporary artifact verification changed metadata".into(),
+        ));
     }
-    write_result
+    file.persist(path).map_err(artifact_error)?;
+    // On Unix, sync the parent directory so the rename is durable; Windows forbids opening a directory.
+    #[cfg(unix)]
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(artifact_error)?;
+    Ok(actual)
 }
 
 pub(crate) fn encode_model_artifact(model: &ModelArtifactData) -> Result<Vec<u8>> {
@@ -1008,30 +1005,6 @@ fn read_artifact_bytes(path: &Path) -> Result<Vec<u8>> {
         ));
     }
     Ok(bytes)
-}
-
-fn create_temporary_path(path: &Path) -> Result<PathBuf> {
-    let parent = usable_parent(path);
-    let filename = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| Error::Artifact("output path has no valid UTF-8 file name".into()))?;
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| Error::Artifact(format!("system clock is before UNIX epoch: {error}")))?
-        .as_nanos();
-    for attempt in 0..100_u32 {
-        let candidate = parent.join(format!(
-            ".{filename}.tmp-{}-{timestamp}-{attempt}",
-            std::process::id()
-        ));
-        if !candidate.exists() {
-            return Ok(candidate);
-        }
-    }
-    Err(Error::Artifact(
-        "could not allocate a temporary output path".into(),
-    ))
 }
 
 fn usable_parent(path: &Path) -> &Path {
