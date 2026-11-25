@@ -129,15 +129,22 @@ fn plan(budget: usize, precision: Precision, shape: Shape) -> Option<Plan> {
     let build = |group: usize| {
         group * estimator_bytes(precision, h, n) + column_bytes(n).max(MIN_RUN * row_bytes((group, h)))
     };
-    let group = (1..=b)
-        .rev()
-        .find(|&group| build(group) <= budget && group * h * n * COLUMN_DIM <= limit)?;
+    let group = (1..=b).rev().find(|&group| {
+        build(group) <= budget
+            && group * h * n * COLUMN_DIM <= limit
+            && group
+                .checked_mul(h + RESERVED)
+                .and_then(|v| v.checked_mul(MIN_RUN * 3 * COLUMN_DIM))
+                .is_some_and(|v| v <= limit)
+    })?;
     let free = budget - group * estimator_bytes(precision, h, n);
     let columns = (free / column_bytes(n))
         .min(limit / (n * 3 * COLUMN_DIM))
         .clamp(1, group * h);
+    let max_row_run = limit / (group * (h + RESERVED) * 3 * COLUMN_DIM);
     let run = (free / row_bytes((group, h)))
         .min(MAX_RUN)
+        .min(max_row_run)
         .min(n.next_multiple_of(MIN_RUN))
         .max(MIN_RUN)
         / MIN_RUN

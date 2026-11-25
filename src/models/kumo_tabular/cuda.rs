@@ -192,6 +192,8 @@ pub(crate) struct Cuda {
     config: Config,
     outputs: usize,
     weights: Weights,
+    /// Serializes operations sharing `self.device.stream()` across concurrent callers.
+    stream_lock: Mutex<()>,
     /// Each block's query scale per key count, uploaded on first use: an
     /// upload waits for the GPU.
     scales: Mutex<HashMap<(usize, usize), Arc<Buffer>>>,
@@ -226,6 +228,7 @@ impl Cuda {
             config,
             outputs,
             weights,
+            stream_lock: Mutex::new(()),
             scales: Mutex::default(),
             queued: AtomicUsize::new(0),
         })
@@ -234,7 +237,9 @@ impl Cuda {
     /// `len` zeros, allocated in stream order without waiting for the GPU,
     /// unless [`QUEUED_BYTES`] have been allocated since it last did.
     fn zeros(&self, len: usize) -> Result<Buffer> {
-        let bytes = len * size_of::<f32>();
+        let bytes = len
+            .checked_mul(size_of::<f32>())
+            .ok_or(Error::ArithmeticOverflow("CUDA buffer"))?;
         if self.queued.fetch_add(bytes, Ordering::Relaxed) + bytes > QUEUED_BYTES {
             self.queued.store(0, Ordering::Relaxed);
             self.device.stream().synchronize().map_err(gpu_error)?;
@@ -469,11 +474,13 @@ impl Cuda {
     /// padding: per layer `[columns, heads, inducing points, head_dim]` and
     /// `[1, key heads, training rows, head_dim]`, as the CPU keeps them.
     pub(super) fn download(&self, context: &Context) -> Result<(Vec<Kv>, Vec<Kv>)> {
+        let _guard = self.stream_lock.lock().unwrap_or_else(PoisonError::into_inner);
         Ok(self.download_slots(&context.slots())?.remove(0))
     }
 
     /// Each slot's keys and values of `ensemble`, as [`Self::download`] gives them.
     pub(super) fn download_ensemble(&self, ensemble: &Ensemble) -> Result<Vec<(Vec<Kv>, Vec<Kv>)>> {
+        let _guard = self.stream_lock.lock().unwrap_or_else(PoisonError::into_inner);
         self.download_slots(&ensemble.slots())
     }
 
@@ -568,7 +575,11 @@ impl Cuda {
     /// into one [`Ensemble`]. Each layer's buffers are freed once stacked, so
     /// the device holds at most one layer twice.
     pub(crate) fn stack(&self, contexts: Vec<Context>) -> Result<Ensemble> {
+        let _guard = self.stream_lock.lock().unwrap_or_else(PoisonError::into_inner);
         let count = contexts.len();
+        if count == 0 {
+            return Err(Error::InvalidArgument("cannot stack zero contexts".into()));
+        }
         let (groups, training_rows) = (contexts[0].categorical.len(), contexts[0].training_rows);
         if contexts
             .iter()
@@ -644,6 +655,7 @@ impl Cuda {
         context: &super::cpu::Context,
         training_rows: usize,
     ) -> Result<Context> {
+        let _guard = self.stream_lock.lock().unwrap_or_else(PoisonError::into_inner);
         let (columns, icl) = context.kvs();
         let upload = |kvs: &[Kv]| {
             kvs.iter()
@@ -679,8 +691,18 @@ impl Cuda {
     /// their label vectors for the cells and for the ICL stage, `[rows, cell]`
     /// and `[rows, icl]`.
     pub(crate) fn fit(&self, x: &[f32], categorical: &[bool], labels: (&[f32], &[f32])) -> Result<Context> {
+        let _guard = self.stream_lock.lock().unwrap_or_else(PoisonError::into_inner);
         let columns = categorical.len();
         let rows = x.len() / columns;
+        let cell_values = columns
+            .checked_mul(rows)
+            .and_then(|v| v.checked_mul(dim(self.config.cell_channels)));
+        let icl_values = rows.checked_mul(dim(self.config.icl_channels));
+        if cell_values.is_none_or(|v| v > u32::MAX as usize)
+            || icl_values.is_none_or(|v| v > u32::MAX as usize)
+        {
+            return Err(Error::UnsupportedBackend(OUT_OF_MEMORY.into()));
+        }
         let means: Vec<f32> = (0..columns)
             .map(|column| {
                 let (sum, count) = x
@@ -742,12 +764,14 @@ impl Cuda {
 
     /// The outputs of each of the `[rows, columns]` query rows `x`.
     pub(crate) fn predict(&self, context: &Context, x: &[f32]) -> Result<Vec<f32>> {
+        let _guard = self.stream_lock.lock().unwrap_or_else(PoisonError::into_inner);
         Ok(self.predict_slots(&context.slots(), &[x])?.remove(0))
     }
 
     /// Each slot's outputs of its `[rows, columns]` query rows `xs[slot]`, all
     /// slots in one pass, a chunk of rows at a time.
     pub(crate) fn predict_ensemble(&self, ensemble: &Ensemble, xs: &[&[f32]]) -> Result<Vec<Vec<f32>>> {
+        let _guard = self.stream_lock.lock().unwrap_or_else(PoisonError::into_inner);
         self.predict_slots(&ensemble.slots(), xs)
     }
 
@@ -770,6 +794,9 @@ impl Cuda {
             for (all, part) in out.iter_mut().zip(self.pass(slots, &chunk)?) {
                 all.extend(part);
             }
+        }
+        if out.iter().any(|slot| slot.iter().any(|value| !value.is_finite())) {
+            return Err(gpu_error("CUDA prediction produced a non-finite value"));
         }
         Ok(out)
     }
