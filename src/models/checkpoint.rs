@@ -186,7 +186,7 @@ pub(crate) fn model_from_checkpoint(path: &Path, kind: CheckpointKind) -> Result
 }
 
 /// The portable model of a validated checkpoint.
-fn model_data(path: &Path, kind: CheckpointKind) -> Result<ModelArtifactData> {
+pub(crate) fn model_data(path: &Path, kind: CheckpointKind) -> Result<ModelArtifactData> {
     let loaded = load_checkpoint(path, Some(kind))?;
     let source_sha256 = decode_sha256(&loaded.summary.source_sha256)?;
     let config = match (loaded.summary.profile, &loaded.summary.config) {
@@ -306,11 +306,17 @@ fn load_checkpoint(path: &Path, kind: Option<CheckpointKind>) -> Result<LoadedCh
             let tensor_bytes = usize::try_from(tensor_bytes)
                 .map_err(|_| Error::Checkpoint(format!("tensor '{}' byte count exceeds usize", info.name)))?;
             let truncated = || Error::Checkpoint(format!("tensor '{}' storage is truncated", info.name));
-            let data = if info.layout.is_contiguous() && info.layout.start_offset() == 0 {
-                storage.get(..tensor_bytes).ok_or_else(truncated)?.to_vec()
+            let size = info.dtype.size_in_bytes();
+            let data = if info.layout.is_contiguous() {
+                let start = info
+                    .layout
+                    .start_offset()
+                    .checked_mul(size)
+                    .ok_or_else(truncated)?;
+                let end = start.checked_add(tensor_bytes).ok_or_else(truncated)?;
+                storage.get(start..end).ok_or_else(truncated)?.to_vec()
             } else {
                 // Copy a strided view, such as a transposed weight, into row-major order.
-                let size = info.dtype.size_in_bytes();
                 let mut data = Vec::with_capacity(tensor_bytes);
                 for element in 0..tensor_bytes / size {
                     let index = storage_index(&info.layout, element);
@@ -438,7 +444,7 @@ fn read_pickle_root(bytes: Vec<u8>) -> Result<(Object, String, CheckpointArchive
         .strip_suffix(".pkl")
         .ok_or_else(|| Error::Checkpoint("invalid data.pkl entry name".into()))?
         .to_owned();
-    let mut pickle = archive.by_name(pickle_name).map_err(checkpoint_error)?;
+    let pickle = archive.by_name(pickle_name).map_err(checkpoint_error)?;
     if pickle.size() > MAX_PICKLE_BYTES {
         return Err(Error::Checkpoint(format!(
             "data.pkl is {} bytes; limit is {MAX_PICKLE_BYTES}",
@@ -448,9 +454,19 @@ fn read_pickle_root(bytes: Vec<u8>) -> Result<(Object, String, CheckpointArchive
 
     let pickle_size = usize::try_from(pickle.size())
         .map_err(|_| Error::Checkpoint("data.pkl size exceeds usize".into()))?;
+    if !pickle.is_file() {
+        return Err(Error::Checkpoint("data.pkl entry is not a file".into()));
+    }
     let mut pickle_bytes = Vec::with_capacity(pickle_size);
-    pickle.read_to_end(&mut pickle_bytes).map_err(checkpoint_error)?;
-    drop(pickle);
+    pickle
+        .take(MAX_PICKLE_BYTES + 1)
+        .read_to_end(&mut pickle_bytes)
+        .map_err(checkpoint_error)?;
+    if u64::try_from(pickle_bytes.len()).unwrap_or(u64::MAX) > MAX_PICKLE_BYTES {
+        return Err(Error::Checkpoint(format!(
+            "data.pkl exceeded the {MAX_PICKLE_BYTES}-byte limit while reading"
+        )));
+    }
     preflight_pickle(&pickle_bytes)?;
 
     let mut stack = Stack::empty();
@@ -571,17 +587,15 @@ fn decode_tensor_info(name: &str, value: &Object, storage_directory: &str) -> Re
             stride.len()
         )));
     }
-    let start_offset = offset_elements
+    // Check that the byte offset fits in usize; Layout stores start_offset in elements.
+    let _ = offset_elements
         .checked_mul(dtype.size_in_bytes())
         .ok_or_else(|| Error::Checkpoint(format!("tensor '{name}' byte offset overflows usize")))?;
-    let path = Path::new(storage_directory)
-        .join(storage_key)
-        .to_string_lossy()
-        .into_owned();
+    let path = format!("{storage_directory}/{storage_key}");
     Ok(TensorInfo {
         name: name.to_owned(),
         dtype,
-        layout: Layout::new(Shape::from(dimensions), stride, start_offset),
+        layout: Layout::new(Shape::from(dimensions), stride, offset_elements),
         path,
         storage_size,
     })
@@ -765,7 +779,7 @@ fn decode_hex(value: u8) -> Result<u8> {
     }
 }
 
-fn same_file_path(left: &Path, right: &Path) -> Result<bool> {
+pub(crate) fn same_file_path(left: &Path, right: &Path) -> Result<bool> {
     if left == right {
         return Ok(true);
     }
@@ -982,11 +996,16 @@ struct PickleValueShape {
 }
 
 impl PickleValueShape {
-    const SCALAR: Self = Self { bytes: 32, depth: 1 };
+    /// Conservative per-node overhead matching `size_of::<candle_core::pickle::Object>()` (56 B).
+    const OBJECT_OVERHEAD: u64 = 64;
+    const SCALAR: Self = Self {
+        bytes: Self::OBJECT_OVERHEAD,
+        depth: 1,
+    };
 
     fn string(length: u64) -> Result<Self> {
         Ok(Self {
-            bytes: 32_u64
+            bytes: Self::OBJECT_OVERHEAD
                 .checked_add(length)
                 .ok_or_else(|| Error::Checkpoint("pickle object size overflows u64".into()))?,
             depth: 1,
@@ -994,8 +1013,12 @@ impl PickleValueShape {
     }
 
     fn container(values: impl IntoIterator<Item = Self>) -> Result<Self> {
-        let mut bytes = 32_u64;
-        let mut depth = 1_usize;
+        Self::SCALAR.extend(values)
+    }
+
+    fn extend(self, values: impl IntoIterator<Item = Self>) -> Result<Self> {
+        let mut bytes = self.bytes;
+        let mut depth = self.depth;
         for value in values {
             bytes = bytes
                 .checked_add(value.bytes)
@@ -1020,7 +1043,6 @@ struct PicklePreflight {
     stack: Vec<PickleValueShape>,
     marks: Vec<usize>,
     memo: BTreeMap<u32, PickleValueShape>,
-    next_memo: u32,
     live_bytes: u64,
 }
 
@@ -1030,7 +1052,6 @@ impl PicklePreflight {
             stack: Vec::new(),
             marks: Vec::new(),
             memo: BTreeMap::new(),
-            next_memo: 0,
             live_bytes: 0,
         }
     }
@@ -1109,17 +1130,13 @@ impl PicklePreflight {
     fn append(&mut self, count: usize, offset: usize) -> Result<()> {
         let values = self.pop_many(count, offset)?;
         let container = self.pop(offset)?;
-        self.push(PickleValueShape::container(
-            std::iter::once(container).chain(values),
-        )?)
+        self.push(container.extend(values)?)
     }
 
     fn append_mark(&mut self, offset: usize) -> Result<()> {
         let values = self.pop_mark(offset)?;
         let container = self.pop(offset)?;
-        self.push(PickleValueShape::container(
-            std::iter::once(container).chain(values),
-        )?)
+        self.push(container.extend(values)?)
     }
 
     fn memo_put(&mut self, id: u32, offset: usize) -> Result<()> {
@@ -1137,17 +1154,7 @@ impl PicklePreflight {
             .live_bytes
             .checked_add(value.bytes)
             .ok_or_else(|| Error::Checkpoint("pickle object size overflows u64".into()))?;
-        self.next_memo = self.next_memo.max(id.saturating_add(1));
         self.check_limits()
-    }
-
-    fn memoize(&mut self, offset: usize) -> Result<()> {
-        let id = self.next_memo;
-        self.next_memo = self
-            .next_memo
-            .checked_add(1)
-            .ok_or_else(|| Error::Checkpoint("pickle memo index overflows u32".into()))?;
-        self.memo_put(id, offset)
     }
 
     fn memo_get(&mut self, id: u32) -> Result<()> {
@@ -1241,7 +1248,6 @@ fn preflight_pickle(bytes: &[u8]) -> Result<()> {
                 let id = cursor.read_u32_le()?;
                 state.memo_put(id, offset)?;
             }
-            0x94 => state.memoize(offset)?,
             b'h' => {
                 let id = u32::from(cursor.read_u8()?);
                 state.memo_get(id)?;
@@ -1284,7 +1290,8 @@ fn preflight_pickle(bytes: &[u8]) -> Result<()> {
             0x87 => state.combine(3, offset)?,
             b'a' => state.append(1, offset)?,
             b's' => state.append(2, offset)?,
-            b't' | b'd' => state.combine_mark(offset)?,
+            // candle-core 0.11.1 misparses `d` (DICT) as EmptyDict, so reject it here.
+            b't' => state.combine_mark(offset)?,
             b'e' | b'u' => state.append_mark(offset)?,
             b'.' => {
                 state.finish(cursor.is_empty(), offset)?;
@@ -1311,7 +1318,7 @@ fn validate_object_tree(
             "pickle object depth exceeds {MAX_PICKLE_OBJECT_DEPTH}"
         )));
     }
-    add_object_bytes(object_bytes, 32)?;
+    add_object_bytes(object_bytes, PickleValueShape::OBJECT_OVERHEAD)?;
     match object {
         Object::Class {
             module_name,
@@ -1511,6 +1518,52 @@ mod tests {
         assert_eq!(order, [0, 2, 4, 1, 3, 5]);
         let offset = Layout::contiguous_with_offset(Shape::from_dims(&[2, 2]), 3);
         assert_eq!(storage_index(&offset, 3), 6);
+    }
+
+    #[test]
+    fn decode_tensor_info_keeps_offset_in_elements_and_uses_zip_slashes() {
+        let rebuild = Object::Reduce {
+            callable: Box::new(Object::Class {
+                module_name: "torch._utils".into(),
+                class_name: "_rebuild_tensor_v2".into(),
+            }),
+            args: Box::new(Object::Tuple(vec![
+                Object::PersistentLoad(Box::new(Object::Tuple(vec![
+                    Object::Unicode("storage".into()),
+                    Object::Class {
+                        module_name: "torch".into(),
+                        class_name: "FloatStorage".into(),
+                    },
+                    Object::Unicode("0".into()),
+                    Object::Unicode("cpu".into()),
+                    Object::Int(6),
+                ]))),
+                Object::Int(2),
+                Object::Tuple(vec![Object::Int(2), Object::Int(2)]),
+                Object::Tuple(vec![Object::Int(1), Object::Int(2)]),
+            ])),
+        };
+        let info = decode_tensor_info("w", &rebuild, "archive/data").expect("valid tensor");
+        assert_eq!(info.path, "archive/data/0");
+        assert_eq!(info.layout.start_offset(), 2);
+        assert!(validate_tensor(&info).is_ok());
+        assert_eq!(storage_index(&info.layout, 0), 2);
+        assert_eq!(storage_index(&info.layout, 3), 5);
+    }
+
+    #[test]
+    fn preflight_rejects_mismatched_candle_opcodes_and_allows_many_flat_appends() {
+        // `d` (DICT) is misparsed by candle-core 0.11.1 as EmptyDict; `0x94` (MEMOIZE) is unsupported.
+        assert!(preflight_pickle(&[0x80, 2, b'(', b'd', b'.']).is_err());
+        assert!(preflight_pickle(&[0x80, 2, b'N', 0x94, b'.']).is_err());
+
+        // Appending more than MAX_PICKLE_OBJECT_DEPTH scalars to a flat list does not nest.
+        let mut flat = vec![0x80, 2, b']'];
+        for _ in 0..=MAX_PICKLE_OBJECT_DEPTH + 10 {
+            flat.extend(b"Na");
+        }
+        flat.push(b'.');
+        assert!(preflight_pickle(&flat).is_ok());
     }
 
     #[test]
