@@ -26,7 +26,7 @@ use axum::{
     extract::DefaultBodyLimit,
     routing::{get, post},
 };
-use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, oneshot};
 
 use self::{
     error::ApiError,
@@ -40,10 +40,11 @@ const GPU_BATCH_ROWS: usize = 1024;
 const CPU_BATCH_ROWS: usize = 32;
 
 /// What the handlers share: the schema requests are checked against, the
-/// queue, and the way to the worker.
+/// queue, a cap on concurrent JSON parsing, and the way to the worker.
 struct Server {
     schema: Schema,
     queue: Arc<Queue>,
+    parse_slots: Arc<Semaphore>,
     jobs: mpsc::Sender<Job>,
 }
 
@@ -136,7 +137,15 @@ pub fn serve(args: &ServeArgs) -> Result<()> {
             std::process::exit(1);
         }
     });
-    let server = Server { schema, queue, jobs };
+    let parse_concurrency = std::thread::available_parallelism()
+        .map_or(4, std::num::NonZero::get)
+        .clamp(2, 16);
+    let server = Server {
+        schema,
+        queue,
+        parse_slots: Arc::new(Semaphore::new(parse_concurrency)),
+        jobs,
+    };
     let app = Router::new()
         .route("/v1/predict", post(api::predict))
         .route("/v1/health", get(api::health))

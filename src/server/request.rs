@@ -2,9 +2,13 @@
 //! the worker's query it becomes.
 
 use std::collections::HashMap;
+use std::marker::PhantomData;
 
 use garde::{Unvalidated, Valid, Validate};
-use serde::{Deserialize, Deserializer, de};
+use serde::{
+    Deserialize, Deserializer,
+    de::{self, DeserializeSeed, MapAccess, SeqAccess},
+};
 
 use super::{
     error::ApiError,
@@ -115,11 +119,26 @@ impl Cell {
     }
 }
 
+/// Either already encoded into flat `f64` rows during streaming JSON parsing,
+/// or bounded raw cells waiting for a trailing `"columns"` key.
+enum RequestData {
+    Encoded(Rows),
+    Raw(Vec<Vec<Option<Cell>>>),
+}
+
+impl RequestData {
+    fn rows(&self) -> usize {
+        match self {
+            Self::Encoded(rows) => rows.count,
+            Self::Raw(rows) => rows.len(),
+        }
+    }
+}
+
 /// `POST /v1/predict`'s body: a table as pandas'
 /// `to_json(orient="split", index=False)` writes it, and options named after
 /// `TabICL`'s predict arguments.
-#[derive(Deserialize, Validate)]
-#[serde(deny_unknown_fields)]
+#[derive(Validate)]
 #[garde(context(Schema))]
 pub(super) struct PredictRequest {
     /// The column names, in the order of each row's values. Without them,
@@ -131,11 +150,391 @@ pub(super) struct PredictRequest {
     /// replaced by its feature's training mean, or for a categorical feature
     /// encoded as a category training never saw.
     #[garde(custom(fit_the_model))]
-    data: Vec<Vec<Option<Cell>>>,
+    data: RequestData,
     #[garde(length(min = 1), custom(for_the_task_once))]
     output_type: Option<Vec<String>>,
     #[garde(custom(for_a_regressor), length(min = 1, max = MAX_ALPHAS), inner(inner(custom(between_0_and_1))))]
     alphas: Option<Vec<f32>>,
+}
+
+/// Deserialize an optional field using `S` when non-null.
+struct OptionSeed<S>(S);
+
+impl<'de, S: DeserializeSeed<'de>> DeserializeSeed<'de> for OptionSeed<S> {
+    type Value = Option<S::Value>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        struct Visitor<S>(S);
+        impl<'de, S: DeserializeSeed<'de>> de::Visitor<'de> for Visitor<S> {
+            type Value = Option<S::Value>;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an optional value")
+            }
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(None)
+            }
+            fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+                self.0.deserialize(deserializer).map(Some)
+            }
+        }
+        deserializer.deserialize_option(Visitor(self.0))
+    }
+}
+
+/// Deserialize a `Vec<T>` stopping as soon as more than `max_len` elements appear.
+struct BoundedVecSeed<T> {
+    max_len: usize,
+    over_limit: String,
+    _marker: PhantomData<T>,
+}
+
+impl<T> BoundedVecSeed<T> {
+    fn new(max_len: usize, over_limit: impl Into<String>) -> Self {
+        Self {
+            max_len,
+            over_limit: over_limit.into(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<'de, T: Deserialize<'de>> DeserializeSeed<'de> for BoundedVecSeed<T> {
+    type Value = Vec<T>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        struct Visitor<T> {
+            max_len: usize,
+            over_limit: String,
+            _marker: PhantomData<T>,
+        }
+        impl<'de, T: Deserialize<'de>> de::Visitor<'de> for Visitor<T> {
+            type Value = Vec<T>;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a sequence")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(value) = seq.next_element::<T>()? {
+                    if values.len() >= self.max_len {
+                        return Err(de::Error::custom(&self.over_limit));
+                    }
+                    values.push(value);
+                }
+                Ok(values)
+            }
+        }
+        deserializer.deserialize_seq(Visitor {
+            max_len: self.max_len,
+            over_limit: self.over_limit,
+            _marker: PhantomData,
+        })
+    }
+}
+
+/// Stream-encode `"data"` directly into flat `f64` rows when the column mapping
+/// is already known (e.g., `"columns"` preceded `"data"`, or the model has no
+/// column names), enforcing row count and row width during deserialization.
+struct EncodedDataSeed<'a> {
+    schema: &'a Schema,
+    /// Maps incoming column position `i` to the model's feature index.
+    incoming_to_feature: Vec<usize>,
+    columns: Option<&'a [String]>,
+}
+
+impl<'de> DeserializeSeed<'de> for EncodedDataSeed<'_> {
+    type Value = Rows;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        struct RowSeed<'a> {
+            schema: &'a Schema,
+            incoming_to_feature: &'a [usize],
+            columns: Option<&'a [String]>,
+            row_index: usize,
+            out: &'a mut [f64],
+        }
+        impl<'de> DeserializeSeed<'de> for RowSeed<'_> {
+            type Value = ();
+            fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+                struct Visitor<'a>(RowSeed<'a>);
+                impl<'de> de::Visitor<'de> for Visitor<'_> {
+                    type Value = ();
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        formatter.write_str("a row of feature values")
+                    }
+                    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+                        let RowSeed {
+                            schema,
+                            incoming_to_feature,
+                            columns,
+                            row_index,
+                            out,
+                        } = self.0;
+                        let mut count = 0_usize;
+                        while let Some(cell) = seq.next_element::<Option<Cell>>()? {
+                            if count >= schema.features {
+                                return Err(de::Error::custom(format!(
+                                    "data: row {row_index} has more than {} values; the model expects {}",
+                                    schema.features, schema.features
+                                )));
+                            }
+                            let feature = incoming_to_feature[count];
+                            let value = encode_value(
+                                cell.as_ref().map(Cell::value),
+                                schema.categories[feature].as_ref(),
+                            )
+                            .map_err(|expected| {
+                                let column = columns
+                                    .map_or_else(|| count.to_string(), |names| format!("{:?}", names[count]));
+                                de::Error::custom(format!(
+                                    "data: row {row_index}, column {column} must be {expected} or null"
+                                ))
+                            })?;
+                            out[feature] = value;
+                            count += 1;
+                        }
+                        if count != schema.features {
+                            return Err(de::Error::custom(format!(
+                                "data: row {row_index} has {count} values; the model expects {}",
+                                schema.features
+                            )));
+                        }
+                        Ok(())
+                    }
+                }
+                deserializer.deserialize_seq(Visitor(self))
+            }
+        }
+        struct Visitor<'a>(EncodedDataSeed<'a>);
+        impl<'de> de::Visitor<'de> for Visitor<'_> {
+            type Value = Rows;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a sequence of rows")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Rows, A::Error> {
+                let schema = self.0.schema;
+                let mut values = Vec::new();
+                let mut count = 0_usize;
+                loop {
+                    if count >= schema.max_request_rows {
+                        if seq.next_element::<de::IgnoredAny>()?.is_some() {
+                            return Err(de::Error::custom(format!(
+                                "data: more than {} rows; the limit is {}",
+                                schema.max_request_rows, schema.max_request_rows
+                            )));
+                        }
+                        break;
+                    }
+                    let row_start = values.len();
+                    values.resize(row_start + schema.features, 0.0);
+                    let row = seq.next_element_seed(RowSeed {
+                        schema,
+                        incoming_to_feature: &self.0.incoming_to_feature,
+                        columns: self.0.columns,
+                        row_index: count,
+                        out: &mut values[row_start..],
+                    })?;
+                    if row.is_none() {
+                        values.truncate(row_start);
+                        break;
+                    }
+                    count += 1;
+                }
+                Ok(Rows { values, count })
+            }
+        }
+        deserializer.deserialize_seq(Visitor(self))
+    }
+}
+
+/// Deserialize `"data"` into bounded raw cells when `"columns"` has not been
+/// seen yet and the model supports named columns.
+struct RawDataSeed<'a>(&'a Schema);
+
+impl<'de> DeserializeSeed<'de> for RawDataSeed<'_> {
+    type Value = Vec<Vec<Option<Cell>>>;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        struct RawRowSeed {
+            row_index: usize,
+            features: usize,
+        }
+        impl<'de> DeserializeSeed<'de> for RawRowSeed {
+            type Value = Vec<Option<Cell>>;
+            fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+                struct Visitor(RawRowSeed);
+                impl<'de> de::Visitor<'de> for Visitor {
+                    type Value = Vec<Option<Cell>>;
+                    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                        formatter.write_str("a row of feature values")
+                    }
+                    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                        let mut row = Vec::with_capacity(self.0.features.min(64));
+                        while let Some(cell) = seq.next_element::<Option<Cell>>()? {
+                            if row.len() >= self.0.features {
+                                return Err(de::Error::custom(format!(
+                                    "data: row {} has more than {} values; the model expects {}",
+                                    self.0.row_index, self.0.features, self.0.features
+                                )));
+                            }
+                            row.push(cell);
+                        }
+                        if row.len() != self.0.features {
+                            return Err(de::Error::custom(format!(
+                                "data: row {} has {} values; the model expects {}",
+                                self.0.row_index,
+                                row.len(),
+                                self.0.features
+                            )));
+                        }
+                        Ok(row)
+                    }
+                }
+                deserializer.deserialize_seq(Visitor(self))
+            }
+        }
+        struct Visitor<'a>(&'a Schema);
+        impl<'de> de::Visitor<'de> for Visitor<'_> {
+            type Value = Vec<Vec<Option<Cell>>>;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a sequence of rows")
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut rows = Vec::new();
+                loop {
+                    if rows.len() >= self.0.max_request_rows {
+                        if seq.next_element::<de::IgnoredAny>()?.is_some() {
+                            return Err(de::Error::custom(format!(
+                                "data: more than {} rows; the limit is {}",
+                                self.0.max_request_rows, self.0.max_request_rows
+                            )));
+                        }
+                        break;
+                    }
+                    let Some(row) = seq.next_element_seed(RawRowSeed {
+                        row_index: rows.len(),
+                        features: self.0.features,
+                    })?
+                    else {
+                        break;
+                    };
+                    rows.push(row);
+                }
+                Ok(rows)
+            }
+        }
+        deserializer.deserialize_seq(Visitor(self.0))
+    }
+}
+
+/// Deserialize a [`PredictRequest`] against `schema`, enforcing row, column,
+/// output, and quantile-level bounds during parsing so malformed bodies cannot
+/// amplify memory before validation.
+struct PredictRequestSeed<'a>(&'a Schema);
+
+impl<'de> DeserializeSeed<'de> for PredictRequestSeed<'_> {
+    type Value = PredictRequest;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        const FIELDS: &[&str] = &["columns", "data", "output_type", "alphas"];
+        struct Visitor<'a>(&'a Schema);
+        impl<'de> de::Visitor<'de> for Visitor<'_> {
+            type Value = PredictRequest;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a predict request object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<PredictRequest, A::Error> {
+                let schema = self.0;
+                let mut columns: Option<Option<Vec<String>>> = None;
+                let mut data: Option<RequestData> = None;
+                let mut output_type: Option<Option<Vec<String>>> = None;
+                let mut alphas: Option<Option<Vec<f32>>> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "columns" => {
+                            if columns.is_some() {
+                                return Err(de::Error::duplicate_field("columns"));
+                            }
+                            let value = map.next_value_seed(OptionSeed(BoundedVecSeed::new(
+                                schema.features + 1,
+                                "columns: too many columns",
+                            )))?;
+                            columns = Some(value);
+                        }
+                        "data" => {
+                            if data.is_some() {
+                                return Err(de::Error::duplicate_field("data"));
+                            }
+                            let parsed = match (&columns, &schema.columns) {
+                                (Some(Some(names)), Some(positions)) => {
+                                    match_the_model(&Some(names.clone()), schema)
+                                        .map_err(|error| de::Error::custom(format!("columns: {error}")))?;
+                                    let incoming_to_feature =
+                                        names.iter().map(|name| positions[name]).collect();
+                                    RequestData::Encoded(map.next_value_seed(EncodedDataSeed {
+                                        schema,
+                                        incoming_to_feature,
+                                        columns: Some(names),
+                                    })?)
+                                }
+                                (Some(Some(names)), None) => {
+                                    if let Err(error) = match_the_model(&Some(names.clone()), schema) {
+                                        return Err(de::Error::custom(format!("columns: {error}")));
+                                    }
+                                    RequestData::Encoded(map.next_value_seed(EncodedDataSeed {
+                                        schema,
+                                        incoming_to_feature: (0..schema.features).collect(),
+                                        columns: None,
+                                    })?)
+                                }
+                                (Some(None), _) | (None, None) => {
+                                    RequestData::Encoded(map.next_value_seed(EncodedDataSeed {
+                                        schema,
+                                        incoming_to_feature: (0..schema.features).collect(),
+                                        columns: None,
+                                    })?)
+                                }
+                                (None, Some(_)) => {
+                                    RequestData::Raw(map.next_value_seed(RawDataSeed(schema))?)
+                                }
+                            };
+                            data = Some(parsed);
+                        }
+                        "output_type" => {
+                            if output_type.is_some() {
+                                return Err(de::Error::duplicate_field("output_type"));
+                            }
+                            let value = map.next_value_seed(OptionSeed(BoundedVecSeed::new(
+                                8,
+                                "output_type: too many outputs",
+                            )))?;
+                            output_type = Some(value);
+                        }
+                        "alphas" => {
+                            if alphas.is_some() {
+                                return Err(de::Error::duplicate_field("alphas"));
+                            }
+                            let value = map.next_value_seed(OptionSeed(BoundedVecSeed::new(
+                                MAX_ALPHAS,
+                                format!("alphas: length is greater than {MAX_ALPHAS}"),
+                            )))?;
+                            alphas = Some(value);
+                        }
+                        other => return Err(de::Error::unknown_field(other, FIELDS)),
+                    }
+                }
+                Ok(PredictRequest {
+                    columns: columns.flatten(),
+                    data: data.ok_or_else(|| de::Error::missing_field("data"))?,
+                    output_type: output_type.flatten(),
+                    alphas: alphas.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(Visitor(self.0))
+    }
 }
 
 #[expect(clippy::ref_option, reason = "garde passes the field as it is")]
@@ -161,24 +560,26 @@ fn match_the_model(columns: &Option<Vec<String>>, schema: &Schema) -> garde::Res
     Ok(())
 }
 
-fn fit_the_model(data: &[Vec<Option<Cell>>], schema: &Schema) -> garde::Result {
-    if data.is_empty() {
+fn fit_the_model(data: &RequestData, schema: &Schema) -> garde::Result {
+    let count = data.rows();
+    if count == 0 {
         return Err(garde::Error::new("has no rows"));
     }
-    if data.len() > schema.max_request_rows {
+    if count > schema.max_request_rows {
         return Err(garde::Error::new(format!(
-            "{} rows; the limit is {}",
-            data.len(),
+            "{count} rows; the limit is {}",
             schema.max_request_rows
         )));
     }
-    for (i, row) in data.iter().enumerate() {
-        if row.len() != schema.features {
-            return Err(garde::Error::new(format!(
-                "row {i} has {} values; the model expects {}",
-                row.len(),
-                schema.features
-            )));
+    if let RequestData::Raw(rows) = data {
+        for (i, row) in rows.iter().enumerate() {
+            if row.len() != schema.features {
+                return Err(garde::Error::new(format!(
+                    "row {i} has {} values; the model expects {}",
+                    row.len(),
+                    schema.features
+                )));
+            }
         }
     }
     Ok(())
@@ -224,6 +625,19 @@ fn between_0_and_1(alpha: &f32, _: &Schema) -> garde::Result {
 }
 
 impl PredictRequest {
+    /// Parse and validate a JSON body against `schema` without materializing
+    /// oversize arrays before checking limits.
+    pub(super) fn parse(body: &[u8], schema: &Schema) -> Result<Query, ApiError> {
+        let mut deserializer = serde_json::Deserializer::from_slice(body);
+        let request = PredictRequestSeed(schema)
+            .deserialize(&mut deserializer)
+            .map_err(|error| ApiError::invalid(error.to_string()))?;
+        deserializer
+            .end()
+            .map_err(|error| ApiError::invalid(error.to_string()))?;
+        Self::into_query(request.check(schema)?, schema)
+    }
+
     /// Check the request against `schema`.
     pub(super) fn check(self, schema: &Schema) -> Result<Valid<Self>, ApiError> {
         Unvalidated::new(self)
@@ -238,33 +652,37 @@ impl PredictRequest {
     /// When a value's type does not fit its feature.
     pub(super) fn into_query(request: Valid<Self>, schema: &Schema) -> Result<Query, ApiError> {
         let request = request.into_inner();
-        // Where each of the model's features is in a row.
-        let mut order: Vec<usize> = (0..schema.features).collect();
-        if let (Some(columns), Some(positions)) = (&request.columns, &schema.columns) {
-            for (i, column) in columns.iter().enumerate() {
-                order[positions[column]] = i;
+        let rows = match request.data {
+            RequestData::Encoded(rows) => rows,
+            RequestData::Raw(raw) => {
+                // Where each of the model's features is in a row.
+                let mut order: Vec<usize> = (0..schema.features).collect();
+                if let (Some(columns), Some(positions)) = (&request.columns, &schema.columns) {
+                    for (i, column) in columns.iter().enumerate() {
+                        order[positions[column]] = i;
+                    }
+                }
+                let mut values = Vec::with_capacity(raw.len() * schema.features);
+                for (r, row) in raw.iter().enumerate() {
+                    for (&i, categories) in order.iter().zip(&schema.categories) {
+                        let value = encode_value(row[i].as_ref().map(Cell::value), categories.as_ref())
+                            .map_err(|expected| {
+                                let column = request
+                                    .columns
+                                    .as_ref()
+                                    .map_or_else(|| i.to_string(), |names| format!("{:?}", names[i]));
+                                ApiError::invalid(format!(
+                                    "data: row {r}, column {column} must be {expected} or null"
+                                ))
+                            })?;
+                        values.push(value);
+                    }
+                }
+                Rows {
+                    values,
+                    count: raw.len(),
+                }
             }
-        }
-        let mut values = Vec::with_capacity(request.data.len() * schema.features);
-        for (r, row) in request.data.iter().enumerate() {
-            for (&i, categories) in order.iter().zip(&schema.categories) {
-                let value = encode_value(row[i].as_ref().map(Cell::value), categories.as_ref()).map_err(
-                    |expected| {
-                        let column = request
-                            .columns
-                            .as_ref()
-                            .map_or_else(|| i.to_string(), |names| format!("{:?}", names[i]));
-                        ApiError::invalid(format!(
-                            "data: row {r}, column {column} must be {expected} or null"
-                        ))
-                    },
-                )?;
-                values.push(value);
-            }
-        }
-        let rows = Rows {
-            values,
-            count: request.data.len(),
         };
         let outputs = match schema.task {
             TaskKind::Classifier => {
@@ -304,7 +722,7 @@ pub(super) fn missing_rows(
     let schema = Schema::new(task, categories, None, count);
     let request = PredictRequest {
         columns: None,
-        data: vec![vec![None; features]; count],
+        data: RequestData::Raw(vec![vec![None; features]; count]),
         output_type: None,
         alphas: None,
     };
@@ -330,21 +748,14 @@ mod tests {
     /// The error that parsing, checking, and reading `json` against `schema`
     /// gives, or `""`.
     fn error(schema: &Schema, json: &str) -> String {
-        let query = serde_json::from_str::<PredictRequest>(json)
-            .map_err(|error| error.to_string())
-            .and_then(|request| {
-                let request = request
-                    .check(schema)
-                    .map_err(|error| error.message().to_owned())?;
-                PredictRequest::into_query(request, schema).map_err(|error| error.message().to_owned())
-            });
-        query.err().unwrap_or_default()
+        PredictRequest::parse(json.as_bytes(), schema)
+            .err()
+            .map_or_else(String::new, |error| error.message().to_owned())
     }
 
     /// The values that `json`'s rows become.
     fn values(schema: &Schema, json: &str) -> Vec<f64> {
-        let request: PredictRequest = serde_json::from_str(json).unwrap();
-        PredictRequest::into_query(request.check(schema).unwrap(), schema)
+        PredictRequest::parse(json.as_bytes(), schema)
             .unwrap()
             .rows
             .values
@@ -433,7 +844,7 @@ mod tests {
             (
                 Classifier,
                 r#"{"data": [[1, 2], [1, 2], [1, 2], [1, 2]]}"#,
-                "data: 4 rows; the limit is 3",
+                "data: more than 3 rows; the limit is 3",
             ),
             (Classifier, r#"{"data": [[1, null]]}"#, ""),
             (
@@ -514,6 +925,23 @@ mod tests {
         assert!(
             error(&unnamed, r#"{"columns": ["a", "b"], "data": [[1, 2]]}"#)
                 .contains("fit without column names")
+        );
+    }
+
+    #[test]
+    fn oversize_arrays_and_trailing_columns_are_handled_boundedly() {
+        let s = schema(TaskKind::Classifier);
+        assert!(
+            error(&s, r#"{"data": [[1, 2, 3]]}"#)
+                .contains("data: row 0 has more than 2 values; the model expects 2")
+        );
+        assert!(
+            error(&s, r#"{"columns": ["a", "b", "c", "d"], "data": [[1, 2]]}"#)
+                .contains("columns: too many columns")
+        );
+        assert_eq!(
+            values(&s, r#"{"data": [[1, 2], [3, 4]], "columns": ["b", "a"]}"#),
+            vec![2.0, 1.0, 4.0, 3.0]
         );
     }
 }
