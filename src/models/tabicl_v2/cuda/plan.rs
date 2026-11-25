@@ -33,6 +33,11 @@ pub(super) const fn row_bytes((b, h): (usize, usize)) -> usize {
 /// blocks of `block_bytes` keys and values each, or `None` when not even two
 /// streamed blocks fit with room for runs of [`MIN_RUN`] rows.
 pub(super) fn plan(budget: usize, (b, h): (usize, usize), block_bytes: usize) -> Option<Plan> {
+    let row_qkv = b.checked_mul(h + RESERVED)?.checked_mul(3 * COLUMN_DIM)?;
+    let max_run = (u32::MAX as usize / row_qkv).min(MAX_RUN);
+    if max_run < MIN_RUN {
+        return None;
+    }
     let row = row_bytes((b, h));
     let minimum = 2 * MIN_RUN * row;
     let resident = ICL_BLOCKS * block_bytes;
@@ -47,7 +52,7 @@ pub(super) fn plan(budget: usize, (b, h): (usize, usize), block_bytes: usize) ->
     // Half of what the cache leaves for runs; a streamed pass's state takes up
     // to a quarter more.
     let workspace = budget - cache;
-    let run_rows = (workspace / 2 / row).clamp(MIN_RUN, MAX_RUN) / MIN_RUN * MIN_RUN;
+    let run_rows = (workspace / 2 / row).clamp(MIN_RUN, max_run) / MIN_RUN * MIN_RUN;
     let pass_rows = if streams {
         (workspace / 4 / (4 * b * ICL_DIM)).clamp(run_rows, MAX_PASS) / run_rows * run_rows
     } else {
