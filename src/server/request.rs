@@ -590,7 +590,7 @@ fn for_the_task_once(outputs: &Option<Vec<String>>, schema: &Schema) -> garde::R
     let Some(outputs) = outputs else { return Ok(()) };
     let known = |name: &str| match schema.task {
         TaskKind::Classifier => CLASSIFIER_OUTPUTS.contains(&name),
-        TaskKind::Regressor => RegressionOutput::parse(name, &[]).is_ok(),
+        TaskKind::Regressor => RegressionOutput::parse(name, &[0.5]).is_ok(),
     };
     if let Some(name) = outputs.iter().find(|name| !known(name)) {
         return Err(garde::Error::new(format!(

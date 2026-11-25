@@ -47,16 +47,24 @@ impl RegressionOutput {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidArgument`] for an unknown name or a non-finite level.
+    /// Returns [`Error::InvalidArgument`] for an unknown name, empty levels, or
+    /// any level outside `(0, 1)`.
     pub fn parse(name: &str, alphas: &[f32]) -> Result<Self> {
         match name {
             "mean" => Ok(Self::Mean),
             "variance" => Ok(Self::Variance),
             "median" => Ok(Self::Median),
-            "quantiles" if alphas.iter().all(|alpha| alpha.is_finite()) => {
+            "quantiles"
+                if !alphas.is_empty()
+                    && alphas
+                        .iter()
+                        .all(|alpha| alpha.is_finite() && *alpha > 0.0 && *alpha < 1.0) =>
+            {
                 Ok(Self::Quantiles(alphas.to_vec()))
             }
-            "quantiles" => Err(Error::InvalidArgument("quantile levels must be finite".into())),
+            "quantiles" => Err(Error::InvalidArgument(
+                "quantile levels must be a nonempty list of finite numbers between 0 and 1".into(),
+            )),
             "raw_quantiles" => Ok(Self::RawQuantiles),
             _ => Err(Error::InvalidArgument(format!(
                 "unknown output_type {name:?}; expected mean, variance, median, quantiles, or raw_quantiles"
@@ -339,7 +347,12 @@ mod tests {
     #[test]
     fn unknown_output_is_rejected() {
         assert!(RegressionOutput::parse("mode", &[]).is_err());
+        assert!(RegressionOutput::parse("quantiles", &[]).is_err());
         assert!(RegressionOutput::parse("quantiles", &[f32::NAN]).is_err());
+        assert!(RegressionOutput::parse("quantiles", &[0.0]).is_err());
+        assert!(RegressionOutput::parse("quantiles", &[1.0]).is_err());
+        assert!(RegressionOutput::parse("quantiles", &[-0.1]).is_err());
+        assert!(RegressionOutput::parse("quantiles", &[1.5]).is_err());
         assert_eq!(
             RegressionOutput::parse("quantiles", &[0.5]).expect("parse"),
             RegressionOutput::Quantiles(vec![0.5])

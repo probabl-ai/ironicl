@@ -41,7 +41,7 @@ pub struct Training {
 /// 10 classes one per codebook task.
 pub struct Fitted {
     model: Arc<Model>,
-    pool: rayon::ThreadPool,
+    pool: Pool,
     training: Training,
     preprocessor: Preprocessor,
     contexts: Vec<Vec<Context>>,
@@ -98,7 +98,7 @@ impl Fitted {
         preprocessor: Preprocessor,
         threads: Option<usize>,
     ) -> Result<Self> {
-        let pool = pool(threads)?;
+        let pool = Pool::new(threads)?;
         let members = preprocessor.members();
         let mut contexts = Vec::with_capacity(members);
         for member in 0..members {
@@ -418,14 +418,13 @@ impl Fitted {
         preprocessor::encode_kumo_tabular(&self.training, &self.model.sha256())
     }
 
-    /// The contexts as `IRCNTXT` bytes, one per member and codebook task,
-    /// named `{member}.{task}`. Their identity is the SHA-256 of
-    /// [`Self::to_bytes`], so they load only with this model's preprocessing.
+    /// The contexts as a validated [`StaticContextArtifact`], for streaming
+    /// serialization without an intermediate byte copy.
     ///
     /// # Errors
     ///
     /// When the contexts do not fit the format.
-    pub fn context_bytes(&self) -> Result<Vec<u8>> {
+    pub(crate) fn context_artifact(&self) -> Result<StaticContextArtifact> {
         let mut tensors = Vec::new();
         #[cfg(feature = "cuda")]
         if let Some(stack) = &self.stack {
@@ -438,7 +437,18 @@ impl Fitted {
                 tensors.extend(self.model.context_tensors(context, &format!("{member}.{task}"))?);
             }
         }
-        StaticContextArtifact::new(self.context_metadata(&self.to_bytes()?), tensors)?.to_bytes()
+        StaticContextArtifact::new(self.context_metadata(&self.to_bytes()?), tensors)
+    }
+
+    /// The contexts as `IRCNTXT` bytes, one per member and codebook task,
+    /// named `{member}.{task}`. Their identity is the SHA-256 of
+    /// [`Self::to_bytes`], so they load only with this model's preprocessing.
+    ///
+    /// # Errors
+    ///
+    /// When the contexts do not fit the format.
+    pub fn context_bytes(&self) -> Result<Vec<u8>> {
+        self.context_artifact()?.to_bytes()
     }
 
     /// The `IRCNTXT` metadata of this model's contexts, given its `IRPREP` bytes.
@@ -498,7 +508,7 @@ impl Fitted {
         let preprocessor =
             Preprocessor::fit(&training.x, &categorical, &training.labels, task, members, seed)?;
         let mut fitted = Self {
-            pool: pool(threads)?,
+            pool: Pool::new(threads)?,
             model,
             training,
             preprocessor,
@@ -547,12 +557,29 @@ impl Fitted {
     }
 }
 
-/// A pool of `threads` worker threads, `None` for one per core.
-fn pool(threads: Option<usize>) -> Result<rayon::ThreadPool> {
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(threads.unwrap_or(0))
-        .build()
-        .map_err(|error| Error::InvalidArgument(format!("cannot start {threads:?} threads: {error}")))
+/// A worker thread pool, or single-threaded execution on WebAssembly without atomics.
+struct Pool(Option<rayon::ThreadPool>);
+
+impl Pool {
+    const THREADS: bool = !cfg!(all(target_family = "wasm", not(target_feature = "atomics")));
+
+    fn new(threads: Option<usize>) -> Result<Self> {
+        if !Self::THREADS {
+            return Ok(Self(None));
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads.unwrap_or(0))
+            .build()
+            .map_err(|error| Error::InvalidArgument(format!("cannot start {threads:?} threads: {error}")))?;
+        Ok(Self(Some(pool)))
+    }
+
+    fn install<R: Send>(&self, work: impl FnOnce() -> R + Send) -> R {
+        match &self.0 {
+            Some(pool) => pool.install(work),
+            None => work(),
+        }
+    }
 }
 
 /// Each class's mean log probability over the codebook tasks that separate
