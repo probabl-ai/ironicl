@@ -60,15 +60,22 @@ async fn answer(server: Arc<Server>, body: Result<Bytes, BytesRejection>) -> Res
     if !server.queue.has_room() {
         return Err(ApiError::overloaded());
     }
+    // Bound concurrent JSON parsing tasks so bursts cannot starve the inference worker.
+    let permit = server
+        .parse_slots
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(ApiError::internal)?;
+    if !server.queue.has_room() {
+        return Err(ApiError::overloaded());
+    }
     // Parsing a large body takes CPU time; keep it off the threads serving connections.
     let parsing = Arc::clone(&server);
-    let query = tokio::task::spawn_blocking(move || {
-        let request: PredictRequest =
-            serde_json::from_slice(&body).map_err(|error| ApiError::invalid(error.to_string()))?;
-        PredictRequest::into_query(request.check(&parsing.schema)?, &parsing.schema)
-    })
-    .await
-    .map_err(ApiError::internal)??;
+    let query = tokio::task::spawn_blocking(move || PredictRequest::parse(&body, &parsing.schema))
+        .await
+        .map_err(ApiError::internal)??;
+    drop(permit);
     server.submit(query).await
 }
 
