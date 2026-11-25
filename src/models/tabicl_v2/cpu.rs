@@ -399,7 +399,7 @@ impl Executor {
                 &column_labels[start * n * COLUMN_DIM..][..group * n * COLUMN_DIM],
                 &icl_labels[start * n * ICL_DIM..][..group * n * ICL_DIM],
                 icl_storage,
-                &output.regions(),
+                output,
             )?;
             // Estimators are the outermost dimension, so a group's slice of
             // each tensor is contiguous.
@@ -1702,13 +1702,12 @@ impl StaticExecutor {
             &column_values,
             (&keys, &values, icl_storage),
             &self.qass_base_scales,
-            self.context.page_aligned_storage().is_some(),
+            self.context.page_aligned_storage().cloned(),
         )?;
         let (budget, _) = crate::memory::device_share(shared_gpu_pools(gpu_weights.gpu(), limits));
         self.device = Device::Metal(Arc::new(crate::models::tabicl_v2::metal::GpuContext {
             split: predict.query_split(budget),
             predict,
-            _storage: self.context.page_aligned_storage().cloned(),
         }));
         Ok(self)
     }
