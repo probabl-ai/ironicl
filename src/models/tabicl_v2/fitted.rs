@@ -140,7 +140,7 @@ impl Preprocessed {
             .training
             .as_ref()
             .ok_or_else(|| invalid("the training rows were not kept, so no context can be built"))?;
-        let (rows, shape) = self.preprocessor.ensemble_rows(&training.group_rows);
+        let (rows, shape) = self.preprocessor.ensemble_rows(&training.group_rows)?;
         let targets = match self.preprocessor.classes() {
             None => training.targets.repeat(shape[0]),
             Some(_) => self
@@ -169,7 +169,7 @@ impl Preprocessed {
     /// As [`Preprocessor::transform`].
     pub fn query_rows(&self, x: Features<'_>, columns: usize) -> Result<(Vec<f32>, [usize; 3])> {
         let group_rows = self.preprocessor.transform(x, columns)?;
-        Ok(self.preprocessor.ensemble_rows(&group_rows))
+        self.preprocessor.ensemble_rows(&group_rows)
     }
 
     /// Run `predict` on the preprocessed rows of `x`, `[rows, columns]`, `step`

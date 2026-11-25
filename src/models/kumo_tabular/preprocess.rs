@@ -129,7 +129,7 @@ fn codebook(classes: usize, rng: &mut PythonRandom) -> Vec<Vec<usize>> {
         .div_ceil(rest)
         .max(4 * (classes as f64).log(MAX_CLASSES as f64).ceil() as usize);
     let draws = if classes <= 200 { 50 } else { 1 };
-    let mut best = (Vec::new(), 0);
+    let mut best = (Vec::new(), 0_u128);
     for _ in 0..draws {
         let mut code = vec![vec![rest; classes]; tasks];
         let mut coverage = vec![0.0; classes];
@@ -142,16 +142,19 @@ fn codebook(classes: usize, rng: &mut PythonRandom) -> Vec<Vec<usize>> {
                 coverage[class] += 1.0;
             }
         }
-        let (mut minimum, mut total) = (usize::MAX, 0);
+        if draws == 1 {
+            return code;
+        }
+        let (mut minimum, mut total) = (u128::MAX, 0_u128);
         for a in 0..classes {
             for b in a + 1..classes {
-                let distance = code.iter().filter(|task| task[a] != task[b]).count();
+                let distance = code.iter().filter(|task| task[a] != task[b]).count() as u128;
                 minimum = minimum.min(distance);
                 total += distance;
             }
         }
-        let pairs = classes * (classes - 1) / 2;
-        let score = minimum * (pairs * tasks + 1) + total;
+        let pairs = (classes as u128) * (classes as u128 - 1) / 2;
+        let score = minimum * (pairs * tasks as u128 + 1) + total;
         if best.0.is_empty() || score > best.1 {
             best = (code, score);
         }
@@ -353,7 +356,7 @@ impl Preprocessor {
             }
             (TaskKind::Regressor, _) => return Err(invalid("y must be finite numbers")),
         };
-        let sources = sources(x, categorical);
+        let sources = sources(x, categorical)?;
         let used: Vec<bool> = (0..CHOICES).map(|choice| choice < members).collect();
         let mut columns = Vec::new();
         for (source, is_categorical, numeric) in sources {
@@ -510,10 +513,13 @@ fn target_scale(values: &[f64]) -> (f64, f64) {
     )
 }
 
+/// Upper bound on categorical code cardinality to prevent unbounded count allocations.
+const MAX_CATEGORIES: usize = 1_000_000;
+
 /// The route columns' sources, each with whether it is a category code
 /// and whether it is on the numeric route: numeric features, then count
 /// columns, then codes.
-fn sources(x: &[f64], categorical: &[bool]) -> Vec<(Source, bool, bool)> {
+fn sources(x: &[f64], categorical: &[bool]) -> Result<Vec<(Source, bool, bool)>> {
     let features = categorical.len();
     let rows = x.len() / features;
     let column = |feature: usize| (0..rows).map(move |row| x[row * features + feature]);
@@ -525,11 +531,21 @@ fn sources(x: &[f64], categorical: &[bool]) -> Vec<(Source, bool, bool)> {
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "Codes are indices"
+            clippy::cast_precision_loss,
+            reason = "Codes are validated non-negative integers below MAX_CATEGORIES"
         )]
         let codes: Vec<Option<usize>> = column(feature)
-            .map(|code| (code >= 0.0).then_some(code as usize))
-            .collect();
+            .map(|code| {
+                if code >= 0.0 {
+                    if !code.is_finite() || code.fract() != 0.0 || code >= MAX_CATEGORIES as f64 {
+                        return Err(invalid("categorical feature has an invalid category code"));
+                    }
+                    Ok(Some(code as usize))
+                } else {
+                    Ok(None)
+                }
+            })
+            .collect::<Result<_>>()?;
         let cardinality = codes.iter().flatten().max().map_or(0, |code| code + 1);
         if cardinality > COUNT_CARDINALITY {
             let mut counts = vec![0.0_f64; cardinality + 1];
@@ -545,7 +561,7 @@ fn sources(x: &[f64], categorical: &[bool]) -> Vec<(Source, bool, bool)> {
             .filter(|&feature| categorical[feature])
             .map(|feature| (Source::Feature(feature), true, false)),
     );
-    sources
+    Ok(sources)
 }
 
 /// `DropConstantColumns`: whether a column differs from its first row
@@ -744,6 +760,12 @@ fn lerp(start: f64, end: f64, weight: f64) -> f64 {
 #[expect(clippy::float_cmp, reason = "PyTorch compares exactly")]
 fn robust(values: &[f64]) -> Choice {
     let mut sorted: Vec<f64> = finite(values).collect();
+    if sorted.is_empty() {
+        return Choice::Robust {
+            median: 0.0,
+            scale: 1.0,
+        };
+    }
     sorted.sort_by(f64::total_cmp);
     let (lower, median, upper) = (
         quantile(&sorted, 0.25),
@@ -1242,5 +1264,43 @@ mod parity {
                 }
             }
         }
+    }
+
+    #[test]
+    fn edge_cases_do_not_panic_or_allocate_unboundedly() {
+        // Single all-NaN row exercises robust() with an empty finite slice.
+        let fitted = Preprocessor::fit(
+            &[f64::NAN],
+            &[false],
+            &crate::Labels::Float(vec![1.0]),
+            crate::TaskKind::Regressor,
+            4,
+            0,
+        )
+        .unwrap();
+        let rows = fitted.transform(&[f64::NAN], 2).unwrap();
+        assert_eq!(rows.x.len(), 1);
+        assert!(rows.x[0].is_nan());
+
+        // Invalid categorical codes are rejected instead of allocating huge count vectors.
+        for bad in [f64::INFINITY, 1.5, 1e12] {
+            assert!(
+                Preprocessor::fit(
+                    &[bad, 0.0],
+                    &[true],
+                    &crate::Labels::Float(vec![1.0, 2.0]),
+                    crate::TaskKind::Regressor,
+                    2,
+                    0,
+                )
+                .is_err()
+            );
+        }
+
+        // Large class counts skip the dead O(classes^2) scoring loop when draws == 1.
+        let mut rng = crate::preprocess::python_random::PythonRandom::new(0);
+        let code = super::codebook(500, &mut rng);
+        assert_eq!(code.len(), 500_usize.div_ceil(9));
+        assert_eq!(code[0].len(), 500);
     }
 }

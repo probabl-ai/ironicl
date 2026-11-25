@@ -137,7 +137,10 @@ pub fn encode(columns: &[Column], categories: &[Option<Labels>]) -> Result<Vec<f
         )));
     }
     let width = columns.len();
-    let mut matrix = vec![0.0; rows * width];
+    let total = rows
+        .checked_mul(width)
+        .ok_or(Error::ArithmeticOverflow("encoded feature matrix"))?;
+    let mut matrix = vec![0.0; total];
     for (j, (column, fitted)) in columns.iter().zip(categories).enumerate() {
         let slots = matrix.iter_mut().skip(j).step_by(width);
         match (column, fitted) {

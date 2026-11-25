@@ -148,7 +148,9 @@ impl Labels {
     pub(crate) fn are_classes(&self) -> bool {
         match self {
             Self::Int(values) => values.is_sorted_by(|a, b| a < b),
-            Self::Float(values) => values.is_sorted_by(|a, b| a < b),
+            Self::Float(values) => {
+                values.iter().all(|value| value.is_finite()) && values.is_sorted_by(|a, b| a < b)
+            }
             Self::Bool(values) => values.is_sorted_by(|a, b| a < b),
             Self::Text(values) => values.is_sorted_by(|a, b| a < b),
         }
@@ -224,5 +226,8 @@ mod tests {
         assert!(Labels::Text(vec!["cat".into()]).encode(&classes).is_err());
         assert!(Labels::Int(vec![1]).encode(&classes).is_err());
         assert!(Labels::Float(vec![f64::NAN]).classes().is_err());
+        assert!(!Labels::Float(vec![f64::NAN]).are_classes());
+        assert!(!Labels::Float(vec![f64::INFINITY]).are_classes());
+        assert!(!Labels::Float(vec![f64::NEG_INFINITY, 1.0]).are_classes());
     }
 }
