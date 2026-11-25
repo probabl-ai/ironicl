@@ -155,6 +155,7 @@ class _KumoTabular(SavedEstimator, BaseEstimator):
                 continue
             if isinstance(value, bool) or not isinstance(value, Integral) or (minimum and value < minimum):
                 raise ValueError(f"{name} must be an integer{' of at least 1' if minimum else ''}, not {value!r}")
+        _threads(self.n_jobs)
 
     def _estimators(self) -> int:
         return DEFAULT_ESTIMATORS[self.size] if self.n_estimators is None else self.n_estimators

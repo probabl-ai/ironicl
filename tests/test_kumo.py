@@ -29,7 +29,14 @@ REGRESSOR = CACHE / "kumo-tabular" / "small-regressor.pt"
 
 class ValidateTest(unittest.TestCase):
     def test_invalid_values_raise(self):
-        for params in ({"size": "xl"}, {"n_estimators": 0}, {"n_estimators": 2.0}, {"random_state": None}):
+        for params in (
+            {"size": "xl"},
+            {"n_estimators": 0},
+            {"n_estimators": 2.0},
+            {"random_state": None},
+            {"n_jobs": 0},
+            {"n_jobs": True},
+        ):
             with self.subTest(params=params), self.assertRaises(ValueError):
                 KumoTabularClassifier(**params).fit(np.zeros((2, 1)), [0, 1])
 

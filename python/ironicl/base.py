@@ -11,6 +11,7 @@ import contextlib
 import os
 import pickle
 import sys
+import tempfile
 import warnings
 from functools import cache
 from importlib.metadata import version
@@ -86,8 +87,28 @@ class SavedEstimator:
         try:
             path = Path(path)
             path.parent.mkdir(parents=True, exist_ok=True)
-            with open(path, "wb") as file:
-                pickle.dump(self, file, protocol=5)
+            # NamedTemporaryFile uses 0o600 on POSIX, matching export()'s owner-only permissions.
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as file:
+                temporary = Path(file.name)
+                try:
+                    pickle.dump(self, file, protocol=5)
+                    file.flush()
+                    os.fsync(file.fileno())
+                except BaseException:
+                    file.close()
+                    temporary.unlink(missing_ok=True)
+                    raise
+            try:
+                os.replace(temporary, path)
+            except BaseException:
+                temporary.unlink(missing_ok=True)
+                raise
         finally:
             del self._save_options
 
@@ -319,6 +340,7 @@ class TabICLBase(SavedEstimator, BaseEstimator):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, kind):
                 raise ValueError(f"{name} must be a{'n integer' if kind is Integral else ' number'}, not {value!r}")
+        _threads(self.n_jobs)
         unsupported = sorted(set(self._norm_methods()) - {"none", "power"})
         if unsupported:
             raise NotImplementedError(f"norm_methods {unsupported} are not supported; only 'none' and 'power'")
@@ -362,9 +384,13 @@ def _progress(verbose: bool, description: str, unit: str, total: int | None = No
 def _threads(n_jobs: int | None) -> int | None:
     """Map ``n_jobs`` to a thread count (``None`` keeps the default); negative
     values count back from all cores, as in TabICL."""
-    if n_jobs is None or n_jobs > 0:
-        return n_jobs
-    return max(1, (os.cpu_count() or 1) + 1 + n_jobs)
+    if n_jobs is None:
+        return None
+    if isinstance(n_jobs, bool) or not isinstance(n_jobs, Integral) or n_jobs == 0:
+        raise ValueError(f"n_jobs must be a non-zero integer or None, not {n_jobs!r}")
+    if n_jobs > 0:
+        return int(n_jobs)
+    return max(1, (os.cpu_count() or 1) + 1 + int(n_jobs))
 
 
 def _features(X, categorical=None) -> tuple[np.ndarray | list, tuple[str, ...] | None]:

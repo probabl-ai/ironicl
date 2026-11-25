@@ -16,6 +16,7 @@ ENVIRONMENT = (
     "IRONICL_OPTIMIZE",
     "IRONICL_THREADS",
     "IRONICL_NO_METAL",
+    "IRONICL_NO_CUDA",
     "IRONICL_MEMORY_LIMIT",
     "IRONICL_DEVICE_MEMORY_LIMIT",
     "IRONICL_MEMORY_OVERFLOW",
@@ -66,8 +67,14 @@ def _config() -> str:
 
 
 def _gpu(info: dict) -> str:
+    if info.get("cuda"):
+        if os.environ.get("IRONICL_NO_CUDA"):
+            return "CUDA (disabled by IRONICL_NO_CUDA)"
+        if info.get("cuda_arch") is not None:
+            return f"CUDA ({info['cuda_arch']})"
+        return "none found (CUDA build)"
     if not info["metal"]:
-        return "none (this build has no Metal support)"
+        return "none (this build has no Metal or CUDA support)"
     if info["gpu"] is None:
         return "none found"
     status = (
