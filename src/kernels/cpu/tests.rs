@@ -258,4 +258,17 @@ fn accelerate_matches_naive_affine_and_attention() {
             super::accelerate::attention(query, q_rows, key, value, source_rows, heads, head_dim, output)
         },
     );
+
+    // NaN scores must fall back instead of silently succeeding with NaN outputs.
+    let mut nan_query = vec![1.0_f32; 4 * 4];
+    nan_query[0] = f32::NAN;
+    let key = vec![1.0_f32; 4 * 4];
+    let value = vec![1.0_f32; 4 * 4];
+    let mut out = vec![0.0_f32; 4 * 4];
+    assert!(!super::small_attention(
+        &nan_query, 4, &key, &value, 4, 1, 4, &mut out
+    ));
+    assert!(!super::accelerate::attention(
+        &nan_query, 4, &key, &value, 4, 1, 4, &mut out
+    ));
 }

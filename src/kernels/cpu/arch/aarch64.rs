@@ -11,6 +11,32 @@ use crate::kernels::cpu::*;
 #[cfg(target_arch = "aarch64")]
 pub(crate) const SMALL_ATTENTION_MAX_SOURCES: usize = 128;
 
+/// Whether `query`/`output` hold `heads * query_rows * head_dim` and `key`/`value`
+/// hold `heads * source_rows * head_dim` without overflow.
+#[cfg(target_arch = "aarch64")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "matches the attention kernel buffer signature"
+)]
+fn attention_buffers_fit(
+    query: &[f32],
+    query_rows: usize,
+    key: &[f32],
+    value: &[f32],
+    source_rows: usize,
+    heads: usize,
+    head_dim: usize,
+    output: &[f32],
+) -> bool {
+    let fits = |rows: usize, a: &[f32], b: &[f32]| {
+        heads
+            .checked_mul(rows)
+            .and_then(|n| n.checked_mul(head_dim))
+            .is_some_and(|len| a.len() >= len && b.len() >= len)
+    };
+    fits(query_rows, query, output) && fits(source_rows, key, value)
+}
+
 /// Exact head-major attention for short sources, such as the row stage's
 /// 26-token sequences. It avoids the tiled kernel's per-pair calls. Returns
 /// false when the shape is not supported.
@@ -29,14 +55,25 @@ pub(crate) fn small_attention(
     head_dim: usize,
     output: &mut [f32],
 ) -> bool {
-    if source_rows == 0 || source_rows > SMALL_ATTENTION_MAX_SOURCES || !head_dim.is_multiple_of(4) {
+    if source_rows == 0
+        || source_rows > SMALL_ATTENTION_MAX_SOURCES
+        || !head_dim.is_multiple_of(4)
+        || !attention_buffers_fit(
+            query,
+            query_rows,
+            key,
+            value,
+            source_rows,
+            heads,
+            head_dim,
+            output,
+        )
+    {
         return false;
     }
-    assert!(query.len() >= heads * query_rows * head_dim && output.len() >= heads * query_rows * head_dim);
-    assert!(key.len() >= heads * source_rows * head_dim && value.len() >= heads * source_rows * head_dim);
     // SAFETY: NEON is a baseline feature of the AArch64 targets this crate builds for. The
-    // assertions above give the slice lengths `small_attention_neon` requires, the early return
-    // gives `0 < source_rows <= SMALL_ATTENTION_MAX_SOURCES` and `head_dim % 4 == 0`.
+    // checked lengths above satisfy `small_attention_neon`, and the early return gives
+    // `0 < source_rows <= SMALL_ATTENTION_MAX_SOURCES` and `head_dim % 4 == 0`.
     unsafe {
         small_attention_neon(
             query,
@@ -47,9 +84,8 @@ pub(crate) fn small_attention(
             heads,
             head_dim,
             output,
-        );
+        )
     }
-    true
 }
 
 /// # Safety
@@ -77,7 +113,7 @@ pub(crate) unsafe fn small_attention_neon(
     heads: usize,
     head_dim: usize,
     output: &mut [f32],
-) {
+) -> bool {
     use core::arch::aarch64::{vaddvq_f32, vdupq_n_f32, vfmaq_f32, vld1q_f32, vst1q_f32};
     let scale = (head_dim as f32).sqrt().recip();
     let mut scores = [0.0_f32; SMALL_ATTENTION_MAX_SOURCES];
@@ -100,12 +136,21 @@ pub(crate) unsafe fn small_attention_neon(
                         dot = vfmaq_f32(dot, vld1q_f32(query.add(column)), vld1q_f32(key.add(column)));
                     }
                     *score = vaddvq_f32(dot) * scale;
+                    if score.is_nan() {
+                        return false;
+                    }
                     maximum = maximum.max(*score);
+                }
+                if !maximum.is_finite() {
+                    return false;
                 }
                 let mut sum = 0.0_f32;
                 for score in &mut scores[..source_rows] {
                     *score = (*score - maximum).exp();
                     sum += *score;
+                }
+                if !sum.is_finite() || sum == 0.0 {
+                    return false;
                 }
                 for column in (0..head_dim).step_by(4) {
                     vst1q_f32(output.add(column), vdupq_n_f32(0.0));
@@ -124,6 +169,7 @@ pub(crate) unsafe fn small_attention_neon(
             }
         }
     }
+    true
 }
 
 /// Smallest `query_rows * source_rows` per head that goes to Accelerate on Apple
@@ -194,17 +240,24 @@ pub(crate) mod accelerate {
         head_dim: usize,
         output: &mut [f32],
     ) -> bool {
-        let (Ok(source), Ok(dim), Ok(_)) = (
+        let (Ok(source), Ok(dim), Some(tile_scores)) = (
             i32::try_from(source_rows),
             i32::try_from(head_dim),
-            i32::try_from(q_rows.min(ATTENTION_TILE) * source_rows),
+            q_rows
+                .min(ATTENTION_TILE)
+                .checked_mul(source_rows)
+                .filter(|&n| i32::try_from(n).is_ok()),
         ) else {
             return false;
         };
-        assert!(query.len() >= heads * q_rows * head_dim && output.len() >= heads * q_rows * head_dim);
-        assert!(key.len() >= heads * source_rows * head_dim && value.len() >= heads * source_rows * head_dim);
+        if source_rows == 0
+            || head_dim == 0
+            || !super::attention_buffers_fit(query, q_rows, key, value, source_rows, heads, head_dim, output)
+        {
+            return false;
+        }
         let scale = (head_dim as f32).sqrt().recip();
-        let mut scores = vec![0.0_f32; q_rows.min(ATTENTION_TILE) * source_rows];
+        let mut scores = vec![0.0_f32; tile_scores];
         let mut sums = vec![0.0_f32; q_rows.min(ATTENTION_TILE)];
         for head in 0..heads {
             let query = &query[head * q_rows * head_dim..];
@@ -217,8 +270,8 @@ pub(crate) mod accelerate {
                 let tile = i32::try_from(rows).expect("tile rows fit i32");
                 // SAFETY: row-major `A = query[start..start + rows, dim]` (lda = dim), `B^T` with
                 // `B = key[source, dim]` (ldb = dim), `C = scores[rows, source]` (ldc = source).
-                // The assertions give `(start + rows) * dim <= q_rows * dim` and `source * dim`
-                // within this head's slices; `scores` holds exactly `rows * source`.
+                // The checked lengths above give `(start + rows) * dim <= q_rows * dim` and
+                // `source * dim` within this head's slices; `scores` holds exactly `rows * source`.
                 unsafe {
                     cblas_sgemm(
                         ROW_MAJOR,
@@ -247,10 +300,16 @@ pub(crate) mod accelerate {
                     // place (both allow it), and the scalar out-pointers are live locals.
                     unsafe {
                         vDSP_maxv(row_ptr, 1, &raw mut negated_maximum, source_rows);
+                        if !negated_maximum.is_finite() {
+                            return false;
+                        }
                         negated_maximum = -negated_maximum;
                         vDSP_vsadd(row_ptr, 1, &raw const negated_maximum, row_ptr, 1, source_rows);
                         vvexpf(row_ptr, row_ptr, &raw const source);
                         vDSP_sve(row_ptr, 1, sum, source_rows);
+                    }
+                    if !sum.is_finite() || *sum == 0.0 {
+                        return false;
                     }
                 }
                 // SAFETY: `A = scores[rows, source]` (lda = source), `B = value[source, dim]`
