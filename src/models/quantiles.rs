@@ -73,6 +73,9 @@ impl RegressionOutput {
     }
 }
 
+/// One query's regression outputs: each requested output's flat values and column width.
+pub(crate) type RegressionOutputs = Vec<(Vec<f32>, usize)>;
+
 /// Summarize `[B, Q, K]` decoded quantiles into each requested output, averaged
 /// over the `B` estimators. Each result is row-major `[Q, columns]`; the second
 /// value is `columns`.
@@ -81,45 +84,72 @@ impl RegressionOutput {
 ///
 /// Returns [`Error::InvalidArgument`] when there are fewer than two quantiles.
 pub fn summarize(decoded: &DecoderOutputs, outputs: &[RegressionOutput]) -> Result<Vec<(Vec<f32>, usize)>> {
+    summarize_range(decoded, 0..decoded.shape()[1], outputs)
+}
+
+/// Like [`summarize`], over `rows` of `[B, Q, K]` `decoded` quantiles.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidArgument`] when there are fewer than two quantiles
+/// or `rows` is outside `0..Q`.
+pub(crate) fn summarize_range(
+    decoded: &DecoderOutputs,
+    rows: std::ops::Range<usize>,
+    outputs: &[RegressionOutput],
+) -> Result<Vec<(Vec<f32>, usize)>> {
     let [b, q, k] = decoded.shape();
     if k < 2 {
         return Err(Error::InvalidArgument(
             "regression needs at least two quantiles".into(),
         ));
     }
+    if rows.end > q || rows.start > rows.end {
+        return Err(Error::InvalidArgument(
+            "quantile row slice is out of range".into(),
+        ));
+    }
+    let count = rows.len();
     let levels = levels(k);
     let mut sums: Vec<Vec<f64>> = outputs
         .iter()
-        .map(|output| vec![0.0; q * output.columns(k)])
-        .collect();
+        .map(|output| {
+            let len = count
+                .checked_mul(output.columns(k))
+                .ok_or(Error::ArithmeticOverflow("regression output"))?;
+            Ok(vec![0.0; len])
+        })
+        .collect::<Result<_>>()?;
     let mut sorted = vec![0.0; k];
-    for (row, raw) in decoded.values().chunks_exact(k).enumerate() {
-        let row = row % q;
-        sorted.copy_from_slice(raw);
-        sorted.sort_unstable_by(f32::total_cmp);
-        let distribution = Distribution::new(&sorted, &levels);
-        for (output, sums) in outputs.iter().zip(&mut sums) {
-            let columns = output.columns(k);
-            let sums = &mut sums[row * columns..][..columns];
-            match output {
-                RegressionOutput::Mean => sums[0] += mean(&sorted),
-                RegressionOutput::Variance => {
-                    let mean = mean(&sorted);
-                    let squares: f64 = sorted
-                        .iter()
-                        .map(|&value| (f64::from(value) - mean).powi(2))
-                        .sum();
-                    sums[0] += squares / (k - 1) as f64;
-                }
-                RegressionOutput::Median => sums[0] += distribution.icdf(0.5),
-                RegressionOutput::Quantiles(alphas) => {
-                    for (sum, &alpha) in sums.iter_mut().zip(alphas) {
-                        *sum += distribution.icdf(f64::from(alpha));
+    for ensemble in 0..b {
+        for (local, row) in rows.clone().enumerate() {
+            let start = (ensemble * q + row) * k;
+            sorted.copy_from_slice(&decoded.values()[start..start + k]);
+            sorted.sort_unstable_by(f32::total_cmp);
+            let distribution = Distribution::new(&sorted, &levels);
+            for (output, sums) in outputs.iter().zip(&mut sums) {
+                let columns = output.columns(k);
+                let sums = &mut sums[local * columns..][..columns];
+                match output {
+                    RegressionOutput::Mean => sums[0] += mean(&sorted),
+                    RegressionOutput::Variance => {
+                        let mean = mean(&sorted);
+                        let squares: f64 = sorted
+                            .iter()
+                            .map(|&value| (f64::from(value) - mean).powi(2))
+                            .sum();
+                        sums[0] += squares / (k - 1) as f64;
                     }
-                }
-                RegressionOutput::RawQuantiles => {
-                    for (sum, &value) in sums.iter_mut().zip(&sorted) {
-                        *sum += f64::from(value);
+                    RegressionOutput::Median => sums[0] += distribution.icdf(0.5),
+                    RegressionOutput::Quantiles(alphas) => {
+                        for (sum, &alpha) in sums.iter_mut().zip(alphas) {
+                            *sum += distribution.icdf(f64::from(alpha));
+                        }
+                    }
+                    RegressionOutput::RawQuantiles => {
+                        for (sum, &value) in sums.iter_mut().zip(&sorted) {
+                            *sum += f64::from(value);
+                        }
                     }
                 }
             }
@@ -133,6 +163,35 @@ pub fn summarize(decoded: &DecoderOutputs, outputs: &[RegressionOutput]) -> Resu
             (values, output.columns(k))
         })
         .collect())
+}
+
+/// Append each query's slice of `decoded` (which covers global rows
+/// `chunk_start..chunk_start + decoded.shape()[1]`) into `results`.
+/// Each entry in `queries` is `(row_count, outputs)` in batch order.
+pub(crate) fn extend_query_summaries(
+    decoded: &DecoderOutputs,
+    chunk_start: usize,
+    queries: &[(usize, &[RegressionOutput])],
+    results: &mut [RegressionOutputs],
+) -> Result<()> {
+    let chunk_end = chunk_start + decoded.shape()[1];
+    let mut cursor = 0;
+    for (&(count, outputs), target) in queries.iter().zip(results.iter_mut()) {
+        let query_start = cursor;
+        let query_end = cursor + count;
+        cursor = query_end;
+        let start = query_start.max(chunk_start);
+        let end = query_end.min(chunk_end);
+        if start >= end {
+            continue;
+        }
+        let summarized = summarize_range(decoded, (start - chunk_start)..(end - chunk_start), outputs)?;
+        for ((values, width), (part, part_width)) in target.iter_mut().zip(summarized) {
+            values.extend(part);
+            *width = part_width;
+        }
+    }
+    Ok(())
 }
 
 /// The probability levels of `K` decoded quantiles: `linspace(0, 1, K + 2)[1:-1]`.

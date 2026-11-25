@@ -335,6 +335,26 @@ impl Fitted {
             Self::KumoTabular(model) => model.predict_regression(x, outputs),
         }
     }
+
+    /// A regressor's outputs for a batch of queries whose row counts sum to
+    /// `x`'s rows, summarizing each query only over its own rows.
+    ///
+    /// # Errors
+    ///
+    /// As the model's prediction, or for a classifier.
+    #[cfg(feature = "server")]
+    pub(crate) fn predict_regression_batch(
+        &self,
+        x: &[f64],
+        queries: &[(usize, &[RegressionOutput])],
+    ) -> Result<Vec<crate::models::quantiles::RegressionOutputs>> {
+        match self {
+            Self::TabIclV2(model) => {
+                model.predict_regression_batch(Features::F64(x), self.categories().len(), queries)
+            }
+            Self::KumoTabular(model) => model.predict_regression_batch(x, queries),
+        }
+    }
 }
 
 /// A model directory's model, ready to predict.

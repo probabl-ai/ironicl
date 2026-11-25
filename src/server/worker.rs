@@ -95,9 +95,18 @@ impl Queue {
 
     /// Fold a batch of `rows` that took `predict` into the row cost.
     pub(super) fn measure(&self, rows: usize, predict: Duration) {
-        let cost = u64::try_from(predict.as_nanos() / rows as u128).unwrap_or(u64::MAX);
+        if rows == 0 {
+            return;
+        }
+        // Floor at 1 ns/row so a sub-nanosecond/row batch or coarse clock
+        // never collapses row_cost to 0 and disables admission control.
+        let cost = u64::try_from((predict.as_nanos() / rows as u128).max(1)).unwrap_or(u64::MAX);
         let old = self.row_cost.load(Ordering::Relaxed);
-        let new = if old == 0 { cost } else { (3 * old + cost) / 4 };
+        let new = if old == 0 {
+            cost
+        } else {
+            u64::try_from((3 * u128::from(old) + u128::from(cost)) / 4).unwrap_or(u64::MAX)
+        };
         self.row_cost.store(new, Ordering::Relaxed);
     }
 }
@@ -121,25 +130,31 @@ impl Worker {
                 self.max_batch_rows,
             );
             next = rest;
-            let rows = batch.iter().map(|job| job.query.rows.count).sum();
-            self.queue.rows.fetch_sub(rows, Ordering::SeqCst);
-            // Clients that hung up get no answer, so skip their rows.
+            let total_rows: usize = batch.iter().map(|job| job.query.rows.count).sum();
+            // Clients that hung up get no answer, so release and skip their rows now.
             let batch: Vec<Job> = batch.into_iter().filter(|job| !job.reply.is_closed()).collect();
+            let active_rows: usize = batch.iter().map(|job| job.query.rows.count).sum();
+            let dropped_rows = total_rows - active_rows;
+            if dropped_rows > 0 {
+                self.queue.rows.fetch_sub(dropped_rows, Ordering::SeqCst);
+            }
             if !batch.is_empty() {
-                self.answer(batch);
+                self.answer(batch, active_rows);
             }
         }
     }
 
-    fn answer(&self, batch: Vec<Job>) {
+    fn answer(&self, batch: Vec<Job>, active_rows: usize) {
         let start = Instant::now();
         let queries: Vec<&Query> = batch.iter().map(|job| &job.query).collect();
         let bodies = self.predict(&queries);
         let predict = start.elapsed();
-        let rows: usize = queries.iter().map(|query| query.rows.count).sum();
+        // Release active rows after prediction finishes and before sending replies,
+        // so in-flight work counts toward queue wait without blocking sequential retries.
+        self.queue.rows.fetch_sub(active_rows, Ordering::SeqCst);
         // Smaller batches overstate the row cost.
-        if 2 * rows >= self.max_batch_rows {
-            self.queue.measure(rows, predict);
+        if 2 * active_rows >= self.max_batch_rows {
+            self.queue.measure(active_rows, predict);
         }
         match bodies {
             Ok(bodies) => {
@@ -147,7 +162,7 @@ impl Worker {
                     let answer = Answer {
                         body,
                         rows: job.query.rows.count,
-                        queue: start - job.enqueued_at,
+                        queue: start.saturating_duration_since(job.enqueued_at),
                         predict,
                     };
                     let _ = job.reply.send(Ok(answer));
@@ -170,7 +185,7 @@ impl Worker {
         if let Some(classes) = &self.classes {
             let probabilities = self.model.predict_probabilities(&values)?;
             let mut rows = probabilities.chunks(classes.len());
-            return Ok(queries
+            return queries
                 .iter()
                 .map(|query| {
                     let Outputs::Classifier {
@@ -183,7 +198,7 @@ impl Worker {
                     let rows = rows.by_ref().take(query.rows.count).collect();
                     classifier_response(labels, probabilities, classes, rows)
                 })
-                .collect());
+                .collect();
         }
         let requested: Vec<(&[RegressionOutput], &[f32])> = queries
             .iter()
@@ -192,26 +207,25 @@ impl Worker {
                 Outputs::Classifier { .. } => unreachable!("a regressor's server makes regressor queries"),
             })
             .collect();
-        let (merged, picks) = merge_outputs(requested.iter().map(|(outputs, _)| *outputs));
-        let results = self.model.predict_regression(&values, &merged)?;
-        let mut start = 0;
-        Ok(queries
+        // Run the neural pass once for the whole batch and summarize each query only
+        // over its own rows with its own alphas, preventing cross-query amplification.
+        let batch_queries: Vec<(usize, &[RegressionOutput])> = queries
             .iter()
-            .zip(requested)
-            .zip(picks)
-            .map(|((query, (outputs, alphas)), picks)| {
-                let count = query.rows.count;
-                let parts = picks
+            .zip(&requested)
+            .map(|(query, &(outputs, _))| (query.rows.count, outputs))
+            .collect();
+        let results = self.model.predict_regression_batch(&values, &batch_queries)?;
+        requested
+            .iter()
+            .zip(&results)
+            .map(|(&(outputs, alphas), query_results)| {
+                let parts = query_results
                     .iter()
-                    .map(|&pick| {
-                        let (values, width) = &results[pick];
-                        (&values[start * width..(start + count) * width], *width)
-                    })
+                    .map(|(values, width)| (values.as_slice(), *width))
                     .collect();
-                start += count;
                 regressor_response(outputs, alphas, parts)
             })
-            .collect())
+            .collect()
     }
 }
 
@@ -236,31 +250,13 @@ fn next_batch<T>(
     (batch, None)
 }
 
-/// Every output that some query asks for, each once, and for each query where
-/// its outputs are in that list.
-fn merge_outputs<'a>(
-    queries: impl Iterator<Item = &'a [RegressionOutput]>,
-) -> (Vec<RegressionOutput>, Vec<Vec<usize>>) {
-    let mut merged: Vec<RegressionOutput> = Vec::new();
-    let mut picks = Vec::new();
-    for outputs in queries {
-        let mut pick = Vec::with_capacity(outputs.len());
-        for output in outputs {
-            let index = merged.iter().position(|seen| seen == output).unwrap_or_else(|| {
-                merged.push(output.clone());
-                merged.len() - 1
-            });
-            pick.push(index);
-        }
-        picks.push(pick);
-    }
-    (merged, picks)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{merge_outputs, next_batch};
-    use crate::RegressionOutput;
+    use std::time::Duration;
+
+    use super::{Queue, next_batch};
+    use crate::models::quantiles::extend_query_summaries;
+    use crate::{DecoderOutputs, RegressionOutput};
 
     #[test]
     fn a_batch_takes_the_queued_jobs_that_fit() {
@@ -277,16 +273,27 @@ mod tests {
     }
 
     #[test]
-    fn a_batch_computes_each_requested_output_once() {
-        use RegressionOutput::{Mean, Median, Quantiles};
-        let queries = [
-            vec![Mean],
-            vec![Quantiles(vec![0.5]), Mean],
-            vec![Median, Quantiles(vec![0.5])],
-            vec![Quantiles(vec![0.1])],
-        ];
-        let (merged, picks) = merge_outputs(queries.iter().map(Vec::as_slice));
-        assert_eq!(merged, [Mean, Quantiles(vec![0.5]), Median, Quantiles(vec![0.1])]);
-        assert_eq!(picks, [vec![0], vec![1, 0], vec![2, 1], vec![3]]);
+    fn queue_measure_floors_at_one_nanosecond_per_row() {
+        let queue = Queue::new(Duration::from_nanos(10));
+        queue.measure(100, Duration::ZERO);
+        assert!(queue.admit(5));
+        assert!(!queue.admit(6));
+    }
+
+    #[test]
+    fn batch_regression_summarizes_each_query_only_over_its_own_rows() {
+        let k = 10_usize;
+        let row = |offset: f32| -> Vec<f32> { (1..=10_u8).map(|i| offset + f32::from(i)).collect() };
+        let decoded = DecoderOutputs::new([1, 3, k], [row(0.0), row(100.0), row(200.0)].concat()).unwrap();
+        let q0 = [RegressionOutput::Mean, RegressionOutput::Quantiles(vec![0.5])];
+        let q1 = [RegressionOutput::Quantiles(vec![0.1, 0.9])];
+        let queries: Vec<(usize, &[RegressionOutput])> = vec![(1, &q0), (2, &q1)];
+        let mut results = vec![vec![(Vec::new(), 0); q0.len()], vec![(Vec::new(), 0); q1.len()]];
+        extend_query_summaries(&decoded, 0, &queries, &mut results).unwrap();
+        assert_eq!(results[0][0].0.len(), 1);
+        assert_eq!(results[0][1].0.len(), 1);
+        assert_eq!(results[1][0].0.len(), 4);
+        assert_eq!(results[1][0].1, 2);
+        assert!((results[0][0].0[0] - 5.5).abs() < 1e-5);
     }
 }

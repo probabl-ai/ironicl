@@ -15,8 +15,9 @@ use crate::format::static_context::{ContextArchitecture, StaticContextArtifact, 
 use crate::preprocess::labels::Labels;
 use crate::progress::{self, Stage};
 use crate::{
-    DecoderOutputs, Error, Optimize, RegressionOutput, Result, TaskKind, format::preprocessor,
-    models::quantiles::summarize,
+    DecoderOutputs, Error, Optimize, RegressionOutput, Result, TaskKind,
+    format::preprocessor,
+    models::quantiles::{RegressionOutputs, extend_query_summaries},
 };
 
 /// Query rows preprocessed at once.
@@ -217,25 +218,50 @@ impl Fitted {
         x: &[f64],
         outputs: &[RegressionOutput],
     ) -> Result<Vec<(Vec<f32>, usize)>> {
+        let features = self.training.categories.len();
+        if x.is_empty() || !x.len().is_multiple_of(features) {
+            return Err(Error::InvalidArgument("X must have the training features".into()));
+        }
+        let rows = x.len() / features;
+        Ok(self
+            .predict_regression_batch(x, &[(rows, outputs)])?
+            .pop()
+            .unwrap_or_default())
+    }
+
+    /// Like [`Self::predict_regression`], for a batch of queries whose row
+    /// counts sum to `x`'s rows: the neural pass runs once on the whole batch
+    /// and each query summarizes only its own rows with its own outputs.
+    pub(crate) fn predict_regression_batch(
+        &self,
+        x: &[f64],
+        queries: &[(usize, &[RegressionOutput])],
+    ) -> Result<Vec<RegressionOutputs>> {
         if self.preprocessor.target_scale.is_none() {
             return Err(Error::InvalidArgument(
                 "a classifier has no regression outputs".into(),
             ));
         }
-        let chunks = self.chunks(x, |x| {
-            let quantiles = self.quantiles(x)?;
-            let rows = quantiles.len() / 999;
-            summarize(&DecoderOutputs::new([1, rows, 999], quantiles)?, outputs)
-        })?;
-        Ok((0..outputs.len())
-            .map(|index| {
-                let values = chunks
-                    .iter()
-                    .flat_map(|chunk| chunk[index].0.iter().copied())
-                    .collect();
-                (values, chunks[0][index].1)
-            })
-            .collect())
+        let features = self.training.categories.len();
+        if x.is_empty() || !x.len().is_multiple_of(features) {
+            return Err(Error::InvalidArgument("X must have the training features".into()));
+        }
+        let rows = x.len() / features;
+        let mut results: Vec<RegressionOutputs> = queries
+            .iter()
+            .map(|(_, outputs)| vec![(Vec::new(), 0); outputs.len()])
+            .collect();
+        for start in (0..rows).step_by(PREDICT_CHUNK_ROWS) {
+            let end = (start + PREDICT_CHUNK_ROWS).min(rows);
+            let quantiles = progress::with_offset(start, rows, || {
+                self.quantiles(&x[start * features..end * features])
+            })?;
+            let chunk_rows = quantiles.len() / 999;
+            let decoded = DecoderOutputs::new([1, chunk_rows, 999], quantiles)?;
+            extend_query_summaries(&decoded, start, queries, &mut results)?;
+            progress::report(Stage::Predict, end, rows)?;
+        }
+        Ok(results)
     }
 
     /// `predict` on each chunk of the `[rows, features]` rows `x`, reporting rows done.
