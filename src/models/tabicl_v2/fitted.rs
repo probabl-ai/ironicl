@@ -305,23 +305,56 @@ impl FittedModel {
         columns: usize,
         outputs: &[RegressionOutput],
     ) -> Result<Vec<(Vec<f32>, usize)>> {
+        let rows = matrix_rows(x, columns)?;
+        Ok(self
+            .predict_regression_batch(x, columns, &[(rows, outputs)])?
+            .pop()
+            .unwrap_or_default())
+    }
+
+    /// Like [`Self::predict_regression`], for a batch of queries whose row
+    /// counts sum to `x`'s rows: the neural pass runs once on the whole batch
+    /// and each query summarizes only its own rows with its own outputs.
+    pub(crate) fn predict_regression_batch(
+        &self,
+        x: Features<'_>,
+        columns: usize,
+        queries: &[(usize, &[RegressionOutput])],
+    ) -> Result<Vec<crate::models::quantiles::RegressionOutputs>> {
         let target_scale = self
             .preprocessed
             .preprocessor
             .target_scale
             .ok_or_else(|| invalid("a classifier has no regression outputs"))?;
-        let chunks = self.chunks(x, columns, |request| {
-            self.context.predict_regression(request, outputs)
-        })?;
-        let mut results = vec![(Vec::new(), 0); outputs.len()];
-        for chunk in chunks {
-            for ((values, width), (part, part_width)) in results.iter_mut().zip(chunk) {
-                values.extend(part);
-                *width = part_width;
-            }
+        let mut results: Vec<crate::models::quantiles::RegressionOutputs> = queries
+            .iter()
+            .map(|(_, outputs)| vec![(Vec::new(), 0); outputs.len()])
+            .collect();
+        let rows = matrix_rows(x, columns)?;
+        if rows == 0 {
+            return Err(invalid("X must be a nonempty matrix of features"));
         }
-        for ((values, _), output) in results.iter_mut().zip(outputs) {
-            unscale(values, output, target_scale);
+        let step = self
+            .context
+            .batch_rows()
+            .unwrap_or(PREDICT_CHUNK_ROWS)
+            .clamp(1, super::cpu::QUERY_CHUNK_ROWS);
+        let mut start = 0;
+        while start < rows {
+            let end = (start + step).min(rows);
+            let (stacked, [members, chunk, features]) = self
+                .preprocessed
+                .query_rows(x.rows(start, end, columns), columns)?;
+            let request = QueryRequest::new(members, chunk, features, &stacked)?;
+            let decoded = progress::with_offset(start, rows, || self.context.predict_logits(request))?;
+            crate::models::quantiles::extend_query_summaries(&decoded, start, queries, &mut results)?;
+            progress::report(Stage::Predict, end, rows)?;
+            start = end;
+        }
+        for (query_results, &(_, outputs)) in results.iter_mut().zip(queries) {
+            for ((values, _), output) in query_results.iter_mut().zip(outputs) {
+                unscale(values, output, target_scale);
+            }
         }
         Ok(results)
     }
