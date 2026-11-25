@@ -34,7 +34,7 @@ use crate::kernels::metal::{
 };
 use crate::{
     Result,
-    format::static_context::TensorStorage,
+    format::static_context::{PageAlignedTensors, TENSOR_PAGE_BYTES, TensorStorage},
     models::tabicl_v2::cpu::{
         COLUMN_BLOCKS, COLUMN_DIM, HEADS, ICL_BLOCKS, ICL_DIM, INDUCING, QUERY_CHUNK_ROWS, RESERVED,
         rope_tables,
@@ -241,8 +241,6 @@ pub(crate) struct GpuContext {
     /// [`PredictGraph::query_split`], which keeps the buckets the
     /// graph keeps within the device's share of memory.
     pub(crate) split: (usize, usize),
-    /// Keeps page-aligned context memory alive while GPU buffers wrap it.
-    pub(crate) _storage: Option<std::sync::Arc<memmap2::Mmap>>,
 }
 
 impl std::fmt::Debug for GpuContext {
@@ -265,6 +263,9 @@ pub(crate) struct PredictGraph {
     /// Each query bucket's buffers and executable. The lock also serializes
     /// graph runs.
     prepared: Mutex<HashMap<usize, Prepared>>,
+    /// Declared last so it drops after `bindings` and `prepared` release any
+    /// no-copy Metal buffers wrapping this mapping.
+    _storage: Option<std::sync::Arc<memmap2::Mmap>>,
 }
 
 /// Round a query count up to a bucket that keeps its top four significant
@@ -338,10 +339,9 @@ impl PredictGraph {
     /// `column_keys` and `column_values` hold each column block's
     /// `[B, H + 4, 8, 128, 16]` cache, `icl_keys` and `icl_values` each ICL
     /// block's `[B, 8, N, 64]` in `icl`'s storage type, and `base_scales` each
-    /// ICL block's `[8, 64]`. With `page_aligned`, the caches are wrapped in
-    /// place instead of copied: each must start a page of page-padded memory
-    /// that stays alive and unwritten while the graph lives ([`Gpu::wrap`]'s
-    /// contract; `GpuContext::_storage` keeps it alive).
+    /// ICL block's `[8, 64]`. When `storage` is `Some`, each cache slice is
+    /// verified to lie page-aligned inside `storage` and wrapped in place
+    /// instead of copied; `self._storage` keeps it alive past every buffer drop.
     #[expect(
         clippy::too_many_arguments,
         reason = "a graph stage takes its inputs, weights, and shape as plain arguments"
@@ -354,7 +354,7 @@ impl PredictGraph {
         column_values: &[&[f32]],
         icl: (&[&[u8]], &[&[u8]], TensorStorage),
         base_scales: &[Vec<f32>],
-        page_aligned: bool,
+        storage: Option<std::sync::Arc<memmap2::Mmap>>,
     ) -> Result<Self> {
         let (icl_keys, icl_values, icl_storage) = icl;
         let gpu = model.gpu();
@@ -364,6 +364,21 @@ impl PredictGraph {
             shape.features as isize,
             shape.training_rows as isize,
         );
+        let wrap_or_copy = |bytes: &[u8]| -> Result<Buffer> {
+            let page_aligned = storage.as_ref().is_some_and(|mapping| {
+                let base = mapping.as_ptr() as usize;
+                let end = base.saturating_add(mapping.len());
+                let start = bytes.as_ptr() as usize;
+                let padded = bytes.len().next_multiple_of(TENSOR_PAGE_BYTES);
+                start >= base
+                    && start.is_multiple_of(TENSOR_PAGE_BYTES)
+                    && start.checked_add(padded).is_some_and(|stop| stop <= end)
+            });
+            // SAFETY: `page_aligned` is true only when `bytes` (padded to `TENSOR_PAGE_BYTES`)
+            // lies page-aligned inside read-only `storage`, which is stored in `self._storage`
+            // (dropped after `bindings` and `prepared`).
+            unsafe { gpu.tensor_buffer(bytes, page_aligned) }
+        };
         // Column stage, feature-major: [B * H, Q, 3] grouped inputs -> [B * H, Q, 128].
         let grouped = builder.placeholder(&[b * h, -1, 3]);
         let mut columns = builder.linear(&grouped, "col_embedder.in_linear", 3, COLUMN_DIM)?;
@@ -372,10 +387,7 @@ impl PredictGraph {
             let prefix = format!("col_embedder.tf_col.blocks.{block}.multihead_attn2");
             // The cached path never reads the reserved streams.
             let cache = |values: &[f32]| -> Result<Tensor> {
-                // SAFETY: with `page_aligned`, the caches lie in the context's page-aligned
-                // storage, which `GpuContext::_storage` keeps alive while this graph lives, and
-                // nothing writes them.
-                let buffer = unsafe { gpu.tensor_buffer(bytemuck::cast_slice(values), page_aligned)? };
+                let buffer = wrap_or_copy(bytemuck::cast_slice(values))?;
                 let full = builder.bound(buffer, &column_shape);
                 Ok(builder.reshape(
                     &builder.slice(&full, 1, RESERVED as isize, h),
@@ -398,13 +410,7 @@ impl PredictGraph {
         for block in 0..ICL_BLOCKS {
             let prefix = format!("icl_predictor.tf_icl.blocks.{block}");
             // Attention runs in the caches' stored type.
-            // SAFETY: as for the column caches above.
-            let (key, value) = unsafe {
-                (
-                    gpu.tensor_buffer(icl_keys[block], page_aligned)?,
-                    gpu.tensor_buffer(icl_values[block], page_aligned)?,
-                )
-            };
+            let (key, value) = (wrap_or_copy(icl_keys[block])?, wrap_or_copy(icl_values[block])?);
             let key = builder.bound_typed(key, &icl_shape, kind(icl_storage));
             let value = builder.bound_typed(value, &icl_shape, kind(icl_storage));
             let base_scale = builder.base_scale(&base_scales[block], ICL_HEAD_DIM);
@@ -435,6 +441,7 @@ impl PredictGraph {
             logits,
             outputs,
             prepared: Mutex::default(),
+            _storage: storage,
         })
     }
 
@@ -574,16 +581,15 @@ impl PredictGraph {
                 b * rows * self.outputs,
             )
         };
-        if output[0].is_nan() {
-            return Err(metal_error("the GPU run failed or wrote NaN"));
+        let values: Vec<f32> = output
+            .chunks_exact(rows * self.outputs)
+            .flat_map(|estimator| &estimator[..query_rows * self.outputs])
+            .copied()
+            .collect();
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(metal_error("the GPU run failed or wrote a non-finite value"));
         }
-        Ok(Some(
-            output
-                .chunks_exact(rows * self.outputs)
-                .flat_map(|estimator| &estimator[..query_rows * self.outputs])
-                .copied()
-                .collect(),
-        ))
+        Ok(Some(values))
     }
 }
 
@@ -613,7 +619,7 @@ pub(crate) fn build_context(
     column_labels: &[f32],
     icl_labels: &[f32],
     icl_storage: TensorStorage,
-    outputs: &[(std::ptr::NonNull<u8>, usize)],
+    outputs: &mut PageAlignedTensors,
 ) -> Result<()> {
     let gpu = model.gpu();
     let builder = Builder::new(model, weights);
@@ -715,7 +721,8 @@ pub(crate) fn build_context(
             (builder.cast(value, icl_kind), icl_shape.clone(), icl_kind),
         ]);
     }
-    if targets.len() != outputs.len() {
+    let regions = outputs.regions();
+    if targets.len() != regions.len() {
         return Err(metal_error("context output regions do not match the graph"));
     }
     // One NaN-propagating max |value| over every output, as stored, so the
@@ -740,11 +747,19 @@ pub(crate) fn build_context(
         .ok_or_else(|| metal_error("context has no outputs"))?;
     let mut outputs = targets
         .into_iter()
-        .zip(outputs)
-        .map(|((tensor, dimensions, kind), &(pointer, bytes))| {
-            // SAFETY: `outputs` are `PageAlignedTensors::regions()`: each starts a page, spans a
-            // page multiple of one live mapping that outlives this build, and nothing else
-            // touches it until `gpu.run` below returns.
+        .zip(regions)
+        .map(|((tensor, dimensions, kind), (pointer, bytes))| {
+            let elem_bytes = if kind == FLOAT { 4_usize } else { 2_usize };
+            let needed = dimensions
+                .iter()
+                .try_fold(elem_bytes, |acc, &d| acc.checked_mul(usize::try_from(d).ok()?))
+                .ok_or_else(|| metal_error("context output shape overflows usize"))?;
+            if bytes < needed {
+                return Err(metal_error("context output region is smaller than its tensor"));
+            }
+            // SAFETY: `regions` came from `&mut PageAlignedTensors`: each starts a page, spans a
+            // page multiple of at least `needed` bytes inside one live mapping exclusively
+            // borrowed until `gpu.run` below returns.
             let buffer = unsafe { gpu.wrap(pointer, bytes)? };
             Ok((tensor, buffer, dimensions, kind))
         })

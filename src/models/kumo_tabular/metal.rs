@@ -393,9 +393,11 @@ impl Metal {
                     Some(&Gpu::executable_execution()),
                 );
         }
-        // SAFETY: the synchronous run above finished.
-        if unsafe { *outputs[0].1.contents().as_ptr().cast::<f32>() }.is_nan() {
-            return Err(metal_error("the GPU run failed or wrote NaN"));
+        for (_, buffer, dimensions, _) in &outputs {
+            let elements = dimensions.iter().product::<isize>().unsigned_abs();
+            if !all_finite(buffer, elements) {
+                return Err(metal_error("the GPU run failed or wrote a non-finite value"));
+            }
         }
         Ok(outputs.into_iter().map(|(_, buffer, _, _)| buffer).collect())
     }
@@ -927,8 +929,33 @@ fn impute(x: &[f32], means: &[f32]) -> (Vec<f32>, Vec<f32>) {
     (imputed, missing)
 }
 
-/// A shared buffer's first `len` floats.
+/// A shared buffer's first `len` floats, copied out.
 fn read(buffer: &Buffer, len: usize) -> Vec<f32> {
-    // SAFETY: the buffer holds at least `len` floats, written by a finished run.
+    let bytes = len
+        .checked_mul(size_of::<f32>())
+        .expect("Metal buffer byte length fits usize");
+    assert!(
+        buffer.length() >= bytes,
+        "Metal buffer length {} is smaller than requested {bytes} bytes",
+        buffer.length()
+    );
+    // SAFETY: the assertion above guarantees the shared buffer holds at least `len` floats,
+    // written by a finished run.
     unsafe { std::slice::from_raw_parts(buffer.contents().as_ptr().cast::<f32>(), len).to_vec() }
+}
+
+/// Whether a finished shared buffer's first `len` floats are all finite.
+fn all_finite(buffer: &Buffer, len: usize) -> bool {
+    let bytes = len
+        .checked_mul(size_of::<f32>())
+        .expect("Metal buffer byte length fits usize");
+    assert!(
+        buffer.length() >= bytes,
+        "Metal buffer length {} is smaller than requested {bytes} bytes",
+        buffer.length()
+    );
+    // SAFETY: the assertion above guarantees the shared buffer holds at least `len` floats,
+    // written by a finished run, and no GPU work touches it now.
+    let values = unsafe { std::slice::from_raw_parts(buffer.contents().as_ptr().cast::<f32>(), len) };
+    values.iter().all(|value| value.is_finite())
 }
