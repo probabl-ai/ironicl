@@ -445,13 +445,25 @@ impl Fitted {
         contexts: Option<&[u8]>,
         threads: Option<usize>,
     ) -> Result<Self> {
+        let artifact = contexts.map(StaticContextArtifact::from_bytes).transpose()?;
+        Self::from_artifact(model, bytes, artifact, threads)
+    }
+
+    /// Like [`Self::from_bytes`], taking a pre-decoded/mapped context artifact
+    /// without copying its bytes.
+    pub(crate) fn from_artifact(
+        model: Arc<Model>,
+        bytes: &[u8],
+        artifact: Option<StaticContextArtifact>,
+        threads: Option<usize>,
+    ) -> Result<Self> {
         let (checkpoint, training) = preprocessor::decode_kumo_tabular(bytes)?;
         if checkpoint != model.sha256() {
             return Err(Error::Artifact(
                 "the saved model was fitted with another checkpoint".into(),
             ));
         }
-        let Some(contexts) = contexts else {
+        let Some(artifact) = artifact else {
             return Self::fit(model, training, threads);
         };
         let categorical: Vec<bool> = training.categories.iter().map(Option::is_some).collect();
@@ -459,7 +471,6 @@ impl Fitted {
         let task = model.release.task;
         let preprocessor =
             Preprocessor::fit(&training.x, &categorical, &training.labels, task, members, seed)?;
-        let artifact = StaticContextArtifact::from_bytes(contexts)?;
         let mut fitted = Self {
             pool: pool(threads)?,
             model,

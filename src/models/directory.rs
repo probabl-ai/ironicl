@@ -15,7 +15,8 @@
 //! checkpoint fills ([`default_weights_dir`]).
 
 use std::{
-    io::Write,
+    fs::File,
+    io::{Read, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -38,9 +39,32 @@ pub const CONTEXT: &str = "context.ircntxt";
 /// The metadata's `format` and `version` for this layout.
 const FORMAT: &str = "ironicl-model";
 const VERSION: u64 = 1;
+const MAX_METADATA_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_PREPROCESSING_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 fn artifact_error(path: &Path, error: impl std::fmt::Display) -> Error {
     Error::Artifact(format!("{}: {error}", path.display()))
+}
+
+fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
+    let file = File::open(path)?;
+    let length = file.metadata()?.len();
+    if length > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file is {length} bytes; limit is {limit}"),
+        ));
+    }
+    let capacity = usize::try_from(length).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file grew beyond the {limit}-byte limit while reading"),
+        ));
+    }
+    Ok(bytes)
 }
 
 /// Write `bytes` to a new owner-only file beside `path`, then rename it into
@@ -175,7 +199,7 @@ impl Metadata {
 /// When the metadata is missing, invalid, or for another layout.
 pub fn read_metadata(dir: &Path) -> Result<Metadata> {
     let path = dir.join(METADATA);
-    let bytes = std::fs::read(&path).map_err(|error| {
+    let bytes = read_bounded(&path, MAX_METADATA_BYTES).map_err(|error| {
         Error::Artifact(format!(
             "{} is not a complete Ironicl model directory ({METADATA}: {error})",
             dir.display()
@@ -367,7 +391,7 @@ pub(crate) fn load(
 ) -> Result<Prepared> {
     read_metadata(dir)?;
     let path = dir.join(PREPROCESSING);
-    let bytes = std::fs::read(&path).map_err(|error| artifact_error(&path, error))?;
+    let bytes = read_bounded(&path, MAX_PREPROCESSING_BYTES).map_err(|error| artifact_error(&path, error))?;
     if preprocessor::architecture(&bytes)? == preprocessor::KUMO_TABULAR {
         if let Some(limit) = limits.host.or(limits.device) {
             return Err(Error::InvalidArgument(format!(
@@ -443,9 +467,8 @@ fn load_kumo_tabular(
     let path = dir.join(CONTEXT);
     let mut unreadable = None;
     if path.exists() {
-        let saved = std::fs::read(&path)
-            .map_err(|error| artifact_error(&path, error))
-            .and_then(|context| Kumo::from_bytes(Arc::clone(&model), bytes, Some(&context), threads));
+        let saved = StaticContextArtifact::read_mapped_prefault(&path)
+            .and_then(|artifact| Kumo::from_artifact(Arc::clone(&model), bytes, Some(artifact), threads));
         match saved {
             Ok(fitted) => {
                 return Ok(Prepared {
@@ -503,7 +526,7 @@ pub struct Summary {
 pub fn inspect(dir: &Path, weights: &Path) -> Result<Summary> {
     let metadata = read_metadata(dir)?;
     let path = dir.join(PREPROCESSING);
-    let bytes = std::fs::read(&path).map_err(|error| artifact_error(&path, error))?;
+    let bytes = read_bounded(&path, MAX_PREPROCESSING_BYTES).map_err(|error| artifact_error(&path, error))?;
     let weights = weights_path(&bytes, weights)?;
     let found = weights.is_file();
     let path = dir.join(CONTEXT);
@@ -563,5 +586,9 @@ mod tests {
             let error = read_metadata(dir.path()).unwrap_err().to_string();
             assert!(error.contains(message), "{bad}: {error}");
         }
+        let oversized = vec![b' '; usize::try_from(super::MAX_METADATA_BYTES).unwrap() + 1];
+        std::fs::write(dir.path().join(METADATA), oversized).unwrap();
+        let error = read_metadata(dir.path()).unwrap_err().to_string();
+        assert!(error.contains("limit"), "{error}");
     }
 }
