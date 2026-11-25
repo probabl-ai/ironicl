@@ -51,6 +51,11 @@ pub(crate) fn bf16_storage_supported_for_target() -> bool {
 }
 
 #[cfg(target_arch = "x86_64")]
+fn fits_product(a: usize, b: usize, len: usize) -> bool {
+    a.checked_mul(b).is_some_and(|needed| len >= needed)
+}
+
+#[cfg(target_arch = "x86_64")]
 #[expect(
     clippy::too_many_arguments,
     reason = "a kernel takes its buffers and their shape as plain arguments"
@@ -65,10 +70,14 @@ pub(crate) fn attention_score_tile_for_target(
     scale: f32,
     scores: &mut [f32],
 ) -> bool {
-    if avx512(backend) && matches!(head_dim, 16 | 64) {
-        // SAFETY: `avx512(backend)` detected avx512f, and
-        // `head_dim` is 16 or 64. Callers pass `query_rows * head_dim` query, `source_rows *
-        // head_dim` key, and `query_rows * source_rows` scores (`reference.rs` slices the tiles).
+    if avx512(backend)
+        && matches!(head_dim, 16 | 64)
+        && fits_product(query_rows, head_dim, query.len())
+        && fits_product(source_rows, head_dim, key.len())
+        && fits_product(query_rows, source_rows, scores.len())
+    {
+        // SAFETY: `avx512(backend)` detected avx512f, `head_dim` is 16 or 64, and every
+        // slice length was verified above.
         unsafe {
             attention_score_tile_avx512(query, query_rows, key, source_rows, head_dim, scale, scores);
         }
@@ -97,10 +106,12 @@ pub(crate) fn attention_score_packed_key_tile_for_target(
         && query_rows <= MAX_PACKED_ATTENTION_QUERY_ROWS
         && source_rows.is_multiple_of(16)
         && matches!(head_dim, 16 | 64)
+        && fits_product(query_rows, head_dim, query.len())
+        && fits_product(head_dim, source_rows, packed_key.len())
+        && fits_product(query_rows, source_rows, scores.len())
     {
-        // SAFETY: avx512f via `avx512(backend)`; `source_rows % 16 == 0` and `head_dim` are
-        // checked here. Callers pass `head_dim * source_rows` packed key and `query_rows *
-        // source_rows` scores (`source_major_online_attention_with_backend_f32`).
+        // SAFETY: avx512f via `avx512(backend)`; `source_rows % 16 == 0`, `head_dim`, and
+        // every slice length were verified above.
         unsafe {
             attention_score_packed_key_tile_avx512(
                 query,
@@ -141,10 +152,12 @@ pub(crate) fn attention_score_packed_key_padded_tile_for_target(
         && packed_source_rows.is_multiple_of(16)
         && packed_source_rows == source_rows.div_ceil(16) * 16
         && matches!(head_dim, 16 | 64)
+        && fits_product(query_rows, head_dim, query.len())
+        && fits_product(head_dim, packed_source_rows, packed_key.len())
+        && fits_product(query_rows, source_rows, scores.len())
     {
-        // SAFETY: avx512f via `avx512(backend)`; the padding relation between `source_rows`
-        // and `packed_source_rows` is checked here. Callers pass `head_dim * packed_source_rows`
-        // packed key and `query_rows * source_rows` scores.
+        // SAFETY: avx512f via `avx512(backend)`; the padding relation and every slice length
+        // were verified above.
         unsafe {
             attention_score_packed_key_padded_tile_avx512(
                 query,
@@ -173,10 +186,14 @@ pub(crate) fn attention_value_tile_fma_for_target(
     head_dim: usize,
     output: &mut [f32],
 ) -> bool {
-    if avx512(backend) && matches!(head_dim, 16 | 64) {
-        // SAFETY: avx512f via `avx512(backend)` and `head_dim` is 16 or 64. Callers pass
-        // `query_rows * source_rows` weights, `source_rows * head_dim` value, and
-        // `query_rows * head_dim` output (`reference.rs` slices the tiles).
+    if avx512(backend)
+        && matches!(head_dim, 16 | 64)
+        && fits_product(query_rows, source_rows, weights.len())
+        && fits_product(source_rows, head_dim, value.len())
+        && fits_product(query_rows, head_dim, output.len())
+    {
+        // SAFETY: avx512f via `avx512(backend)`, `head_dim` is 16 or 64, and every slice
+        // length was verified above.
         unsafe {
             attention_value_tile_fma_avx512(weights, query_rows, value, source_rows, head_dim, output);
         }
@@ -196,8 +213,15 @@ pub(crate) fn attention_value_tile_bf16_fma_for_target(
     head_dim: usize,
     output: &mut [f32],
 ) -> bool {
-    if avx512(backend) && std::is_x86_feature_detected!("avx512bw") && matches!(head_dim, 16 | 64) {
-        // SAFETY: as in `attention_value_tile_fma_for_target`; avx512bw was detected here.
+    if avx512(backend)
+        && std::is_x86_feature_detected!("avx512bw")
+        && matches!(head_dim, 16 | 64)
+        && fits_product(query_rows, source_rows, weights.len())
+        && fits_product(source_rows, head_dim, value.len())
+        && fits_product(query_rows, head_dim, output.len())
+    {
+        // SAFETY: as in `attention_value_tile_fma_for_target`; avx512bw and all slice lengths
+        // were verified above.
         unsafe {
             attention_value_tile_bf16_fma_avx512(weights, query_rows, value, source_rows, head_dim, output);
         }
@@ -961,9 +985,13 @@ pub(crate) fn affine_input3_transposed_for_target(
     output_dim: usize,
     output: &mut [f32],
 ) -> bool {
-    if std::is_x86_feature_detected!("avx512f") {
-        // SAFETY: avx512f was detected just above. The lengths are checked by
-        // `reference::affine_input3_transposed_f32`, the only caller.
+    if std::is_x86_feature_detected!("avx512f")
+        && fits_product(rows, 3, input.len())
+        && fits_product(3, output_dim, weight.len())
+        && bias.len() >= output_dim
+        && fits_product(rows, output_dim, output.len())
+    {
+        // SAFETY: avx512f was detected and every slice length was verified above.
         unsafe {
             affine_input3_transposed_avx512(input, rows, weight, bias, output_dim, output);
         }

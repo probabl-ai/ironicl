@@ -23,8 +23,15 @@ pub(crate) fn attention_score_tile_for_target(
     scale: f32,
     scores: &mut [f32],
 ) -> bool {
-    let scores = &mut scores[..query_rows * source_rows];
-    affine_for_target(query, query_rows, head_dim, key, None, source_rows, scores);
+    let Some(score_len) = query_rows.checked_mul(source_rows) else {
+        return false;
+    };
+    let Some(scores) = scores.get_mut(..score_len) else {
+        return false;
+    };
+    if !affine_for_target(query, query_rows, head_dim, key, None, source_rows, scores) {
+        return false;
+    }
     for score in scores {
         *score *= scale;
     }
