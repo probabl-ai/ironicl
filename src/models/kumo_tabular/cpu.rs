@@ -31,6 +31,7 @@ const ATTENTION_ROWS: usize = 64;
 /// A loaded Kumo-Tabular checkpoint.
 pub struct Model {
     pub release: Release,
+    pub(super) optimize: crate::Optimize,
     config: Config,
     artifact: ModelArtifact,
     /// The NVIDIA GPU that fits and predicts, when there is one.
@@ -352,6 +353,11 @@ impl Model {
     ///
     /// When the artifact is another model.
     pub fn new(artifact: ModelArtifact) -> Result<Self> {
+        Self::with_optimize(artifact, crate::Optimize::Safe)
+    }
+
+    /// Load a checkpoint at the precision used throughout fit and prediction.
+    pub(crate) fn with_optimize(artifact: ModelArtifact, optimize: crate::Optimize) -> Result<Self> {
         let ModelProfile::KumoTabular(release) = artifact.summary().profile else {
             return Err(Error::Artifact(
                 "the model is not a Kumo-Tabular checkpoint".into(),
@@ -373,6 +379,7 @@ impl Model {
             .flatten();
         Ok(Self {
             release,
+            optimize,
             config,
             artifact,
             #[cfg(feature = "cuda")]

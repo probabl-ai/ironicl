@@ -795,13 +795,15 @@ impl KumoTabular {
     /// Import the checkpoint of `release`, such as `large-classifier`, as
     /// `Model` does, and load it.
     #[new]
-    fn new(py: Python<'_>, checkpoint: PathBuf, release: &str) -> PyResult<Self> {
+    #[pyo3(signature = (checkpoint, release, optimize="safe"))]
+    fn new(py: Python<'_>, checkpoint: PathBuf, release: &str, optimize: &str) -> PyResult<Self> {
+        let optimize = optimize.parse::<Optimize>().map_err(py_error)?;
         let release = release
             .parse()
             .map_err(|error: String| PyValueError::new_err(error))?;
         py.detach(|| {
             load_checkpoint_model(&checkpoint, crate::CheckpointKind::KumoTabular(Some(release)))
-                .and_then(cpu::Model::new)
+                .and_then(|artifact| cpu::Model::with_optimize(artifact, optimize))
         })
         .map(|model| Self(Arc::new(model)))
         .map_err(py_error)

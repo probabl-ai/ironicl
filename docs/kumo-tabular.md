@@ -31,6 +31,15 @@ quantile. `predict` summarizes those quantiles as `TabICLRegressor.predict` does
 `output_type` and `alphas` ([python.md](python.md#regressor)): `"mean"`, their mean, is what
 NVIDIA's benchmark predicts, and `"raw_quantiles"` are NVIDIA's output.
 
+## Precision
+
+`optimize` selects the precision for fitting and predicting, not the size, preprocessing, or
+ensemble. `"safe"` is the FP32 reference; `"auto"` and `"fast"` permit progressively less precise
+arithmetic on backends that support it. Otherwise they run in FP32. An explicit value overrides
+`IRONICL_OPTIMIZE`; with neither set the level is `"safe"`. The estimator records it in `optimize_`.
+Saving or exporting a model preserves its level, even without the KV cache. As with TabICL,
+`ironicl prepare --optimize` and `ironicl serve --optimize` rebuild a cache at a different level.
+
 ## Checkpoints
 
 NVIDIA releases a classifier and a regressor in three sizes, as FP32 PyTorch files, at revision

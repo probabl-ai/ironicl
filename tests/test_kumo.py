@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 from sklearn.exceptions import NotFittedError
@@ -31,6 +32,7 @@ class ValidateTest(unittest.TestCase):
     def test_invalid_values_raise(self):
         for params in (
             {"size": "xl"},
+            {"optimize": "turbo"},
             {"n_estimators": 0},
             {"n_estimators": 2.0},
             {"random_state": None},
@@ -39,6 +41,12 @@ class ValidateTest(unittest.TestCase):
         ):
             with self.subTest(params=params), self.assertRaises(ValueError):
                 KumoTabularClassifier(**params).fit(np.zeros((2, 1)), [0, 1])
+
+    def test_explicit_optimize_wins_over_environment(self):
+        with patch.dict(os.environ, IRONICL_OPTIMIZE="fast"):
+            for estimator in (KumoTabularClassifier, KumoTabularRegressor):
+                self.assertEqual(estimator()._optimize(), "fast")
+                self.assertEqual(estimator(optimize="safe")._optimize(), "safe")
 
     def test_default_estimators_follow_the_size(self):
         self.assertEqual(KumoTabularClassifier()._estimators(), 16)
@@ -88,6 +96,52 @@ class FitTest(unittest.TestCase):
                     np.testing.assert_array_equal(loaded.predict_proba(self.x[70:]), expected)
             with self.assertRaises(ValueError):
                 self.model.save(path, save_training_data=False)
+
+    def test_saved_level_survives_an_environment_change(self):
+        with patch.dict(os.environ, IRONICL_OPTIMIZE="auto"):
+            model = KumoTabularClassifier(size="small", n_estimators=1).fit(
+                self.x[:70], self.y[:70]
+            )
+        expected = model.predict_proba(self.x[70:])
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.dict(os.environ, IRONICL_OPTIMIZE="fast"),
+        ):
+            for keep_cache in (True, False):
+                with self.subTest(keep_cache=keep_cache):
+                    path = Path(directory) / "saved.pkl"
+                    model.save(path, save_kv_cache=keep_cache)
+                    loaded = KumoTabularClassifier.load(path)
+                    self.assertEqual(loaded.optimize_, "auto")
+                    np.testing.assert_array_equal(
+                        loaded.predict_proba(self.x[70:]), expected
+                    )
+
+    @unittest.skipUnless(os.environ.get("IRONICL_BIN"), "needs IRONICL_BIN")
+    def test_prepare_rebuilds_only_on_level_change(self):
+        model = KumoTabularClassifier(
+            size="small", n_estimators=1, optimize="auto"
+        ).fit(self.x[:70], self.y[:70])
+        with tempfile.TemporaryDirectory() as directory:
+            model.export(directory, kv_cache=False)
+            binary = os.environ["IRONICL_BIN"]
+            for args, action, level in (
+                ([], "Built", "auto"),
+                (["--optimize", "fast"], "Built", "fast"),
+                ([], "Reused", "fast"),
+            ):
+                with self.subTest(args=args, action=action):
+                    result = subprocess.run(
+                        [binary, "prepare", directory, *args],
+                        check=True,
+                        text=True,
+                        capture_output=True,
+                    )
+                    self.assertIn(f"{action} the KV cache", result.stdout)
+                    output = subprocess.check_output(
+                        [binary, "inspect", directory], text=True
+                    )
+                    self.assertIn(f"KV cache:      {level}", output)
 
     def test_saved_weights_restore_a_missing_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:
