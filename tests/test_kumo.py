@@ -115,7 +115,11 @@ np.save('cpu.npy', model.predict_proba(np.load('query.npy')))
 
         def predict(level):
             model = KumoTabularRegressor(size="small", n_estimators=4, optimize=level).fit(train, y)
-            return model.predict(query, output_type="raw_quantiles")
+            result = model.predict(query, output_type="raw_quantiles")
+            if level == "fast":
+                restored = pickle.loads(pickle.dumps(model))
+                np.testing.assert_array_equal(restored.predict(query, output_type="raw_quantiles"), result)
+            return result
 
         safe = predict("safe")
         for level, budget in (("auto", 1e-3), ("fast", 1e-2)):

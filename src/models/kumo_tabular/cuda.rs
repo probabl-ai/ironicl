@@ -735,7 +735,7 @@ impl Cuda {
             for (s, (columns, _)) in out.iter_mut().enumerate() {
                 columns.push(Kv {
                     key: slot(&keys, s),
-                    value: slot(&values, s),
+                    value: super::cpu::Values::F32(slot(&values, s)),
                     groups,
                     heads,
                     rows: points,
@@ -749,7 +749,10 @@ impl Cuda {
             for (s, (_, icl)) in out.iter_mut().enumerate() {
                 icl.push(Kv {
                     key: unpad(&keys[s * len..][..len], (key_heads, rows, icl_dim)),
-                    value: unpad(&values[s * len..][..len], (key_heads, rows, icl_dim)),
+                    value: super::cpu::Values::F32(unpad(
+                        &values[s * len..][..len],
+                        (key_heads, rows, icl_dim),
+                    )),
                     groups: 1,
                     heads: key_heads,
                     rows,
@@ -892,7 +895,7 @@ impl Cuda {
                             Self::bytes(self.upload(&super::half_cache(&out)?)?)
                         }
                     };
-                    Ok((pad(&kv.key)?, pad(&kv.value)?))
+                    Ok((pad(&kv.key)?, pad(&kv.value.floats())?))
                 })
                 .collect::<Result<Vec<_>>>()
         };

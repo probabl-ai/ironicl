@@ -54,6 +54,15 @@ caches and all other stages stay FP32. Regression `auto` stays FP32: FP16 missed
 training-target standard deviation budget at the quantile tails. Exported caches use the same
 portable FP32 tensors as before, with their build level recorded; loading on the CPU requires no GPU.
 
+On CPUs with `AVX512_BF16`, `fast` stores retained ICL values in BF16 and keeps keys in FP32.
+Training still uses FP32 attention; all CPU levels share TabICL's source-major online attention.
+Other CPUs and CPU `auto` keep values in FP32. On a Ryzen 7 9800X3D (96 MiB L3), with 1,500
+training rows, 256 query rows, 10 columns, and two small members, `fast` halves retained ICL value
+storage (peak process RSS fell by about 37 MiB for classification) and cut single-row prediction
+from 8.3 to 7.4 ms for classification and 8.5 to 7.5 ms for regression. Because both caches fit in
+L3, 256-row batch prediction matched FP32 (`76.5` vs. `77.8` ms classification; `82.8` vs. `81.3` ms
+regression), and compressing values added about 12 ms to the ~493 ms fit.
+
 ## Checkpoints
 
 NVIDIA releases a classifier and a regressor in three sizes, as FP32 PyTorch files, at revision

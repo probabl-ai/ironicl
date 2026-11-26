@@ -494,7 +494,7 @@ pub fn tiled_online_scaled_dot_product_attention_f32(
     clippy::too_many_lines,
     reason = "a kernel takes its buffers and their shape as plain arguments"
 )]
-pub(crate) fn tiled_online_scaled_dot_product_attention_with_backend_f32(
+fn tiled_online_scaled_dot_product_attention_with_backend_f32(
     query: &[f32],
     query_rows: usize,
     key: &[f32],
@@ -681,11 +681,16 @@ pub(crate) fn tiled_online_scaled_dot_product_attention_with_backend_f32(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum SourceValues<'a> {
+    F32(&'a [f32]),
+    Bf16(&'a [u16]),
+}
+
 /// Execute cached attention with source tiles outermost so one K/V tile serves
 /// every bounded query block while it remains cache-resident.
 #[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
     reason = "a kernel takes its buffers and their shape as plain arguments"
 )]
 pub(crate) fn source_major_online_attention_with_backend_f32(
@@ -702,198 +707,26 @@ pub(crate) fn source_major_online_attention_with_backend_f32(
     scratch: &mut OnlineAttentionScratch<'_>,
     output: &mut [f32],
 ) -> Result<()> {
-    let _profile = profile::scope(Category::Attention);
-    let query_elements = checked_elements(
-        checked_elements(heads, query_rows, "attention query heads and rows")?,
-        head_dim,
-        "attention query",
-    )?;
-    let source_elements = checked_elements(
-        checked_elements(heads, source_rows, "attention source heads and rows")?,
-        head_dim,
-        "attention source",
-    )?;
-    if query_block_rows == 0 || key_tile_rows == 0 {
-        return Err(Error::InvalidArgument(
-            "attention tile dimensions must be non-zero".into(),
-        ));
-    }
-    require_length(query, query_elements, "attention query")?;
-    require_length(key, source_elements, "attention key")?;
-    require_length(value, source_elements, "attention value")?;
-    require_length(output, query_elements, "attention output")?;
-    if super::cpu::attention_f32(
-        backend,
+    source_major_online_attention(
         query,
         query_rows,
         key,
-        value,
+        SourceValues::F32(value),
         source_rows,
         heads,
         head_dim,
+        query_block_rows,
+        key_tile_rows,
+        backend,
+        scratch,
         output,
-    ) {
-        return Ok(());
-    }
-    let block_rows = query_rows.min(query_block_rows);
-    let tile_rows = source_rows.min(key_tile_rows);
-    let packed_tile_rows = tile_rows.div_ceil(16) * 16;
-    let score_elements = checked_elements(block_rows, tile_rows, "attention score scratch")?;
-    let state_elements = checked_elements(heads, query_rows, "attention online state")?;
-    if scratch.scores.len() < score_elements {
-        return Err(Error::InvalidArgument(format!(
-            "attention score scratch has length {}; expected at least {score_elements}",
-            scratch.scores.len()
-        )));
-    }
-    if scratch.maximum.len() < state_elements || scratch.denominator.len() < state_elements {
-        return Err(Error::InvalidArgument(
-            "attention online state scratch is too small".into(),
-        ));
-    }
-
-    scratch.maximum[..state_elements].fill(f32::NEG_INFINITY);
-    scratch.denominator[..state_elements].fill(0.0);
-    output.fill(0.0);
-    let scale = (head_dim as f32).sqrt().recip();
-    let mut packed_key = vec![0.0; packed_tile_rows * head_dim];
-    for source_start in (0..source_rows).step_by(key_tile_rows) {
-        let sources = (source_rows - source_start).min(key_tile_rows);
-        let packed_sources = sources.div_ceil(16) * 16;
-        for head in 0..heads {
-            let source_tile_start = (head * source_rows + source_start) * head_dim;
-            let key_tile = &key[source_tile_start..][..sources * head_dim];
-            let value_tile = &value[source_tile_start..][..sources * head_dim];
-            packed_key[..packed_sources * head_dim].fill(0.0);
-            for dimension in 0..head_dim {
-                for source in 0..sources {
-                    packed_key[dimension * packed_sources + source] = key_tile[source * head_dim + dimension];
-                }
-            }
-            let packed_key_tile = &packed_key[..packed_sources * head_dim];
-            for query_start in (0..query_rows).step_by(query_block_rows) {
-                let rows = (query_rows - query_start).min(query_block_rows);
-                let query_tile_start = (head * query_rows + query_start) * head_dim;
-                let query_tile = &query[query_tile_start..][..rows * head_dim];
-                let score_tile = &mut scratch.scores[..rows * sources];
-                let packed_score = super::cpu::attention_score_packed_key_padded_tile_f32(
-                    backend,
-                    query_tile,
-                    rows,
-                    packed_key_tile,
-                    sources,
-                    packed_sources,
-                    head_dim,
-                    scale,
-                    score_tile,
-                );
-                if !packed_score
-                    && !super::cpu::attention_score_tile_f32(
-                        backend, query_tile, rows, key_tile, sources, head_dim, scale, score_tile,
-                    )
-                {
-                    for row in 0..rows {
-                        let query_row = &query_tile[row * head_dim..][..head_dim];
-                        let scores = &mut score_tile[row * sources..][..sources];
-                        for source in 0..sources {
-                            let key_row = &key_tile[source * head_dim..][..head_dim];
-                            let dot = super::cpu::attention_dot_f32(backend, query_row, key_row)
-                                .unwrap_or_else(|| {
-                                    query_row
-                                        .iter()
-                                        .zip(key_row)
-                                        .fold(0.0, |sum, (q, k)| q.mul_add(*k, sum))
-                                });
-                            scores[source] = dot * scale;
-                        }
-                    }
-                }
-                for row in 0..rows {
-                    let scores = &mut score_tile[row * sources..][..sources];
-                    let state = head * query_rows + query_start + row;
-                    let tile_maximum = attention_score_maximum(backend, scores)?;
-                    let maximum = scratch.maximum[state].max(tile_maximum);
-                    if maximum.is_infinite() && maximum.is_sign_positive() {
-                        return Err(Error::InvalidArgument(
-                            "softmax normalization is not finite".into(),
-                        ));
-                    }
-                    if maximum == f32::NEG_INFINITY {
-                        continue;
-                    }
-                    let output_row =
-                        &mut output[(head * query_rows + query_start + row) * head_dim..][..head_dim];
-                    if scratch.denominator[state] != 0.0 {
-                        let old_scale = (scratch.maximum[state] - maximum).exp();
-                        for result in &mut *output_row {
-                            *result *= old_scale;
-                        }
-                        scratch.denominator[state] *= old_scale;
-                    }
-                    if let Some(sum) = super::cpu::softmax_exp_sum_f32(backend, scores, maximum) {
-                        scratch.denominator[state] += sum;
-                    } else {
-                        for score in &mut *scores {
-                            let weight = (*score - maximum).exp();
-                            scratch.denominator[state] += weight;
-                            *score = weight;
-                        }
-                    }
-                    scratch.maximum[state] = maximum;
-                }
-                let output_tile_start = (head * query_rows + query_start) * head_dim;
-                let output_tile = &mut output[output_tile_start..][..rows * head_dim];
-                if !super::cpu::attention_value_tile_fma_f32(
-                    backend,
-                    score_tile,
-                    rows,
-                    value_tile,
-                    sources,
-                    head_dim,
-                    output_tile,
-                ) {
-                    for row in 0..rows {
-                        let output_row = &mut output_tile[row * head_dim..][..head_dim];
-                        for source in 0..sources {
-                            let value_row = &value_tile[source * head_dim..][..head_dim];
-                            if !super::cpu::attention_value_fma_f32(
-                                backend,
-                                score_tile[row * sources + source],
-                                value_row,
-                                output_row,
-                            ) {
-                                for dimension in 0..head_dim {
-                                    output_row[dimension] = score_tile[row * sources + source]
-                                        .mul_add(value_row[dimension], output_row[dimension]);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    for head in 0..heads {
-        for row in 0..query_rows {
-            let denominator = scratch.denominator[head * query_rows + row];
-            if !denominator.is_finite() || denominator == 0.0 {
-                return Err(Error::InvalidArgument(
-                    "softmax normalization is not finite".into(),
-                ));
-            }
-            for result in &mut output[(head * query_rows + row) * head_dim..][..head_dim] {
-                *result /= denominator;
-            }
-        }
-    }
-    Ok(())
+    )
 }
 
 /// Execute source-major cached attention with FP32 K, BF16 V, and FP32
 /// arithmetic. This policy preserves score precision while reducing V traffic.
 #[expect(
     clippy::too_many_arguments,
-    clippy::too_many_lines,
     reason = "a kernel takes its buffers and their shape as plain arguments"
 )]
 pub(crate) fn source_major_online_attention_f32_key_bf16_value_with_backend_f32(
@@ -901,6 +734,41 @@ pub(crate) fn source_major_online_attention_f32_key_bf16_value_with_backend_f32(
     query_rows: usize,
     key: &[f32],
     value: &[u16],
+    source_rows: usize,
+    heads: usize,
+    head_dim: usize,
+    query_block_rows: usize,
+    key_tile_rows: usize,
+    backend: super::cpu::Isa,
+    scratch: &mut OnlineAttentionScratch<'_>,
+    output: &mut [f32],
+) -> Result<()> {
+    source_major_online_attention(
+        query,
+        query_rows,
+        key,
+        SourceValues::Bf16(value),
+        source_rows,
+        heads,
+        head_dim,
+        query_block_rows,
+        key_tile_rows,
+        backend,
+        scratch,
+        output,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "a kernel takes its buffers and their shape as plain arguments"
+)]
+fn source_major_online_attention(
+    query: &[f32],
+    query_rows: usize,
+    key: &[f32],
+    value: SourceValues<'_>,
     source_rows: usize,
     heads: usize,
     head_dim: usize,
@@ -928,12 +796,33 @@ pub(crate) fn source_major_online_attention_f32_key_bf16_value_with_backend_f32(
     }
     require_length(query, query_elements, "attention query")?;
     require_length(key, source_elements, "attention key")?;
-    if value.len() != source_elements {
-        return Err(Error::InvalidArgument(
-            "BF16 attention V length does not match dimensions".into(),
-        ));
-    }
     require_length(output, query_elements, "attention output")?;
+    match value {
+        SourceValues::F32(value) => {
+            require_length(value, source_elements, "attention value")?;
+            if super::cpu::attention_f32(
+                backend,
+                query,
+                query_rows,
+                key,
+                value,
+                source_rows,
+                heads,
+                head_dim,
+                output,
+            ) {
+                return Ok(());
+            }
+        }
+        SourceValues::Bf16(value) => {
+            if value.len() != source_elements {
+                return Err(Error::InvalidArgument(
+                    "BF16 attention V length does not match dimensions".into(),
+                ));
+            }
+        }
+    }
+
     let block_rows = query_rows.min(query_block_rows);
     let tile_rows = source_rows.min(key_tile_rows);
     let score_elements = checked_elements(block_rows, tile_rows, "attention score scratch")?;
@@ -954,56 +843,72 @@ pub(crate) fn source_major_online_attention_f32_key_bf16_value_with_backend_f32(
     scratch.denominator[..state_elements].fill(0.0);
     output.fill(0.0);
     let scale = (head_dim as f32).sqrt().recip();
-    let mut packed_key = vec![0.0; tile_rows * head_dim];
+    // Transposing K pays off once packed AVX-512 scoring amortizes across enough query rows.
+    let pack_keys = backend == super::cpu::Isa::Avx512
+        && query_rows >= 8
+        && block_rows <= 16
+        && head_dim != 0
+        && head_dim.is_multiple_of(16);
+    let packed_tile_rows = tile_rows.div_ceil(16) * 16;
+    let mut packed_key = if pack_keys {
+        vec![0.0; packed_tile_rows * head_dim]
+    } else {
+        Vec::new()
+    };
     for source_start in (0..source_rows).step_by(key_tile_rows) {
         let sources = (source_rows - source_start).min(key_tile_rows);
+        let packed_sources = sources.div_ceil(16) * 16;
         let tile_elements = sources * head_dim;
         for head in 0..heads {
             let source_tile_start = (head * source_rows + source_start) * head_dim;
             let key_tile = &key[source_tile_start..][..tile_elements];
-            let value_tile = &value[source_tile_start..][..tile_elements];
-            for dimension in 0..head_dim {
-                for source in 0..sources {
-                    packed_key[dimension * sources + source] = key_tile[source * head_dim + dimension];
+            if pack_keys {
+                for dimension in 0..head_dim {
+                    let dst = &mut packed_key[dimension * packed_sources..][..packed_sources];
+                    for source in 0..sources {
+                        dst[source] = key_tile[source * head_dim + dimension];
+                    }
+                    dst[sources..].fill(0.0);
                 }
             }
-            let packed_key_tile = &packed_key[..sources * head_dim];
             for query_start in (0..query_rows).step_by(query_block_rows) {
                 let rows = (query_rows - query_start).min(query_block_rows);
                 let query_tile_start = (head * query_rows + query_start) * head_dim;
                 let query_tile = &query[query_tile_start..][..rows * head_dim];
                 let score_tile = &mut scratch.scores[..rows * sources];
-                let packed_score = {
-                    let _profile = profile::scope(Category::AttentionScore);
-                    super::cpu::attention_score_packed_key_tile_f32(
-                        backend,
-                        query_tile,
-                        rows,
-                        packed_key_tile,
-                        sources,
-                        head_dim,
-                        scale,
-                        score_tile,
-                    )
-                };
-                if !packed_score
-                    && !super::cpu::attention_score_tile_f32(
-                        backend, query_tile, rows, key_tile, sources, head_dim, scale, score_tile,
-                    )
                 {
-                    for row in 0..rows {
-                        let query_row = &query_tile[row * head_dim..][..head_dim];
-                        let scores = &mut score_tile[row * sources..][..sources];
-                        for source in 0..sources {
-                            let key_row = &key_tile[source * head_dim..][..head_dim];
-                            let dot = super::cpu::attention_dot_f32(backend, query_row, key_row)
-                                .unwrap_or_else(|| {
-                                    query_row
-                                        .iter()
-                                        .zip(key_row)
-                                        .fold(0.0, |sum, (q, k)| q.mul_add(*k, sum))
-                                });
-                            scores[source] = dot * scale;
+                    let _profile = profile::scope(Category::AttentionScore);
+                    let packed_score = pack_keys
+                        && super::cpu::attention_score_packed_key_padded_tile_f32(
+                            backend,
+                            query_tile,
+                            rows,
+                            &packed_key[..packed_sources * head_dim],
+                            sources,
+                            packed_sources,
+                            head_dim,
+                            scale,
+                            score_tile,
+                        );
+                    if !packed_score
+                        && !super::cpu::attention_score_tile_f32(
+                            backend, query_tile, rows, key_tile, sources, head_dim, scale, score_tile,
+                        )
+                    {
+                        for row in 0..rows {
+                            let query_row = &query_tile[row * head_dim..][..head_dim];
+                            let scores = &mut score_tile[row * sources..][..sources];
+                            for source in 0..sources {
+                                let key_row = &key_tile[source * head_dim..][..head_dim];
+                                let dot = super::cpu::attention_dot_f32(backend, query_row, key_row)
+                                    .unwrap_or_else(|| {
+                                        query_row
+                                            .iter()
+                                            .zip(key_row)
+                                            .fold(0.0, |sum, (q, k)| q.mul_add(*k, sum))
+                                    });
+                                scores[source] = dot * scale;
+                            }
                         }
                     }
                 }
@@ -1047,24 +952,60 @@ pub(crate) fn source_major_online_attention_f32_key_bf16_value_with_backend_f32(
                 let output_tile = &mut output[output_tile_start..][..rows * head_dim];
                 {
                     let _profile = profile::scope(Category::AttentionValue);
-                    if !super::cpu::attention_value_tile_bf16_fma_f32(
-                        backend,
-                        score_tile,
-                        rows,
-                        value_tile,
-                        sources,
-                        head_dim,
-                        output_tile,
-                    ) {
-                        for row in 0..rows {
-                            let output_row = &mut output_tile[row * head_dim..][..head_dim];
-                            for source in 0..sources {
-                                let value_row = &value_tile[source * head_dim..][..head_dim];
-                                for dimension in 0..head_dim {
-                                    output_row[dimension] = score_tile[row * sources + source].mul_add(
-                                        f32::from_bits(u32::from(value_row[dimension]) << 16),
-                                        output_row[dimension],
-                                    );
+                    match value {
+                        SourceValues::F32(value) => {
+                            let value_tile = &value[source_tile_start..][..tile_elements];
+                            if !super::cpu::attention_value_tile_fma_f32(
+                                backend,
+                                score_tile,
+                                rows,
+                                value_tile,
+                                sources,
+                                head_dim,
+                                output_tile,
+                            ) {
+                                for row in 0..rows {
+                                    let output_row = &mut output_tile[row * head_dim..][..head_dim];
+                                    for source in 0..sources {
+                                        let value_row = &value_tile[source * head_dim..][..head_dim];
+                                        if !super::cpu::attention_value_fma_f32(
+                                            backend,
+                                            score_tile[row * sources + source],
+                                            value_row,
+                                            output_row,
+                                        ) {
+                                            for dimension in 0..head_dim {
+                                                output_row[dimension] = score_tile[row * sources + source]
+                                                    .mul_add(value_row[dimension], output_row[dimension]);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        SourceValues::Bf16(value) => {
+                            let value_tile = &value[source_tile_start..][..tile_elements];
+                            if !super::cpu::attention_value_tile_bf16_fma_f32(
+                                backend,
+                                score_tile,
+                                rows,
+                                value_tile,
+                                sources,
+                                head_dim,
+                                output_tile,
+                            ) {
+                                for row in 0..rows {
+                                    let output_row = &mut output_tile[row * head_dim..][..head_dim];
+                                    for source in 0..sources {
+                                        let value_row = &value_tile[source * head_dim..][..head_dim];
+                                        for dimension in 0..head_dim {
+                                            output_row[dimension] = score_tile[row * sources + source]
+                                                .mul_add(
+                                                    f32::from_bits(u32::from(value_row[dimension]) << 16),
+                                                    output_row[dimension],
+                                                );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1407,6 +1348,101 @@ mod tests {
             assert_close(&source_major, &expected);
         }
         eprintln!("online attention maximum absolute error: {maximum_error}");
+    }
+
+    #[test]
+    fn source_major_bf16_and_32_dim_attention_match_materialized() {
+        let cases = [
+            (2, 1, 151, 32),
+            (2, 16, 128, 32),
+            (2, 19, 151, 32),
+            (2, 1, 137, 64),
+            (2, 16, 137, 64),
+            (2, 19, 137, 64),
+        ];
+        let mut state = 7_u32;
+        for (heads, q_rows, s_rows, head_dim) in cases {
+            let mut next_vec = |len| {
+                (0..len)
+                    .map(|_| {
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        (state as f32 / u32::MAX as f32 - 0.5) * 3.0
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let (q_len, s_len) = (heads * q_rows * head_dim, heads * s_rows * head_dim);
+            let (query, key, value) = (next_vec(q_len), next_vec(s_len), next_vec(s_len));
+            let bf16: Vec<u16> = value
+                .iter()
+                .map(|&v| crate::kernels::cpu::f32_to_bf16_rne(v))
+                .collect();
+            let dequant: Vec<f32> = bf16.iter().map(|&w| half::bf16::from_bits(w).to_f32()).collect();
+
+            let oracle = |v: &[f32]| {
+                let (mut scores, mut out) = (vec![0.0; heads * q_rows * s_rows], vec![0.0; q_len]);
+                scaled_dot_product_attention_f32(
+                    &query,
+                    q_rows,
+                    &key,
+                    v,
+                    s_rows,
+                    heads,
+                    head_dim,
+                    &mut scores,
+                    &mut out,
+                )
+                .expect("valid materialized attention");
+                out
+            };
+            let (expected_f32, expected_bf16) = (oracle(&value), oracle(&dequant));
+
+            let mut scores = vec![0.0; q_rows.min(16) * s_rows.min(128)];
+            let (mut maximum, mut denominator) = (vec![0.0; heads * q_rows], vec![0.0; heads * q_rows]);
+            let mut actual = vec![0.0; q_len];
+            for backend in [
+                crate::kernels::cpu::Isa::Portable,
+                crate::kernels::cpu::Isa::detect(),
+            ] {
+                let mut scratch = OnlineAttentionScratch {
+                    scores: &mut scores,
+                    maximum: &mut maximum,
+                    denominator: &mut denominator,
+                };
+                source_major_online_attention_with_backend_f32(
+                    &query,
+                    q_rows,
+                    &key,
+                    &value,
+                    s_rows,
+                    heads,
+                    head_dim,
+                    16,
+                    128,
+                    backend,
+                    &mut scratch,
+                    &mut actual,
+                )
+                .expect("valid source-major FP32 attention");
+                assert_close(&actual, &expected_f32);
+
+                source_major_online_attention_f32_key_bf16_value_with_backend_f32(
+                    &query,
+                    q_rows,
+                    &key,
+                    &bf16,
+                    s_rows,
+                    heads,
+                    head_dim,
+                    16,
+                    128,
+                    backend,
+                    &mut scratch,
+                    &mut actual,
+                )
+                .expect("valid source-major BF16 attention");
+                assert_close(&actual, &expected_bf16);
+            }
+        }
     }
 
     #[test]
