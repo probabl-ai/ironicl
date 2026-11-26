@@ -259,7 +259,7 @@ impl Metal {
             };
             Kv {
                 key: read(&pair[0]),
-                value: read(&pair[1]),
+                value: super::cpu::Values::F32(read(&pair[1])),
                 groups,
                 heads,
                 rows,
@@ -290,11 +290,14 @@ impl Metal {
         let gpu = self.weights.gpu();
         let mut caches = Vec::with_capacity(2 * (columns.len() + icl.len()));
         for (layers, kind) in [(columns, FLOAT), (icl, self.icl_kind)] {
-            for values in layers.iter().flat_map(|kv| [&kv.key, &kv.value]) {
+            for values in layers
+                .iter()
+                .flat_map(|kv| [kv.key.as_slice().into(), kv.value.floats()])
+            {
                 caches.push(if kind == FLOAT {
-                    gpu.buffer(values)?
+                    gpu.buffer(&values)?
                 } else {
-                    gpu.buffer_bytes(bytemuck::cast_slice(&super::half_cache(values)?))?
+                    gpu.buffer_bytes(bytemuck::cast_slice(&super::half_cache(&values)?))?
                 });
             }
         }

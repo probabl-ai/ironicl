@@ -15,7 +15,8 @@ use super::{Config, Release};
 use crate::format::static_context::{StaticContextArtifact, StaticContextTensor, StaticContextTensorData};
 use crate::kernels::reference::{
     OnlineAttentionScratch, affine_f32, gelu_f32, rope_non_interleaved_f32,
-    tiled_online_scaled_dot_product_attention_f32,
+    source_major_online_attention_f32_key_bf16_value_with_backend_f32,
+    source_major_online_attention_with_backend_f32,
 };
 use crate::{Error, ModelArtifact, Result, TaskKind, format::model::ModelProfile};
 
@@ -25,8 +26,8 @@ const NORM_EPS: f32 = f32::EPSILON;
 const HEAD_NORM_EPS: f32 = 1e-6;
 /// Rows a stage runs at once, which bounds its buffers.
 const CHUNK_ROWS: usize = 256;
-/// Query rows per attention job.
-const ATTENTION_ROWS: usize = 64;
+/// Max query rows per attention job; a multiple of 16 for the unrolled AVX-512 tiles.
+const ATTENTION_ROWS: usize = 128;
 
 /// A loaded Kumo-Tabular checkpoint.
 pub struct Model {
@@ -47,10 +48,40 @@ pub struct Model {
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct Kv {
     pub(super) key: Vec<f32>,
-    pub(super) value: Vec<f32>,
+    pub(super) value: Values,
     pub(super) groups: usize,
     pub(super) heads: usize,
     pub(super) rows: usize,
+}
+
+/// Only retained CPU ICL values may use BF16; keys and transient training values stay FP32.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) enum Values {
+    F32(Vec<f32>),
+    Bf16(Vec<u16>),
+}
+
+impl Values {
+    /// The portable representation for saving or uploading a context.
+    pub(super) fn floats(&self) -> std::borrow::Cow<'_, [f32]> {
+        match self {
+            Self::F32(v) => v.as_slice().into(),
+            Self::Bf16(v) => v.iter().map(|&w| half::bf16::from_bits(w).to_f32()).collect(),
+        }
+    }
+
+    fn compress(&mut self) {
+        let Self::F32(values) = self else { return };
+        // A custom checkpoint can produce finite FP32 beyond the finite BF16 range.
+        if let Some(bits) = values
+            .iter()
+            .copied()
+            .map(crate::kernels::cpu::f32_to_bf16_finite)
+            .collect()
+        {
+            *self = Self::Bf16(bits);
+        }
+    }
 }
 
 impl Kv {
@@ -58,13 +89,15 @@ impl Kv {
     fn first_heads(mut self, heads: usize, head_dim: usize) -> Self {
         if heads < self.heads {
             let (old, new) = (self.heads * self.rows * head_dim, heads * self.rows * head_dim);
-            for tensor in [&mut self.key, &mut self.value] {
-                *tensor = tensor
+            let keep = |tensor: &[f32]| {
+                tensor
                     .chunks(old)
                     .flat_map(|group| &group[..new])
                     .copied()
-                    .collect();
-            }
+                    .collect()
+            };
+            self.key = keep(&self.key);
+            self.value = Values::F32(keep(&self.value.floats()));
             self.heads = heads;
         }
         self
@@ -139,17 +172,20 @@ fn stack(kvs: &[Kv], name: &str) -> [StaticContextTensor; 2] {
     let dimensions = [kvs.len(), first.groups, first.heads, first.rows, head_dim]
         .map(|n| n as u64)
         .to_vec();
-    let values = |part: fn(&Kv) -> &Vec<f32>| kvs.iter().flat_map(part).copied().collect();
+    let mut values = Vec::with_capacity(first.key.len() * kvs.len());
+    for kv in kvs {
+        values.extend_from_slice(&kv.value.floats());
+    }
     [
         StaticContextTensor {
             name: format!("{name}.key"),
             dimensions: dimensions.clone(),
-            values: values(|kv| &kv.key),
+            values: kvs.iter().flat_map(|kv| &kv.key).copied().collect(),
         },
         StaticContextTensor {
             name: format!("{name}.value"),
             dimensions,
-            values: values(|kv| &kv.value),
+            values,
         },
     ]
 }
@@ -172,7 +208,7 @@ fn unstack(artifact: &StaticContextArtifact, name: &str, layers: usize) -> Resul
         .zip(values.chunks(size))
         .map(|(key, value)| Kv {
             key: key.to_vec(),
-            value: value.to_vec(),
+            value: Values::F32(value.to_vec()),
             groups,
             heads,
             rows,
@@ -467,6 +503,10 @@ impl Model {
         Ok(context)
     }
 
+    fn bf16_values(&self) -> bool {
+        self.optimize == crate::Optimize::Fast && crate::kernels::cpu::bf16_storage_supported()
+    }
+
     /// The column and ICL layers a context holds.
     pub(crate) fn layers(&self) -> (usize, usize) {
         (
@@ -614,7 +654,11 @@ impl Model {
             if layer + 1 < self.config.icl_layers {
                 rows = block.forward(&rows, 1, &kv)?;
             }
-            context.icl.push(kv.first_heads(query_heads, block.head_dim()));
+            let mut kept = kv.first_heads(query_heads, block.head_dim());
+            if self.bf16_values() {
+                kept.value.compress();
+            }
+            context.icl.push(kept);
         }
         Ok(context)
     }
@@ -683,12 +727,7 @@ impl Model {
             feature = "cuda",
             all(feature = "metal", target_os = "macos", target_arch = "aarch64")
         )),
-        expect(
-            unused_mut,
-            clippy::unused_self,
-            clippy::unnecessary_wraps,
-            reason = "The GPU path moves the context there and can fail"
-        )
+        expect(clippy::unnecessary_wraps, reason = "GPU placement can fail")
     )]
     pub(crate) fn place(&self, mut context: Context) -> Result<Context> {
         #[cfg(feature = "cuda")]
@@ -712,6 +751,12 @@ impl Model {
             context.metal = Some(metal.upload_context(&context, training_rows)?);
             context.columns = Vec::new();
             context.icl = Vec::new();
+        }
+        // Successful GPU placement emptied `icl`; a CPU fallback still owns its host values.
+        if self.bf16_values() {
+            for kv in &mut context.icl {
+                kv.value.compress();
+            }
         }
         Ok(context)
     }
@@ -1136,7 +1181,7 @@ impl Block<'_> {
         let value = to_heads(&self.project(&normed, 2)?, groups, self.heads, head_dim);
         Ok(Kv {
             key: self.transform(key, groups, true)?,
-            value,
+            value: Values::F32(value),
             groups,
             heads: self.heads,
             rows: x.len() / (groups * self.width),
@@ -1180,7 +1225,7 @@ impl Block<'_> {
                     }
                 });
         }
-        let attended = from_heads(&self.attend(&q, rows, groups, kv)?, groups, heads, head_dim);
+        let attended = from_heads(&self.attend(&q, rows, kv)?, groups, heads, head_dim);
         let out = linear(
             &attended,
             width,
@@ -1229,50 +1274,87 @@ impl Block<'_> {
     /// Softmax attention of `[groups, heads, rows, head_dim]` queries to their
     /// group's keys and values; with fewer key heads, query head `h` uses key
     /// head `h / (heads / key heads)`.
-    fn attend(&self, q: &[f32], rows: usize, groups: usize, kv: &Kv) -> Result<Vec<f32>> {
+    fn attend(&self, q: &[f32], rows: usize, kv: &Kv) -> Result<Vec<f32>> {
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
         let (heads, head_dim) = (self.heads, self.head_dim());
         let share = heads / kv.heads;
-        let mut out = vec![0.0; q.len()];
-        let jobs: Vec<(usize, usize, usize)> = (0..groups)
-            .flat_map(|g| {
-                (0..heads).flat_map(move |h| (0..rows).step_by(ATTENTION_ROWS).map(move |r| (g, h, r)))
-            })
-            .collect();
-        let pieces: Vec<Vec<f32>> = jobs
-            .par_iter()
-            .map(|&(group, head, start)| {
-                let count = ATTENTION_ROWS.min(rows - start);
-                let kv_group = if kv.groups == 1 { 0 } else { group };
-                let source = ((kv_group * kv.heads + head / share) * kv.rows) * head_dim;
-                let key = &kv.key[source..][..kv.rows * head_dim];
-                let value = &kv.value[source..][..kv.rows * head_dim];
-                let query = &q[((group * heads + head) * rows + start) * head_dim..][..count * head_dim];
-                let mut output = vec![0.0; count * head_dim];
-                let (blocks, tiles) = (16, 128);
-                let mut scores = vec![0.0; blocks.min(count) * tiles.min(kv.rows)];
-                let (mut maximum, mut denominator) = (vec![0.0; blocks], vec![0.0; blocks]);
-                tiled_online_scaled_dot_product_attention_f32(
-                    query,
+        // All `share` query heads for one `(group, kv_head)` are contiguous in `[groups, heads,
+        // rows, head_dim]` and attend independently to the same key/value slice. Shrink chunks on
+        // small batches so GQA's 2 KV heads still fan out across all CPU threads.
+        let shared_rows = share * rows;
+        let total_rows = q.len() / head_dim;
+        let target = (total_rows / rayon::current_num_threads().max(1)).clamp(1, ATTENTION_ROWS);
+        let chunk_rows = if target >= 16 { target / 16 * 16 } else { target };
+        let pair_stride = shared_rows * head_dim;
+        let chunk_stride = chunk_rows * head_dim;
+        let backend = crate::kernels::cpu::Isa::detect();
+        let (blocks, tiles) = (16, 128);
+        let attend_chunk = |q_chunk: &[f32], out_chunk: &mut [f32], range: std::ops::Range<usize>| {
+            let count = out_chunk.len() / head_dim;
+            let key = &kv.key[range.clone()];
+            let mut scores = vec![0.0; blocks.min(count) * tiles.min(kv.rows)];
+            let (mut maximum, mut denominator) = (vec![0.0; count], vec![0.0; count]);
+            let mut scratch = OnlineAttentionScratch {
+                scores: &mut scores,
+                maximum: &mut maximum,
+                denominator: &mut denominator,
+            };
+            match &kv.value {
+                Values::F32(v) => source_major_online_attention_with_backend_f32(
+                    q_chunk,
                     count,
                     key,
-                    value,
+                    &v[range],
                     kv.rows,
                     1,
                     head_dim,
                     blocks,
                     tiles,
-                    &mut OnlineAttentionScratch {
-                        scores: &mut scores,
-                        maximum: &mut maximum,
-                        denominator: &mut denominator,
-                    },
-                    &mut output,
-                )?;
-                Ok(output)
-            })
-            .collect::<Result<_>>()?;
-        for ((group, head, start), piece) in jobs.into_iter().zip(pieces) {
-            out[((group * heads + head) * rows + start) * head_dim..][..piece.len()].copy_from_slice(&piece);
+                    backend,
+                    &mut scratch,
+                    out_chunk,
+                ),
+                Values::Bf16(v) => source_major_online_attention_f32_key_bf16_value_with_backend_f32(
+                    q_chunk,
+                    count,
+                    key,
+                    &v[range],
+                    kv.rows,
+                    1,
+                    head_dim,
+                    blocks,
+                    tiles,
+                    backend,
+                    &mut scratch,
+                    out_chunk,
+                ),
+            }
+        };
+        let kv_range = |pair: usize| {
+            let (group, kv_head) = (pair / kv.heads, pair % kv.heads);
+            let kv_group = if kv.groups == 1 { 0 } else { group };
+            let source = ((kv_group * kv.heads + kv_head) * kv.rows) * head_dim;
+            source..source + kv.rows * head_dim
+        };
+        let mut out = vec![0.0; q.len()];
+        if shared_rows <= chunk_rows {
+            out.par_chunks_mut(pair_stride)
+                .zip(q.par_chunks(pair_stride))
+                .enumerate()
+                .try_for_each(|(pair, (pair_out, pair_q))| attend_chunk(pair_q, pair_out, kv_range(pair)))?;
+        } else {
+            out.par_chunks_mut(pair_stride)
+                .zip(q.par_chunks(pair_stride))
+                .enumerate()
+                .try_for_each(|(pair, (pair_out, pair_q))| {
+                    let range = kv_range(pair);
+                    pair_out
+                        .par_chunks_mut(chunk_stride)
+                        .zip(pair_q.par_chunks(chunk_stride))
+                        .try_for_each(|(out_chunk, q_chunk)| attend_chunk(q_chunk, out_chunk, range.clone()))
+                })?;
         }
         Ok(out)
     }
@@ -1284,6 +1366,20 @@ pub(crate) mod tests {
 
     use super::Model;
     use crate::models::kumo_tabular::preprocess::fixtures::{case, rows};
+
+    #[test]
+    fn bf16_values_round_once_and_keep_unrepresentable_layers_in_fp32() {
+        use super::Values;
+        let mut values = Values::F32(vec![1.003, -2.0]);
+        values.compress();
+        assert!(matches!(values, Values::Bf16(_)));
+        assert_eq!(&*values.floats(), &[1.0, -2.0]);
+        for v in [f32::MAX, f32::from_bits(0xffff_ffff)] {
+            let mut layer = Values::F32(vec![v]);
+            layer.compress();
+            assert!(matches!(layer, Values::F32(_)));
+        }
+    }
 
     /// The model of `IRONICL_CHECKPOINT_FIXTURES/kumo-tabular-<size>-<task>.pt`.
     pub(crate) fn model(size: &str, task: &str) -> Model {

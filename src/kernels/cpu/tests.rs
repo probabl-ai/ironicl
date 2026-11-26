@@ -272,3 +272,25 @@ fn accelerate_matches_naive_affine_and_attention() {
         &nan_query, 4, &key, &value, 4, 1, 4, &mut out
     ));
 }
+
+#[test]
+fn bf16_conversion_preserves_nan_and_rejects_overflow() {
+    use super::{f32_to_bf16_finite, f32_to_bf16_rne};
+
+    assert_eq!(f32_to_bf16_finite(0.0), Some(0x0000));
+    assert_eq!(f32_to_bf16_finite(-0.0), Some(0x8000));
+    // Ties to even: 1.0 + 2^-8 rounds down to 1.0 (even); + next ULP rounds up.
+    assert_eq!(f32_to_bf16_finite(f32::from_bits(0x3f80_8000)), Some(0x3f80));
+    assert_eq!(f32_to_bf16_finite(f32::from_bits(0x3f81_8000)), Some(0x3f82));
+    // Max finite BF16 (0x7f7f_0000) stays finite; f32::MAX overflows to +Inf.
+    assert_eq!(f32_to_bf16_finite(f32::from_bits(0x7f7f_7fff)), Some(0x7f7f));
+    assert_eq!(f32_to_bf16_finite(f32::MAX), None);
+    assert_eq!(f32_to_bf16_finite(f32::MIN), None);
+    assert_eq!(f32_to_bf16_finite(f32::INFINITY), None);
+    assert_eq!(f32_to_bf16_finite(f32::NEG_INFINITY), None);
+    for bits in [0x7fc0_0001_u32, 0x7fff_ffff, 0xffc0_0001, 0xffff_ffff] {
+        let nan = f32::from_bits(bits);
+        assert_eq!(f32_to_bf16_finite(nan), None);
+        assert!(half::bf16::from_bits(f32_to_bf16_rne(nan)).is_nan());
+    }
+}

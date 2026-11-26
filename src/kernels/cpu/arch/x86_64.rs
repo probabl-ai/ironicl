@@ -56,6 +56,11 @@ fn fits_product(a: usize, b: usize, len: usize) -> bool {
 }
 
 #[cfg(target_arch = "x86_64")]
+fn simd_head_dim(head_dim: usize) -> bool {
+    head_dim != 0 && head_dim.is_multiple_of(16)
+}
+
+#[cfg(target_arch = "x86_64")]
 #[expect(
     clippy::too_many_arguments,
     reason = "a kernel takes its buffers and their shape as plain arguments"
@@ -71,57 +76,15 @@ pub(crate) fn attention_score_tile_for_target(
     scores: &mut [f32],
 ) -> bool {
     if avx512(backend)
-        && matches!(head_dim, 16 | 64)
+        && simd_head_dim(head_dim)
         && fits_product(query_rows, head_dim, query.len())
         && fits_product(source_rows, head_dim, key.len())
         && fits_product(query_rows, source_rows, scores.len())
     {
-        // SAFETY: `avx512(backend)` detected avx512f, `head_dim` is 16 or 64, and every
-        // slice length was verified above.
+        // SAFETY: `avx512(backend)` detected avx512f, `head_dim` is a non-zero multiple of 16,
+        // and every slice length was verified above.
         unsafe {
             attention_score_tile_avx512(query, query_rows, key, source_rows, head_dim, scale, scores);
-        }
-        true
-    } else {
-        false
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[expect(
-    clippy::too_many_arguments,
-    reason = "a kernel takes its buffers and their shape as plain arguments"
-)]
-pub(crate) fn attention_score_packed_key_tile_for_target(
-    backend: Isa,
-    query: &[f32],
-    query_rows: usize,
-    packed_key: &[f32],
-    source_rows: usize,
-    head_dim: usize,
-    scale: f32,
-    scores: &mut [f32],
-) -> bool {
-    if avx512(backend)
-        && query_rows <= MAX_PACKED_ATTENTION_QUERY_ROWS
-        && source_rows.is_multiple_of(16)
-        && matches!(head_dim, 16 | 64)
-        && fits_product(query_rows, head_dim, query.len())
-        && fits_product(head_dim, source_rows, packed_key.len())
-        && fits_product(query_rows, source_rows, scores.len())
-    {
-        // SAFETY: avx512f via `avx512(backend)`; `source_rows % 16 == 0`, `head_dim`, and
-        // every slice length were verified above.
-        unsafe {
-            attention_score_packed_key_tile_avx512(
-                query,
-                query_rows,
-                packed_key,
-                source_rows,
-                head_dim,
-                scale,
-                scores,
-            );
         }
         true
     } else {
@@ -151,7 +114,7 @@ pub(crate) fn attention_score_packed_key_padded_tile_for_target(
         && source_rows <= packed_source_rows
         && packed_source_rows.is_multiple_of(16)
         && packed_source_rows == source_rows.div_ceil(16) * 16
-        && matches!(head_dim, 16 | 64)
+        && simd_head_dim(head_dim)
         && fits_product(query_rows, head_dim, query.len())
         && fits_product(head_dim, packed_source_rows, packed_key.len())
         && fits_product(query_rows, source_rows, scores.len())
@@ -187,13 +150,13 @@ pub(crate) fn attention_value_tile_fma_for_target(
     output: &mut [f32],
 ) -> bool {
     if avx512(backend)
-        && matches!(head_dim, 16 | 64)
+        && simd_head_dim(head_dim)
         && fits_product(query_rows, source_rows, weights.len())
         && fits_product(source_rows, head_dim, value.len())
         && fits_product(query_rows, head_dim, output.len())
     {
-        // SAFETY: avx512f via `avx512(backend)`, `head_dim` is 16 or 64, and every slice
-        // length was verified above.
+        // SAFETY: avx512f via `avx512(backend)`, `head_dim` is a non-zero multiple of 16, and
+        // every slice length was verified above.
         unsafe {
             attention_value_tile_fma_avx512(weights, query_rows, value, source_rows, head_dim, output);
         }
@@ -215,7 +178,7 @@ pub(crate) fn attention_value_tile_bf16_fma_for_target(
 ) -> bool {
     if avx512(backend)
         && std::is_x86_feature_detected!("avx512bw")
-        && matches!(head_dim, 16 | 64)
+        && simd_head_dim(head_dim)
         && fits_product(query_rows, source_rows, weights.len())
         && fits_product(source_rows, head_dim, value.len())
         && fits_product(query_rows, head_dim, output.len())
@@ -508,6 +471,30 @@ pub(crate) unsafe fn attention_score_packed_key_padded_tile_avx512(
     // `packed_source_rows`, so `source < source_rows`, `lanes >= 1`, and the masked store writes
     // only `scores[row * source_rows + source..][..lanes]`, inside row `row < query_rows`.
     unsafe {
+        if source_rows == packed_source_rows {
+            attention_score_packed_key_tile_avx512(
+                query,
+                query_rows,
+                packed_key,
+                source_rows,
+                head_dim,
+                scale,
+                scores,
+            );
+            return;
+        }
+        if query_rows == 16 {
+            attention_score_packed_key_padded_tile_avx512_rows::<16>(
+                query,
+                packed_key,
+                source_rows,
+                packed_source_rows,
+                head_dim,
+                scale,
+                scores,
+            );
+            return;
+        }
         let scale = _mm512_set1_ps(scale);
         for source in (0..packed_source_rows).step_by(16) {
             let mut accumulators = [_mm512_setzero_ps(); MAX_PACKED_ATTENTION_QUERY_ROWS];
@@ -528,6 +515,58 @@ pub(crate) unsafe fn attention_score_packed_key_padded_tile_avx512(
                 (1_u16 << lanes) - 1
             };
             for row in 0..query_rows {
+                _mm512_mask_storeu_ps(
+                    scores.as_mut_ptr().add(row * source_rows + source),
+                    mask,
+                    _mm512_mul_ps(accumulators[row], scale),
+                );
+            }
+        }
+    }
+}
+
+/// `attention_score_packed_key_padded_tile_avx512` unrolled for `QUERY_ROWS` query rows.
+///
+/// # Safety
+///
+/// As for `attention_score_packed_key_padded_tile_avx512` with `query_rows == QUERY_ROWS`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+pub(crate) unsafe fn attention_score_packed_key_padded_tile_avx512_rows<const QUERY_ROWS: usize>(
+    query: &[f32],
+    packed_key: &[f32],
+    source_rows: usize,
+    packed_source_rows: usize,
+    head_dim: usize,
+    scale: f32,
+    scores: &mut [f32],
+) {
+    use core::arch::x86_64::{
+        _mm512_fmadd_ps, _mm512_loadu_ps, _mm512_mask_storeu_ps, _mm512_mul_ps, _mm512_set1_ps,
+        _mm512_setzero_ps,
+    };
+    // SAFETY: as in `attention_score_packed_key_padded_tile_avx512`, with `row < QUERY_ROWS`.
+    unsafe {
+        let scale = _mm512_set1_ps(scale);
+        for source in (0..packed_source_rows).step_by(16) {
+            let mut accumulators = [_mm512_setzero_ps(); QUERY_ROWS];
+            for dimension in 0..head_dim {
+                let key = _mm512_loadu_ps(packed_key.as_ptr().add(dimension * packed_source_rows + source));
+                for row in 0..QUERY_ROWS {
+                    accumulators[row] = _mm512_fmadd_ps(
+                        key,
+                        _mm512_set1_ps(query[row * head_dim + dimension]),
+                        accumulators[row],
+                    );
+                }
+            }
+            let lanes = (source_rows - source).min(16);
+            let mask = if lanes == 16 {
+                u16::MAX
+            } else {
+                (1_u16 << lanes) - 1
+            };
+            for row in 0..QUERY_ROWS {
                 _mm512_mask_storeu_ps(
                     scores.as_mut_ptr().add(row * source_rows + source),
                     mask,
@@ -561,8 +600,13 @@ pub(crate) unsafe fn attention_value_tile_fma_avx512(
     // SAFETY: with `dimension + 16 <= head_dim`, the output loads and stores cover
     // `output[(row_start + row) * head_dim + dimension..][..16]` with `row_start + row <
     // query_rows`, and the value load covers `value[source * head_dim + dimension..][..16]` with
-    // `source < source_rows`. The weight read uses checked indexing.
+    // `source < source_rows`. The 16-row call has the same contract. The weight read uses
+    // checked indexing.
     unsafe {
+        if query_rows == 16 {
+            attention_value_tile_fma_avx512_rows::<16>(weights, value, source_rows, head_dim, output);
+            return;
+        }
         for dimension in (0..head_dim).step_by(16) {
             for row_start in (0..query_rows).step_by(8) {
                 let rows = (query_rows - row_start).min(8);
@@ -587,6 +631,50 @@ pub(crate) unsafe fn attention_value_tile_fma_avx512(
                         accumulators[row],
                     );
                 }
+            }
+        }
+    }
+}
+
+/// `attention_value_tile_fma_avx512` unrolled for `QUERY_ROWS` query rows.
+///
+/// # Safety
+///
+/// As for `attention_value_tile_fma_avx512` with `query_rows == QUERY_ROWS`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+pub(crate) unsafe fn attention_value_tile_fma_avx512_rows<const QUERY_ROWS: usize>(
+    weights: &[f32],
+    value: &[f32],
+    source_rows: usize,
+    head_dim: usize,
+    output: &mut [f32],
+) {
+    use core::arch::x86_64::{
+        _mm512_fmadd_ps, _mm512_loadu_ps, _mm512_set1_ps, _mm512_setzero_ps, _mm512_storeu_ps,
+    };
+    // SAFETY: as in `attention_value_tile_fma_avx512`, with `row < QUERY_ROWS`.
+    unsafe {
+        for dimension in (0..head_dim).step_by(16) {
+            let mut accumulators = [_mm512_setzero_ps(); QUERY_ROWS];
+            for row in 0..QUERY_ROWS {
+                accumulators[row] = _mm512_loadu_ps(output.as_ptr().add(row * head_dim + dimension));
+            }
+            for source in 0..source_rows {
+                let value = _mm512_loadu_ps(value.as_ptr().add(source * head_dim + dimension));
+                for row in 0..QUERY_ROWS {
+                    accumulators[row] = _mm512_fmadd_ps(
+                        _mm512_set1_ps(weights[row * source_rows + source]),
+                        value,
+                        accumulators[row],
+                    );
+                }
+            }
+            for row in 0..QUERY_ROWS {
+                _mm512_storeu_ps(
+                    output.as_mut_ptr().add(row * head_dim + dimension),
+                    accumulators[row],
+                );
             }
         }
     }

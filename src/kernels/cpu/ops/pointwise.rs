@@ -6,10 +6,17 @@ use crate::kernels::cpu::*;
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 pub(crate) const SQRT_2: f32 = core::f32::consts::SQRT_2;
 
+#[inline]
 pub(crate) fn f32_to_bf16_rne(value: f32) -> u16 {
-    let bits = value.to_bits();
-    let rounding_bias = 0x7fff + ((bits >> 16) & 1);
-    u16::try_from(bits.wrapping_add(rounding_bias) >> 16).expect("rounded BF16 bits fit u16")
+    half::bf16::from_f32(value).to_bits()
+}
+
+/// Round `value` to BF16 (nearest-even), or return `None` if it is non-finite
+/// or overflows the finite BF16 range.
+#[inline]
+pub(crate) fn f32_to_bf16_finite(value: f32) -> Option<u16> {
+    let rounded = half::bf16::from_f32(value);
+    rounded.is_finite().then_some(rounded.to_bits())
 }
 
 /// Whether the CPU has native BF16 support (`AVX512_BF16`). Gates storing a

@@ -2921,8 +2921,11 @@ fn page_aligned(
     )?;
     for (index, tensor) in tensors.iter().enumerate() {
         let storage = storage_of(&tensor.name);
-        let holds =
-            |value: &f32| value.is_finite() && (storage != TensorStorage::F16 || value.abs() <= 65504.0);
+        let holds = |value: &f32| match storage {
+            TensorStorage::Fp32 => value.is_finite(),
+            TensorStorage::Bf16 => crate::kernels::cpu::f32_to_bf16_finite(*value).is_some(),
+            TensorStorage::F16 => value.is_finite() && value.abs() <= 65504.0,
+        };
         if !tensor.values.iter().all(holds) {
             return Err(Error::InvalidArgument(format!(
                 "static context tensor '{}' has a value {storage:?} cannot hold",
