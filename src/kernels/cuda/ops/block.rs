@@ -161,8 +161,9 @@ pub(crate) fn norm_rows<const SLOTS: usize, const RMS: bool>(
 /// then `x * base[head, d] * (1 + tanh(gate[token, head, d])) *
 /// key_scale[pair, d]`, each factor only when its buffer is not empty, in FP32
 /// into `packed` (`format` 0) or FP16 into `packed_hi` (1). Dims from `dim` to
-/// 64 are zero. One warp per (token, head); lane `p` holds dims `p` and
-/// `p + dim / 2`. Grid: one warp per (token, head), 256 threads per block.
+/// 64, and rows from `len` to `padded`, are zero. One warp per (row, head) of
+/// the padded rows; lane `p` holds dims `p` and `p + dim / 2`. Grid: one warp
+/// per (padded row, head), 256 threads per block.
 #[device]
 pub(crate) fn pack_heads_body(
     x: &[f32],
@@ -183,14 +184,26 @@ pub(crate) fn pack_heads_body(
     let global =
         thread::blockIdx_x() as usize * thread::blockDim_x() as usize + thread::threadIdx_x() as usize;
     let (item, lane) = (global / 32, global % 32);
-    let (len, heads, dim) = (len as usize, heads as usize, dim as usize);
+    let (len, padded, heads, dim) = (len as usize, padded as usize, heads as usize, dim as usize);
     // Warp-uniform: every lane of a warp has the same item.
-    if item >= sequences as usize * len * heads {
+    if item >= sequences as usize * padded * heads {
         return;
     }
-    let (head, token) = (item % heads, item / heads);
-    let (sequence, row) = (token / len, token % len);
+    let (head, slot) = (item % heads, item / heads);
+    let (sequence, row) = (slot / padded, slot % padded);
     let pair = sequence * heads + head;
+    let at = (pair * padded + row) * 64;
+    if row >= len {
+        // A padding row: zeros, so the buffer needs no clearing first.
+        // SAFETY: `pair < sequences * heads` and `row < padded`: `at + lane` and `at + lane + 32`
+        // lie in `[sequences * heads, padded, 64]` and are this lane's alone.
+        unsafe {
+            store_packed(packed, packed_hi, format, at + lane, 0.0);
+            store_packed(packed, packed_hi, format, at + lane + 32, 0.0);
+        }
+        return;
+    }
+    let token = sequence * len + row;
     let half = dim / 2;
     let active = lane < half;
     let dims = [lane, lane + half];
@@ -218,7 +231,6 @@ pub(crate) fn pack_heads_body(
             );
         values = [values[0] * scale, values[1] * scale];
     }
-    let at = (pair * padded as usize + row) * 64;
     if active {
         #[unroll]
         for k in 0..2 {

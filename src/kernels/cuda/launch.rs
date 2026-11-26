@@ -557,10 +557,10 @@ impl Device {
         assert!(!matches!(packed, Output::Split { .. }) && dim <= HEAD_DIM && len <= padded);
         let mut unused = Unused::new(self)?;
         let (y, hi, _, format) = unused.outputs(Some(packed));
-        let config = config(threads(sequences * len * heads * 32), 256);
-        // SAFETY: one warp per (token, head) of `sequences * len * heads`, writing rows `row < len
-        // <= padded` of pair `sequence * heads + head` to the buffer `format` names, which callers
-        // size to `[sequences * heads, padded, 64]`; `x` holds `[sequences * len, heads * dim]`,
+        let config = config(threads(sequences * padded * heads * 32), 256);
+        // SAFETY: one warp per (row, head) of `sequences * padded * heads`, writing row `row <
+        // padded` of pair `sequence * heads + head` (zeros from `len`) to the buffer `format` names,
+        // which callers size to `[sequences * heads, padded, 64]`; `x` holds `[sequences * len, heads * dim]`,
         // `gate` is empty or `[sequences * len * heads, dim]`, `base` empty or `[heads, dim]`,
         // `key_scale` empty or `[sequences * heads, 64]`, and `frequencies` empty or `dim / 2`.
         let launch = unsafe {

@@ -528,12 +528,9 @@ impl Cuda {
         norm: bool,
     ) -> Result<Buffer> {
         let size = sequences * heads * padded * HEAD_DIM;
-        let mut out = if len == padded {
-            // SAFETY: pack_heads fills all 64 lanes, including narrow heads' zero dimensions.
-            unsafe { self.scratch(size)? }
-        } else {
-            self.zeros(size)?
-        };
+        // SAFETY: pack_heads fills all 64 lanes of every padded row, writing zeros past `len` and
+        // past narrow heads' dimensions.
+        let mut out = unsafe { self.scratch(size)? };
         self.pack_into(
             x,
             (base, rope),
@@ -695,10 +692,13 @@ impl Cuda {
             Ok(Operand::F32(packed))
         } else {
             let len = pairs * padded * HEAD_DIM;
-            let mut q = if cache == Precision::Fp32 {
-                Operand::F32(self.zeros(len)?)
-            } else {
-                Operand::Half(self.zeros(len)?)
+            // SAFETY: pack_into fills every padded row, as in `pack`.
+            let mut q = unsafe {
+                if cache == Precision::Fp32 {
+                    Operand::F32(self.scratch(len)?)
+                } else {
+                    Operand::Half(self.scratch(len)?)
+                }
             };
             self.pack_into(
                 &projected,
@@ -1224,11 +1224,13 @@ impl Cuda {
         let total = count * rows;
         let (cell, readout) = (dim(config.cell_channels), dim(config.readout_tokens));
         // `[columns, slots, rows, cell]`, so each (column, slot) group is contiguous.
-        let mut cells = self.zeros(columns * total * cell)?;
+        // SAFETY: each slot's embed_cells stores every column of its rows.
+        let mut cells = unsafe { self.scratch(columns * total * cell)? };
         for (slot, (x, inputs)) in xs.iter().zip(&slots.inputs).enumerate() {
             self.embed_cells(x, *inputs, &mut cells, (slot, count))?;
         }
-        let mut readouts = self.zeros(total * readout * cell)?;
+        // SAFETY: repeat writes every value.
+        let mut readouts = unsafe { self.scratch(total * readout * cell)? };
         self.device.repeat(
             &self.weights.readout,
             &mut readouts,
@@ -1323,11 +1325,13 @@ impl Cuda {
         let columns = context.categorical.len();
         let rows = x.len() / columns;
         let (cell, readout) = (dim(config.cell_channels), dim(config.readout_tokens));
-        let mut cells = self.zeros(columns * rows * cell)?;
+        // SAFETY: embed_cells stores every column of the rows.
+        let mut cells = unsafe { self.scratch(columns * rows * cell)? };
         let inputs = (&context.means, &context.kinds, context.categorical.as_slice());
         self.embed_cells(x, inputs, &mut cells, (0, 1))?;
         self.add_rows(&mut cells, recording.labels, (rows, cell))?;
-        let mut readouts = self.zeros(rows * readout * cell)?;
+        // SAFETY: repeat writes every value.
+        let mut readouts = unsafe { self.scratch(rows * readout * cell)? };
         self.device.repeat(
             &self.weights.readout,
             &mut readouts,
@@ -1335,7 +1339,8 @@ impl Cuda {
         )?;
         let points = dim(config.inducing_points);
         for (layer, (inducing, output)) in self.weights.columns.iter().enumerate() {
-            let mut queries = self.zeros(columns * points * cell)?;
+            // SAFETY: repeat writes every value.
+            let mut queries = unsafe { self.scratch(columns * points * cell)? };
             self.device.repeat(
                 &self.weights.inducing[layer],
                 &mut queries,
@@ -1470,7 +1475,8 @@ impl Cuda {
         let step = (CHUNK_VALUES / (tokens * cell)).clamp(1, rows);
         for start in (0..rows).step_by(step) {
             let count = step.min(rows - start);
-            let mut sequences = self.zeros(count * tokens * cell)?;
+            // SAFETY: the gather writes every value of the `count` sequences.
+            let mut sequences = unsafe { self.scratch(count * tokens * cell)? };
             self.sequences(
                 readouts,
                 cells,
@@ -1482,7 +1488,8 @@ impl Cuda {
             let (keys, values) = (Self::bytes(keys)?, Self::bytes(values)?);
             let kv = (&keys, &values, block.heads, tokens);
             if last {
-                let mut queries = self.zeros(count * readout * cell)?;
+                // SAFETY: as for `sequences`.
+                let mut queries = unsafe { self.scratch(count * readout * cell)? };
                 self.sequences(
                     readouts,
                     cells,
