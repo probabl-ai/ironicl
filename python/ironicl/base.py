@@ -58,6 +58,14 @@ class SavedEstimator:
     model's bytes (``_fitted_state``) and load them (``_load_fitted``).
     """
 
+    optimize: str | None = None
+
+    def _optimize(self) -> str:
+        optimize = self.optimize if self.optimize is not None else os.environ.get("IRONICL_OPTIMIZE", "safe")
+        if optimize not in ("safe", "auto", "fast"):
+            raise ValueError(f"optimize must be 'safe', 'auto', or 'fast', not {optimize!r}")
+        return optimize
+
     # Whether loading always needs the training data, even with the context.
     _needs_training_data = False
 
@@ -355,12 +363,6 @@ class TabICLBase(SavedEstimator, BaseEstimator):
 
     def _resolve_threads(self) -> int | None:
         return _threads(self.n_jobs)
-
-    def _optimize(self) -> str:
-        optimize = self.optimize if self.optimize is not None else os.environ.get("IRONICL_OPTIMIZE", "safe")
-        if optimize not in ("safe", "auto", "fast"):
-            raise ValueError(f"optimize must be 'safe', 'auto', or 'fast', not {optimize!r}")
-        return optimize
 
     def _checkpoint(self, data: bytes | None = None) -> Path:
         """The checkpoint path, downloaded if missing, or written from ``data`` when given."""

@@ -58,6 +58,12 @@ impl Fitted {
         self.model.release
     }
 
+    /// The precision level requested for this fit, including on FP32-only backends.
+    #[must_use]
+    pub fn optimize(&self) -> Optimize {
+        self.model.optimize
+    }
+
     /// Fit `model` on `training` with `threads` worker threads, `None` for
     /// one per core, reporting members built.
     ///
@@ -464,7 +470,7 @@ impl Fitted {
             class_count: 0,
             class_permutations: Vec::new(),
             feature_permutations: Vec::new(),
-            optimize: Optimize::Safe,
+            optimize: self.optimize(),
         }
     }
 

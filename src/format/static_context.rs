@@ -66,7 +66,7 @@ const fn byte_limit(bytes: u64) -> usize {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextArchitecture {
     TabIclV2,
-    /// Kumo-Tabular: no permutations, FP32 at `safe`, one context per
+    /// Kumo-Tabular: no permutations, one context per
     /// member and codebook task.
     KumoTabular(Release),
 }
@@ -1145,10 +1145,9 @@ fn validate_metadata(metadata: &StaticContextMetadata) -> Result<()> {
         if metadata.class_count != 0
             || !metadata.class_permutations.is_empty()
             || !metadata.feature_permutations.is_empty()
-            || metadata.optimize != Optimize::Safe
         {
             return Err(artifact_error(
-                "a Kumo-Tabular context has no class count or permutations and is at safe",
+                "a Kumo-Tabular context has no class count or permutations",
             ));
         }
         return Ok(());

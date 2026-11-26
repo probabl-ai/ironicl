@@ -8,7 +8,7 @@ scikit-learn's interface. See docs/kumo-tabular.md.
 from __future__ import annotations
 
 import warnings
-from functools import cache
+from functools import lru_cache
 from numbers import Integral
 from pathlib import Path
 
@@ -36,9 +36,9 @@ SIZES = ("small", "medium", "large")
 DEFAULT_ESTIMATORS = {"small": 8, "medium": 8, "large": 16}
 
 
-@cache  # One resident model per checkpoint for the process lifetime.
-def _model(checkpoint: Path, release: str) -> _core.KumoTabular:
-    model = _core.KumoTabular(checkpoint, release)
+@lru_cache(maxsize=1)  # Keep repeated fits warm without pinning every precision's GPU weights.
+def _model(checkpoint: Path, release: str, optimize: str) -> _core.KumoTabular:
+    model = _core.KumoTabular(checkpoint, release, optimize)
     expected = SHA256.get(release)
     if expected is not None and model.sha256 != expected:
         warnings.warn(
@@ -62,6 +62,7 @@ class _KumoTabular(SavedEstimator, BaseEstimator):
         verbose: bool = False,
         model_path: str | Path | None = None,
         allow_auto_download: bool = True,
+        optimize: str | None = None,
     ):
         self.size = size
         self.n_estimators = n_estimators
@@ -70,6 +71,7 @@ class _KumoTabular(SavedEstimator, BaseEstimator):
         self.verbose = verbose
         self.model_path = model_path
         self.allow_auto_download = allow_auto_download
+        self.optimize = optimize
 
     _task: str
     _needs_training_data = True
@@ -84,10 +86,11 @@ class _KumoTabular(SavedEstimator, BaseEstimator):
         """Fit the members' preprocessing and contexts in Rust on ``X`` and
         ``targets``, as ``_core.KumoTabular.fit`` takes them."""
         self._validate()
+        optimize = self._optimize()
         x, names = _features(X)
         checkpoint = self._checkpoint()
         with self._progress("Building context", "estimator") as progress:
-            fitted = _model(checkpoint, self._release()).fit(
+            fitted = _model(checkpoint, self._release(), optimize).fit(
                 x,
                 **targets,
                 n_estimators=self._estimators(),
@@ -100,6 +103,7 @@ class _KumoTabular(SavedEstimator, BaseEstimator):
         if names is not None:
             self.feature_names_in_ = np.asarray(names, dtype=object)
         self.n_features_in_ = len(x) if isinstance(x, list) else x.shape[1]
+        self.optimize_ = optimize
         self.checkpoint_path_ = checkpoint
         self.fitted_ = fitted
 
@@ -140,8 +144,10 @@ class _KumoTabular(SavedEstimator, BaseEstimator):
     def _load_fitted(self, checkpoint: bytes | None, context: bytes | None) -> None:
         """Load with this machine's threads: the saved contexts, else fitted again."""
         self._restore_checkpoint(checkpoint)
+        # Pickles written before Kumo supported optimize always ran at safe.
+        self.optimize_ = getattr(self, "optimize_", "safe")
         with self._progress("Building context", "estimator") as progress:
-            self.fitted_ = _model(self.checkpoint_path_, self._release()).load(
+            self.fitted_ = _model(self.checkpoint_path_, self._release(), self.optimize_).load(
                 self.fitted_, self._threads(), progress, context
             )
         _warn_cpu_members(self.fitted_)
@@ -198,7 +204,9 @@ class KumoTabularClassifier(ClassifierMixin, _KumoTabular):
     ``random_state`` seeds the members' random draws: Ironicl draws them
     itself, so a seed gives the same model on every machine. ``n_jobs`` sets
     the worker threads (``None`` uses every core; negative values count back
-    from all cores). ``verbose=True`` shows progress.
+    from all cores). ``verbose=True`` shows progress. ``optimize`` selects
+    ``"safe"``, ``"auto"``, or ``"fast"``; ``None`` reads ``IRONICL_OPTIMIZE``
+    and defaults to ``"safe"``. The fitted level is ``optimize_``.
 
     The checkpoint is downloaded from Hugging Face's ``nvidia/Kumo-Tabular``
     at a pinned revision into Ironicl's cache folder, unless ``model_path``

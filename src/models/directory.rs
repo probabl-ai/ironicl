@@ -126,6 +126,7 @@ pub fn write_kumo_tabular(dir: &Path, model: &kumo_tabular::fitted::Fitted, kv_c
         feature_names: training.feature_names.clone(),
         classes: model.classes().cloned(),
         weights: encode_sha256(&model.checkpoint_sha256()),
+        optimize: (model.optimize() != Optimize::Safe).then_some(model.optimize()),
     };
     let context = |path: &Path| write_atomic(path, &model.context_bytes()?);
     write_files(dir, &model.to_bytes()?, kv_cache.then_some(context), &metadata)
@@ -171,6 +172,9 @@ pub struct Metadata {
     /// The SHA-256 of the checkpoint the weights come from, which names their
     /// file in the weights folder.
     pub weights: String,
+    /// Fallback when no cache records the level (older exports default to `safe`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimize: Option<Optimize>,
 }
 
 impl Metadata {
@@ -185,6 +189,7 @@ impl Metadata {
             feature_names: preprocessor.feature_names.clone(),
             classes: preprocessor.classes().cloned(),
             weights: encode_sha256(&model.context.context_metadata().model_sha256),
+            optimize: None,
         }
     }
 }
@@ -407,23 +412,16 @@ pub(crate) fn load(
     threads: Option<usize>,
     limits: MemoryLimits,
 ) -> Result<Prepared> {
-    read_metadata(dir)?;
+    let metadata = read_metadata(dir)?;
     let path = dir.join(PREPROCESSING);
     let bytes = read_bounded(&path, MAX_PREPROCESSING_BYTES).map_err(|error| artifact_error(&path, error))?;
-    if preprocessor::architecture(&bytes)? == preprocessor::KUMO_TABULAR {
-        if let Some(limit) = limits.host.or(limits.device) {
-            return Err(Error::InvalidArgument(format!(
-                "Kumo-Tabular does not support memory limits ({} is set)",
-                limit.source
-            )));
-        }
-        return load_kumo_tabular(dir, &bytes, weights, optimize, threads);
+    let kumo = preprocessor::architecture(&bytes)? == preprocessor::KUMO_TABULAR;
+    if kumo && let Some(limit) = limits.host.or(limits.device) {
+        return Err(Error::InvalidArgument(format!(
+            "Kumo-Tabular does not support memory limits ({} is set)",
+            limit.source
+        )));
     }
-    let executor = executor(&weights_path(&bytes, weights)?)?;
-    let (_, preprocessed) = executor
-        .decode_preprocessed(&bytes)
-        .map_err(|error| artifact_error(&path, error))?;
-    let preprocessed = Arc::new(preprocessed);
     let path = dir.join(CONTEXT);
     // A missing, unreadable, or invalid cache is rebuilt like a mismatched
     // one; one that exists but cannot be read is reported.
@@ -442,7 +440,51 @@ pub(crate) fn load(
     };
     let optimize = optimize
         .or(saved.as_ref().map(|context| context.metadata().optimize))
+        .or(metadata.optimize)
         .unwrap_or_default();
+    let weights = weights_path(&bytes, weights)?;
+    if kumo {
+        let model = Arc::new(kumo_tabular::cpu::Model::with_optimize(
+            load_weights(&weights)?,
+            optimize,
+        )?);
+        if let Some(cache) = saved.filter(|c| c.metadata().optimize == optimize) {
+            match kumo_tabular::fitted::Fitted::from_artifact(
+                Arc::clone(&model),
+                &bytes,
+                Some(cache),
+                threads,
+            ) {
+                Ok(fitted) => {
+                    return Ok(Prepared {
+                        model: Fitted::KumoTabular(Box::new(fitted)),
+                        optimize,
+                        built: false,
+                        warning,
+                    });
+                }
+                Err(error) => {
+                    warning = Some(format!(
+                        "could not load the saved KV cache {}, so rebuilt it: {error}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        let fitted = kumo_tabular::fitted::Fitted::from_bytes(model, &bytes, None, threads)
+            .map_err(|error| artifact_error(&dir.join(PREPROCESSING), error))?;
+        return Ok(Prepared {
+            model: Fitted::KumoTabular(Box::new(fitted)),
+            optimize,
+            built: true,
+            warning,
+        });
+    }
+    let executor = executor(&weights)?;
+    let (_, preprocessed) = executor
+        .decode_preprocessed(&bytes)
+        .map_err(|error| artifact_error(&dir.join(PREPROCESSING), error))?;
+    let preprocessed = Arc::new(preprocessed);
     if let Some(context) = saved
         && *context.metadata() == executor.fitted_context_metadata(&preprocessed, optimize)?
     {
@@ -465,65 +507,6 @@ pub(crate) fn load(
         built: true,
         warning,
     })
-}
-
-/// Kumo-Tabular runs at `safe` only. Load its saved contexts or fit them again.
-fn load_kumo_tabular(
-    dir: &Path,
-    bytes: &[u8],
-    weights: &Path,
-    optimize: Option<Optimize>,
-    threads: Option<usize>,
-) -> Result<Prepared> {
-    use kumo_tabular::fitted::Fitted as Kumo;
-    let model = Arc::new(kumo_tabular::cpu::Model::new(load_weights(&weights_path(
-        bytes, weights,
-    )?)?)?);
-    let mut warning = optimize
-        .filter(|&level| level != Optimize::Safe)
-        .map(|level| format!("Kumo-Tabular runs at safe only, so --optimize {level} does not apply"));
-    let path = dir.join(CONTEXT);
-    let mut unreadable = None;
-    if path.exists() {
-        let saved = StaticContextArtifact::read_mapped_prefault(&path)
-            .and_then(|artifact| Kumo::from_artifact(Arc::clone(&model), bytes, Some(artifact), threads));
-        match saved {
-            Ok(fitted) => {
-                return Ok(Prepared {
-                    model: Fitted::KumoTabular(Box::new(fitted)),
-                    optimize: Optimize::Safe,
-                    built: false,
-                    warning,
-                });
-            }
-            Err(error) => unreadable = Some(error),
-        }
-    }
-    let fitted = Kumo::from_bytes(model, bytes, None, threads)
-        .map_err(|error| artifact_error(&dir.join(PREPROCESSING), error))?;
-    if let Some(error) = unreadable {
-        add(
-            &mut warning,
-            &format!(
-                "could not read the saved KV cache {}, so rebuilt it: {error}",
-                path.display()
-            ),
-        );
-    }
-    Ok(Prepared {
-        model: Fitted::KumoTabular(Box::new(fitted)),
-        optimize: Optimize::Safe,
-        built: true,
-        warning,
-    })
-}
-
-/// `more` added to `warning`.
-fn add(warning: &mut Option<String>, more: &str) {
-    *warning = Some(match warning.take() {
-        Some(warning) => format!("{warning}; {more}"),
-        None => more.to_owned(),
-    });
 }
 
 /// What `ironicl inspect` shows of a model directory.
@@ -585,6 +568,7 @@ mod tests {
             feature_names: Some(vec!["a".into(), "b".into()]),
             classes: Some(Labels::Text(vec!["no".into(), "yes".into()])),
             weights: "00".repeat(32),
+            optimize: None,
         };
         let json = serde_json::to_string(&metadata).unwrap();
         assert!(json.contains(r#""task":"classifier","n_features":2"#), "{json}");

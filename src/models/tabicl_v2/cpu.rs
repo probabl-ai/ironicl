@@ -54,7 +54,8 @@ pub struct DecoderOutputs {
 /// On the Apple Silicon GPU, `Auto` and `Fast` store ICL caches in FP16. On a
 /// BF16-capable CPU (`AVX512_BF16`), `Fast` stores ICL values in BF16. Elsewhere
 /// every level is FP32.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Optimize {
     /// FP32 throughout; matches `TabICL` within `1e-4`.
     #[default]
