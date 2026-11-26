@@ -109,7 +109,7 @@ embeddings are saved transposed; import copies them into row-major order.
   rows once and keeps each member's context: the column means that replace missing values, each
   column layer's keys and values of its inducing points, and each ICL layer's keys and values,
   in medium and large only the 2 heads query rows use. Predicting runs only the query rows.
-- `cuda.rs`: on an NVIDIA GPU, with the `cuda` feature, a member's whole forward pass runs on
+- `cuda/`: on an NVIDIA GPU, with the `cuda` feature, a member's whole forward pass runs on
   the device and its context stays there: the imputation means and each layer's column
   and ICL keys and values. Predicting uploads only the query rows and downloads only the outputs.
   The blocks chain the kernels TabICLv2's ICL stage uses (`kernels/cuda/launch.rs`): `RMSNorm`,
@@ -117,11 +117,11 @@ embeddings are saved transposed; import copies them into row-major order.
   norm, and query scaling, and split attention over the cached keys and values, which test rows
   of medium and large read through 2 heads. The small model's 32-wide heads are zero-padded to
   the kernels' 64. Kumo-Tabular's own kernels build the cell embedding's features and the row
-  stage's sequences. The weights upload once per process. Buffers are allocated and freed in
-  stream order, so the CPU queues work without waiting for the GPU; it waits once 1 GiB has
-  been allocated since it last did, which bounds the memory of queued work. A context that does not fit in device
-  memory is built on the CPU, and `IRONICL_NO_CUDA` keeps everything there. When every member's
-  context is on the GPU, the contexts are stacked and one pass predicts all members, as
+  stage's sequences. The weights upload once per process. Each fit or prediction owns a workspace:
+  layers and passes overwrite the same buffers in stream order, growing them only for a larger
+  shape. The call releases the workspace without releasing the fitted contexts. A context that
+  does not fit in device memory is built on the CPU, and `IRONICL_NO_CUDA` keeps everything there.
+  When every member's context is on the GPU, the contexts are stacked and one pass predicts all members, as
   TabICLv2's ensemble does: products and norms run on every member's rows at once, reading each
   weight once, and each member attends to its own keys and values. Saving copies a
   context to the host; loading copies it to the GPU, so a context saved on one device loads on

@@ -58,8 +58,6 @@ impl Module {
 /// The builds of the kernels, from `IRONICL_CUDA_ARCH`; the first is
 /// cuda-oxide's own.
 const MODULES: &[Module] = include!(concat!(env!("OUT_DIR"), "/cuda_modules.rs"));
-/// Freed stream-ordered memory the pool keeps across synchronizations.
-const POOL_KEPT_BYTES: u64 = 1 << 30;
 
 pub(crate) fn gpu_error(error: impl Display) -> Error {
     Error::UnsupportedBackend(format!("CUDA: {error}"))
@@ -160,12 +158,6 @@ impl Device {
                 built.join(", "),
             )));
         };
-        // Stream-ordered frees return memory to the pool, and by default a synchronization
-        // releases it to the driver, so the next pass maps it again. Keep a pass's worth.
-        context
-            .default_mem_pool()
-            .and_then(|pool| pool.set_release_threshold(POOL_KEPT_BYTES))
-            .map_err(gpu_error)?;
         let stream = context.new_stream().map_err(gpu_error)?;
         let copy = context.new_stream().map_err(gpu_error)?;
         let multiprocessors =
@@ -223,19 +215,6 @@ impl Device {
         len: usize,
     ) -> std::result::Result<DeviceBuffer<T>, DriverError> {
         DeviceBuffer::zeroed(&self.stream, len)
-    }
-
-    /// Allocate on the kernel stream without waiting for the GPU. Drop frees in stream order.
-    ///
-    /// # Safety
-    /// Initialize every element on the same stream before reading it, including padding.
-    #[expect(unsafe_code, reason = "the caller initializes this stream-ordered allocation")]
-    pub(crate) unsafe fn scratch<T: DeviceCopy>(
-        &self,
-        len: usize,
-    ) -> std::result::Result<DeviceBuffer<T>, DriverError> {
-        // SAFETY: the caller is responsible for initialization.
-        unsafe { DeviceBuffer::uninitialized_async(&self.stream, len) }
     }
 
     /// `values` copied to the device.
