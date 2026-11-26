@@ -1030,7 +1030,7 @@ impl StaticContextArtifact {
         self.encode(&mut writer)?;
         writer.into_inner().map_err(artifact_error)?;
         file.as_file().sync_all().map_err(artifact_error)?;
-        file.persist(path).map(drop).map_err(artifact_error)
+        crate::format::persist_atomic(file, path).map_err(artifact_error)
     }
 
     /// The verified artifact at `path`, prefaulted as by

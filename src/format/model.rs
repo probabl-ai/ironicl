@@ -454,7 +454,7 @@ pub(crate) fn write_model_artifact(path: &Path, model: &ModelArtifactData) -> Re
             "temporary artifact verification changed metadata".into(),
         ));
     }
-    file.persist(path).map_err(artifact_error)?;
+    crate::format::persist_atomic(file, path).map_err(artifact_error)?;
     // On Unix, sync the parent directory so the rename is durable; Windows forbids opening a directory.
     #[cfg(unix)]
     File::open(parent)

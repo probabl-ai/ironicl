@@ -79,9 +79,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     file.write_all(bytes)
         .and_then(|()| file.as_file().sync_all())
         .map_err(|error| artifact_error(path, error))?;
-    file.persist(path)
-        .map(drop)
-        .map_err(|error| artifact_error(path, error))
+    crate::format::persist_atomic(file, path).map_err(|error| artifact_error(path, error))
 }
 
 fn remove(path: &Path) -> Result<()> {
