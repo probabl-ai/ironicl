@@ -1,5 +1,8 @@
 # Kernel Design
 
+See [kernel-guidelines.md](kernel-guidelines.md) for general and
+platform-specific rules on profiling, benchmarking, parity, safety, and tuning.
+
 ## Kernel Inventory
 
 ### Required Portable Kernels

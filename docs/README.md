@@ -20,6 +20,7 @@ records what each has verified.
 | [artifact-format.md](artifact-format.md) | Model, preprocessing, and static-context formats, and how contexts are built |
 | [precision.md](precision.md) | FP32, BF16, and INT8 numerical policy |
 | [kernels.md](kernels.md) | Kernel inventory, layouts, and fusion boundaries |
+| [kernel-guidelines.md](kernel-guidelines.md) | General and platform-specific kernel and performance engineering guidelines |
 | [amd-zen5.md](amd-zen5.md) | Ryzen 7 9800X3D target and runtime dispatch |
 | [apple-development.md](apple-development.md) | M1 Max development workflow and limitations |
 | [memory-and-io.md](memory-and-io.md) | RAM sizing, bandwidth model, and NVMe use |
