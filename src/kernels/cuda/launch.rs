@@ -35,21 +35,20 @@ pub(crate) struct Dense {
 impl Dense {
     /// A dense layer from its FP32 weight `[n, k]` and bias.
     pub(crate) fn upload(device: &Device, w: &[f32], b: &[f32]) -> Result<Self> {
-        let (hi, lo): (Vec<u16>, Vec<u16>) = w
-            .iter()
-            .map(|&v| {
-                (
-                    half::f16::from_f32(v).to_bits(),
-                    half::f16::from_f32(low_part(v)).to_bits(),
-                )
-            })
-            .unzip();
-        Ok(Self {
-            w: device.upload(w)?,
-            hi: device.upload(&hi)?,
-            lo: device.upload(&lo)?,
-            b: device.upload(b)?,
-        })
+        Self::for_precision(device, w, b, Precision::Split)
+    }
+
+    /// Keep the FP32 weights for narrow products, plus only the parts read at `precision`.
+    pub(crate) fn for_precision(device: &Device, w: &[f32], b: &[f32], precision: Precision) -> Result<Self> {
+        let mut dense = Self::upload_f32(device, w, b)?;
+        if precision != Precision::Fp32 {
+            let half = |v| half::f16::from_f32(v).to_bits();
+            dense.hi = device.upload(&w.iter().copied().map(half).collect::<Vec<_>>())?;
+            if precision == Precision::Split {
+                dense.lo = device.upload(&w.iter().copied().map(low_part).map(half).collect::<Vec<_>>())?;
+            }
+        }
+        Ok(dense)
     }
 
     /// A dense layer for FP32 products only, without the FP16 parts the
@@ -421,6 +420,17 @@ impl Device {
         launch.map_err(gpu_error)
     }
 
+    /// Depth per split and split count. The caller sizes the partial sums from the same plan.
+    pub(crate) fn product_splits(&self, (rows, width, depth): (usize, usize, usize)) -> (usize, usize) {
+        let blocks = rows.div_ceil(64) * width.div_ceil(64);
+        let wanted = (2 * self.multiprocessors())
+            .div_ceil(blocks)
+            .min(depth / 64)
+            .max(1);
+        let chunk = depth.div_ceil(wanted).next_multiple_of(16);
+        (chunk, depth.div_ceil(chunk))
+    }
+
     /// A product in FP32 on the CUDA cores: 64 x 64 tiles, `depth` split over
     /// extra blocks until about two waves run, their partial sums added with
     /// the epilogue by `linear_reduce`.
@@ -433,13 +443,7 @@ impl Device {
         (rows, width, depth): (usize, usize, usize),
         mode: u32,
     ) -> Result<()> {
-        let blocks = rows.div_ceil(64) * width.div_ceil(64);
-        let wanted = (2 * self.multiprocessors())
-            .div_ceil(blocks)
-            .min(depth / 64)
-            .max(1);
-        let chunk = depth.div_ceil(wanted).next_multiple_of(16);
-        let splits = depth.div_ceil(chunk);
+        let (chunk, splits) = self.product_splits((rows, width, depth));
         assert!(
             splits == 1 || splits * rows * width <= partial.len(),
             "split-K partials past their buffer"

@@ -54,6 +54,50 @@ class ValidateTest(unittest.TestCase):
         self.assertEqual(KumoTabularClassifier(n_estimators=3)._estimators(), 3)
 
 
+class PrecisionTest(unittest.TestCase):
+    # More than 256 rows exercises CUDA's split products; 1 query also checks its FP32 fallback.
+    @staticmethod
+    def data():
+        rng = np.random.default_rng(29)
+        x = rng.normal(size=(337, 7)).astype(np.float32)
+        y = 3 * x[:, 0] - x[:, 1] + 0.1 * rng.normal(size=len(x))
+        x[::11, 0] = np.nan
+        return x[:273], x[273:], y[:273]
+
+    @unittest.skipUnless(CHECKPOINT.exists(), NEEDS_CHECKPOINT)
+    def test_probability_error_against_safe(self):
+        train, query, y = self.data()
+        for classes in (3, 12):  # The latter uses codebook tasks.
+            labels = np.digitize(y, np.quantile(y, np.arange(1, classes) / classes))
+
+            def predict(level):
+                model = KumoTabularClassifier(size="small", n_estimators=2, optimize=level).fit(train, labels)
+                return np.vstack((model.predict_proba(query[:1]), model.predict_proba(query)))
+
+            safe = predict("safe")
+            for level, budget in (("auto", 1e-3), ("fast", 1e-2)):
+                with self.subTest(classes=classes, level=level):
+                    actual = predict(level)
+                    np.testing.assert_allclose(actual, safe, rtol=0, atol=budget)
+                    gap = safe.max(axis=1) - safe[np.arange(len(safe)), actual.argmax(axis=1)]
+                    self.assertLessEqual(gap.max(), 2 * budget)
+
+    @unittest.skipUnless(REGRESSOR.exists(), f"needs {REGRESSOR}")
+    def test_all_quantiles_against_safe(self):
+        train, query, y = self.data()
+
+        def predict(level):
+            model = KumoTabularRegressor(size="small", n_estimators=2, optimize=level).fit(train, y)
+            return model.predict(query, output_type="raw_quantiles")
+
+        safe = predict("safe")
+        for level, budget in (("auto", 1e-3), ("fast", 1e-2)):
+            with self.subTest(level=level):
+                actual = predict(level)
+                self.assertEqual(actual.shape, (len(query), 999))
+                np.testing.assert_allclose(actual, safe, rtol=0, atol=budget * y.std())
+
+
 @unittest.skipUnless(CHECKPOINT.exists(), NEEDS_CHECKPOINT)
 @unittest.skipIf(pd is None, "needs pandas")
 class FitTest(unittest.TestCase):
