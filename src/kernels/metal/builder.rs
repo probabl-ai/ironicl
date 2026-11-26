@@ -56,10 +56,14 @@ impl<'w, 'a> Builder<'w, 'a> {
     }
 
     pub(crate) fn placeholder(&self, dimensions: &[isize]) -> Tensor {
+        self.placeholder_typed(dimensions, FLOAT)
+    }
+
+    pub(crate) fn placeholder_typed(&self, dimensions: &[isize], kind: MPSDataType) -> Tensor {
         // SAFETY: graph construction on `self.graph` (impl comment).
         unsafe {
             self.graph
-                .placeholderWithShape_dataType_name(Some(&shape(dimensions)), FLOAT, None)
+                .placeholderWithShape_dataType_name(Some(&shape(dimensions)), kind, None)
         }
     }
 
@@ -70,11 +74,7 @@ impl<'w, 'a> Builder<'w, 'a> {
 
     /// A placeholder of element type `kind` bound to `buffer`, in that type.
     pub(crate) fn bound_typed(&self, buffer: Buffer, dimensions: &[isize], kind: MPSDataType) -> Tensor {
-        // SAFETY: graph construction on `self.graph` (impl comment).
-        let tensor = unsafe {
-            self.graph
-                .placeholderWithShape_dataType_name(Some(&shape(dimensions)), kind, None)
-        };
+        let tensor = self.placeholder_typed(dimensions, kind);
         self.bindings
             .borrow_mut()
             .push((tensor.clone(), buffer, dimensions.to_vec(), kind));

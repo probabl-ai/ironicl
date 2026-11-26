@@ -6,6 +6,7 @@ tested in Rust."""
 import os
 import pickle
 import subprocess
+import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -82,12 +83,38 @@ class PrecisionTest(unittest.TestCase):
                     gap = safe.max(axis=1) - safe[np.arange(len(safe)), actual.argmax(axis=1)]
                     self.assertLessEqual(gap.max(), 2 * budget)
 
+    @unittest.skipUnless(CHECKPOINT.exists(), NEEDS_CHECKPOINT)
+    def test_gpu_cache_loads_on_cpu(self):
+        train, query, y = self.data()
+        model = KumoTabularClassifier(size="small", n_estimators=2, optimize="auto").fit(train, y > 0)
+        if model.fitted_.device == "cpu":
+            self.skipTest("needs a GPU-built cache")
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            model.save(path / "model.pkl")
+            np.save(path / "query.npy", query)
+            subprocess.run(
+                [sys.executable, "-c", """
+import numpy as np
+from ironicl import KumoTabularClassifier
+model = KumoTabularClassifier.load('model.pkl')
+assert model.fitted_.device == 'cpu' and model.optimize_ == 'auto'
+np.save('cpu.npy', model.predict_proba(np.load('query.npy')))
+"""], cwd=path, env={**os.environ, "IRONICL_NO_METAL": "1", "IRONICL_NO_CUDA": "1"}, check=True,
+            )
+            np.testing.assert_allclose(np.load(path / "cpu.npy"), model.predict_proba(query), rtol=0, atol=1e-3)
+
     @unittest.skipUnless(REGRESSOR.exists(), f"needs {REGRESSOR}")
     def test_all_quantiles_against_safe(self):
-        train, query, y = self.data()
+        # The tails on this case distinguish the auto and fast accuracy budgets on Metal.
+        rng = np.random.default_rng(971)
+        x = rng.normal(size=(1500, 20)).astype(np.float32)
+        y = (x[:, 0] - 0.5 * x[:, 1] + rng.normal(0, 0.3, len(x)))[:1000]
+        x.ravel()[::71] = np.nan
+        train, query = x[:1000], x[1000:]
 
         def predict(level):
-            model = KumoTabularRegressor(size="small", n_estimators=2, optimize=level).fit(train, y)
+            model = KumoTabularRegressor(size="small", n_estimators=4, optimize=level).fit(train, y)
             return model.predict(query, output_type="raw_quantiles")
 
         safe = predict("safe")

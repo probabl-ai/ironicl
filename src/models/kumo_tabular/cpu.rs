@@ -375,7 +375,7 @@ impl Model {
         // be equal, or the model runs on the CPU, which applies each.
         #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
         let metal = rope_shared(&artifact, config)
-            .then(|| super::metal::Metal::new(config, Self::dim(release.outputs())))
+            .then(|| super::metal::Metal::new(release, optimize))
             .flatten();
         Ok(Self {
             release,

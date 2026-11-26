@@ -1,5 +1,5 @@
 //! Kumo-Tabular on Apple Silicon GPUs: a member's whole forward pass as one
-//! `MPSGraph` executable, in FP32.
+//! `MPSGraph` executable, in FP32 with optional FP16 ICL attention and caches.
 //!
 //! Fitting runs one graph per training shape, for every member: the cell
 //! embedding, the interleaved column and row stages, and the ICL stage, with
@@ -25,9 +25,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+use half::f16;
 use objc2::{AllocAnyThread, rc::Retained};
 use objc2_foundation::{NSArray, NSDictionary};
 use objc2_metal::MTLBuffer;
+use objc2_metal_performance_shaders::MPSDataType;
 use objc2_metal_performance_shaders_graph::{
     MPSGraph, MPSGraphDevice, MPSGraphExecutable, MPSGraphShapedType, MPSGraphTensor, MPSGraphTensorData,
 };
@@ -118,6 +120,8 @@ pub(crate) struct Metal {
     weights: ModelWeights,
     config: Config,
     outputs: usize,
+    /// Fixed for this model and therefore for every executable in `graphs`.
+    icl_kind: MPSDataType,
     graphs: Mutex<HashMap<Key, Arc<Compiled>>>,
 }
 
@@ -187,15 +191,22 @@ enum Columns<'t> {
 
 impl Metal {
     /// The system GPU, or `None` without one or with `IRONICL_NO_METAL` set.
-    pub(crate) fn new(config: Config, outputs: usize) -> Option<Self> {
+    pub(crate) fn new(release: super::Release, optimize: crate::Optimize) -> Option<Self> {
         if std::env::var_os("IRONICL_NO_METAL").is_some() {
             return None;
         }
         let gpu = Gpu::new().ok().flatten()?;
         Some(Self {
             weights: ModelWeights::new(gpu),
-            config,
-            outputs,
+            config: release.size.config(),
+            outputs: dim(release.outputs()),
+            // FP16 attention missed auto's error bound for the regression quantile tails.
+            icl_kind: match (optimize, release.task) {
+                (crate::Optimize::Fast, _) | (crate::Optimize::Auto, crate::TaskKind::Classifier) => {
+                    MPSDataType::Float16
+                }
+                _ => FLOAT,
+            },
             graphs: Mutex::default(),
         })
     }
@@ -236,11 +247,21 @@ impl Metal {
         let key_heads = config.query_key_value_heads.map_or(icl_heads, dim);
         let rows = context.training_rows;
         let layers = dim(config.embedding_layers);
-        let kv = |pair: &[Buffer], (groups, heads, rows, head_dim): (usize, usize, usize, usize)| {
+        let kv = |pair: &[Buffer], kind, (groups, heads, rows, head_dim): (usize, usize, usize, usize)| {
             let len = groups * heads * rows * head_dim;
+            let read = |buffer: &Buffer| {
+                if kind == FLOAT {
+                    host_values::<f32>(buffer, len).to_vec()
+                } else {
+                    host_values::<u16>(buffer, len)
+                        .iter()
+                        .map(|&v| f16::from_bits(v).to_f32())
+                        .collect()
+                }
+            };
             Kv {
-                key: read(&pair[0], len),
-                value: read(&pair[1], len),
+                key: read(&pair[0]),
+                value: read(&pair[1]),
                 groups,
                 heads,
                 rows,
@@ -252,11 +273,11 @@ impl Metal {
         (
             column_caches
                 .chunks(2)
-                .map(|pair| kv(pair, (columns, heads, points, cell_dim)))
+                .map(|pair| kv(pair, FLOAT, (columns, heads, points, cell_dim)))
                 .collect(),
             icl_caches
                 .chunks(2)
-                .map(|pair| kv(pair, (1, key_heads, rows, icl_dim)))
+                .map(|pair| kv(pair, self.icl_kind, (1, key_heads, rows, icl_dim)))
                 .collect(),
         )
     }
@@ -269,12 +290,20 @@ impl Metal {
     ) -> Result<Context> {
         let (columns, icl) = context.kvs();
         let gpu = self.weights.gpu();
-        let caches = columns
-            .iter()
-            .chain(icl)
-            .flat_map(|kv| [&kv.key, &kv.value])
-            .map(|values| gpu.buffer(values))
-            .collect::<Result<_>>()?;
+        let mut caches = Vec::with_capacity(2 * (columns.len() + icl.len()));
+        for (layers, kind) in [(columns, FLOAT), (icl, self.icl_kind)] {
+            for values in layers.iter().flat_map(|kv| [&kv.key, &kv.value]) {
+                caches.push(if kind == FLOAT {
+                    gpu.buffer(values)?
+                } else {
+                    let half: Vec<_> = values.iter().map(|&v| f16::from_f32(v).to_bits()).collect();
+                    if !half.iter().all(|&v| f16::from_bits(v).is_finite()) {
+                        return Err(metal_error("ICL cache does not fit in FP16"));
+                    }
+                    gpu.buffer_bytes(bytemuck::cast_slice(&half))?
+                });
+            }
+        }
         Ok(Context {
             caches,
             training_rows,
@@ -305,7 +334,7 @@ impl Metal {
                 training: context.training_rows,
             };
             let outputs = self.run(key, weights, &feeds)?;
-            out.extend_from_slice(&read(&outputs[0], rows * self.outputs));
+            out.extend_from_slice(host_values::<f32>(&outputs[0], rows * self.outputs));
         }
         Ok(out)
     }
@@ -336,19 +365,28 @@ impl Metal {
         }
         for ((tensor, dimensions), feed) in compiled.inputs.iter().zip(feeds) {
             let elements = dimensions.iter().product::<isize>().unsigned_abs();
+            let kind = tensor_kind(tensor);
             let buffer = match feed {
-                Feed::Data(values) if values.len() == elements => gpu.buffer(values)?,
-                Feed::Buffer(buffer) if buffer.length() >= elements * size_of::<f32>() => (*buffer).clone(),
+                Feed::Data(values) if kind == FLOAT && values.len() == elements => gpu.buffer(values)?,
+                Feed::Buffer(buffer) if buffer.length() >= elements * element_bytes(kind) => {
+                    (*buffer).clone()
+                }
                 _ => return Err(metal_error("a graph input is not its input's size")),
             };
-            bindings.push((tensor.clone(), buffer, dimensions.clone(), FLOAT));
+            bindings.push((tensor.clone(), buffer, dimensions.clone(), kind));
         }
         let outputs = compiled
             .outputs
             .iter()
             .map(|(tensor, dimensions)| {
                 let elements = dimensions.iter().product::<isize>().unsigned_abs();
-                Ok((tensor.clone(), gpu.empty(elements)?, dimensions.clone(), FLOAT))
+                let kind = tensor_kind(tensor);
+                Ok((
+                    tensor.clone(),
+                    gpu.empty_bytes(elements * element_bytes(kind))?,
+                    dimensions.clone(),
+                    kind,
+                ))
             })
             .collect::<Result<Vec<Binding>>>()?;
         let data = |bindings: &[Binding], order: &[usize]| {
@@ -374,6 +412,8 @@ impl Metal {
             data(&outputs, &compiled.target_order),
         );
         // NaN until the run writes it: a run that fails without a word leaves it.
+        // The first fit output is a column cache; the predict output is the head. Both are FP32.
+        assert_eq!(outputs[0].3, FLOAT);
         // SAFETY: the first output holds at least one float and nothing else uses it yet.
         unsafe { *outputs[0].1.contents().as_ptr().cast::<f32>() = f32::NAN };
         let _running = compiled
@@ -393,9 +433,16 @@ impl Metal {
                     Some(&Gpu::executable_execution()),
                 );
         }
-        for (_, buffer, dimensions, _) in &outputs {
-            let elements = dimensions.iter().product::<isize>().unsigned_abs();
-            if !all_finite(buffer, elements) {
+        for (_, buffer, dimensions, kind) in &outputs {
+            let len = dimensions.iter().product::<isize>().unsigned_abs();
+            let finite = if *kind == FLOAT {
+                host_values::<f32>(buffer, len).iter().all(|v| v.is_finite())
+            } else {
+                host_values::<u16>(buffer, len)
+                    .iter()
+                    .all(|&v| f16::from_bits(v).is_finite())
+            };
+            if !finite {
                 return Err(metal_error("the GPU run failed or wrote a non-finite value"));
             }
         }
@@ -429,6 +476,7 @@ impl Metal {
             &Columns::Fit(&cell_labels),
         )?;
         let mut hidden = builder.reshape(&builder.add(&hidden, &icl_labels), &[1, r, icl as isize]);
+        builder.set_attention(self.icl_kind);
         let (layers, log) = (dim(config.icl_layers), (rows.max(1) as f32).ln());
         for layer in 0..layers {
             let names = Names::new(&format!("icl_block.layers.{layer}"));
@@ -445,8 +493,10 @@ impl Metal {
                 )?;
             }
             let dims = vec![1, key_heads as isize, r, (icl / icl_heads) as isize];
-            outputs.push((builder.slice(&key, 1, 0, key_heads as isize), dims.clone()));
-            outputs.push((builder.slice(&value, 1, 0, key_heads as isize), dims));
+            for tensor in [&key, &value] {
+                let kept = builder.slice(tensor, 1, 0, key_heads as isize);
+                outputs.push((builder.cast(&kept, self.icl_kind), dims.clone()));
+            }
         }
         Ok(outputs)
     }
@@ -457,7 +507,7 @@ impl Metal {
     fn predict_graph(
         &self,
         builder: &Builder<'_, '_>,
-        input: &mut impl FnMut(&[isize]) -> Tensor,
+        input: &mut impl FnMut(&[isize], MPSDataType) -> Tensor,
         (rows, columns, training): (usize, usize, usize),
     ) -> Result<Outputs> {
         let config = self.config;
@@ -468,11 +518,15 @@ impl Metal {
         );
         let key_heads = config.query_key_value_heads.map_or(icl_heads, dim);
         let (r, c) = (rows as isize, columns as isize);
-        let (x, missing, kinds) = (input(&[r, c]), input(&[r, c]), input(&[1, c]));
+        let (x, missing, kinds) = (
+            input(&[r, c], FLOAT),
+            input(&[r, c], FLOAT),
+            input(&[1, c], FLOAT),
+        );
         let (points, heads) = (dim(config.inducing_points), dim(config.embedding_heads));
         let column_dims = [c, heads as isize, points as isize, (cell / heads) as isize];
         let column_caches: Vec<(Tensor, Tensor)> = (0..dim(config.embedding_layers))
-            .map(|_| (input(&column_dims), input(&column_dims)))
+            .map(|_| (input(&column_dims, FLOAT), input(&column_dims, FLOAT)))
             .collect();
         let icl_dims = [
             1,
@@ -481,7 +535,7 @@ impl Metal {
             (icl / icl_heads) as isize,
         ];
         let icl_caches: Vec<(Tensor, Tensor)> = (0..dim(config.icl_layers))
-            .map(|_| (input(&icl_dims), input(&icl_dims)))
+            .map(|_| (input(&icl_dims, self.icl_kind), input(&icl_dims, self.icl_kind)))
             .collect();
         let (hidden, _) = self.row_embedding(
             builder,
@@ -514,13 +568,15 @@ impl Metal {
     fn compile(&self, key: Key, weights: &Weights<'_, '_>) -> Result<Compiled> {
         let builder = Builder::new(&self.weights, weights);
         let mut inputs = Vec::new();
-        let mut input = |dimensions: &[isize]| {
-            let tensor = builder.placeholder(dimensions);
+        let mut input = |dimensions: &[isize], kind| {
+            let tensor = builder.placeholder_typed(dimensions, kind);
             inputs.push((tensor.clone(), dimensions.to_vec()));
             tensor
         };
         let outputs = match key {
-            Key::Fit { rows, columns } => self.fit_graph(&builder, &mut input, (rows, columns))?,
+            Key::Fit { rows, columns } => {
+                self.fit_graph(&builder, &mut |dims| input(dims, FLOAT), (rows, columns))?
+            }
             Key::Predict {
                 rows,
                 columns,
@@ -539,11 +595,12 @@ impl Metal {
         let executable = unsafe {
             let types: Vec<_> = dimensions
                 .iter()
-                .map(|dims| {
+                .zip(&tensors)
+                .map(|(dims, tensor)| {
                     MPSGraphShapedType::initWithShape_dataType(
                         MPSGraphShapedType::alloc(),
                         Some(&shape(dims)),
-                        FLOAT,
+                        tensor.dataType(),
                     )
                 })
                 .collect();
@@ -929,33 +986,32 @@ fn impute(x: &[f32], means: &[f32]) -> (Vec<f32>, Vec<f32>) {
     (imputed, missing)
 }
 
-/// A shared buffer's first `len` floats, copied out.
-fn read(buffer: &Buffer, len: usize) -> Vec<f32> {
-    let bytes = len
-        .checked_mul(size_of::<f32>())
-        .expect("Metal buffer byte length fits usize");
-    assert!(
-        buffer.length() >= bytes,
-        "Metal buffer length {} is smaller than requested {bytes} bytes",
-        buffer.length()
-    );
-    // SAFETY: the assertion above guarantees the shared buffer holds at least `len` floats,
-    // written by a finished run.
-    unsafe { std::slice::from_raw_parts(buffer.contents().as_ptr().cast::<f32>(), len).to_vec() }
+fn tensor_kind(tensor: &Tensor) -> MPSDataType {
+    // SAFETY: a property read of a live tensor.
+    unsafe { tensor.dataType() }
 }
 
-/// Whether a finished shared buffer's first `len` floats are all finite.
-fn all_finite(buffer: &Buffer, len: usize) -> bool {
+fn element_bytes(kind: MPSDataType) -> usize {
+    match kind {
+        FLOAT => 4,
+        MPSDataType::Float16 => 2,
+        _ => unreachable!("Kumo graphs bind only float and half"),
+    }
+}
+
+/// A finished shared buffer's first `len` elements, with checked length and alignment.
+fn host_values<T: bytemuck::Pod>(buffer: &Buffer, len: usize) -> &[T] {
     let bytes = len
-        .checked_mul(size_of::<f32>())
+        .checked_mul(size_of::<T>())
         .expect("Metal buffer byte length fits usize");
     assert!(
         buffer.length() >= bytes,
         "Metal buffer length {} is smaller than requested {bytes} bytes",
         buffer.length()
     );
-    // SAFETY: the assertion above guarantees the shared buffer holds at least `len` floats,
-    // written by a finished run, and no GPU work touches it now.
-    let values = unsafe { std::slice::from_raw_parts(buffer.contents().as_ptr().cast::<f32>(), len) };
-    values.iter().all(|value| value.is_finite())
+    // SAFETY: the buffer owns at least `bytes` initialized shared bytes; its GPU run is
+    // finished, and this reference cannot outlive the buffer. The cast also checks alignment.
+    bytemuck::cast_slice(unsafe {
+        std::slice::from_raw_parts(buffer.contents().as_ptr().cast::<u8>(), bytes)
+    })
 }

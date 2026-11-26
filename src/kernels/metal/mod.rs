@@ -159,8 +159,12 @@ impl Gpu {
     }
 
     pub(crate) fn empty(&self, elements: usize) -> Result<Buffer> {
+        self.empty_bytes(elements * size_of::<f32>())
+    }
+
+    pub(crate) fn empty_bytes(&self, bytes: usize) -> Result<Buffer> {
         self.device
-            .newBufferWithLength_options(elements * 4, MTLResourceOptions::StorageModeShared)
+            .newBufferWithLength_options(bytes, MTLResourceOptions::StorageModeShared)
             .ok_or_else(|| metal_error("cannot allocate a buffer"))
     }
 
