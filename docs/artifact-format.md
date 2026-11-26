@@ -133,7 +133,8 @@ broadcast. Values stay source-major, so one sequential value row updates all que
 
 A Kumo-Tabular context has header kind 2, and in place of TabICLv2's architecture values its
 cell width, column layers, inducing points, ICL width, and outputs (10 or 999), which name the
-release. It has no permutations, class count 0, and `optimize` `safe`. `B` counts its contexts,
+release. It has no permutations, class count 0, and the `optimize` level used to build it.
+The level records the arithmetic policy, not the tensors' file type. `B` counts its contexts,
 one per member and codebook task, named `{member}.{task}`; `N` and `H` are the training rows and
 the training data's features. A member keeps `C` of its preprocessed columns, which loading checks
 against the preprocessing it fits from `IRPREP`. Each context holds exactly these FP32 tensors,

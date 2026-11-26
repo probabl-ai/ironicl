@@ -1,5 +1,5 @@
 //! Kumo-Tabular on NVIDIA GPUs: a member's whole forward pass on the device,
-//! with FP32 attention and resident contexts. Large block products can use tensor cores.
+//! with resident contexts. Large block products and attention to FP16 caches can use tensor cores.
 //!
 //! The weights are uploaded once. Fitting runs the training rows through every
 //! stage and keeps each column layer's inducing-point keys and values, each
@@ -64,7 +64,8 @@ type Layers = Vec<Vec<(Bytes, Bytes)>>;
 /// values, filled in order.
 struct Recording<'a> {
     labels: &'a Buffer,
-    slots: std::vec::IntoIter<Buffer>,
+    slots: std::vec::IntoIter<CacheSlot>,
+    invalid: &'a mut Buffer,
     recorded: Vec<(Bytes, Bytes)>,
 }
 
@@ -72,16 +73,49 @@ impl Recording<'_> {
     /// `keys` and `values` copied into the next two buffers and recorded.
     fn record(&mut self, device: &Device, keys: &Buffer, values: &Buffer) -> Result<()> {
         let mut next = |source: &Buffer| -> Result<Bytes> {
-            let mut kept = self
-                .slots
+            self.slots
                 .next()
-                .expect("fit allocates two buffers per column layer");
-            device.copy_into(source, &mut kept, (0, source.len()))?;
-            Cuda::bytes(kept)
+                .expect("fit allocates two buffers per column layer")
+                .keep(device, source, self.invalid)
         };
         let pair = (next(keys)?, next(values)?);
         self.recorded.push(pair);
         Ok(())
+    }
+}
+
+/// A persistent cache allocation, reserved before fit launches its first kernel.
+enum CacheSlot {
+    Full(Buffer),
+    Half(DeviceBuffer<u16>),
+}
+
+impl CacheSlot {
+    /// Keep a prefix of the FP32 training heads. Narrow only the copy used by query rows.
+    fn keep(self, device: &Device, source: &Buffer, invalid: &mut Buffer) -> Result<Bytes> {
+        match self {
+            Self::Full(mut out) => {
+                let len = out.len();
+                device.copy_into(source, &mut out, (0, len))?;
+                Cuda::bytes(out)
+            }
+            Self::Half(mut out) => {
+                assert!(out.len() <= source.len() && invalid.len() == 1);
+                // SAFETY: one thread per retained element, bounded by `out.len()` in the kernel;
+                // `source` covers that prefix and `invalid` holds the one atomic flag.
+                unsafe {
+                    device.kernels.keep_half(
+                        device.stream(),
+                        config(threads(out.len()), 256),
+                        source,
+                        &mut out,
+                        invalid,
+                    )
+                }
+                .map_err(gpu_error)?;
+                Cuda::bytes(out)
+            }
+        }
     }
 }
 
@@ -220,6 +254,9 @@ pub(crate) struct Cuda {
     outputs: usize,
     weights: Weights,
     precision: Precision,
+    /// Precision of resident caches, independently of the products. `Split`
+    /// selects FP16 attention; `Half` would select FP8, which cannot share heads.
+    cache_precision: Precision,
     /// Serializes operations sharing `self.device.stream()` across concurrent callers.
     stream_lock: Mutex<()>,
     /// Each block's query scale per key count, uploaded on first use: an
@@ -245,12 +282,12 @@ impl Cuda {
     /// The GPU with the model's weights, or `None` without a GPU or with
     /// `IRONICL_NO_CUDA` set.
     pub(crate) fn new<'a>(
-        config: Config,
-        outputs: usize,
+        release: super::Release,
         optimize: crate::Optimize,
         tensor: &dyn Fn(&str) -> &'a [f32],
     ) -> Option<Self> {
         let device = Device::new().ok().flatten()?;
+        let (config, outputs) = (release.size.config(), dim(release.outputs()));
         let precision = Precision::for_optimize(optimize);
         let weights = Weights::upload(&device, &config, outputs, tensor, precision).ok()?;
         Some(Self {
@@ -259,6 +296,11 @@ impl Cuda {
             outputs,
             weights,
             precision,
+            cache_precision: if release.half_kv(optimize) {
+                Precision::Split
+            } else {
+                Precision::Fp32
+            },
             stream_lock: Mutex::new(()),
             scales: Mutex::default(),
             queued: AtomicUsize::new(0),
@@ -285,11 +327,11 @@ impl Cuda {
     /// `len` zeros for a context, outside the stream-ordered pool: a long-lived
     /// buffer there would keep the pool from reusing its memory. Unlike
     /// [`Self::zeros`], it waits for the GPU.
-    fn kept(&self, len: usize) -> Result<Buffer> {
+    fn kept<T: DeviceCopy>(&self, len: usize) -> Result<DeviceBuffer<T>> {
         self.device.zeroed(len).map_err(device_error)
     }
 
-    fn bytes(buffer: Buffer) -> Result<Bytes> {
+    fn bytes<T: DeviceCopy + bytemuck::NoUninit>(buffer: DeviceBuffer<T>) -> Result<Bytes> {
         buffer
             .cast_chunks::<u8>()
             .map_err(|_| gpu_error("keys and values do not cast to bytes"))
@@ -389,16 +431,35 @@ impl Cuda {
         norm: bool,
     ) -> Result<Buffer> {
         let mut out = self.zeros(sequences * heads * padded * HEAD_DIM)?;
+        self.pack_into(
+            x,
+            (base, rope),
+            (sequences, len, padded),
+            (heads, dim),
+            norm,
+            Output::F32(&mut out),
+        )?;
+        Ok(out)
+    }
+
+    fn pack_into(
+        &self,
+        x: &Buffer,
+        (base, rope): (Option<&Buffer>, Option<&Buffer>),
+        (sequences, len, padded): (usize, usize, usize),
+        (heads, dim): (usize, usize),
+        norm: bool,
+        out: Output<'_>,
+    ) -> Result<()> {
         let none = self.zeros(0)?;
         self.device.pack_heads(
             (x, &none),
             (base.unwrap_or(&none), &none, rope.unwrap_or(&none)),
-            Output::F32(&mut out),
+            out,
             (sequences, len, padded),
             (heads, dim),
             norm,
-        )?;
-        Ok(out)
+        )
     }
 
     /// A block's keys and values for `groups` groups of `rows` rows of `x`,
@@ -432,16 +493,28 @@ impl Cuda {
         &self,
         block: &Block,
         query: &Buffer,
-        (groups, rows): (usize, usize),
-        (keys, values, key_heads, key_rows): (&Bytes, &Bytes, usize, usize),
+        shape: (usize, usize),
+        kv: (&Bytes, &Bytes, usize, usize),
     ) -> Result<Buffer> {
+        self.forward_at(block, query, shape, kv, Precision::Fp32)
+    }
+
+    /// Project, normalize, and scale the queries directly into the attention kernel's layout.
+    fn packed_query(
+        &self,
+        block: &Block,
+        query: &Buffer,
+        (groups, rows): (usize, usize),
+        key_rows: usize,
+        cache: Precision,
+    ) -> Result<Operand> {
         let (width, heads, dim) = (block.width, block.heads, block.dim());
         let (pairs, padded, tokens) = (groups * heads, padded_query_rows(rows), groups * rows);
         let normed = self.block_norm(query, &block.query_norm, tokens)?;
         let projected = self.product(normed.input(), &block.query, None, (tokens, width, width), false)?;
         let base = self.query_scale(block, key_rows)?;
         let rope = block.rope.as_ref();
-        let packed = if let Some((first, second)) = &block.gate {
+        if let Some((first, second)) = &block.gate {
             // The gate reads each head's query before scaling.
             let mut packed = self.pack(
                 &projected,
@@ -480,25 +553,46 @@ impl Cuda {
                 )
             };
             launch.map_err(gpu_error)?;
-            packed
+            Ok(Operand::F32(packed))
         } else {
-            self.pack(
+            let len = pairs * padded * HEAD_DIM;
+            let mut q = if cache == Precision::Fp32 {
+                Operand::F32(self.zeros(len)?)
+            } else {
+                Operand::Half(self.zeros(len)?)
+            };
+            self.pack_into(
                 &projected,
                 (Some(&*base), rope),
                 (groups, rows, padded),
                 (heads, dim),
                 true,
-            )?
-        };
-        let (_, splits) = self.device.icl_split(Precision::Fp32, pairs, padded, key_rows);
+                q.output(),
+            )?;
+            Ok(q)
+        }
+    }
+
+    fn forward_at(
+        &self,
+        block: &Block,
+        query: &Buffer,
+        (groups, rows): (usize, usize),
+        (keys, values, key_heads, key_rows): (&Bytes, &Bytes, usize, usize),
+        cache: Precision,
+    ) -> Result<Buffer> {
+        let (width, heads, dim) = (block.width, block.heads, block.dim());
+        let (pairs, padded, tokens) = (groups * heads, padded_query_rows(rows), groups * rows);
+        let packed = self.packed_query(block, query, (groups, rows), key_rows, cache)?;
+        let (_, splits) = self.device.icl_split(cache, pairs, padded, key_rows);
         let (mut part, mut lse) = (
             self.zeros(pairs * padded * splits * HEAD_DIM)?,
             self.zeros(pairs * padded * splits)?,
         );
         let mut attended = self.zeros(pairs * padded * HEAD_DIM)?;
         self.device.attend_icl(
-            Precision::Fp32,
-            Activation::F32(&packed),
+            cache,
+            packed.input(),
             (keys, values),
             (&mut part, &mut lse, &mut attended),
             (pairs, padded, key_rows),
@@ -595,14 +689,22 @@ impl Cuda {
         let key_heads = config.query_key_value_heads.map_or(icl_heads, dim);
         let rows = slots.training_rows;
         let floats = |bytes: &Bytes| -> Result<Vec<f32>> {
-            Ok(self
-                .device
-                .download(bytes)?
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|word| f32::from_le_bytes(*word))
-                .collect())
+            let bytes = self.device.download(bytes)?;
+            Ok(if self.cache_precision == Precision::Fp32 {
+                bytes
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&w| f32::from_le_bytes(w))
+                    .collect()
+            } else {
+                bytes
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&w| half::f16::from_le_bytes(w).to_f32())
+                    .collect()
+            })
         };
         // One slot's `[pairs, padded rows, 64]` values without their padding.
         let unpad = |values: &[f32], (pairs, rows, head_dim): (usize, usize, usize)| -> Vec<f32> {
@@ -660,6 +762,17 @@ impl Cuda {
     /// Whether stacking `contexts` fits in free device memory: stacking holds
     /// its largest layer's stacked keys and values on top of the contexts.
     pub(crate) fn stack_fits(&self, contexts: &[&Context]) -> Result<bool> {
+        // The FP16 kernel launches one y block per (query head, split). Splits exceed
+        // one only for small grids; a larger ensemble can still predict member by member.
+        if self.cache_precision != Precision::Fp32
+            && let Some(first) = contexts.first()
+        {
+            let pairs =
+                dim(self.config.icl_heads).max(first.categorical.len() * dim(self.config.embedding_heads));
+            if contexts.len() > crate::kernels::cuda::launch::MAX_GRID_YZ / pairs {
+                return Ok(false);
+            }
+        }
         let largest = contexts.first().map_or(0, |context| {
             context
                 .columns
@@ -702,19 +815,21 @@ impl Cuda {
                 }
             }
         }
-        let to_floats = |bytes: Bytes| -> Result<Buffer> {
+        let words = |bytes: Bytes| {
             bytes
-                .cast_chunks::<f32>()
-                .map_err(|_| gpu_error("keys and values do not cast to floats"))
+                .cast_chunks::<u32>()
+                .map_err(|_| gpu_error("packed head is not whole words"))
         };
         // Each slot's `[groups, chunk]` into `[groups, slots, chunk]`, or with one
         // group its slot's place in `[slots, ...]`.
         let stack_layer = |parts: Vec<(Bytes, Bytes)>, groups: usize| -> Result<(Bytes, Bytes)> {
-            let len = parts[0].0.len() / size_of::<f32>();
-            let (mut keys, mut values) = (self.kept(count * len)?, self.kept(count * len)?);
+            let len = parts[0].0.len() / size_of::<u32>();
+            // Every padded head is a multiple of four bytes, including FP16 heads. The
+            // interleave kernel only copies these 32-bit words, without doing arithmetic.
+            let (mut keys, mut values) = (self.kept::<u32>(count * len)?, self.kept::<u32>(count * len)?);
             for (slot, (key, value)) in parts.into_iter().enumerate() {
                 for (source, out) in [(key, &mut keys), (value, &mut values)] {
-                    let source = to_floats(source)?;
+                    let source = words(source)?;
                     let chunk = len / groups;
                     assert!(source.len() == len && out.len() == count * len && slot < count);
                     // SAFETY: one thread per value of `source` `[groups, chunk]`; `out` holds
@@ -771,7 +886,11 @@ impl Cuda {
                                 out[(pair * padded + row) * HEAD_DIM..][..head_dim].copy_from_slice(source);
                             }
                         }
-                        Self::bytes(self.upload(&out)?)
+                        if self.cache_precision == Precision::Fp32 {
+                            Self::bytes(self.upload(&out)?)
+                        } else {
+                            Self::bytes(self.upload(&super::half_cache(&out)?)?)
+                        }
                     };
                     Ok((pad(&kv.key)?, pad(&kv.value)?))
                 })
@@ -833,13 +952,25 @@ impl Cuda {
         let key_heads = config.query_key_value_heads.map_or(dim(config.icl_heads), dim);
         // Uploads and the context's buffers wait for the GPU: they come before any work is queued.
         let (cell_labels, label_rows) = (self.upload(labels.0)?, self.upload(labels.1)?);
-        let kept = |count: usize, len: usize| (0..count).map(|_| self.kept(len)).collect::<Result<Vec<_>>>();
+        let kept = |count: usize, len: usize| {
+            (0..count)
+                .map(|_| {
+                    if self.cache_precision == Precision::Fp32 {
+                        self.kept(len).map(CacheSlot::Full)
+                    } else {
+                        self.kept(len).map(CacheSlot::Half)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()
+        };
+        let mut invalid = self.zeros(usize::from(self.cache_precision != Precision::Fp32))?;
         let column_len =
             columns * dim(config.embedding_heads) * padded_rows(dim(config.inducing_points)) * HEAD_DIM;
         let prefix = key_heads * padded_rows(rows) * HEAD_DIM;
         let mut recording = Recording {
             labels: &cell_labels,
             slots: kept(2 * self.weights.columns.len(), column_len)?.into_iter(),
+            invalid: &mut invalid,
             recorded: Vec::new(),
         };
         let mut icl_slots = kept(2 * self.weights.icl.len(), prefix)?.into_iter();
@@ -850,16 +981,18 @@ impl Cuda {
         for (layer, block) in self.weights.icl.iter().enumerate() {
             let (keys, values) = self.key_value(block, &hidden, (1, rows))?;
             let mut slot = || icl_slots.next().expect("fit allocates two buffers per ICL layer");
-            let (mut kept_keys, mut kept_values) = (slot(), slot());
-            self.device.copy_into(&keys, &mut kept_keys, (0, prefix))?;
-            self.device.copy_into(&values, &mut kept_values, (0, prefix))?;
+            let kept = (
+                slot().keep(&self.device, &keys, &mut invalid)?,
+                slot().keep(&self.device, &values, &mut invalid)?,
+            );
             if layer + 1 < self.weights.icl.len() {
                 let (keys, values) = (Self::bytes(keys)?, Self::bytes(values)?);
                 hidden = self.forward(block, &hidden, (1, rows), (&keys, &values, block.heads, rows))?;
             }
-            context
-                .icl
-                .push((Self::bytes(kept_keys)?, Self::bytes(kept_values)?));
+            context.icl.push(kept);
+        }
+        if !invalid.is_empty() && self.device.download(&invalid)?[0] != 0.0 {
+            return Err(gpu_error("cached keys or values overflow FP16"));
         }
         Ok(context)
     }
@@ -927,11 +1060,12 @@ impl Cuda {
         for (layer, ((_, output), (keys, values))) in
             self.weights.columns.iter().zip(slots.columns).enumerate()
         {
-            cells = self.forward(
+            cells = self.forward_at(
                 output,
                 &cells,
                 (columns * count, rows),
                 (keys, values, output.heads, points),
+                self.cache_precision,
             )?;
             self.row_stage(layer, &mut readouts, &mut cells, (total, columns))?;
         }
@@ -948,11 +1082,12 @@ impl Cuda {
         }
         let key_heads = config.query_key_value_heads.map_or(dim(config.icl_heads), dim);
         for (block, (keys, values)) in self.weights.icl.iter().zip(slots.icl) {
-            hidden = self.forward(
+            hidden = self.forward_at(
                 block,
                 &hidden,
                 (count, rows),
                 (keys, values, key_heads, slots.training_rows),
+                self.cache_precision,
             )?;
         }
         let normed = self.rms(&hidden, &self.weights.icl_norm, total)?;
@@ -1032,12 +1167,12 @@ impl Cuda {
             )?;
             let (keys, values) = self.key_value(output, &summaries, (columns, points))?;
             recording.record(&self.device, &keys, &values)?;
-            let (keys, values) = &recording.recorded[layer];
+            let (keys, values) = (Self::bytes(keys)?, Self::bytes(values)?);
             cells = self.forward(
                 output,
                 &cells,
                 (columns, rows),
-                (keys, values, output.heads, points),
+                (&keys, &values, output.heads, points),
             )?;
             self.row_stage(layer, &mut readouts, &mut cells, (rows, columns))?;
         }
@@ -1406,5 +1541,31 @@ impl Block {
                 None
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CacheSlot, Device};
+
+    #[test]
+    fn narrowing_checks_only_retained_heads_and_reports_overflow() {
+        let Some(device) = Device::new().unwrap() else {
+            return;
+        };
+        let source = device.upload(&[1.25_f32, -65_504.0, 70_000.0, f32::NAN]).unwrap();
+        for (len, valid) in [(2, true), (3, false), (4, false)] {
+            let slot = CacheSlot::Half(device.zeroed(len).unwrap());
+            let mut flag = device.zeroed(1).unwrap();
+            let kept = slot.keep(&device, &source, &mut flag).unwrap();
+            assert_eq!(device.download(&flag).unwrap()[0] == 0.0, valid);
+            if valid {
+                let host = super::super::half_cache(&[1.25, -65_504.0]).unwrap();
+                assert_eq!(
+                    device.download(&kept).unwrap(),
+                    bytemuck::cast_slice::<u16, u8>(&host)
+                );
+            }
+        }
     }
 }

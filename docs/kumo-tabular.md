@@ -42,8 +42,11 @@ Saving or exporting a model preserves its level, even without the KV cache. As w
 
 On CUDA, large transformer projections and MLPs use TabICL's tensor-core kernels: `auto` uses a
 high and a low FP16 part per operand; `fast` uses just the high part. Small products, the cell
-embedding, query gates, output heads, residuals, attention, and cached keys and values stay FP32.
-The checkpoint, seed, and ensemble members do not change.
+embedding, query gates, output heads, residuals, and training attention stay FP32. For classifiers
+at `auto` or `fast` and regressors at `fast`, the GPU stores the column and ICL caches in FP16.
+Predictions attend to these caches with FP16 queries. This halves resident KV storage, not the
+entire model. Regression `auto` uses split products but retains FP32 caches. Both levels keep
+medium and large's shared KV heads; neither uses FP8. The checkpoint, seed, and members do not change.
 
 On Metal, the classifier's `auto` and `fast`, and the regressor's `fast`, store the in-context
 learning (ICL) keys and values in FP16 on the GPU and use FP16 attention in that stage. Column
@@ -176,8 +179,9 @@ uploads the weights (1.8 s):
 NVIDIA's code on the same GPU, in FP32 and in FP16, fits in 0.24 s and 0.09 s and predicts in 0.10 s
 and 0.04 s at 1,000 rows; at 5,000 rows it fits in 1.51 s and 0.42 s and predicts in 0.17 s and
 0.05 s. In FP32 the remaining gap is the matrix product, about 1.4 times slower than cuBLAS's;
-tensor-core products reduce that gap. In a separate warm run on the RTX 5080 (1,000 training
-rows, 20 features, four members, median of three fits and predictions):
+tensor-core products reduce that gap. To isolate their effect, the following measurements use
+FP32 caches at **all** levels. Times are medians of three warm runs on the RTX 5080 with 1,000
+training rows, 20 features, and four members:
 
 | Model | Level | Fit | Predict 1 row | Predict 500 rows | Max error vs. `safe` |
 |---|---|---:|---:|---:|---:|
@@ -190,6 +194,21 @@ rows, 20 features, four members, median of three fits and predictions):
 
 Errors are absolute probability differences (no label changes here), or differences across all
 999 quantiles divided by the training target's standard deviation. These timings exclude weight upload.
+
+With FP16 ICL caches alone, the large classifier's `auto`/`fast` batch prediction took 79/62 ms;
+with FP16 column caches too, 76/59 ms. The final maximum probability errors were `1.1e-4` and
+`3.2e-4`. The small regressor at `fast` took 46 ms with a maximum error of `7.5e-3` training-target
+standard deviations. Using FP16 caches for regression `auto` exceeded its `1e-3` error budget,
+so it keeps the FP32-cache result in the table. On a wider table (100 features, 200 queries),
+sampled peak process GPU memory was 4,638/4,594/4,128 MiB for `safe`/`auto`/`fast`. The weights
+and temporary buffers also consume memory, so halving the KV cache does not halve the peak.
+
+To reproduce the warm comparison with the installed package and cached checkpoints:
+
+```bash
+python tools/benchmark_kumo_precision.py classifier --size large --device cuda
+python tools/benchmark_kumo_precision.py regressor --size small --device cuda
+```
 
 On an Apple M1 Max, medium with 4 members on 20 features and 500 query rows, after a first fit
 that compiles the graphs (about 1.4 s), against NVIDIA's code on the GPU through PyTorch's MPS

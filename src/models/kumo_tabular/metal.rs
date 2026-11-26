@@ -200,12 +200,10 @@ impl Metal {
             weights: ModelWeights::new(gpu),
             config: release.size.config(),
             outputs: dim(release.outputs()),
-            // FP16 attention missed auto's error bound for the regression quantile tails.
-            icl_kind: match (optimize, release.task) {
-                (crate::Optimize::Fast, _) | (crate::Optimize::Auto, crate::TaskKind::Classifier) => {
-                    MPSDataType::Float16
-                }
-                _ => FLOAT,
+            icl_kind: if release.half_kv(optimize) {
+                MPSDataType::Float16
+            } else {
+                FLOAT
             },
             graphs: Mutex::default(),
         })
@@ -296,11 +294,7 @@ impl Metal {
                 caches.push(if kind == FLOAT {
                     gpu.buffer(values)?
                 } else {
-                    let half: Vec<_> = values.iter().map(|&v| f16::from_f32(v).to_bits()).collect();
-                    if !half.iter().all(|&v| f16::from_bits(v).is_finite()) {
-                        return Err(metal_error("ICL cache does not fit in FP16"));
-                    }
-                    gpu.buffer_bytes(bytemuck::cast_slice(&half))?
+                    gpu.buffer_bytes(bytemuck::cast_slice(&super::half_cache(values)?))?
                 });
             }
         }
