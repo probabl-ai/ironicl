@@ -520,7 +520,8 @@ impl Cuda {
         )
     }
 
-    /// Project, normalize, and scale the queries directly into the attention kernel's layout.
+    /// Pack projected queries for attention. For the row stage, return the base
+    /// scales and gates to apply when attention reads them.
     fn packed_query(
         &self,
         work: &mut Scratch,
@@ -528,8 +529,8 @@ impl Cuda {
         query: &Buffer,
         (groups, rows, padded): (usize, usize, usize),
         key_rows: usize,
-        cache: Precision,
-    ) -> Result<Precision> {
+        kind: Precision,
+    ) -> Result<Option<(Arc<Buffer>, Buffer)>> {
         let (width, heads, dim) = (block.width, block.heads, block.dim());
         let (pairs, tokens) = (groups * heads, groups * rows);
         let precision = self.product_precision(tokens);
@@ -549,7 +550,8 @@ impl Cuda {
         let base = self.query_scale(block, key_rows)?;
         let rope = block.rope.as_ref();
         if let Some((first, second)) = &block.gate {
-            // The gate reads each head's query before scaling.
+            // Row self-attention and its gate both read these FP32 queries.
+            assert_eq!(kind, Precision::Fp32);
             let packed = work
                 .packed
                 .full
@@ -572,39 +574,18 @@ impl Cuda {
                 (pairs * padded, 64, HEAD_DIM),
                 true,
             )?;
-            let gates = work.projected.reserve(&self.device, pairs * padded * dim)?;
+            let mut gates = work.projected.prefix(&self.device, pairs * padded * dim)?;
             self.product_into(
                 &mut work.partial,
                 Activation::F32(hidden),
                 second,
                 None,
-                Output::F32(gates),
+                Output::F32(&mut gates),
                 (pairs * padded, dim, 64),
                 false,
             )?;
-            // SAFETY: one thread per value of `packed` `[pairs, padded, 64]`; `base` holds `[heads,
-            // dim]` and `gates` `[pairs * padded, dim]`.
-            let launch = unsafe {
-                self.device.kernels.scale_heads(
-                    self.device.stream(),
-                    config(threads(pairs * padded * HEAD_DIM), 256),
-                    packed,
-                    &base,
-                    gates,
-                    n(pairs),
-                    n(padded),
-                    n(heads),
-                    n(dim),
-                )
-            };
-            launch.map_err(gpu_error)?;
-            Ok(Precision::Fp32)
+            Ok(Some((base, gates)))
         } else {
-            let kind = if cache == Precision::Fp32 {
-                Precision::Fp32
-            } else {
-                Precision::Half
-            };
             let q = work
                 .packed
                 .output(&self.device, kind, pairs * padded * HEAD_DIM)?;
@@ -616,7 +597,7 @@ impl Cuda {
                 true,
                 q,
             )?;
-            Ok(kind)
+            Ok(None)
         }
     }
 
@@ -634,13 +615,13 @@ impl Cuda {
         let (width, heads, dim) = (block.width, block.heads, block.dim());
         // The FP32 kernel masks the final query tile itself. In particular, the row gate
         // should project real tokens, not 64 rows for each short feature sequence.
-        let padded = if cache == Precision::Fp32 {
-            rows
+        let (padded, packed) = if cache == Precision::Fp32 {
+            (rows, Precision::Fp32)
         } else {
-            padded_query_rows(rows)
+            (padded_query_rows(rows), Precision::Half)
         };
         let (pairs, tokens) = (groups * heads, groups * rows);
-        let packed = self.packed_query(work, block, query, (groups, rows, padded), key_rows, cache)?;
+        let gate = self.packed_query(work, block, query, (groups, rows, padded), key_rows, packed)?;
         let (_, splits) = self.device.icl_split(cache, pairs, padded, key_rows);
         let chunks = pairs * padded * splits;
         let part = work
@@ -651,6 +632,7 @@ impl Cuda {
         self.device.attend_icl(
             cache,
             work.packed.input(packed),
+            gate.as_ref().map(|(base, gates)| (base.as_ref(), gates, dim)),
             (keys, values),
             (part, lse, attended),
             (pairs, padded, key_rows, block.key_stride(key_rows)),

@@ -547,6 +547,7 @@ impl Stages<'_> {
             } else {
                 Activation::Half(work.packed.get())
             },
+            None,
             (cache.keys, cache.values),
             (work.part.get_mut(), work.lse.get_mut(), work.attention.get_mut()),
             (
