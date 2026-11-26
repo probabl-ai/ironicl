@@ -16,6 +16,28 @@ use std::{collections::BTreeMap, fmt};
 
 use crate::TaskKind;
 
+/// Convert a portable FP32 cache to the representation both GPU backends read. Never
+/// let overflow during placement turn a valid saved context into non-finite attention.
+#[cfg(any(
+    feature = "cuda",
+    all(feature = "metal", target_os = "macos", target_arch = "aarch64")
+))]
+fn half_cache(values: &[f32]) -> crate::Result<Vec<u16>> {
+    values
+        .iter()
+        .map(|&v| {
+            let value = half::f16::from_f32(v);
+            if value.is_finite() {
+                Ok(value.to_bits())
+            } else {
+                Err(crate::Error::InvalidArgument(
+                    "cached keys or values do not fit in FP16".into(),
+                ))
+            }
+        })
+        .collect()
+}
+
 /// A model size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Size {
@@ -97,6 +119,18 @@ impl Release {
             TaskKind::Classifier => 10,
             TaskKind::Regressor => 999,
         }
+    }
+
+    /// FP16 K/V misses the `auto` bound on regression quantile tails on both GPUs.
+    #[cfg(any(
+        feature = "cuda",
+        all(feature = "metal", target_os = "macos", target_arch = "aarch64")
+    ))]
+    fn half_kv(self, optimize: crate::Optimize) -> bool {
+        matches!(
+            (optimize, self.task),
+            (crate::Optimize::Fast, _) | (crate::Optimize::Auto, TaskKind::Classifier)
+        )
     }
 
     /// Every tensor the checkpoint holds, by name, with its dimensions.

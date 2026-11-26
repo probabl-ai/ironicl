@@ -822,8 +822,8 @@ pub(crate) mod device {
     /// each (column, member) group is contiguous. One thread per source value.
     #[kernel]
     pub fn kumo_interleave(
-        source: &[f32],
-        mut out: DisjointSlice<f32>,
+        source: &[u32],
+        mut out: DisjointSlice<u32>,
         groups: u32,
         slots: u32,
         slot: u32,
@@ -838,6 +838,22 @@ pub(crate) mod device {
         // SAFETY: `group < groups`, `slot < slots`, and `at < chunk`, which the launcher checks
         // against `out` `[groups, slots, chunk]`; each thread writes its own slot.
         unsafe { *out.get_unchecked_mut((group * slots + slot as usize) * chunk + at) = source[i] };
+    }
+
+    /// Narrow a retained prefix of a packed K/V buffer, flagging overflow or NaN.
+    #[kernel]
+    pub fn keep_half(source: &[f32], mut out: DisjointSlice<u16>, mut invalid: DisjointSlice<f32>) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if let Some(word) = out.get_mut(index) {
+            let bits = (source[i] as f16).to_bits();
+            *word = bits;
+            if bits & 0x7c00 == 0x7c00 {
+                // SAFETY: the launcher supplies one aligned FP32 flag. All concurrent writes are atomic.
+                let flag = unsafe { cuda_device::atomic::DeviceAtomicF32::from_ptr(invalid.as_mut_ptr()) };
+                flag.store(1.0, cuda_device::atomic::AtomicOrdering::Relaxed);
+            }
+        }
     }
 
     /// `out[offset + i] = source[i]` for `len` values.
