@@ -78,7 +78,12 @@ impl Device {
             queries,
             (&block.cache.keys, &block.cache.values),
             (&mut part, &mut lse, &mut out),
-            (pairs, padded, rows),
+            (
+                pairs,
+                padded,
+                rows,
+                crate::kernels::cuda::launch::padded_rows(rows),
+            ),
             1,
         )?;
         let padded_out = self.download(&out)?;

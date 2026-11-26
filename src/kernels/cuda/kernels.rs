@@ -50,8 +50,8 @@ pub(crate) mod device {
 
     use crate::kernels::cuda::ops::{
         D, attend16_f32, attention16_tc_body, block_head_body, block_tail_body, block_tail_core_f32,
-        column_block_body, e4m3, fast_body, linear16_body, load_normed_f32, max16, norm_rows,
-        pack_heads_body, product4x4, store_activation, sum16,
+        column_block_body, e4m3, fast_body, linear16_body, load_normed_f32, max16, norm_rows, pack_f16,
+        pack_heads_body, pack_lo, product4x4, sum16,
     };
 
     /// Tensor-core partial attention over FP16 keys and values, 64 queries per
@@ -227,7 +227,7 @@ pub(crate) mod device {
 
     /// `LayerNorm` over `width` values (at most 512) of each of `rows` rows (row
     /// strides `ldx`, `ldy`), epsilon 1e-5, population variance, written as
-    /// [`store_activation`] does with `format`. One warp per row; each lane loads
+    /// [`crate::kernels::cuda::ops::store_activation`] does with `format`. One warp per row; each lane loads
     /// its values once, all loads in flight together, and keeps them in
     /// registers. 256 threads per block.
     #[kernel]
@@ -572,7 +572,7 @@ pub(crate) mod device {
     /// Attention outputs `[(b * heads + j) * qp + q, 64]` back to tokens
     /// `[B * Q, heads * dim]`, times `value_scale[b * heads + j]`, the FP8
     /// values' scale per dim, unless `value_scale` is empty; written as
-    /// [`store_activation`] does with `format`.
+    /// [`crate::kernels::cuda::ops::store_activation`] does with `format`.
     #[kernel]
     pub fn heads_to_tokens(
         attended: &[f32],
@@ -587,7 +587,7 @@ pub(crate) mod device {
         dim: u32,
         format: u32,
     ) {
-        let i = thread::index_1d().get();
+        let i = thread::index_1d().get() * 4;
         let (q, heads, dim) = (queries as usize, heads as usize, dim as usize);
         if i >= ensembles as usize * q * heads * dim {
             return;
@@ -595,13 +595,29 @@ pub(crate) mod device {
         let (d, head, token) = (i % dim, (i / dim) % heads, i / (heads * dim));
         let (b, row) = (token / q, token % q);
         let pair = b * heads + head;
-        let mut value = attended[(pair * qp as usize + row) * 64 + d];
-        if !value_scale.is_empty() {
-            value *= value_scale[pair * 64 + d];
+        // SAFETY: dim is a multiple of four and at most 64. All four values are in the
+        // same head, aligned to 16 bytes in FP32 and 8 in FP16; one writer per vector.
+        unsafe {
+            let at = (pair * qp as usize + row) * 64 + d;
+            let mut v = (*attended.as_ptr().add(at).cast::<F32x4>()).0;
+            if !value_scale.is_empty() {
+                let s = (*value_scale.as_ptr().add(pair * 64 + d).cast::<F32x4>()).0;
+                #[unroll]
+                for j in 0..4 {
+                    v[j] *= s[j];
+                }
+            }
+            if format == 0 {
+                *tokens.as_mut_ptr().add(i).cast::<F32x4>() = F32x4(v);
+            } else {
+                *tokens_hi.as_mut_ptr().add(i).cast::<u64>() =
+                    u64::from(pack_f16(v[0], v[1])) | (u64::from(pack_f16(v[2], v[3])) << 32);
+                if format == 2 {
+                    *tokens_lo.as_mut_ptr().add(i).cast::<u64>() =
+                        u64::from(pack_lo(v[0], v[1])) | (u64::from(pack_lo(v[2], v[3])) << 32);
+                }
+            }
         }
-        // SAFETY: `i < B * q * heads * dim` (returned above), within the buffers `format` names,
-        // which the launcher sizes to at least `[B q, heads * dim]`; one thread per `i`.
-        unsafe { store_activation((&mut tokens, &mut tokens_hi, &mut tokens_lo), format, i, value) };
     }
 
     // ---------------------------------------------------------------------------
@@ -671,9 +687,16 @@ pub(crate) mod device {
         format: u32,
         eps: f32,
     ) {
-        norm_rows::<32, true>(
-            x, gamma, gamma, &mut y, &mut y_hi, &mut y_lo, rows, width, width, width, format, eps,
-        );
+        use crate::kernels::cuda::ops::rms_half;
+        match (format, width) {
+            (1, 128) => rms_half::<1>(x, gamma, &mut y_hi, rows, eps),
+            (1, 256) => rms_half::<2>(x, gamma, &mut y_hi, rows, eps),
+            (1, 512) => rms_half::<4>(x, gamma, &mut y_hi, rows, eps),
+            (1, 1024) => rms_half::<8>(x, gamma, &mut y_hi, rows, eps),
+            _ => norm_rows::<32, true>(
+                x, gamma, gamma, &mut y, &mut y_hi, &mut y_lo, rows, width, width, width, format, eps,
+            ),
+        }
     }
 
     /// `x[g, r, :] += vectors[r, :]` for `groups` groups of `rows` rows of
@@ -710,8 +733,8 @@ pub(crate) mod device {
             return;
         }
         let (row, pair) = ((i / 64) % padded, i / (64 * padded));
-        let scale =
-            base[(pair % heads as usize) * dim + d] * (1.0 + gates[(pair * padded + row) * dim + d].tanh());
+        let scale = base[(pair % heads as usize) * dim + d]
+            * (1.0 + cuda_device::float::tanh_approx_f32(gates[(pair * padded + row) * dim + d]));
         // SAFETY: `i < pairs * padded * 64`, the launcher's size of `q`; each thread touches
         // its own `q[i]`.
         unsafe { *q.get_unchecked_mut(i) *= scale };
@@ -721,7 +744,7 @@ pub(crate) mod device {
     // Kumo-Tabular: the cell embedding's features and the row stage's sequences.
     // ---------------------------------------------------------------------------
 
-    /// Column `column`'s cell features `out[rows, 208]` from the preprocessed
+    /// Consecutive columns starting at `column`, each `[rows, 208]`, from the preprocessed
     /// rows `x[rows, columns]`. For each grouped column `g` of 3, column
     /// `(column + 2^g - 1) % columns`: the sines and then the cosines of its
     /// value times its kind's 32 frequencies, the value replaced by the
@@ -740,11 +763,11 @@ pub(crate) mod device {
         column: u32,
     ) {
         let i = thread::index_1d().get();
-        let (rows, columns, column) = (rows as usize, columns as usize, column as usize);
-        if i >= rows * 208 {
+        let (rows, columns) = (rows as usize, columns as usize);
+        if i >= out.len() {
             return;
         }
-        let (j, row) = (i % 208, i / 208);
+        let (j, row, column) = (i % 208, (i / 208) % rows, column as usize + i / (208 * rows));
         let value = if j < 192 {
             let (g, k) = (j / 64, j % 64);
             let source = (column + (1 << g) - 1) % columns;
@@ -763,15 +786,35 @@ pub(crate) mod device {
         } else {
             0.0
         };
-        // SAFETY: `i < rows * 208`, the launcher's size of `out`; one thread per `i`.
+        // SAFETY: `i < out.len()` above; one thread per output element.
         unsafe { *out.get_unchecked_mut(i) = value };
+    }
+
+    /// Scatter this member's consecutive projected columns into the ensemble's cell tensor.
+    #[kernel]
+    pub fn kumo_store_cells(
+        source: &[f32],
+        mut cells: DisjointSlice<f32>,
+        offset: u32,
+        slots: u32,
+        chunk: u32,
+    ) {
+        let i = thread::index_1d().get();
+        if i < source.len() {
+            let chunk = chunk as usize;
+            let at = offset as usize + (i / chunk * slots as usize) * chunk + i % chunk;
+            // SAFETY: each source group owns one [rows, cell] slice of [columns, slots, rows, cell].
+            unsafe {
+                *cells.get_unchecked_mut(at) = *source.get_unchecked(i);
+            }
+        }
     }
 
     /// Rows `start..start + rows` of the row stage's sequences `[rows,
     /// tokens, width]`, `tokens` being the `readouts` readout tokens and then,
     /// unless `tokens == readout`, each column's cell: gathered from
     /// `readouts[total, readout, width]` and `cells[columns, total, width]`
-    /// (`scatter` 0), or written back to them (1). One thread per value.
+    /// (`scatter` 0), or written back to them (1). One thread per four aligned values.
     #[kernel]
     pub fn kumo_sequences(
         mut readouts: DisjointSlice<f32>,
@@ -793,22 +836,26 @@ pub(crate) mod device {
             tokens as usize,
             width as usize,
         );
-        if i >= rows * tokens * width {
+        let vectors = width / 4;
+        if i >= rows * tokens * vectors {
             return;
         }
-        let (c, token, row) = (i % width, (i / width) % tokens, i / (width * tokens));
+        let (c, token, row) = (i % vectors * 4, (i / vectors) % tokens, i / (vectors * tokens));
         let global = start as usize + row;
         // SAFETY: `row < rows`, `start + rows <= total`, `token < tokens`, and `c < width`, as the
-        // launcher asserts: the readout slot lies in `[total, readout, width]`, the cell slot in
-        // `[columns, total, width]` for column `token - readout`, and `i` in `sequences`; each
+        // launcher asserts. Width is a multiple of four and so is c, hence each aligned vector
+        // stays inside its row in readouts, cells, and sequences; each
         // thread touches its own slots, which no two threads share.
         unsafe {
             let other = if token < readout {
-                readouts.get_unchecked_mut((global * readout + token) * width + c)
+                readouts.as_mut_ptr().add((global * readout + token) * width + c)
             } else {
-                cells.get_unchecked_mut(((token - readout) * total + global) * width + c)
-            };
-            let sequence = sequences.get_unchecked_mut(i);
+                cells
+                    .as_mut_ptr()
+                    .add(((token - readout) * total + global) * width + c)
+            }
+            .cast::<F32x4>();
+            let sequence = sequences.as_mut_ptr().add(i * 4).cast::<F32x4>();
             if scatter == 0 {
                 *sequence = *other;
             } else {
@@ -838,6 +885,96 @@ pub(crate) mod device {
         // SAFETY: `group < groups`, `slot < slots`, and `at < chunk`, which the launcher checks
         // against `out` `[groups, slots, chunk]`; each thread writes its own slot.
         unsafe { *out.get_unchecked_mut((group * slots + slot as usize) * chunk + at) = source[i] };
+    }
+
+    /// Sort one member's 999 quantiles per block, in place. Map non-finite inputs to infinity
+    /// so the final validation still rejects them even when trimming would discard a member.
+    #[kernel]
+    pub fn kumo_sort_quantiles(mut raw: DisjointSlice<f32>) {
+        static mut TILE: SharedArray<f32, 1024, 16> = SharedArray::UNINIT;
+        let lane = thread::threadIdx_x() as usize;
+        let start = thread::blockIdx_x() as usize * 999;
+        // SAFETY: the grid has one 256-thread block per row. Each load/store owns its index;
+        // within each bitonic stage the 512 pairs partition the shared tile. A barrier separates
+        // every stage, including the initial loads and final stores.
+        unsafe {
+            let tile = SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(TILE));
+            for j in 0..4 {
+                let i = lane + 256 * j;
+                let v = if i < 999 {
+                    *raw.as_mut_ptr().add(start + i)
+                } else {
+                    f32::INFINITY
+                };
+                *tile.add(i) = if v.is_finite() { v } else { f32::INFINITY };
+            }
+            thread::sync_threads();
+            for level in 1..=10 {
+                for bit in (0..level).rev() {
+                    let stride = 1 << bit;
+                    for j in 0..2 {
+                        let pair = lane + 256 * j;
+                        let low = 2 * (pair & !(stride - 1)) + (pair & (stride - 1));
+                        let high = low + stride;
+                        let (a, b) = (*tile.add(low), *tile.add(high));
+                        if (low & (1 << level) == 0 && a > b) || (low & (1 << level) != 0 && a < b) {
+                            *tile.add(low) = b;
+                            *tile.add(high) = a;
+                        }
+                    }
+                    thread::sync_threads();
+                }
+            }
+            for j in 0..4 {
+                let i = lane + 256 * j;
+                if i < 999 {
+                    *raw.as_mut_ptr().add(start + i) = *tile.add(i);
+                }
+            }
+        }
+    }
+
+    /// Invert the target transform, trim a fifth from each end, and average in FP64, as on CPU.
+    #[kernel]
+    pub fn kumo_trim_quantiles(
+        raw: &[f32],
+        mut out: DisjointSlice<f32>,
+        rows: u32,
+        members: u32,
+        negative: u32,
+        mean: f64,
+        scale: f64,
+    ) {
+        let index = thread::index_1d();
+        let i = index.get();
+        if let Some(slot) = out.get_mut(index) {
+            let (row, q) = (i / 999, i % 999);
+            let mut sorted = [0.0_f64; 16];
+            for m in 0..members as usize {
+                let flipped = (negative >> m) & 1 != 0;
+                let v = raw[(m * rows as usize + row) * 999 + if flipped { 998 - q } else { q }];
+                if !v.is_finite() {
+                    *slot = f32::NAN;
+                    return;
+                }
+                let v = f64::from(if flipped { -v } else { v }) * scale + mean;
+                let mut j = m;
+                while j > 0 && sorted[j - 1] > v {
+                    sorted[j] = sorted[j - 1];
+                    j -= 1;
+                }
+                sorted[j] = v;
+            }
+            let cut = (members / 5) as usize;
+            let mut sum = 0.0;
+            for j in cut..members as usize - cut {
+                sum += sorted[j];
+            }
+            #[allow(clippy::cast_possible_truncation, reason = "The public quantiles are FP32")]
+            {
+                *slot = (sum / f64::from(members - 2 * (members / 5))) as f32;
+            }
+        }
     }
 
     /// Narrow a retained prefix of a packed K/V buffer, flagging overflow or NaN.
@@ -1302,8 +1439,46 @@ pub(crate) mod device {
         // slots alias them, untouched without `SPLIT`). The launcher's grid, block, and buffers
         // match the contract (`ldx = k`, `ldy = ldr = n`, `k` a multiple of 32).
         unsafe {
-            linear16_body::<false>(
+            linear16_body::<false, false>(
                 (a, a, bt, bt),
+                (x, x_lo, w, w_lo),
+                (b, r),
+                (&mut y, &mut y_hi, &mut y_lo),
+                (m, n, k),
+                (ldx, ldy, ldr, mode),
+            );
+        }
+    }
+
+    /// FP16 product with weights prepacked into contiguous shared-memory tiles at upload.
+    #[kernel]
+    pub fn linear16_tiled(
+        x: &[u16],
+        x_lo: &[u16],
+        w: &[u16],
+        w_lo: &[u16],
+        b: &[f32],
+        r: &[f32],
+        mut y: DisjointSlice<f32>,
+        mut y_hi: DisjointSlice<u16>,
+        mut y_lo: DisjointSlice<u16>,
+        m: u32,
+        n: u32,
+        k: u32,
+        ldx: u32,
+        ldy: u32,
+        ldr: u32,
+        mode: u32,
+    ) {
+        static mut AS: SharedArray<u32, { 3 * 64 * 16 }, 128> = SharedArray::UNINIT;
+        static mut BS: SharedArray<u32, { 3 * 64 * 16 }, 128> = SharedArray::UNINIT;
+        // SAFETY: the launcher uses one 128-thread block per 64 x 64 output tile, and `n` and `k`
+        // consist of complete 64 x 32 weight tiles. The kernel does not read the low parts.
+        unsafe {
+            let a = SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(AS));
+            let wt = SharedArray::as_raw_mut_ptr(core::ptr::addr_of_mut!(BS));
+            linear16_body::<false, true>(
+                (a, a, wt, wt),
                 (x, x_lo, w, w_lo),
                 (b, r),
                 (&mut y, &mut y_hi, &mut y_lo),
@@ -1351,7 +1526,7 @@ pub(crate) mod device {
         // block, and buffers match the contract (`ldx = k`, `ldy = ldr = n`, `k` a multiple of 32,
         // split `next` only with a split input).
         unsafe {
-            linear16_body::<true>(
+            linear16_body::<true, false>(
                 tiles,
                 (x, x_lo, w, w_lo),
                 (b, r),
@@ -1761,9 +1936,11 @@ pub(crate) mod device {
         let mut acc = [[0.0f32; 4]; 4];
         let mut max = [f32::NEG_INFINITY; 4];
         let mut total = [0.0f32; 4];
-        // The cache holds np / 64 tiles, so the last chunk can be shorter.
-        let tiles = (chunk_tiles as usize).min(np / 64 - first_tile);
-        for step in 0..2 * tiles {
+        // The cache is padded to 64 keys, but a short row or the last chunk may need
+        // only the first 32. An entirely masked step adds nothing to the softmax.
+        let remaining = n_valid as usize - first_tile * 64;
+        let steps = (2 * chunk_tiles as usize).min(remaining.div_ceil(32));
+        for step in 0..steps {
             let key0 = first_tile * 64 + step * 32;
             // The previous step is done reading K, V, and P.
             thread::sync_threads();
@@ -1772,13 +1949,17 @@ pub(crate) mod device {
                 let index = tid + i * 128;
                 let (key, c) = (index / 16, (index % 16) * 4);
                 let at = (kv * np + key0 + key) * 64 + c;
-                // SAFETY: `first_tile < np / 64` (the launcher's chunks), so `key0 + key <
-                // (first_tile + tiles) * 64 <= np` and, with `kv = bh / kv_share < pairs / kv_share`,
-                // 16 aligned bytes lie in the FP32 `[pairs / kv_share, np, 64]` caches; the shared indices stay in `KS` and `VS`,
-                // whose readers the barrier above retired.
+                // SAFETY: for a real row `key0 + key < np` and `kv < pairs / kv_share`;
+                // the 16-byte loads stay in each cache. A compact final tile supplies zeros
+                // for missing rows. Shared destinations are in KS/VS, with readers retired.
                 unsafe {
-                    *ks.add(key * 68 + c).cast::<F32x4>() = *kp.add(at).cast::<F32x4>();
-                    *vs.add(key * 64 + c).cast::<F32x4>() = *vp.add(at).cast::<F32x4>();
+                    let (k4, v4) = if key0 + key < np {
+                        (*kp.add(at).cast::<F32x4>(), *vp.add(at).cast::<F32x4>())
+                    } else {
+                        (F32x4::splat(0.0), F32x4::splat(0.0))
+                    };
+                    *ks.add(key * 68 + c).cast::<F32x4>() = k4;
+                    *vs.add(key * 64 + c).cast::<F32x4>() = v4;
                 }
             }
             thread::sync_threads();

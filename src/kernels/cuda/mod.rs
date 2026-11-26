@@ -217,19 +217,17 @@ impl Device {
         DeviceBuffer::zeroed(&self.stream, len)
     }
 
-    /// `len` zeroed elements on the device, allocated and zeroed in stream
-    /// order: unlike [`Self::zeroed`], it does not wait for the GPU, and the
-    /// buffer is freed in stream order too.
-    pub(crate) fn zeroed_async<T: DeviceCopy>(
+    /// Allocate on the kernel stream without waiting for the GPU. Drop frees in stream order.
+    ///
+    /// # Safety
+    /// Initialize every element on the same stream before reading it, including padding.
+    #[expect(unsafe_code, reason = "the caller initializes this stream-ordered allocation")]
+    pub(crate) unsafe fn scratch<T: DeviceCopy>(
         &self,
         len: usize,
     ) -> std::result::Result<DeviceBuffer<T>, DriverError> {
-        #[expect(unsafe_code, reason = "an uninitialized allocation, zeroed before any read")]
-        // SAFETY: the zeroing is enqueued on the same stream right after the allocation, so
-        // nothing reads the buffer before it is written.
-        let mut buffer = unsafe { DeviceBuffer::uninitialized_async(&self.stream, len)? };
-        buffer.zero_async(&self.stream)?;
-        Ok(buffer)
+        // SAFETY: the caller is responsible for initialization.
+        unsafe { DeviceBuffer::uninitialized_async(&self.stream, len) }
     }
 
     /// `values` copied to the device.

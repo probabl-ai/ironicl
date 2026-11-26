@@ -801,11 +801,12 @@ impl Model {
         &self,
         stack: &super::cuda::Ensemble,
         xs: &[&[f32]],
+        quantiles: Option<super::cuda::Quantiles>,
     ) -> Result<Vec<Vec<f32>>> {
         self.cuda
             .as_ref()
             .expect("a stack lives on its model's GPU")
-            .predict_ensemble(stack, xs)
+            .predict_ensemble(stack, xs, quantiles)
     }
 
     /// The stacked slots as named FP32 tensors, under the prefix next to each
