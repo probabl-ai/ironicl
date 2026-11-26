@@ -30,6 +30,36 @@ pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
+/// Atomically move `file` onto `path`. On Windows, concurrent writers replacing
+/// the same destination can transiently return `ERROR_ACCESS_DENIED` (5) or
+/// `ERROR_SHARING_VIOLATION` (32), so retry briefly unless `path` is a directory.
+pub(crate) fn persist_atomic(file: tempfile::NamedTempFile, path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        file.persist(path).map(drop).map_err(|err| err.error)
+    }
+    #[cfg(windows)]
+    {
+        const RETRIES: u32 = 20;
+        let mut current = file;
+        for attempt in 0..=RETRIES {
+            match current.persist(path) {
+                Ok(_) => return Ok(()),
+                Err(err) => {
+                    let transient = err.error.kind() == std::io::ErrorKind::PermissionDenied
+                        || err.error.raw_os_error() == Some(32);
+                    if attempt == RETRIES || !transient || path.is_dir() {
+                        return Err(err.error);
+                    }
+                    current = err.file;
+                    std::thread::sleep(std::time::Duration::from_millis(5 * u64::from(attempt + 1)));
+                }
+            }
+        }
+        unreachable!("loop returns on attempt == RETRIES")
+    }
+}
+
 /// An [`Error::Artifact`] from any displayable cause.
 pub(crate) fn artifact_error(error: impl fmt::Display) -> Error {
     Error::Artifact(error.to_string())
