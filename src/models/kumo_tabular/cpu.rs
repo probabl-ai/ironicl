@@ -365,7 +365,7 @@ impl Model {
         };
         let config = release.size.config();
         #[cfg(feature = "cuda")]
-        let cuda = super::cuda::Cuda::new(config, Self::dim(release.outputs()), &|name| {
+        let cuda = super::cuda::Cuda::new(config, Self::dim(release.outputs()), optimize, &|name| {
             artifact
                 .tensor_f32(name)
                 .map(crate::format::model::ModelTensorF32::values)

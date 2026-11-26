@@ -40,6 +40,11 @@ arithmetic on backends that support it. Otherwise they run in FP32. An explicit 
 Saving or exporting a model preserves its level, even without the KV cache. As with TabICL,
 `ironicl prepare --optimize` and `ironicl serve --optimize` rebuild a cache at a different level.
 
+On CUDA, large transformer projections and MLPs use TabICL's tensor-core kernels: `auto` uses a
+high and a low FP16 part per operand; `fast` uses just the high part. Small products, the cell
+embedding, query gates, output heads, residuals, attention, and cached keys and values stay FP32.
+The checkpoint, seed, and ensemble members do not change.
+
 ## Checkpoints
 
 NVIDIA releases a classifier and a regressor in three sizes, as FP32 PyTorch files, at revision
@@ -85,7 +90,7 @@ embeddings are saved transposed; import copies them into row-major order.
   column layer's keys and values of its inducing points, and each ICL layer's keys and values,
   in medium and large only the 2 heads query rows use. Predicting runs only the query rows.
 - `cuda.rs`: on an NVIDIA GPU, with the `cuda` feature, a member's whole forward pass runs on
-  the device in FP32 and its context stays there: the imputation means and each layer's column
+  the device and its context stays there: the imputation means and each layer's column
   and ICL keys and values. Predicting uploads only the query rows and downloads only the outputs.
   The blocks chain the kernels TabICLv2's ICL stage uses (`kernels/cuda/launch.rs`): `RMSNorm`,
   products with their bias, GELU, and residual epilogues, heads packed with `RoPE`, the per-head
@@ -165,7 +170,20 @@ uploads the weights (1.8 s):
 NVIDIA's code on the same GPU, in FP32 and in FP16, fits in 0.24 s and 0.09 s and predicts in 0.10 s
 and 0.04 s at 1,000 rows; at 5,000 rows it fits in 1.51 s and 0.42 s and predicts in 0.17 s and
 0.05 s. In FP32 the remaining gap is the matrix product, about 1.4 times slower than cuBLAS's;
-tensor cores are the follow-up for FP16.
+tensor-core products reduce that gap. In a separate warm run on the RTX 5080 (1,000 training
+rows, 20 features, four members, median of three fits and predictions):
+
+| Model | Level | Fit | Predict 1 row | Predict 500 rows | Max error vs. `safe` |
+|---|---|---:|---:|---:|---:|
+| Large classifier | `safe` | 306 ms | 7.4 ms | 109 ms | — |
+| | `auto` | 247 ms | 7.6 ms | 89 ms | 1.1e-6 |
+| | `fast` | 200 ms | 6.8 ms | 70 ms | 4.3e-4 |
+| Small regressor | `safe` | 111 ms | 4.0 ms | 55 ms | — |
+| | `auto` | 104 ms | 4.0 ms | 54 ms | 3.4e-5 |
+| | `fast` | 97 ms | 3.9 ms | 50 ms | 3.9e-3 |
+
+Errors are absolute probability differences (no label changes here), or differences across all
+999 quantiles divided by the training target's standard deviation. These timings exclude weight upload.
 
 On an Apple M1 Max, medium with 4 members on 20 features and 500 query rows, after a first fit
 that compiles the graphs (about 1.4 s), against NVIDIA's code on the GPU through PyTorch's MPS
@@ -190,4 +208,4 @@ notices. Ironicl downloads the weights from Hugging Face and never ships them. N
    Done.
 3. The regressor on the CPU, as `KumoTabularRegressor`. Done.
 4. Metal. Done, in FP32.
-5. CUDA. Done, in FP32; the tensor-core levels of `optimize` come next.
+5. CUDA. Done, with FP32 and tensor-core products.

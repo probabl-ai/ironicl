@@ -1,5 +1,5 @@
 //! Kumo-Tabular on NVIDIA GPUs: a member's whole forward pass on the device,
-//! in FP32, its context kept there.
+//! with FP32 attention and resident contexts. Large block products can use tensor cores.
 //!
 //! The weights are uploaded once. Fitting runs the training rows through every
 //! stage and keeps each column layer's inducing-point keys and values, each
@@ -30,6 +30,33 @@ use crate::{Error, Result};
 
 type Buffer = DeviceBuffer<f32>;
 type Bytes = DeviceBuffer<u8>;
+
+/// A block product's operand. Its producer writes the required representation
+/// directly: no separate rounding kernel or temporary FP32 copy.
+enum Operand {
+    F32(Buffer),
+    Half(DeviceBuffer<u16>),
+    Split(DeviceBuffer<u16>, DeviceBuffer<u16>),
+}
+
+impl Operand {
+    fn input(&self) -> Activation<'_> {
+        match self {
+            Self::F32(x) => Activation::F32(x),
+            Self::Half(hi) => Activation::Half(hi),
+            Self::Split(hi, lo) => Activation::Split { hi, lo },
+        }
+    }
+
+    fn output(&mut self) -> Output<'_> {
+        match self {
+            Self::F32(x) => Output::F32(x),
+            Self::Half(hi) => Output::Half(hi),
+            Self::Split(hi, lo) => Output::Split { hi, lo },
+        }
+    }
+}
+
 /// Per layer, each slot's keys and values, before they are stacked.
 type Layers = Vec<Vec<(Bytes, Bytes)>>;
 /// What fitting records the column keys and values with: the training rows'
@@ -192,6 +219,7 @@ pub(crate) struct Cuda {
     config: Config,
     outputs: usize,
     weights: Weights,
+    precision: Precision,
     /// Serializes operations sharing `self.device.stream()` across concurrent callers.
     stream_lock: Mutex<()>,
     /// Each block's query scale per key count, uploaded on first use: an
@@ -219,15 +247,18 @@ impl Cuda {
     pub(crate) fn new<'a>(
         config: Config,
         outputs: usize,
+        optimize: crate::Optimize,
         tensor: &dyn Fn(&str) -> &'a [f32],
     ) -> Option<Self> {
         let device = Device::new().ok().flatten()?;
-        let weights = Weights::upload(&device, &config, outputs, tensor).ok()?;
+        let precision = Precision::for_optimize(optimize);
+        let weights = Weights::upload(&device, &config, outputs, tensor, precision).ok()?;
         Some(Self {
             device,
             config,
             outputs,
             weights,
+            precision,
             stream_lock: Mutex::new(()),
             scales: Mutex::default(),
             queued: AtomicUsize::new(0),
@@ -236,9 +267,9 @@ impl Cuda {
 
     /// `len` zeros, allocated in stream order without waiting for the GPU,
     /// unless [`QUEUED_BYTES`] have been allocated since it last did.
-    fn zeros(&self, len: usize) -> Result<Buffer> {
+    fn zeros<T: DeviceCopy>(&self, len: usize) -> Result<DeviceBuffer<T>> {
         let bytes = len
-            .checked_mul(size_of::<f32>())
+            .checked_mul(size_of::<T>())
             .ok_or(Error::ArithmeticOverflow("CUDA buffer"))?;
         if self.queued.fetch_add(bytes, Ordering::Relaxed) + bytes > QUEUED_BYTES {
             self.queued.store(0, Ordering::Relaxed);
@@ -264,33 +295,78 @@ impl Cuda {
             .map_err(|_| gpu_error("keys and values do not cast to bytes"))
     }
 
-    /// `act(x wᵀ + b) (+ residual)` for `rows` rows of `depth` values, in FP32.
+    /// Block widths are multiples of 32. Small products and grids too tall
+    /// for the tensor-core kernel use the tiled FP32 fallback.
+    fn operand(&self, rows: usize, width: usize) -> Result<Operand> {
+        let len = rows * width;
+        if rows <= self.precision.tensor_rows()
+            || rows.div_ceil(64) > crate::kernels::cuda::launch::MAX_GRID_YZ
+        {
+            return Ok(Operand::F32(self.zeros(len)?));
+        }
+        match self.precision {
+            Precision::Split => Ok(Operand::Split(self.zeros(len)?, self.zeros(len)?)),
+            Precision::Half => Ok(Operand::Half(self.zeros(len)?)),
+            Precision::Fp32 => unreachable!("FP32 has no tensor-core row threshold"),
+        }
+    }
+
+    /// `act(x wᵀ + b) (+ residual)`, with an FP32 result.
     fn product(
         &self,
-        x: &Buffer,
+        x: Activation<'_>,
         dense: &Dense,
         residual: Option<&Buffer>,
         (rows, width, depth): (usize, usize, usize),
         gelu: bool,
     ) -> Result<Buffer> {
         let mut out = self.zeros(rows * width)?;
-        // `product` splits `depth` so; its partial sums need room for every split.
-        let blocks = rows.div_ceil(64) * width.div_ceil(64);
-        let wanted = (2 * self.device.multiprocessors())
-            .div_ceil(blocks)
-            .min(depth / 64)
-            .max(1);
-        let splits = depth.div_ceil(depth.div_ceil(wanted).next_multiple_of(16));
-        let mut partial = self.zeros(if splits > 1 { splits * rows * width } else { 0 })?;
-        self.device.product(
-            Activation::F32(x),
+        self.product_into(
+            x,
             dense,
             residual,
-            (Some(&mut out), None),
-            &mut partial,
+            Output::F32(&mut out),
             (rows, width, depth),
             gelu,
         )?;
+        Ok(out)
+    }
+
+    fn product_into(
+        &self,
+        x: Activation<'_>,
+        dense: &Dense,
+        residual: Option<&Buffer>,
+        out: Output<'_>,
+        (rows, width, depth): (usize, usize, usize),
+        gelu: bool,
+    ) -> Result<()> {
+        let partial = if matches!(x, Activation::F32(_)) {
+            let (_, splits) = self.device.product_splits((rows, width, depth));
+            if splits > 1 { splits * rows * width } else { 0 }
+        } else {
+            0
+        };
+        let outputs = match out {
+            Output::F32(y) => (Some(y), None),
+            next => (None, Some(next)),
+        };
+        self.device.product(
+            x,
+            dense,
+            residual,
+            outputs,
+            &mut self.zeros(partial)?,
+            (rows, width, depth),
+            gelu,
+        )
+    }
+
+    fn block_norm(&self, x: &Buffer, gamma: &Buffer, rows: usize) -> Result<Operand> {
+        let width = gamma.len();
+        let mut out = self.operand(rows, width)?;
+        self.device
+            .rms_norm(x, gamma, out.output(), (rows, width), NORM_EPS)?;
         Ok(out)
     }
 
@@ -334,10 +410,10 @@ impl Cuda {
         (groups, rows): (usize, usize),
     ) -> Result<(Buffer, Buffer)> {
         let (width, heads, dim) = (block.width, block.heads, block.dim());
-        let normed = self.rms(x, &block.key_value_norm, groups * rows)?;
+        let normed = self.block_norm(x, &block.key_value_norm, groups * rows)?;
         let shape = (groups * rows, width, width);
-        let keys = self.product(&normed, &block.key, None, shape, false)?;
-        let values = self.product(&normed, &block.value, None, shape, false)?;
+        let keys = self.product(normed.input(), &block.key, None, shape, false)?;
+        let values = self.product(normed.input(), &block.value, None, shape, false)?;
         let padded = padded_rows(rows);
         let keys = self.pack(
             &keys,
@@ -361,8 +437,8 @@ impl Cuda {
     ) -> Result<Buffer> {
         let (width, heads, dim) = (block.width, block.heads, block.dim());
         let (pairs, padded, tokens) = (groups * heads, padded_query_rows(rows), groups * rows);
-        let normed = self.rms(query, &block.query_norm, tokens)?;
-        let projected = self.product(&normed, &block.query, None, (tokens, width, width), false)?;
+        let normed = self.block_norm(query, &block.query_norm, tokens)?;
+        let projected = self.product(normed.input(), &block.query, None, (tokens, width, width), false)?;
         let base = self.query_scale(block, key_rows)?;
         let rope = block.rope.as_ref();
         let packed = if let Some((first, second)) = &block.gate {
@@ -374,8 +450,20 @@ impl Cuda {
                 (heads, dim),
                 true,
             )?;
-            let hidden = self.product(&packed, first, None, (pairs * padded, 64, HEAD_DIM), true)?;
-            let gates = self.product(&hidden, second, None, (pairs * padded, dim, 64), false)?;
+            let hidden = self.product(
+                Activation::F32(&packed),
+                first,
+                None,
+                (pairs * padded, 64, HEAD_DIM),
+                true,
+            )?;
+            let gates = self.product(
+                Activation::F32(&hidden),
+                second,
+                None,
+                (pairs * padded, dim, 64),
+                false,
+            )?;
             // SAFETY: one thread per value of `packed` `[pairs, padded, 64]`; `base` holds `[heads,
             // dim]` and `gates` `[pairs * padded, dim]`.
             let launch = unsafe {
@@ -416,18 +504,32 @@ impl Cuda {
             (pairs, padded, key_rows),
             heads / key_heads,
         )?;
-        let mut merged = self.zeros(tokens * width)?;
+        let mut merged = self.operand(tokens, width)?;
         self.device.heads_to_tokens(
             (&attended, &self.zeros(0)?),
-            Output::F32(&mut merged),
+            merged.output(),
             (groups, rows, padded),
             (heads, dim),
         )?;
-        let middle = self.product(&merged, &block.out, Some(query), (tokens, width, width), false)?;
-        let normed = self.rms(&middle, &block.mlp_norm, tokens)?;
-        let hidden = self.product(&normed, &block.mlp_in, None, (tokens, 2 * width, width), true)?;
+        let middle = self.product(
+            merged.input(),
+            &block.out,
+            Some(query),
+            (tokens, width, width),
+            false,
+        )?;
+        let normed = self.block_norm(&middle, &block.mlp_norm, tokens)?;
+        let mut hidden = self.operand(tokens, 2 * width)?;
+        self.product_into(
+            normed.input(),
+            &block.mlp_in,
+            None,
+            hidden.output(),
+            (tokens, 2 * width, width),
+            true,
+        )?;
         self.product(
-            &hidden,
+            hidden.input(),
             &block.mlp_out,
             Some(&middle),
             (tokens, width, 2 * width),
@@ -836,7 +938,13 @@ impl Cuda {
         let mut hidden = self.rms(&readouts, &self.weights.norm, total * readout)?;
         let icl = dim(config.icl_channels);
         if let Some(project) = &self.weights.row_project {
-            hidden = self.product(&hidden, project, None, (total, icl, readout * cell), false)?;
+            hidden = self.product(
+                Activation::F32(&hidden),
+                project,
+                None,
+                (total, icl, readout * cell),
+                false,
+            )?;
         }
         let key_heads = config.query_key_value_heads.map_or(dim(config.icl_heads), dim);
         for (block, (keys, values)) in self.weights.icl.iter().zip(slots.icl) {
@@ -848,9 +956,15 @@ impl Cuda {
             )?;
         }
         let normed = self.rms(&hidden, &self.weights.icl_norm, total)?;
-        let wide = self.product(&normed, &self.weights.head.0, None, (total, 2 * icl, icl), true)?;
+        let wide = self.product(
+            Activation::F32(&normed),
+            &self.weights.head.0,
+            None,
+            (total, 2 * icl, icl),
+            true,
+        )?;
         let out = self.product(
-            &wide,
+            Activation::F32(&wide),
             &self.weights.head.1,
             None,
             (total, self.outputs, 2 * icl),
@@ -931,7 +1045,7 @@ impl Cuda {
         match &self.weights.row_project {
             Some(project) => {
                 let (width, icl) = (readout * cell, dim(config.icl_channels));
-                self.product(&normed, project, None, (rows, icl, width), false)
+                self.product(Activation::F32(&normed), project, None, (rows, icl, width), false)
             }
             None => Ok(normed),
         }
@@ -975,7 +1089,7 @@ impl Cuda {
                 bits | usize::from(categorical[(column + (1 << g) - 1) % columns]) << g
             });
             let embedded = self.product(
-                &features,
+                Activation::F32(&features),
                 &self.weights.patterns[pattern],
                 None,
                 (rows, cell, FEATURES),
@@ -1079,6 +1193,7 @@ impl Weights {
         config: &Config,
         outputs: usize,
         tensor: &dyn Fn(&str) -> &'a [f32],
+        precision: Precision,
     ) -> Result<Self> {
         let up = |values: &[f32]| device.upload(values);
         let dense = |weight: &[f32], bias: &[f32]| Dense::upload_f32(device, weight, bias);
@@ -1090,7 +1205,7 @@ impl Weights {
         };
         let (cell, icl) = (dim(config.cell_channels), dim(config.icl_channels));
         let block = |prefix: &str, width: usize, heads: usize, scaling: Scaling, rope: bool| {
-            Block::upload(device, tensor, prefix, (width, heads), (scaling, rope))
+            Block::upload(device, tensor, prefix, (width, heads), (scaling, rope), precision)
         };
         let embedding = "row_embedding.cell_embedding";
         let patterns = (0..8)
@@ -1212,13 +1327,15 @@ impl Block {
         prefix: &str,
         (width, heads): (usize, usize),
         (scaling, rope): (Scaling, bool),
+        precision: Precision,
     ) -> Result<Self> {
         let up = |name: &str| device.upload(tensor(&format!("{prefix}.{name}")));
-        let linear = |name: &str| {
-            Dense::upload_f32(
+        let linear = |name: &str, precision| {
+            Dense::for_precision(
                 device,
                 tensor(&format!("{prefix}.{name}.weight")),
                 tensor(&format!("{prefix}.{name}.bias")),
+                precision,
             )
         };
         let (qkv_weight, qkv_bias) = (
@@ -1226,10 +1343,11 @@ impl Block {
             tensor(&format!("{prefix}.attn.qkv_lin.bias")),
         );
         let part = |p: usize| {
-            Dense::upload_f32(
+            Dense::for_precision(
                 device,
                 &qkv_weight[p * width * width..][..width * width],
                 &qkv_bias[p * width..][..width],
+                precision,
             )
         };
         let dim = width / heads;
@@ -1247,7 +1365,7 @@ impl Block {
             let bias = tensor(&format!("{prefix}.attn.sdpa.query_scaling.gate.0.bias"));
             Some((
                 Dense::upload_f32(device, &padded, bias)?,
-                linear("attn.sdpa.query_scaling.gate.2")?,
+                linear("attn.sdpa.query_scaling.gate.2", Precision::Fp32)?,
             ))
         } else {
             None
@@ -1260,10 +1378,10 @@ impl Block {
             query: part(0)?,
             key: part(1)?,
             value: part(2)?,
-            out: linear("attn.out_lin")?,
+            out: linear("attn.out_lin", precision)?,
             mlp_norm: up("mlp.0.weight")?,
-            mlp_in: linear("mlp.1")?,
-            mlp_out: linear("mlp.3")?,
+            mlp_in: linear("mlp.1", precision)?,
+            mlp_out: linear("mlp.3", precision)?,
             head_scale: if scaling == Scaling::None {
                 Vec::new()
             } else {
