@@ -26,6 +26,8 @@ pub(crate) fn low_part(value: f32) -> f32 {
 /// A dense layer `[n, k]`: FP32 for the CUDA cores, FP16 high and scaled low
 /// parts for the tensor cores, and its bias.
 pub(crate) struct Dense {
+    /// High part in 64-output by 32-input tiles, in the tensor-core kernel's shared-memory order.
+    tiled: bool,
     pub(crate) w: DeviceBuffer<f32>,
     pub(crate) hi: DeviceBuffer<u16>,
     pub(crate) lo: DeviceBuffer<u16>,
@@ -43,7 +45,29 @@ impl Dense {
         let mut dense = Self::upload_f32(device, w, b)?;
         if precision != Precision::Fp32 {
             let half = |v| half::f16::from_f32(v).to_bits();
-            dense.hi = device.upload(&w.iter().copied().map(half).collect::<Vec<_>>())?;
+            assert!(!b.is_empty() && !w.is_empty() && w.len().is_multiple_of(b.len()));
+            let (width, depth) = (b.len(), w.len() / b.len());
+            dense.tiled =
+                precision == Precision::Half && width.is_multiple_of(64) && depth.is_multiple_of(32);
+            let hi = if dense.tiled {
+                let mut hi = Vec::with_capacity(w.len());
+                for n in (0..width).step_by(64) {
+                    for k in (0..depth).step_by(32) {
+                        for row in 0..64 {
+                            // swizzled32 in the kernel permutes four 16-byte packets per row.
+                            // XOR is its own inverse: write the packets in destination order.
+                            for chunk in 0..4 {
+                                let at = (n + row) * depth + k + (chunk ^ ((row >> 1) & 3)) * 8;
+                                hi.extend(w[at..at + 8].iter().copied().map(half));
+                            }
+                        }
+                    }
+                }
+                hi
+            } else {
+                w.iter().copied().map(half).collect()
+            };
+            dense.hi = device.upload(&hi)?;
             if precision == Precision::Split {
                 dense.lo = device.upload(&w.iter().copied().map(low_part).map(half).collect::<Vec<_>>())?;
             }
@@ -55,6 +79,7 @@ impl Dense {
     /// tensor cores read.
     pub(crate) fn upload_f32(device: &Device, w: &[f32], b: &[f32]) -> Result<Self> {
         Ok(Self {
+            tiled: false,
             w: device.upload(w)?,
             hi: empty(device)?,
             lo: empty(device)?,
@@ -385,9 +410,17 @@ impl Device {
         let (unused_y, next_hi, next_lo, _) = unused.outputs(next);
         let y = out.unwrap_or(unused_y);
         let config = config((width.div_ceil(64), rows.div_ceil(64), 1), 128);
+        if dense.tiled {
+            assert!(
+                matches!(input, Activation::Half(_))
+                    && width == dense.b.len()
+                    && dense.hi.len() == width * depth
+            );
+        }
         let (rows, width, depth) = (n(rows), n(width), n(depth));
         let kernel = match input {
             Activation::Split { .. } => LoadedModule::linear16_split,
+            _ if dense.tiled => LoadedModule::linear16_tiled,
             _ => LoadedModule::linear16,
         };
         // SAFETY: grid (ceil(width / 64), ceil(rows / 64)) of 128 threads, as `linear16_body`
@@ -602,7 +635,7 @@ impl Device {
             &mut DeviceBuffer<f32>,
             &mut DeviceBuffer<f32>,
         ),
-        (pairs, padded_queries, rows): (usize, usize, usize),
+        (pairs, padded_queries, rows, stride): (usize, usize, usize, usize),
         kv_share: usize,
     ) -> Result<()> {
         let block_rows = icl_block_rows(precision, padded_queries);
@@ -614,26 +647,25 @@ impl Device {
             kv_share == 1 || precision != Precision::Half,
             "FP8 caches are not shared"
         );
-        let cache = pairs / kv_share * padded_rows(rows) * HEAD_DIM * value_bytes(precision);
+        assert!(stride == padded_rows(rows) || (precision == Precision::Fp32 && stride == rows));
+        let cache = pairs / kv_share * stride * HEAD_DIM * value_bytes(precision);
         let chunks = pairs * padded_queries * splits;
         assert!(
             keys.len() >= cache
                 && values.len() >= cache
-                && part.len() >= chunks * HEAD_DIM
+                && (splits == 1 || part.len() >= chunks * HEAD_DIM)
                 && lse.len() >= chunks
                 && out.len() >= pairs * padded_queries * HEAD_DIM
         );
         let blocks = pairs * splits;
-        let (qp, np, splits32) = (n(padded_queries), n(padded_rows(rows)), n(splits));
+        let (qp, np, splits32) = (n(padded_queries), n(stride), n(splits));
         let scale = 0.125 / std::f32::consts::LN_2; // 1 / sqrt(64), in the exp2 domain
         let stream = self.stream();
         let tiles = padded_queries.div_ceil(block_rows);
-        // SAFETY: grid (qp / block_rows, blocks of `pairs * splits`) of 128 threads,
-        // `block_rows` being the chosen kernel's rows per block; `qp` (`padded_query_rows`) is a
-        // multiple of it, so the unchecked query copies stay in `[pairs, qp, 64]`. The caches hold
-        // `pairs / kv_share * np * 64` values of the precision's width and `part` and `lse` hold
-        // every chunk, as asserted above (`BlockCache` and `Workspace::reserve` size them so).
-        // Chunks start below `np / 64` tiles.
+        let dest = if splits == 1 { &mut *out } else { &mut *part };
+        // SAFETY: each 128-thread block covers one query tile and key chunk. FP32 guards the
+        // last tile; tensor-core callers pad queries and keys to whole tiles. The stride and
+        // buffer checks above cover every cache read and every (pair, chunk, query) output.
         let launch = unsafe {
             match (precision, queries) {
                 (Precision::Fp32, Activation::F32(queries)) => {
@@ -647,7 +679,7 @@ impl Device {
                                 queries,
                                 keys,
                                 values,
-                                &mut *part,
+                                &mut *dest,
                                 &mut *lse,
                                 qp,
                                 np,
@@ -681,7 +713,7 @@ impl Device {
                         queries,
                         keys,
                         values,
-                        part,
+                        dest,
                         lse,
                         qp,
                         np,
@@ -701,6 +733,10 @@ impl Device {
             }
         };
         launch?;
+        // A single chunk is already normalized and in [pairs, queries, 64] order.
+        if splits == 1 {
+            return Ok(());
+        }
         let config = config(threads(pairs * padded_queries * HEAD_DIM), 256);
         // SAFETY: every access of `icl_attention_merge` is bounds-checked (its write goes through
         // `get_mut`); one thread per output value of `[pairs, qp, 64]`.
@@ -723,10 +759,18 @@ impl Device {
     ) -> Result<()> {
         let mut unused = Unused::new(self)?;
         let (y, hi, lo, format) = unused.outputs(Some(out));
-        let config = config(threads(ensembles * q * heads * dim), 256);
-        // SAFETY: one thread per token value, writing `i < ensembles * q * heads * dim` to the
-        // buffers `format` names; callers' `out` holds `[ensembles * q, heads * dim]`, `attended`
-        // `[ensembles * heads, qp, 64]`, and `value_scale` is empty or `[ensembles * heads, 64]`.
+        assert!(dim != 0 && dim <= HEAD_DIM && dim.is_multiple_of(4));
+        assert!(q <= qp && attended.len() >= ensembles * heads * qp * HEAD_DIM);
+        assert!(value_scale.is_empty() || value_scale.len() >= ensembles * heads * HEAD_DIM);
+        let len = ensembles * q * heads * dim;
+        assert!(match format {
+            0 => y.len() >= len,
+            1 => hi.len() >= len,
+            _ => hi.len() >= len && lo.len() >= len,
+        });
+        let config = config(threads(len / 4), 256);
+        // SAFETY: one thread per four aligned token values. The shape checks cover all source,
+        // optional scale, and destination vectors; unused representations are not touched.
         let launch = unsafe {
             self.kernels.heads_to_tokens(
                 self.stream(),
@@ -756,6 +800,45 @@ mod tests {
     #[expect(clippy::cast_precision_loss, reason = "Small test values")]
     fn value(i: usize, period: usize) -> f32 {
         (i % period) as f32 / period as f32 - 0.5
+    }
+
+    #[test]
+    fn tiled_half_projections_match_row_major_with_a_partial_row_tile() {
+        let Some(device) = Device::new().unwrap() else {
+            return;
+        };
+        let (rows, width, depth) = (67, 128, 96);
+        let weights = (0..width * depth).map(|i| value(i, 251)).collect::<Vec<_>>();
+        let bias = (0..width).map(|i| value(i, 37)).collect::<Vec<_>>();
+        let x = (0..rows * depth)
+            .map(|i| half::f16::from_f32(value(i, 31)).to_bits())
+            .collect::<Vec<_>>();
+        let x = device.upload(&x).unwrap();
+        let residual = device
+            .upload(&(0..rows * width).map(|i| value(i, 11)).collect::<Vec<_>>())
+            .unwrap();
+        let plain = Dense::upload(&device, &weights, &bias).unwrap();
+        let tiled = Dense::for_precision(&device, &weights, &bias, Precision::Half).unwrap();
+        assert!(!plain.tiled && tiled.tiled);
+        for gelu in [false, true] {
+            let product = |dense: &Dense| {
+                let mut out = device.zeroed(rows * width).unwrap();
+                let mut next = device.zeroed(rows * width).unwrap();
+                device
+                    .product(
+                        Activation::Half(&x),
+                        dense,
+                        (!gelu).then_some(&residual),
+                        (Some(&mut out), Some(super::Output::Half(&mut next))),
+                        &mut device.zeroed(0).unwrap(),
+                        (rows, width, depth),
+                        gelu,
+                    )
+                    .unwrap();
+                (device.download(&out).unwrap(), device.download(&next).unwrap())
+            };
+            assert_eq!(product(&plain), product(&tiled));
+        }
     }
 
     /// Products and FP32 attention past the grid's 65,535 blocks in y run in
@@ -821,7 +904,7 @@ mod tests {
                 Activation::F32(&query_buffer),
                 (&k_bytes, &v_bytes),
                 (&mut part, &mut lse, &mut attended),
-                (pairs, qp, keys),
+                (pairs, qp, keys, np),
                 1,
             )
             .unwrap();

@@ -18,9 +18,63 @@
     reason = "#[unroll] loops index register arrays in step"
 )]
 
+use cuda_device::vector::F32x4;
 use cuda_device::{DisjointSlice, device, thread, warp};
 
-use super::store_activation;
+use super::{pack_f16, store_activation};
+
+/// Dense `RMSNorm` directly to packed FP16 for tensor-core products. Each lane owns four
+/// adjacent values per vector, so both its FP32 read and its FP16 write are coalesced.
+#[allow(
+    clippy::cast_ptr_alignment,
+    reason = "Device allocations and four-value row offsets are vector aligned"
+)]
+#[device]
+pub(crate) fn rms_half<const V: usize>(
+    x: &[f32],
+    gamma: &[f32],
+    hi: &mut DisjointSlice<u16>,
+    rows: u32,
+    eps: f32,
+) {
+    let tid = thread::index_1d().get();
+    let (row, lane) = (tid / 32, tid % 32);
+    if row >= rows as usize {
+        return;
+    }
+    let mut values = [[0.0_f32; 4]; V];
+    let mut sum = 0.0;
+    #[unroll]
+    for j in 0..V {
+        let at = (row * 32 * V + 32 * j + lane) * 4;
+        // SAFETY: width is 128 * V; this aligned float4 lies inside the row.
+        values[j] = unsafe { (*x.as_ptr().add(at).cast::<F32x4>()).0 };
+        #[unroll]
+        for c in 0..4 {
+            sum += values[j][c] * values[j][c];
+        }
+    }
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "Widths at most 1024 are exactly representable"
+    )]
+    let inv = cuda_device::float::rsqrt_approx_f32(warp::reduce_sum_f32(sum) / (128 * V) as f32 + eps);
+    #[unroll]
+    for j in 0..V {
+        let col = (32 * j + lane) * 4;
+        // SAFETY: gamma and hi have width 128 * V; each aligned pack belongs to one lane.
+        unsafe {
+            let g = (*gamma.as_ptr().add(col).cast::<F32x4>()).0;
+            let mut v = values[j];
+            #[unroll]
+            for c in 0..4 {
+                v[c] = v[c] * inv * g[c];
+            }
+            *hi.as_mut_ptr().add(row * 128 * V + col).cast::<u64>() =
+                u64::from(pack_f16(v[0], v[1])) | (u64::from(pack_f16(v[2], v[3])) << 32);
+        }
+    }
+}
 
 /// A norm over `width` values (at most `32 * SLOTS`) of each of `rows` rows
 /// (row strides `ldx`, `ldy`), written as [`store_activation`] does with
@@ -65,7 +119,10 @@ pub(crate) fn norm_rows<const SLOTS: usize, const RMS: bool>(
     #[allow(clippy::cast_precision_loss, reason = "At most 32 * SLOTS")]
     let count = width as f32;
     let (mean, inverse) = if RMS {
-        (0.0, 1.0 / libm::sqrtf(warp::reduce_sum_f32(sum) / count + eps))
+        (
+            0.0,
+            1.0 / cuda_device::float::sqrt_rn_f32(warp::reduce_sum_f32(sum) / count + eps),
+        )
     } else {
         let mean = warp::reduce_sum_f32(sum) / count;
         let mut squares = 0.0f32;
@@ -78,7 +135,7 @@ pub(crate) fn norm_rows<const SLOTS: usize, const RMS: bool>(
         }
         (
             mean,
-            1.0 / libm::sqrtf(warp::reduce_sum_f32(squares) / count + eps),
+            1.0 / cuda_device::float::sqrt_rn_f32(warp::reduce_sum_f32(squares) / count + eps),
         )
     };
     #[unroll]
@@ -146,7 +203,7 @@ pub(crate) fn pack_heads_body(
         if !frequencies.is_empty() {
             #[allow(clippy::cast_precision_loss, reason = "Positions are small")]
             let angle = row as f32 * frequencies[lane];
-            let (sin, cos) = (libm::sinf(angle), libm::cosf(angle));
+            let (sin, cos) = angle.sin_cos();
             values = [
                 values[0] * cos - values[1] * sin,
                 values[1] * cos + values[0] * sin,
@@ -156,7 +213,7 @@ pub(crate) fn pack_heads_body(
     if norm != 0 {
         #[allow(clippy::cast_precision_loss, reason = "Head dims are at most 64")]
         let scale = 1.0
-            / libm::sqrtf(
+            / cuda_device::float::sqrt_rn_f32(
                 warp::reduce_sum_f32(values[0] * values[0] + values[1] * values[1]) / dim as f32 + 1e-6,
             );
         values = [values[0] * scale, values[1] * scale];

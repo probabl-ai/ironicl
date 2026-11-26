@@ -163,6 +163,15 @@ impl Block {
     fn dim(&self) -> usize {
         self.width / self.heads
     }
+
+    /// Row self-attention uses temporary FP32 keys, not a persistent tiled cache.
+    fn key_stride(&self, rows: usize) -> usize {
+        if self.gate.is_some() {
+            rows
+        } else {
+            padded_rows(rows)
+        }
+    }
 }
 
 /// The model's weights on the device.
@@ -221,6 +230,64 @@ struct Slots<'a> {
     icl: &'a [(Bytes, Bytes)],
 }
 
+/// Combine a small regression ensemble before downloading its outputs. Larger ensembles
+/// use the same trimmed mean on the host rather than spilling a per-thread sort to memory.
+#[derive(Clone, Copy)]
+pub(crate) struct Quantiles {
+    mean: f64,
+    scale: f64,
+    negative: u32,
+    members: usize,
+}
+
+impl Quantiles {
+    pub(crate) fn new((mean, scale): (f64, f64), signs: &[f64]) -> Option<Self> {
+        if signs.is_empty() || signs.len() > 16 {
+            return None;
+        }
+        let negative = signs
+            .iter()
+            .enumerate()
+            .fold(0, |bits, (i, sign)| bits | (u32::from(*sign < 0.0) << i));
+        Some(Self {
+            mean,
+            scale,
+            negative,
+            members: signs.len(),
+        })
+    }
+
+    fn reduce(self, device: &Device, mut raw: Buffer, rows: usize) -> Result<Buffer> {
+        let members = self.members;
+        assert_eq!(raw.len(), members * rows * 999);
+        // SAFETY: one 256-thread block owns each complete row of 999 values. The reduction
+        // reads those sorted rows in stream order and initializes every output. This final
+        // buffer is downloaded immediately, so it cannot accumulate as queued workspace.
+        unsafe {
+            device
+                .kernels
+                .kumo_sort_quantiles(device.stream(), config((members * rows, 1, 1), 256), &mut raw)
+                .map_err(gpu_error)?;
+            let mut out = device.scratch(rows * 999).map_err(device_error)?;
+            device
+                .kernels
+                .kumo_trim_quantiles(
+                    device.stream(),
+                    config(threads(rows * 999), 256),
+                    &raw,
+                    &mut out,
+                    n(rows),
+                    n(members),
+                    self.negative,
+                    self.mean,
+                    self.scale,
+                )
+                .map_err(gpu_error)?;
+            Ok(out)
+        }
+    }
+}
+
 impl Context {
     fn slots(&self) -> Slots<'_> {
         Slots {
@@ -262,7 +329,8 @@ pub(crate) struct Cuda {
     /// Each block's query scale per key count, uploaded on first use: an
     /// upload waits for the GPU.
     scales: Mutex<HashMap<(usize, usize), Arc<Buffer>>>,
-    /// Bytes allocated since the last wait for the GPU.
+    /// Every half-budget, wait for the previous interval rather than draining the whole stream.
+    fence: cuda_core::Event,
     queued: AtomicUsize,
 }
 
@@ -290,8 +358,10 @@ impl Cuda {
         let (config, outputs) = (release.size.config(), dim(release.outputs()));
         let precision = Precision::for_optimize(optimize);
         let weights = Weights::upload(&device, &config, outputs, tensor, precision).ok()?;
+        let fence = device.stream().record_event(None).ok()?;
         Some(Self {
             device,
+            fence,
             config,
             outputs,
             weights,
@@ -307,17 +377,34 @@ impl Cuda {
         })
     }
 
-    /// `len` zeros, allocated in stream order without waiting for the GPU,
-    /// unless [`QUEUED_BYTES`] have been allocated since it last did.
-    fn zeros<T: DeviceCopy>(&self, len: usize) -> Result<DeviceBuffer<T>> {
+    /// Stream-ordered workspace, bounded by [`QUEUED_BYTES`].
+    ///
+    /// # Safety
+    /// Write every element on the kernel stream before reading it.
+    unsafe fn scratch<T: DeviceCopy>(&self, len: usize) -> Result<DeviceBuffer<T>> {
         let bytes = len
             .checked_mul(size_of::<T>())
             .ok_or(Error::ArithmeticOverflow("CUDA buffer"))?;
-        if self.queued.fetch_add(bytes, Ordering::Relaxed) + bytes > QUEUED_BYTES {
-            self.queued.store(0, Ordering::Relaxed);
-            self.device.stream().synchronize().map_err(gpu_error)?;
+        if self.queued.fetch_add(bytes, Ordering::Relaxed) + bytes > QUEUED_BYTES / 2 {
+            self.queued.store(bytes, Ordering::Relaxed);
+            // All callers hold stream_lock. Small allocations can queue two half-budgets;
+            // before a large allocation, drain earlier work as for the original full-budget fence.
+            if bytes >= QUEUED_BYTES / 2 {
+                self.device.stream().synchronize().map_err(gpu_error)?;
+            } else {
+                self.fence.synchronize().map_err(gpu_error)?;
+            }
+            self.fence.record(self.device.stream()).map_err(gpu_error)?;
         }
-        self.device.zeroed_async(len).map_err(device_error)
+        // SAFETY: the caller initializes the buffer.
+        unsafe { self.device.scratch(len) }.map_err(device_error)
+    }
+
+    fn zeros<T: DeviceCopy>(&self, len: usize) -> Result<DeviceBuffer<T>> {
+        // SAFETY: the memset initializes the whole allocation on the same stream.
+        let mut out = unsafe { self.scratch(len)? };
+        out.zero_async(self.device.stream()).map_err(device_error)?;
+        Ok(out)
     }
 
     fn upload<T: DeviceCopy>(&self, values: &[T]) -> Result<DeviceBuffer<T>> {
@@ -339,16 +426,22 @@ impl Cuda {
 
     /// Block widths are multiples of 32. Small products and grids too tall
     /// for the tensor-core kernel use the tiled FP32 fallback.
-    fn operand(&self, rows: usize, width: usize) -> Result<Operand> {
+    ///
+    /// # Safety
+    /// Fill the operand with a norm, product, or heads-to-tokens launch before using it as input.
+    unsafe fn operand(&self, rows: usize, width: usize) -> Result<Operand> {
         let len = rows * width;
         if rows <= self.precision.tensor_rows()
             || rows.div_ceil(64) > crate::kernels::cuda::launch::MAX_GRID_YZ
         {
-            return Ok(Operand::F32(self.zeros(len)?));
+            // SAFETY: the caller initializes all rows.
+            return Ok(Operand::F32(unsafe { self.scratch(len)? }));
         }
         match self.precision {
-            Precision::Split => Ok(Operand::Split(self.zeros(len)?, self.zeros(len)?)),
-            Precision::Half => Ok(Operand::Half(self.zeros(len)?)),
+            // SAFETY: the caller initializes both split parts, or the single high part.
+            Precision::Split => unsafe { Ok(Operand::Split(self.scratch(len)?, self.scratch(len)?)) },
+            // SAFETY: as above.
+            Precision::Half => Ok(Operand::Half(unsafe { self.scratch(len)? })),
             Precision::Fp32 => unreachable!("FP32 has no tensor-core row threshold"),
         }
     }
@@ -362,7 +455,8 @@ impl Cuda {
         (rows, width, depth): (usize, usize, usize),
         gelu: bool,
     ) -> Result<Buffer> {
-        let mut out = self.zeros(rows * width)?;
+        // SAFETY: the product (or split-K reduction) writes every cell of the dense result.
+        let mut out = unsafe { self.scratch(rows * width)? };
         self.product_into(
             x,
             dense,
@@ -398,7 +492,8 @@ impl Cuda {
             dense,
             residual,
             outputs,
-            &mut self.zeros(partial)?,
+            // SAFETY: split-K writes all partials before the reduction; other paths use none.
+            &mut unsafe { self.scratch(partial)? },
             (rows, width, depth),
             gelu,
         )
@@ -406,7 +501,8 @@ impl Cuda {
 
     fn block_norm(&self, x: &Buffer, gamma: &Buffer, rows: usize) -> Result<Operand> {
         let width = gamma.len();
-        let mut out = self.operand(rows, width)?;
+        // SAFETY: rms_norm fills every value of the chosen representation.
+        let mut out = unsafe { self.operand(rows, width)? };
         self.device
             .rms_norm(x, gamma, out.output(), (rows, width), NORM_EPS)?;
         Ok(out)
@@ -414,7 +510,8 @@ impl Cuda {
 
     fn rms(&self, x: &Buffer, gamma: &Buffer, rows: usize) -> Result<Buffer> {
         let width = gamma.len();
-        let mut out = self.zeros(rows * width)?;
+        // SAFETY: rms_norm writes the full dense output.
+        let mut out = unsafe { self.scratch(rows * width)? };
         self.device
             .rms_norm(x, gamma, Output::F32(&mut out), (rows, width), NORM_EPS)?;
         Ok(out)
@@ -430,7 +527,13 @@ impl Cuda {
         (heads, dim): (usize, usize),
         norm: bool,
     ) -> Result<Buffer> {
-        let mut out = self.zeros(sequences * heads * padded * HEAD_DIM)?;
+        let size = sequences * heads * padded * HEAD_DIM;
+        let mut out = if len == padded {
+            // SAFETY: pack_heads fills all 64 lanes, including narrow heads' zero dimensions.
+            unsafe { self.scratch(size)? }
+        } else {
+            self.zeros(size)?
+        };
         self.pack_into(
             x,
             (base, rope),
@@ -475,7 +578,7 @@ impl Cuda {
         let shape = (groups * rows, width, width);
         let keys = self.product(normed.input(), &block.key, None, shape, false)?;
         let values = self.product(normed.input(), &block.value, None, shape, false)?;
-        let padded = padded_rows(rows);
+        let padded = block.key_stride(rows);
         let keys = self.pack(
             &keys,
             (None, block.rope.as_ref()),
@@ -499,17 +602,53 @@ impl Cuda {
         self.forward_at(block, query, shape, kv, Precision::Fp32)
     }
 
+    /// Training attends to every head, not just the prefix kept for prediction. At `fast`,
+    /// run those long ungated products on tensor cores too; `keep` checks both conversions.
+    fn training_block(
+        &self,
+        block: &Block,
+        query: &Buffer,
+        shape: (usize, usize),
+        kv: (Buffer, Buffer),
+        key_rows: usize,
+        invalid: &mut Buffer,
+    ) -> Result<Buffer> {
+        let pairs = shape.0 * block.heads;
+        let (_, splits) =
+            self.device
+                .icl_split(Precision::Split, pairs, padded_query_rows(shape.1), key_rows);
+        let (keys, values, precision) = if self.precision == Precision::Half
+            && pairs * splits <= crate::kernels::cuda::launch::MAX_GRID_YZ
+        {
+            let mut narrow = |full: Buffer| {
+                // SAFETY: keep_half writes the entire converted buffer and checks for overflow.
+                let half = CacheSlot::Half(unsafe { self.scratch(full.len())? });
+                half.keep(&self.device, &full, invalid)
+            };
+            (narrow(kv.0)?, narrow(kv.1)?, Precision::Split)
+        } else {
+            (Self::bytes(kv.0)?, Self::bytes(kv.1)?, Precision::Fp32)
+        };
+        self.forward_at(
+            block,
+            query,
+            shape,
+            (&keys, &values, block.heads, key_rows),
+            precision,
+        )
+    }
+
     /// Project, normalize, and scale the queries directly into the attention kernel's layout.
     fn packed_query(
         &self,
         block: &Block,
         query: &Buffer,
-        (groups, rows): (usize, usize),
+        (groups, rows, padded): (usize, usize, usize),
         key_rows: usize,
         cache: Precision,
     ) -> Result<Operand> {
         let (width, heads, dim) = (block.width, block.heads, block.dim());
-        let (pairs, padded, tokens) = (groups * heads, padded_query_rows(rows), groups * rows);
+        let (pairs, tokens) = (groups * heads, groups * rows);
         let normed = self.block_norm(query, &block.query_norm, tokens)?;
         let projected = self.product(normed.input(), &block.query, None, (tokens, width, width), false)?;
         let base = self.query_scale(block, key_rows)?;
@@ -582,23 +721,39 @@ impl Cuda {
         cache: Precision,
     ) -> Result<Buffer> {
         let (width, heads, dim) = (block.width, block.heads, block.dim());
-        let (pairs, padded, tokens) = (groups * heads, padded_query_rows(rows), groups * rows);
-        let packed = self.packed_query(block, query, (groups, rows), key_rows, cache)?;
+        // The FP32 kernel masks the final query tile itself. In particular, the row gate
+        // should project real tokens, not 64 rows for each short feature sequence.
+        let padded = if cache == Precision::Fp32 {
+            rows
+        } else {
+            padded_query_rows(rows)
+        };
+        let (pairs, tokens) = (groups * heads, groups * rows);
+        let packed = self.packed_query(block, query, (groups, rows, padded), key_rows, cache)?;
         let (_, splits) = self.device.icl_split(cache, pairs, padded, key_rows);
-        let (mut part, mut lse) = (
-            self.zeros(pairs * padded * splits * HEAD_DIM)?,
-            self.zeros(pairs * padded * splits)?,
-        );
-        let mut attended = self.zeros(pairs * padded * HEAD_DIM)?;
+        // SAFETY: each attention block writes its full tile of partials and log-sum-exps;
+        // the merge then writes every padded output row.
+        let (mut part, mut lse, mut attended) = unsafe {
+            (
+                self.scratch(if splits > 1 {
+                    pairs * padded * splits * HEAD_DIM
+                } else {
+                    0
+                })?,
+                self.scratch(pairs * padded * splits)?,
+                self.scratch(pairs * padded * HEAD_DIM)?,
+            )
+        };
         self.device.attend_icl(
             cache,
             packed.input(),
             (keys, values),
             (&mut part, &mut lse, &mut attended),
-            (pairs, padded, key_rows),
+            (pairs, padded, key_rows, block.key_stride(key_rows)),
             heads / key_heads,
         )?;
-        let mut merged = self.operand(tokens, width)?;
+        // SAFETY: heads_to_tokens writes all unpadded tokens, including both parts for Split.
+        let mut merged = unsafe { self.operand(tokens, width)? };
         self.device.heads_to_tokens(
             (&attended, &self.zeros(0)?),
             merged.output(),
@@ -613,7 +768,8 @@ impl Cuda {
             false,
         )?;
         let normed = self.block_norm(&middle, &block.mlp_norm, tokens)?;
-        let mut hidden = self.operand(tokens, 2 * width)?;
+        // SAFETY: product_into writes all tokens of the MLP expansion.
+        let mut hidden = unsafe { self.operand(tokens, 2 * width)? };
         self.product_into(
             normed.input(),
             &block.mlp_in,
@@ -989,8 +1145,8 @@ impl Cuda {
                 slot().keep(&self.device, &values, &mut invalid)?,
             );
             if layer + 1 < self.weights.icl.len() {
-                let (keys, values) = (Self::bytes(keys)?, Self::bytes(values)?);
-                hidden = self.forward(block, &hidden, (1, rows), (&keys, &values, block.heads, rows))?;
+                hidden =
+                    self.training_block(block, &hidden, (1, rows), (keys, values), rows, &mut invalid)?;
             }
             context.icl.push(kept);
         }
@@ -1003,17 +1159,27 @@ impl Cuda {
     /// The outputs of each of the `[rows, columns]` query rows `x`.
     pub(crate) fn predict(&self, context: &Context, x: &[f32]) -> Result<Vec<f32>> {
         let _guard = self.stream_lock.lock().unwrap_or_else(PoisonError::into_inner);
-        Ok(self.predict_slots(&context.slots(), &[x])?.remove(0))
+        Ok(self.predict_slots(&context.slots(), &[x], None)?.remove(0))
     }
 
     /// Each slot's outputs of its `[rows, columns]` query rows `xs[slot]`, all
     /// slots in one pass, a chunk of rows at a time.
-    pub(crate) fn predict_ensemble(&self, ensemble: &Ensemble, xs: &[&[f32]]) -> Result<Vec<Vec<f32>>> {
+    pub(crate) fn predict_ensemble(
+        &self,
+        ensemble: &Ensemble,
+        xs: &[&[f32]],
+        quantiles: Option<Quantiles>,
+    ) -> Result<Vec<Vec<f32>>> {
         let _guard = self.stream_lock.lock().unwrap_or_else(PoisonError::into_inner);
-        self.predict_slots(&ensemble.slots(), xs)
+        self.predict_slots(&ensemble.slots(), xs, quantiles)
     }
 
-    fn predict_slots(&self, slots: &Slots<'_>, xs: &[&[f32]]) -> Result<Vec<Vec<f32>>> {
+    fn predict_slots(
+        &self,
+        slots: &Slots<'_>,
+        xs: &[&[f32]],
+        quantiles: Option<Quantiles>,
+    ) -> Result<Vec<Vec<f32>>> {
         let columns = slots.inputs[0].2.len();
         let rows = xs[0].len() / columns;
         if xs.len() != slots.inputs.len() || xs.iter().any(|x| x.len() != rows * columns) {
@@ -1022,15 +1188,24 @@ impl Cuda {
             ));
         }
         let step = (PASS_ROWS / xs.len()).clamp(1, rows.max(1));
-        let mut out: Vec<Vec<f32>> = vec![Vec::with_capacity(rows * self.outputs); xs.len()];
+        let outputs = if quantiles.is_some() { 1 } else { xs.len() };
+        let mut out: Vec<Vec<f32>> = (0..outputs)
+            .map(|_| Vec::with_capacity(rows * self.outputs))
+            .collect();
         for start in (0..rows).step_by(step) {
             let count = step.min(rows - start);
             let chunk: Vec<&[f32]> = xs
                 .iter()
                 .map(|x| &x[start * columns..][..count * columns])
                 .collect();
-            for (all, part) in out.iter_mut().zip(self.pass(slots, &chunk)?) {
-                all.extend(part);
+            let raw = self.pass(slots, &chunk)?;
+            let result = match quantiles {
+                Some(q) => q.reduce(&self.device, raw, count)?,
+                None => raw,
+            };
+            let host = self.device.download(&result)?;
+            for (all, part) in out.iter_mut().zip(host.chunks_exact(count * self.outputs)) {
+                all.extend_from_slice(part);
             }
         }
         if out.iter().any(|slot| slot.iter().any(|value| !value.is_finite())) {
@@ -1042,7 +1217,7 @@ impl Cuda {
     /// One pass over every slot's `[rows, columns]` query rows `xs[slot]`:
     /// products, norms, and attention run on all slots' rows at once, each
     /// slot attending to its own keys and values.
-    fn pass(&self, slots: &Slots<'_>, xs: &[&[f32]]) -> Result<Vec<Vec<f32>>> {
+    fn pass(&self, slots: &Slots<'_>, xs: &[&[f32]]) -> Result<Buffer> {
         let config = self.config;
         let (count, columns) = (xs.len(), slots.inputs[0].2.len());
         let rows = xs[0].len() / columns;
@@ -1093,27 +1268,33 @@ impl Cuda {
                 self.cache_precision,
             )?;
         }
-        let normed = self.rms(&hidden, &self.weights.icl_norm, total)?;
-        let wide = self.product(
-            Activation::F32(&normed),
+        let normed = if self.precision == Precision::Half {
+            self.block_norm(&hidden, &self.weights.icl_norm, total)?
+        } else {
+            Operand::F32(self.rms(&hidden, &self.weights.icl_norm, total)?)
+        };
+        // SAFETY: the first head projection fills its entire output in the input's format.
+        let mut wide = unsafe {
+            match normed {
+                Operand::F32(_) => Operand::F32(self.scratch(total * 2 * icl)?),
+                _ => self.operand(total, 2 * icl)?,
+            }
+        };
+        self.product_into(
+            normed.input(),
             &self.weights.head.0,
             None,
+            wide.output(),
             (total, 2 * icl, icl),
             true,
         )?;
-        let out = self.product(
-            Activation::F32(&wide),
+        self.product(
+            wide.input(),
             &self.weights.head.1,
             None,
             (total, self.outputs, 2 * icl),
             false,
-        )?;
-        Ok(self
-            .device
-            .download(&out)?
-            .chunks(rows * self.outputs)
-            .map(<[f32]>::to_vec)
-            .collect())
+        )
     }
 
     fn add_rows(&self, x: &mut Buffer, vectors: &Buffer, (rows, width): (usize, usize)) -> Result<()> {
@@ -1161,21 +1342,23 @@ impl Cuda {
                 (points * cell, columns * points * cell),
             )?;
             let (keys, values) = self.key_value(inducing, &cells, (columns, rows))?;
-            let (keys, values) = (Self::bytes(keys)?, Self::bytes(values)?);
-            let summaries = self.forward(
+            let summaries = self.training_block(
                 inducing,
                 &queries,
                 (columns, points),
-                (&keys, &values, inducing.heads, rows),
+                (keys, values),
+                rows,
+                recording.invalid,
             )?;
             let (keys, values) = self.key_value(output, &summaries, (columns, points))?;
             recording.record(&self.device, &keys, &values)?;
-            let (keys, values) = (Self::bytes(keys)?, Self::bytes(values)?);
-            cells = self.forward(
+            cells = self.training_block(
                 output,
                 &cells,
                 (columns, rows),
-                (&keys, &values, output.heads, points),
+                (keys, values),
+                points,
+                recording.invalid,
             )?;
             self.row_stage(layer, &mut readouts, &mut cells, (rows, columns))?;
         }
@@ -1203,14 +1386,34 @@ impl Cuda {
         let rows = x.len() / columns;
         let cell = dim(self.config.cell_channels);
         let x = self.upload(x)?;
-        let mut features = self.zeros(rows * FEATURES)?;
-        for column in 0..columns {
-            // SAFETY: one thread per value of `features` `[rows, FEATURES]`; `x` holds `[rows,
-            // columns]`, `means` and `kinds` `columns`, and the frequency tables `3 * 32`.
+        let pattern = |column| {
+            (0..3).fold(0, |bits, g| {
+                bits | usize::from(categorical[(column + (1 << g) - 1) % columns]) << g
+            })
+        };
+        // Adjacent columns with the same kinds use the same projection. Bound each feature
+        // workspace to 4 MiB (or one column for taller training tables).
+        let limit = if self.precision == Precision::Half {
+            ((1 << 20) / (rows * FEATURES)).max(1)
+        } else {
+            1
+        };
+        let mut column = 0;
+        while column < columns {
+            let kind = pattern(column);
+            let group = 1
+                + ((column + 1)..columns.min(column + limit))
+                    .take_while(|&c| pattern(c) == kind)
+                    .count();
+            let tokens = group * rows;
+            // SAFETY: the feature kernel initializes every element of this group.
+            let mut features = unsafe { self.scratch(tokens * FEATURES)? };
+            // SAFETY: one thread per value of [group, rows, FEATURES]; column + group <= columns;
+            // x holds [rows, columns], means and kinds hold columns, and each frequency table 3 * 32.
             let launch = unsafe {
                 self.device.kernels.kumo_cell_features(
                     self.device.stream(),
-                    config(threads(rows * FEATURES), 256),
+                    config(threads(tokens * FEATURES), 256),
                     &x,
                     means,
                     kinds,
@@ -1223,21 +1426,30 @@ impl Cuda {
                 )
             };
             launch.map_err(gpu_error)?;
-            let pattern = (0..3).fold(0, |bits, g| {
-                bits | usize::from(categorical[(column + (1 << g) - 1) % columns]) << g
-            });
             let embedded = self.product(
                 Activation::F32(&features),
-                &self.weights.patterns[pattern],
+                &self.weights.patterns[kind],
                 None,
-                (rows, cell, FEATURES),
+                (tokens, cell, FEATURES),
                 false,
             )?;
-            self.device.copy_into(
-                &embedded,
-                cells,
-                ((column * slots + slot) * rows * cell, rows * cell),
-            )?;
+            let chunk = rows * cell;
+            let offset = (column * slots + slot) * chunk;
+            assert!(offset + ((group - 1) * slots + 1) * chunk <= cells.len());
+            // SAFETY: the checked destination covers the final strided column and all prior ones.
+            unsafe {
+                self.device.kernels.kumo_store_cells(
+                    self.device.stream(),
+                    config(threads(embedded.len()), 256),
+                    &embedded,
+                    &mut *cells,
+                    n(offset),
+                    n(slots),
+                    n(chunk),
+                )
+            }
+            .map_err(gpu_error)?;
+            column += group;
         }
         Ok(())
     }
@@ -1299,15 +1511,15 @@ impl Cuda {
         scatter: bool,
     ) -> Result<()> {
         let (cell, readout) = (dim(self.config.cell_channels), dim(self.config.readout_tokens));
-        assert!(start + count <= rows && sequences.len() >= count * tokens * cell);
+        assert!(cell.is_multiple_of(4) && start + count <= rows && sequences.len() >= count * tokens * cell);
         assert!(readouts.len() >= rows * readout * cell && cells.len() >= (tokens - readout) * rows * cell);
-        // SAFETY: one thread per value of `sequences` `[count, tokens, cell]`; `readouts` holds
+        // SAFETY: one thread copies four aligned values of `sequences` `[count, tokens, cell]`; `readouts` holds
         // `[rows, readout, cell]` and `cells` `[tokens - readout, rows, cell]` (`tokens == readout`
         // reads no cell), and `start + count <= rows`, all asserted.
         let launch = unsafe {
             self.device.kernels.kumo_sequences(
                 self.device.stream(),
-                config(threads(count * tokens * cell), 256),
+                config(threads(count * tokens * (cell / 4)), 256),
                 readouts,
                 cells,
                 sequences,
@@ -1334,7 +1546,18 @@ impl Weights {
         precision: Precision,
     ) -> Result<Self> {
         let up = |values: &[f32]| device.upload(values);
-        let dense = |weight: &[f32], bias: &[f32]| Dense::upload_f32(device, weight, bias);
+        let dense = |weight: &[f32], bias: &[f32]| {
+            Dense::for_precision(
+                device,
+                weight,
+                bias,
+                if precision == Precision::Half {
+                    precision
+                } else {
+                    Precision::Fp32
+                },
+            )
+        };
         let linear = |prefix: &str| {
             dense(
                 tensor(&format!("{prefix}.weight")),
@@ -1550,6 +1773,48 @@ impl Block {
 #[cfg(test)]
 mod tests {
     use super::{CacheSlot, Device};
+
+    #[test]
+    fn device_quantiles_sort_flip_trim_and_reject_invalid_members() {
+        let Some(device) = Device::new().unwrap() else {
+            return;
+        };
+        let signs: Vec<_> = (0..16).map(|m| if m % 2 == 0 { -1.0 } else { 1.0 }).collect();
+        assert!(super::Quantiles::new((0.0, 1.0), &[1.0; 17]).is_none());
+        for members in [1, 4, 5, 16] {
+            let (mean, scale) = (9.0, 2.5);
+            let q = super::Quantiles::new((mean, scale), &signs[..members]).unwrap();
+            let mut raw = Vec::new();
+            for (m, sign) in signs[..members].iter().enumerate() {
+                for row in 0..2 {
+                    for j in 0..999 {
+                        // Multiplication by 17 permutes the 999 ranks. After flipping, the
+                        // members' rows differ only by a known increasing member offset.
+                        let v = i16::try_from((j * 17) % 999 + row * 1000 + m * m).unwrap();
+                        raw.push(if *sign < 0.0 { -f32::from(v) } else { f32::from(v) });
+                    }
+                }
+            }
+            let reduce = |raw: &[f32]| {
+                device
+                    .download(&q.reduce(&device, device.upload(raw).unwrap(), 2).unwrap())
+                    .unwrap()
+            };
+            let values = reduce(&raw);
+            let cut = members / 5;
+            let kept = cut..members - cut;
+            let offset = f64::from(u32::try_from(kept.clone().map(|m| m * m).sum::<usize>()).unwrap())
+                / f64::from(u32::try_from(kept.len()).unwrap());
+            for (i, &v) in values.iter().enumerate() {
+                let rank = u16::try_from(i / 999 * 1000 + i % 999).unwrap();
+                #[expect(clippy::cast_possible_truncation, reason = "The head returns FP32")]
+                let expected = ((f64::from(rank) + offset) * scale + mean) as f32;
+                assert_eq!(v, expected);
+            }
+            raw[42] = f32::NAN;
+            assert!(reduce(&raw).iter().any(|v| v.is_nan()));
+        }
+    }
 
     #[test]
     fn narrowing_checks_only_retained_heads_and_reports_overflow() {

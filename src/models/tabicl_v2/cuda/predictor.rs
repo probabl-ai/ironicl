@@ -549,7 +549,12 @@ impl Stages<'_> {
             },
             (cache.keys, cache.values),
             (work.part.get_mut(), work.lse.get_mut(), work.attention.get_mut()),
-            (pairs, padded, rows),
+            (
+                pairs,
+                padded,
+                rows,
+                crate::kernels::cuda::launch::padded_rows(rows),
+            ),
             1,
         )?;
         let attended = self.output(tensor, &mut work.a, &mut work.attended);

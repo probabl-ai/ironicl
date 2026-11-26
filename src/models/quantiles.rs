@@ -117,6 +117,15 @@ pub(crate) fn summarize_range(
             "quantile row slice is out of range".into(),
         ));
     }
+    // For a single distribution, raw quantiles need neither FP64 averaging nor tail fits.
+    // In particular, Kumo has already sorted and reduced its members on the device.
+    if b == 1 && outputs == [RegressionOutput::RawQuantiles] {
+        let mut values = decoded.values()[rows.start * k..rows.end * k].to_vec();
+        for row in values.chunks_exact_mut(k) {
+            row.sort_unstable_by(f32::total_cmp);
+        }
+        return Ok(vec![(values, k)]);
+    }
     let count = rows.len();
     let levels = levels(k);
     let mut sums: Vec<Vec<f64>> = outputs
@@ -134,7 +143,7 @@ pub(crate) fn summarize_range(
             let start = (ensemble * q + row) * k;
             sorted.copy_from_slice(&decoded.values()[start..start + k]);
             sorted.sort_unstable_by(f32::total_cmp);
-            let distribution = Distribution::new(&sorted, &levels);
+            let distribution = std::cell::LazyCell::new(|| Distribution::new(&sorted, &levels));
             for (output, sums) in outputs.iter().zip(&mut sums) {
                 let columns = output.columns(k);
                 let sums = &mut sums[local * columns..][..columns];

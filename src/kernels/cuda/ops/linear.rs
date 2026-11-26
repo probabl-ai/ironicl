@@ -26,7 +26,7 @@
 
 use cuda_device::async_copy::{cp_async_cg_16, cp_async_commit_group, cp_async_wait_group};
 use cuda_device::convert::cvt_f32x2_f16x2;
-use cuda_device::vector::F32x4;
+use cuda_device::vector::{F32x2, F32x4};
 use cuda_device::wmma::{ldmatrix_x4, mma_m16n8k16_f16_f16, mma_m16n8k16_f32_f16};
 use cuda_device::{DisjointSlice, device, thread, warp};
 
@@ -258,7 +258,8 @@ pub(crate) unsafe fn load_normed<const SPLIT: bool>(
 /// stages too, so the warps rarely wait on shared memory. Every per-thread
 /// pointer and offset is computed once.
 ///
-/// `x` is `[m, ldx]` and `w` `[n, k]`. With `SPLIT`, both also carry a low
+/// `x` is `[m, ldx]`. `w` is `[n, k]` in row order, or (with `TILED`) in 64 x 32 tiles
+/// laid out as the shared operand. With `SPLIT`, both operands also carry a low
 /// FP16 part (`x_lo`, `w_lo`, scaled by [`LO_SCALE`]) and each product is
 /// `hi·hi + (hi·lo + lo·hi) / LO_SCALE`, close to FP32, the corrections
 /// accumulating in FP16 per K step ([`add_correction`]). `mode` bit 1 applies
@@ -276,9 +277,10 @@ pub(crate) unsafe fn load_normed<const SPLIT: bool>(
 /// `3 * 64 * 16` u32 that nothing else touches. `x` (`x_lo`) holds `[m, ldx = k]` and `w` (`w_lo`)
 /// `[n, k]`, 16-byte aligned with `k` a multiple of 32; `b` holds `n`. With `mode & 2` `r` holds
 /// `[m, ldr]`, with `mode & 4` `y`, and with `mode & 8` `y_hi` (`y_lo` with `SPLIT`), `[m, ldy]`,
-/// with `n <= ldr, ldy`.
+/// with `n <= ldr, ldy`. `TILED` requires `!SPLIT`, complete 64-column tiles, and dense
+/// output and residual rows (`ldy = ldr = n`) for the aligned pair loads and stores.
 #[device]
-pub(crate) unsafe fn linear16_body<const SPLIT: bool>(
+pub(crate) unsafe fn linear16_body<const SPLIT: bool, const TILED: bool>(
     (a_hi, a_lo, b_hi, b_lo): (*mut u32, *mut u32, *mut u32, *mut u32),
     (x, x_lo, w, w_lo): (&[u16], &[u16], &[u16], &[u16]),
     (b, r): (&[f32], &[f32]),
@@ -321,14 +323,24 @@ pub(crate) unsafe fn linear16_body<const SPLIT: bool>(
     // and `step < k / 32`, so each 16 bytes lie in `x` `[m, ldx = k]`, `w` `[n, k]`, and with
     // `SPLIT` their low parts; `k` a multiple of 32 keeps them 16-byte aligned. `stage * STAGE +
     // swizzled32(row < 64, chunk < 4) + 4 <= 3 * STAGE`, the contract's tile size. A stage is
-    // overwritten only after the barrier that follows its last `ldmatrix`.
+    // overwritten only after the barrier that follows its last `ldmatrix`. For TILED, packet
+    // 0..256 copies one complete 2048-half weight tile to the identical shared layout.
     let load = |step: usize, stage: usize| unsafe {
         #[unroll]
         for j in 0..2 {
             let at = stage * STAGE + a_src[j].1;
             let (xa, wa) = (a_src[j].0 + step * 32, b_src[j] + step * 32);
             cp_async_cg_16(a_hi.add(at), x.as_ptr().add(xa).cast::<u32>());
-            cp_async_cg_16(b_hi.add(at), w.as_ptr().add(wa).cast::<u32>());
+            if TILED {
+                let packet = j * 128 + tid;
+                let tile = col0 * k + step * 64 * 32;
+                cp_async_cg_16(
+                    b_hi.add(stage * STAGE + packet * 4),
+                    w.as_ptr().add(tile + packet * 8).cast::<u32>(),
+                );
+            } else {
+                cp_async_cg_16(b_hi.add(at), w.as_ptr().add(wa).cast::<u32>());
+            }
             if SPLIT {
                 cp_async_cg_16(a_lo.add(at), x_lo.as_ptr().add(xa).cast::<u32>());
                 cp_async_cg_16(b_lo.add(at), w_lo.as_ptr().add(wa).cast::<u32>());
@@ -447,6 +459,45 @@ pub(crate) unsafe fn linear16_body<const SPLIT: bool>(
             }
         }
     }
+    if TILED {
+        // Tiled weights have complete column tiles and even output strides. Each lane owns
+        // two adjacent columns on each of two rows: write those columns in one transaction.
+        #[unroll]
+        for mt in 0..2 {
+            #[unroll]
+            for half in 0..2 {
+                let row = row0 + warp_m * 32 + mt * 16 + r_lane + half * 8;
+                if row < m {
+                    #[unroll]
+                    for nt in 0..4 {
+                        let col = col0 + warp_n * 32 + nt * 8 + c_lane;
+                        let x = acc[mt][nt];
+                        let mut ab = [x[2 * half] + bias[nt][0], x[2 * half + 1] + bias[nt][1]];
+                        if mode & 1 != 0 {
+                            ab = [gelu(ab[0]), gelu(ab[1])];
+                        }
+                        // SAFETY: col is even and col + 2 <= n. Tiled callers use aligned dense
+                        // row-major buffers and only request valid residual/output representations.
+                        unsafe {
+                            if mode & 2 != 0 {
+                                let add = (*r.as_ptr().add(row * ldr + col).cast::<F32x2>()).0;
+                                ab[0] += add[0];
+                                ab[1] += add[1];
+                            }
+                            let at = row * ldy + col;
+                            if mode & 4 != 0 {
+                                *y.as_mut_ptr().add(at).cast::<F32x2>() = F32x2(ab);
+                            }
+                            if mode & 8 != 0 {
+                                *y_hi.as_mut_ptr().add(at).cast::<u32>() = pack_f16(ab[0], ab[1]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
     let next = if SPLIT { 2 } else { 1 };
     #[unroll]
     for mt in 0..2 {
@@ -463,7 +514,7 @@ pub(crate) unsafe fn linear16_body<const SPLIT: bool>(
                     }
                     value += bias[nt][e % 2];
                     if mode & 1 != 0 {
-                        value = 0.5 * value * (1.0 + libm::erff(value * core::f32::consts::FRAC_1_SQRT_2));
+                        value = gelu(value);
                     }
                     if mode & 2 != 0 {
                         // SAFETY: `row < m`, `col < n <= ldr`; with `mode & 2` this function's

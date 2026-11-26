@@ -41,8 +41,10 @@ Saving or exporting a model preserves its level, even without the KV cache. As w
 `ironicl prepare --optimize` and `ironicl serve --optimize` rebuild a cache at a different level.
 
 On CUDA, large transformer projections and MLPs use TabICL's tensor-core kernels: `auto` uses a
-high and a low FP16 part per operand; `fast` uses just the high part. Small products, the cell
-embedding, query gates, output heads, residuals, and training attention stay FP32. For classifiers
+high and a low FP16 part per operand; `fast` uses one FP16 part and accumulates in FP32. At `fast`,
+weights with complete 64-by-32 tiles are packed once on upload, and each lane writes two adjacent
+projection outputs together. Large output-head products and ungated training attention can also use
+tensor cores at `fast`. Small products, cell embedding, query gates, and residuals stay FP32. For classifiers
 at `auto` or `fast` and regressors at `fast`, the GPU stores the column and ICL caches in FP16.
 Predictions attend to these caches with FP16 queries. This halves resident KV storage, not the
 entire model. Regression `auto` uses split products but retains FP32 caches. Both levels keep
@@ -204,7 +206,7 @@ training rows, 20 features, and four members:
 Errors are absolute probability differences (no label changes here), or differences across all
 999 quantiles divided by the training target's standard deviation. These timings exclude weight upload.
 
-With FP16 ICL caches alone, the large classifier's `auto`/`fast` batch prediction took 79/62 ms;
+Before the throughput changes below, with FP16 ICL caches alone, the large classifier's `auto`/`fast` batch prediction took 79/62 ms;
 with FP16 column caches too, 76/59 ms. The final maximum probability errors were `1.1e-4` and
 `3.2e-4`. The small regressor at `fast` took 46 ms with a maximum error of `7.5e-3` training-target
 standard deviations. Using FP16 caches for regression `auto` exceeded its `1e-3` error budget,
@@ -212,11 +214,35 @@ so it keeps the FP32-cache result in the table. On a wider table (100 features, 
 sampled peak process GPU memory was 4,638/4,594/4,128 MiB for `safe`/`auto`/`fast`. The weights
 and temporary buffers also consume memory, so halving the KV cache does not halve the peak.
 
-To reproduce the warm comparison with the installed package and cached checkpoints:
+With the current CUDA kernels, on the same RTX 5080, the following comparison uses NVIDIA's
+[eager PyTorch implementation](https://github.com/NVIDIA/structured-data-models/tree/3fdf108a1f1b719b1b983373b71bbba79fcab7e6)
+with FP16 autocast and `estimator_batch_size=None`. Both use the released weights, 1,000 training
+rows, 20 numeric features, and four members. Each entry is the median of three fresh-process
+medians, five warm runs per process. Timings include transfers from host inputs to host predictions,
+but not checkpoint loading or the initial construction of NVIDIA's CPU `TableTensor`.
+
+| Model | Implementation | Fit | Predict 1 row | Predict 500 rows |
+|---|---|---:|---:|---:|
+| Large classifier | Ironicl `fast` | 107.6 ms | 3.88 ms | 29.64 ms |
+| | NVIDIA FP16 | 89.6 ms | 17.24 ms | 32.37 ms |
+| Small regressor | Ironicl `fast` | 55.9 ms | 1.72 ms | 11.82 ms |
+| | NVIDIA FP16 | 33.4 ms | 13.83 ms | 14.14 ms |
+
+Fit remains slower in Ironicl. For a separate numerical check, we replayed NVIDIA's ensemble draws
+rather than assuming the two random generators select the same ensemble. Neither implementation
+changed any of NVIDIA FP32's 500 classifier labels. Maximum probability differences from NVIDIA
+FP32 were `2.71e-4` (Ironicl) and `1.04e-3` (NVIDIA FP16). Across all 999 regression quantiles,
+the maximum differences were `3.29e-3` and `7.77e-3` training-target standard deviations.
+
+To reproduce the timings with cached checkpoints, run each model separately. The `--nvidia-fp16`
+command requires the pinned `sdm` above, pandas, and CUDA-enabled PyTorch (measured with
+`2.14.1+cu130`). It compares speed only; it does not replay ensemble draws.
 
 ```bash
 python tools/benchmark_kumo_precision.py classifier --size large --device cuda
 python tools/benchmark_kumo_precision.py regressor --size small --device cuda
+python tools/benchmark_kumo_precision.py classifier --size large --device cuda --nvidia-fp16
+python tools/benchmark_kumo_precision.py regressor --size small --device cuda --nvidia-fp16
 ```
 
 On an Apple M1 Max, medium with 4 members on 20 features and 500 query rows, after a first fit

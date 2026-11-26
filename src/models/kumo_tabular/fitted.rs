@@ -9,6 +9,8 @@
 
 use std::sync::Arc;
 
+use rayon::prelude::*;
+
 use super::cpu::{Context, Model, Targets};
 use super::preprocess::{MAX_CLASSES, Preprocessor};
 use crate::format::static_context::{ContextArchitecture, StaticContextArtifact, StaticContextMetadata};
@@ -297,19 +299,26 @@ impl Fitted {
             .flat_map(|(member, tasks)| tasks.iter().enumerate().map(move |(task, c)| (member, task, c)))
     }
 
+    fn queries(&self, x: &[f64]) -> Result<Vec<super::preprocess::MemberRows>> {
+        self.pool.install(|| {
+            (0..self.contexts.len())
+                .into_par_iter()
+                .map(|member| self.preprocessor.transform(x, member))
+                .collect()
+        })
+    }
+
     /// Each member's outputs of the rows `x`, per context: all members in
     /// one pass when they are stacked on the GPU, else one member at a time.
     fn outputs(&self, x: &[f64]) -> Result<Vec<Vec<Vec<f32>>>> {
-        let queries = (0..self.contexts.len())
-            .map(|member| self.preprocessor.transform(x, member))
-            .collect::<Result<Vec<_>>>()?;
+        let queries = self.queries(x)?;
         #[cfg(feature = "cuda")]
         if let Some(stack) = &self.stack {
             let xs: Vec<&[f32]> = self
                 .slots()
                 .map(|(member, _, _)| queries[member].x.as_slice())
                 .collect();
-            let mut outputs = self.model.predict_stacked(stack, &xs)?.into_iter();
+            let mut outputs = self.model.predict_stacked(stack, &xs, None)?.into_iter();
             return Ok(self
                 .contexts
                 .iter()
@@ -346,10 +355,19 @@ impl Fitted {
     )]
     fn quantiles(&self, x: &[f64]) -> Result<Vec<f32>> {
         let (mean, scale) = self.preprocessor.target_scale.expect("a regressor");
+        let signs = &self.preprocessor.draws.target_signs;
+        #[cfg(feature = "cuda")]
+        if let Some(stack) = &self.stack
+            && let Some(q) = super::cuda::Quantiles::new((mean, scale), signs)
+        {
+            let queries = self.queries(x)?;
+            let xs = queries.iter().map(|query| query.x.as_slice()).collect::<Vec<_>>();
+            return Ok(self.model.predict_stacked(stack, &xs, Some(q))?.remove(0));
+        }
         let members = self.contexts.len();
         let mut all = Vec::with_capacity(members);
         for (member, mut outputs) in self.outputs(x)?.into_iter().enumerate() {
-            let sign = self.preprocessor.draws.target_signs[member];
+            let sign = signs[member];
             let mut values: Vec<f64> = outputs
                 .remove(0)
                 .into_iter()
