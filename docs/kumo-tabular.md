@@ -45,6 +45,12 @@ high and a low FP16 part per operand; `fast` uses just the high part. Small prod
 embedding, query gates, output heads, residuals, attention, and cached keys and values stay FP32.
 The checkpoint, seed, and ensemble members do not change.
 
+On Metal, the classifier's `auto` and `fast`, and the regressor's `fast`, store the in-context
+learning (ICL) keys and values in FP16 on the GPU and use FP16 attention in that stage. Column
+caches and all other stages stay FP32. Regression `auto` stays FP32: FP16 missed the `1e-3`
+training-target standard deviation budget at the quantile tails. Exported caches use the same
+portable FP32 tensors as before, with their build level recorded; loading on the CPU requires no GPU.
+
 ## Checkpoints
 
 NVIDIA releases a classifier and a regressor in three sizes, as FP32 PyTorch files, at revision
@@ -107,7 +113,7 @@ embeddings are saved transposed; import copies them into row-major order.
   context to the host; loading copies it to the GPU, so a context saved on one device loads on
   the other.
 - `metal.rs`: on an Apple Silicon GPU, with the `metal` feature, a member's whole forward pass
-  runs as one `MPSGraph` executable in FP32: one per training shape to fit, which outputs the
+  runs as one `MPSGraph` executable: one per training shape to fit, which outputs the
   member's column and ICL keys and values, and one per power-of-two query bucket to predict,
   which reads them. The blocks are the transformer block TabICLv2's Metal graphs use
   (`kernels/metal/block.rs`), with `RMSNorm`, `RoPE`, the per-head norm, query scaling, and shared
@@ -194,6 +200,13 @@ backend:
 | 1,000 | 3.77 s | 0.48 s | 0.68 s | 1.73 s | 0.19 s | 0.30 s |
 | 5,000 | 21.95 s | 2.88 s | 3.84 s | 2.31 s | 0.27 s | 0.42 s |
 
+With 2,000 training rows, 20 columns, four members and 500 queries, the medium classifier on the
+M1 Max fit in 1,032 ms at `safe` and 980 ms at `auto` (warm medians). Batch prediction took 213 ms
+and 197 ms, single-row prediction 41 ms and 40 ms. Peak process RSS fell from 1.80 to 1.26 GiB.
+The largest probability difference was `4.9e-5`, with no label changes. On the small regressor
+at 1,000 rows, FP16 ICL attention's largest quantile difference was `1.9e-3` training-target
+standard deviations, within the `fast` budget (`1e-2`) but not the `auto` budget.
+
 ## License
 
 The weights are under OpenMDW-1.1, which allows commercial use, modification, conversion, and
@@ -207,5 +220,5 @@ notices. Ironicl downloads the weights from Hugging Face and never ships them. N
 2. The classifier on the CPU, as `KumoTabularClassifier`, with pickling, export, and the server.
    Done.
 3. The regressor on the CPU, as `KumoTabularRegressor`. Done.
-4. Metal. Done, in FP32.
+4. Metal. Done, with FP32 and FP16 ICL attention.
 5. CUDA. Done, with FP32 and tensor-core products.
