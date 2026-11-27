@@ -62,7 +62,7 @@ fn imports_official_classifier_and_reuses_automatic_cache() {
         panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
     let directory = tempdir().expect("temporary cache directory");
-    let explicit_model = directory.path().join("classifier.irmodel");
+    let explicit_model = directory.path().join("classifier.ir");
     let imported =
         import_checkpoint(&checkpoint, CheckpointKind::TabIclV2, &explicit_model).expect("import classifier");
     assert_eq!(imported.source_sha256, CLASSIFIER_SHA256);
@@ -95,7 +95,7 @@ fn imports_official_classifier_and_reuses_automatic_cache() {
 #[test]
 #[ignore = "needs official checkpoint fixtures; run with --ignored once IRONICL_CHECKPOINT_FIXTURES is set. See CONTRIBUTING.md"]
 fn loads_official_classifier_artifact_when_fixture_is_available() {
-    let Some(path) = fixture("tabicl-classifier-v2.irmodel") else {
+    let Some(path) = fixture("tabicl-classifier-v2.ir") else {
         panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
     let model = load_model_artifact(&path).expect("load official classifier artifact");
@@ -118,7 +118,7 @@ fn loads_official_classifier_artifact_when_fixture_is_available() {
     reason = "test data from small integer indices; b, q, h, n name the model's dimensions"
 )]
 fn built_context_matches_the_uncached_forward_pass() {
-    let Some(model_path) = fixture("tabicl-classifier-v2.irmodel") else {
+    let Some(model_path) = fixture("tabicl-classifier-v2.ir") else {
         panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
     let executor = Executor::new(load_model_artifact(&model_path).expect("load classifier artifact"));
@@ -211,7 +211,7 @@ fn built_context_matches_the_uncached_forward_pass() {
     reason = "test data from small integer indices; b, q, h, n name the model's dimensions"
 )]
 fn large_cached_query_runs_in_chunks() {
-    let Some(model_path) = fixture("tabicl-classifier-v2.irmodel") else {
+    let Some(model_path) = fixture("tabicl-classifier-v2.ir") else {
         panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
     let executor = Executor::new(load_model_artifact(&model_path).expect("load classifier artifact"));
@@ -271,7 +271,7 @@ fn large_cached_query_runs_in_chunks() {
     reason = "test data from small integer indices; b, q, h, n name the model's dimensions"
 )]
 fn reduced_precision_context_predicts_all_missing_rows() {
-    let Some(model_path) = fixture("tabicl-classifier-v2.irmodel") else {
+    let Some(model_path) = fixture("tabicl-classifier-v2.ir") else {
         panic!("fixtures required to run this test; set the fixture env vars. See CONTRIBUTING.md");
     };
     let executor = Executor::new(load_model_artifact(&model_path).expect("load classifier artifact"));
@@ -340,7 +340,7 @@ fn imports_the_kumo_tabular_checkpoints_that_are_available() {
             assert!(inspect_checkpoint(&checkpoint, Some(CheckpointKind::KumoTabular(Some(other)))).is_err());
         }
         assert!(inspect_checkpoint(&checkpoint, Some(CheckpointKind::TabIclV2)).is_err());
-        let model = output.path().join("model.irmodel");
+        let model = output.path().join("model.ir");
         let imported = import_checkpoint(&checkpoint, kind, &model).expect("import");
         assert_eq!(imported.profile, ironicl::ModelProfile::KumoTabular(release));
         assert_eq!(inspect_model_artifact(&model).expect("inspect"), imported);

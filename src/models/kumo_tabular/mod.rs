@@ -39,7 +39,8 @@ fn half_cache(values: &[f32]) -> crate::Result<Vec<u16>> {
 }
 
 /// A model size.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Size {
     Small,
     Medium,
@@ -90,7 +91,8 @@ impl fmt::Display for Size {
 }
 
 /// A released checkpoint: a size and a task.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Release {
     pub size: Size,
     pub task: TaskKind,

@@ -32,7 +32,7 @@ static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn executor() -> Executor {
     let directory = std::env::var_os("IRONICL_CHECKPOINT_FIXTURES")
         .expect("set IRONICL_CHECKPOINT_FIXTURES to run this ignored test; see CONTRIBUTING.md");
-    let model = load_model_artifact(&Path::new(&directory).join("tabicl-classifier-v2.irmodel"))
+    let model = load_model_artifact(&Path::new(&directory).join("tabicl-classifier-v2.ir"))
         .expect("load classifier artifact");
     Executor::new(model)
 }

@@ -93,7 +93,7 @@ pub fn load_checkpoint_model(path: &Path, kind: CheckpointKind) -> Result<ModelA
     }
 }
 
-/// The folder of imported weights, `<checkpoint SHA-256>.irmodel` files, that
+/// The folder of imported weights, `<checkpoint SHA-256>.ir` files, that
 /// loading a checkpoint fills: `models/v<version>` in Ironicl's cache, under
 /// `XDG_CACHE_HOME` or `~/.cache`.
 ///
@@ -135,7 +135,7 @@ fn cache_model_path(cache_root: &Path, source_sha256: &str) -> Result<PathBuf> {
     Ok(cache_root
         .join("models")
         .join(format!("v{}", crate::format::model::MODEL_ARTIFACT_VERSION))
-        .join(format!("{source_sha256}.irmodel")))
+        .join(format!("{source_sha256}.ir")))
 }
 
 #[cfg(test)]
@@ -147,7 +147,7 @@ mod tests {
         let digest = "a".repeat(64);
         assert_eq!(
             cache_model_path(Path::new("cache"), &digest),
-            Ok(PathBuf::from(format!("cache/models/v1/{digest}.irmodel")))
+            Ok(PathBuf::from(format!("cache/models/v1/{digest}.ir")))
         );
     }
 

@@ -11,12 +11,11 @@
 //!   is missing or describes another context.
 //!
 //! The weights stay out of it, in a shared folder of `<checkpoint
-//! SHA-256>.irmodel` files: by default the model cache that loading a
+//! SHA-256>.ir` files: by default the model cache that loading a
 //! checkpoint fills ([`default_weights_dir`]).
 
 use std::{
-    fs::File,
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -26,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ClassifierAggregation, Error, Executor, Features, FittedModel, Labels, Optimize, RegressionOutput,
     Result, StaticContextArtifact, TaskKind,
-    format::{encode_sha256, model::load_model_artifact, preprocessor},
+    format::{encode_sha256, model::load_model_artifact, preprocessor, read_bounded},
     memory::MemoryLimits,
     models::kumo_tabular,
 };
@@ -46,40 +45,12 @@ fn artifact_error(path: &Path, error: impl std::fmt::Display) -> Error {
     Error::Artifact(format!("{}: {error}", path.display()))
 }
 
-fn read_bounded(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
-    let file = File::open(path)?;
-    let length = file.metadata()?.len();
-    if length > limit {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("file is {length} bytes; limit is {limit}"),
-        ));
-    }
-    let capacity = usize::try_from(length).unwrap_or(0);
-    let mut bytes = Vec::with_capacity(capacity);
-    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > limit {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("file grew beyond the {limit}-byte limit while reading"),
-        ));
-    }
-    Ok(bytes)
-}
-
 /// Write `bytes` to a new owner-only file beside `path`, then rename it into
 /// place, so a reader never sees a partial file.
 fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
-    let directory = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut file = tempfile::Builder::new()
-        .prefix(".ironicl-")
-        .suffix(".tmp")
-        .tempfile_in(directory)
-        .map_err(|error| artifact_error(directory, error))?;
-    file.write_all(bytes)
-        .and_then(|()| file.as_file().sync_all())
-        .map_err(|error| artifact_error(path, error))?;
-    crate::format::persist_atomic(file, path).map_err(|error| artifact_error(path, error))
+    crate::format::write_atomic(path, |file| {
+        file.write_all(bytes).map_err(|e| artifact_error(path, e))
+    })
 }
 
 fn remove(path: &Path) -> Result<()> {
@@ -222,7 +193,7 @@ pub fn read_metadata(dir: &Path) -> Result<Metadata> {
 /// with.
 fn weights_path(bytes: &[u8], weights: &Path) -> Result<PathBuf> {
     let sha256 = encode_sha256(&preprocessor::checkpoint_sha256(bytes)?);
-    Ok(weights.join(format!("{sha256}.irmodel")))
+    Ok(weights.join(format!("{sha256}.ir")))
 }
 
 fn executor(path: &Path) -> Result<Executor> {

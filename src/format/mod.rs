@@ -7,11 +7,17 @@
 //! Each format still owns its own header layout, magic, version, and dtype
 //! numbering; only the mechanics live here.
 
+pub mod container;
 pub mod model;
 pub mod preprocessor;
 pub mod static_context;
 
-use std::fmt;
+use std::{
+    fmt,
+    fs::File,
+    io::{self, Read},
+    path::Path,
+};
 
 use sha2::{Digest, Sha256};
 
@@ -28,6 +34,52 @@ const HEX: &[u8; 16] = b"0123456789abcdef";
 /// SHA-256 digest of `bytes`.
 pub(crate) fn sha256(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+/// Read a complete small artifact without trusting either the reported file size or EOF.
+pub(crate) fn read_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    let limit = limit.min(isize::MAX as u64);
+    let file = File::open(path)?;
+    let length = file.metadata()?.len();
+    if length > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file is {length} bytes; limit is {limit}"),
+        ));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(length).unwrap_or(0));
+    file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file grew beyond the {limit}-byte limit while reading"),
+        ));
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+/// Write and validate a new owner-only file before publishing it beside the destination.
+/// Close and remove the temporary on any error; never modify the old mapping in place.
+pub(crate) fn write_atomic<T>(
+    path: &Path,
+    write: impl FnOnce(&mut tempfile::NamedTempFile) -> Result<T>,
+) -> Result<T> {
+    let io_error = |e| artifact_error(format!("{}: {e}", path.display()));
+    let mut file = tempfile::Builder::new()
+        .prefix(".ironicl-")
+        .suffix(".tmp")
+        .tempfile_in(parent_dir(path))
+        .map_err(io_error)?;
+    let result = write(&mut file)?;
+    file.as_file().sync_all().map_err(io_error)?;
+    persist_atomic(file, path).map_err(io_error)?;
+    Ok(result)
 }
 
 /// Atomically move `file` onto `path`. On Windows, concurrent writers replacing
