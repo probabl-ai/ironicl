@@ -49,11 +49,11 @@ impl Model {
     }
 }
 
-/// Inspect a model directory, Ironicl weights (.irmodel), or a PyTorch
+/// Inspect a model directory, an Ironicl artifact (.ir), or a PyTorch
 /// checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Args)]
 pub struct InspectArgs {
-    /// A model directory, an .irmodel file, or a checkpoint.
+    /// A model directory, an Ironicl artifact, or a checkpoint.
     pub path: PathBuf,
     /// The model the checkpoint is [default: found from its contents]
     #[arg(long)]
@@ -188,11 +188,11 @@ mod tests {
             })
         );
         assert_eq!(
-            parse(&["import", "model.ckpt", "--model", "tabicl", "-o", "model.irmodel"]).unwrap(),
+            parse(&["import", "model.ckpt", "--model", "tabicl", "-o", "model.ir"]).unwrap(),
             Command::Import(ImportArgs {
                 checkpoint: PathBuf::from("model.ckpt"),
                 model: Model::Tabicl,
-                output: Some(PathBuf::from("model.irmodel")),
+                output: Some(PathBuf::from("model.ir")),
             })
         );
         assert_eq!(

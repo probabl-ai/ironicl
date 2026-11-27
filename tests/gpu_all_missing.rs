@@ -25,7 +25,7 @@ const MISSING: f32 = -100.0;
 fn assert_safe_matches_auto(missing_training: &[usize], missing_query: &[usize]) {
     let directory = std::env::var_os("IRONICL_CHECKPOINT_FIXTURES")
         .expect("set IRONICL_CHECKPOINT_FIXTURES to run this ignored test; see CONTRIBUTING.md");
-    let model = load_model_artifact(&Path::new(&directory).join("tabicl-classifier-v2.irmodel"))
+    let model = load_model_artifact(&Path::new(&directory).join("tabicl-classifier-v2.ir"))
         .expect("load classifier artifact");
     let executor = Executor::new(model);
     let (b, n, q, h) = (4, 2000, 100, 8);

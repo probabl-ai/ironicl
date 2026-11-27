@@ -1,34 +1,24 @@
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt,
-    fs::{self, File},
-    io::{Read, Write},
-    path::Path,
-};
+use std::{collections::BTreeMap, fmt, fs, path::Path, sync::Arc};
 
 use crate::{
     TaskKind,
     error::{Error, Result},
     format::{
-        ByteReader, CHECKSUM_BYTES, TENSOR_ALIGNMENT, align_up, artifact_error, encode_sha256,
-        pad_to_alignment, sha256, u64_to_usize, usize_to_u32, usize_to_u64, write_u16, write_u32, write_u64,
+        artifact_error,
+        container::{
+            self, DISK_ALIGNMENT, DType, Entry, Header, Kind, MAX_TENSOR_COUNT, MEMORY_ALIGNMENT, Writer,
+            decode_le,
+        },
+        encode_sha256, u64_to_usize,
     },
     models::kumo_tabular::Release,
 };
 
-pub const MODEL_ARTIFACT_MAGIC: [u8; 8] = *b"IRMODEL\0";
-pub const MODEL_ARTIFACT_VERSION: u32 = 1;
+pub(crate) use container::DType as ModelTensorDType;
+pub use container::{MAGIC as MODEL_ARTIFACT_MAGIC, VERSION as MODEL_ARTIFACT_VERSION};
 
-/// The header's architecture IDs.
-const TABICL_V2: u32 = 1;
-const KUMO_TABULAR: u32 = 2;
-const HEADER_BYTES: usize = 144;
 /// Kumo-Tabular large is about 860 MB.
 const MAX_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
-const MAX_DIRECTORY_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_TENSOR_COUNT: usize = 4096;
-const MAX_TENSOR_RANK: usize = 16;
-const MAX_TENSOR_NAME_BYTES: usize = 4096;
 const MAX_TENSOR_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TOTAL_TENSOR_BYTES: u64 = 1000 * 1024 * 1024;
 const CLASSIFIER_SHA256: [u8; 32] = [
@@ -60,8 +50,10 @@ impl fmt::Display for ModelProfile {
 }
 
 /// A model's architecture and its values, as the artifact header stores them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ModelConfig {
+    #[serde(rename = "tabicl_v2")]
     TabIclV2(TabIclV2Config),
     /// A released checkpoint, whose size fixes every value.
     KumoTabular(Release),
@@ -75,71 +67,11 @@ impl ModelConfig {
             Self::KumoTabular(release) => Some(release.task),
         }
     }
-
-    /// The header's architecture ID and its seven values.
-    fn header(&self) -> Result<(u32, [u64; 7])> {
-        match self {
-            Self::TabIclV2(config) => Ok((TABICL_V2, config.required_values()?)),
-            Self::KumoTabular(release) => {
-                let config = release.size.config();
-                let (classes, quantiles) = match release.task {
-                    TaskKind::Classifier => (10, 0),
-                    TaskKind::Regressor => (0, 999),
-                };
-                Ok((
-                    KUMO_TABULAR,
-                    [
-                        classes,
-                        quantiles,
-                        config.cell_channels,
-                        config.embedding_layers,
-                        config.inducing_points,
-                        config.icl_channels,
-                        config.icl_layers,
-                    ],
-                ))
-            }
-        }
-    }
-
-    fn from_header(architecture: u32, values: [u64; 7]) -> Result<Self> {
-        match architecture {
-            TABICL_V2 => {
-                let [
-                    max_classes,
-                    num_quantiles,
-                    embed_dim,
-                    column_blocks,
-                    row_blocks,
-                    row_cls_tokens,
-                    icl_blocks,
-                ] = values.map(Some);
-                let config = TabIclV2Config {
-                    max_classes,
-                    num_quantiles,
-                    embed_dim,
-                    column_blocks,
-                    row_blocks,
-                    row_cls_tokens,
-                    icl_blocks,
-                };
-                config.validate()?;
-                Ok(Self::TabIclV2(config))
-            }
-            KUMO_TABULAR => Release::ALL
-                .into_iter()
-                .map(Self::KumoTabular)
-                .find(|config| config.header().is_ok_and(|(_, header)| header == values))
-                .ok_or_else(|| Error::Artifact("Kumo-Tabular values match no released size".into())),
-            _ => Err(Error::Artifact(format!(
-                "model architecture {architecture} is unknown"
-            ))),
-        }
-    }
 }
 
 /// `TabICLv2`'s architecture values.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TabIclV2Config {
     pub max_classes: Option<u64>,
     pub num_quantiles: Option<u64>,
@@ -185,62 +117,6 @@ impl TabIclV2Config {
     }
 }
 
-/// A storage dtype supported by the portable model artifact.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ModelTensorDType {
-    U8,
-    I64,
-    Bf16,
-    F16,
-    F32,
-    F64,
-}
-
-impl ModelTensorDType {
-    fn id(self) -> u8 {
-        match self {
-            Self::U8 => 1,
-            Self::I64 => 2,
-            Self::Bf16 => 3,
-            Self::F16 => 4,
-            Self::F32 => 5,
-            Self::F64 => 6,
-        }
-    }
-
-    fn from_id(id: u8) -> Result<Self> {
-        match id {
-            1 => Ok(Self::U8),
-            2 => Ok(Self::I64),
-            3 => Ok(Self::Bf16),
-            4 => Ok(Self::F16),
-            5 => Ok(Self::F32),
-            6 => Ok(Self::F64),
-            _ => Err(Error::Artifact(format!("unsupported tensor dtype ID {id}"))),
-        }
-    }
-
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::U8 => "u8",
-            Self::I64 => "i64",
-            Self::Bf16 => "bf16",
-            Self::F16 => "f16",
-            Self::F32 => "f32",
-            Self::F64 => "f64",
-        }
-    }
-
-    pub(crate) fn size_in_bytes(self) -> u64 {
-        match self {
-            Self::U8 => 1,
-            Self::Bf16 | Self::F16 => 2,
-            Self::F32 => 4,
-            Self::I64 | Self::F64 => 8,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ModelTensor {
     pub name: String,
@@ -268,11 +144,22 @@ pub struct ModelArtifactSummary {
     pub config: ModelConfig,
 }
 
-/// An owned FP32 tensor from a validated executable model artifact.
-#[derive(Debug, Clone, PartialEq)]
+/// A logical FP32 tensor backed by owned values or an immutable mapping.
+#[derive(Debug, Clone)]
 pub struct ModelTensorF32 {
     dimensions: Vec<u64>,
-    values: Vec<f32>,
+    storage: ModelStorage,
+}
+
+#[derive(Debug, Clone)]
+enum ModelStorage {
+    Owned(Vec<f32>),
+    Mapped(Arc<memmap2::Mmap>, std::ops::Range<usize>),
+}
+impl PartialEq for ModelTensorF32 {
+    fn eq(&self, other: &Self) -> bool {
+        self.dimensions == other.dimensions && self.values() == other.values()
+    }
 }
 
 impl ModelTensorF32 {
@@ -285,14 +172,17 @@ impl ModelTensorF32 {
     /// Tensor values decoded from the artifact's little-endian FP32 payload.
     #[must_use]
     pub fn values(&self) -> &[f32] {
-        &self.values
+        match &self.storage {
+            ModelStorage::Owned(v) => v,
+            ModelStorage::Mapped(m, r) => bytemuck::cast_slice(&m[r.clone()]),
+        }
     }
 }
 
 /// An owned, executable official `TabICLv2` classifier or regressor model.
 ///
 /// The loader validates the complete official tensor manifest before it returns
-/// this type. Tensor values are stored in owned, host-native FP32 vectors.
+/// this type. File loads retain the immutable mapping on little-endian hosts.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelArtifact {
     summary: ModelArtifactSummary,
@@ -307,8 +197,20 @@ impl ModelArtifact {
     ///
     /// Returns [`Error::Artifact`] when the file is invalid, is not an
     /// official model, or does not have its exact tensor manifest.
+    ///
+    /// The file must remain immutable while loaded. Publish changes by rename.
     pub fn load(path: &Path) -> Result<Self> {
-        Self::from_bytes(&read_artifact_bytes(path)?)
+        // WebAssembly filesystems need not support file-backed mmap.
+        #[cfg(target_family = "wasm")]
+        {
+            let bytes = crate::format::read_bounded(path, MAX_ARTIFACT_BYTES).map_err(artifact_error)?;
+            Self::from_bytes(&bytes)
+        }
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let mapping = Arc::new(container::map_immutable(path, MAX_ARTIFACT_BYTES)?);
+            Self::decode(&mapping, Some(&mapping))
+        }
     }
 
     /// Verify and prepare bytes from an official `TabICLv2` model artifact.
@@ -322,8 +224,12 @@ impl ModelArtifact {
     /// Returns [`Error::Artifact`] when the bytes are invalid or do not match
     /// the official manifest.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let parsed = parse_model_artifact_bytes(bytes)?;
-        let (task, manifest) = match parsed.summary.profile {
+        Self::decode(bytes, None)
+    }
+
+    fn decode(bytes: &[u8], mapping: Option<&Arc<memmap2::Mmap>>) -> Result<Self> {
+        let (header, summary) = parse_model_artifact_bytes(bytes)?;
+        let (task, manifest) = match summary.profile {
             ModelProfile::TabIclV2Classifier => (TaskKind::Classifier, tensor_manifest(TaskKind::Classifier)),
             ModelProfile::TabIclV2Regressor => (TaskKind::Regressor, tensor_manifest(TaskKind::Regressor)),
             ModelProfile::KumoTabular(release) => (release.task, release.manifest()),
@@ -333,46 +239,48 @@ impl ModelArtifact {
                 ));
             }
         };
-        if !matches!(parsed.summary.profile, ModelProfile::KumoTabular(_)) {
-            validate_config(&parsed.summary.config, task)?;
+        if !matches!(summary.profile, ModelProfile::KumoTabular(_)) {
+            validate_config(&summary.config, task)?;
         }
-        validate_manifest(&parsed.tensors, &manifest, task)?;
+        validate_manifest(&header.tensors, &manifest, task)?;
 
         let mut tensors = BTreeMap::new();
-        for tensor in parsed.tensors {
-            let payload = bytes
-                .get(tensor.payload_range)
-                .ok_or_else(|| Error::Artifact(format!("tensor '{}' payload is missing", tensor.name)))?;
-            let values: Vec<f32> = payload
-                .as_chunks()
-                .0
-                .iter()
-                .map(|&chunk| f32::from_le_bytes(chunk))
-                .collect();
-            if values.iter().any(|value| !value.is_finite()) {
-                return Err(Error::Artifact(format!(
+        for entry in &header.tensors {
+            let range = header.range(entry);
+            let payload = &bytes[range.clone()];
+            if !entry.dtype.all_finite(payload)? {
+                return Err(artifact_error(format!(
                     "tensor '{}' contains a non-finite value",
-                    tensor.name
+                    entry.name
                 )));
             }
+            let storage = if let Some(mapping) = mapping.filter(|_| cfg!(target_endian = "little")) {
+                bytemuck::try_cast_slice::<u8, f32>(payload).map_err(artifact_error)?;
+                ModelStorage::Mapped(Arc::clone(mapping), range)
+            } else {
+                ModelStorage::Owned(decode_le(payload, f32::from_le_bytes))
+            };
             tensors.insert(
-                tensor.name,
+                entry.name.clone(),
                 ModelTensorF32 {
-                    dimensions: tensor.dimensions,
-                    values,
+                    dimensions: entry.shape.clone(),
+                    storage,
                 },
             );
         }
-        if parsed.summary.profile == ModelProfile::TabIclV2Regressor {
+        if summary.profile == ModelProfile::TabIclV2Regressor {
             for (name, dimensions) in tensor_manifest(TaskKind::Classifier) {
                 if let std::collections::btree_map::Entry::Vacant(entry) = tensors.entry(name) {
                     let values = vec![0.0; u64_to_usize(dimensions.iter().product(), "layer-norm bias")?];
-                    entry.insert(ModelTensorF32 { dimensions, values });
+                    entry.insert(ModelTensorF32 {
+                        dimensions,
+                        storage: ModelStorage::Owned(values),
+                    });
                 }
             }
         }
         Ok(Self {
-            summary: parsed.summary,
+            summary,
             task,
             tensors,
         })
@@ -411,394 +319,128 @@ pub fn load_model_artifact(path: &Path) -> Result<ModelArtifact> {
     ModelArtifact::load(path)
 }
 
-#[derive(Debug)]
-struct ParsedTensor {
-    name: String,
-    dtype: ModelTensorDType,
-    dimensions: Vec<u64>,
-    payload_range: std::ops::Range<usize>,
-}
-
-#[derive(Debug)]
-struct ParsedModelArtifact {
-    summary: ModelArtifactSummary,
-    tensors: Vec<ParsedTensor>,
-}
-
 /// Read and verify a portable Ironicl model artifact.
 ///
 /// # Errors
 ///
 /// Returns [`Error::Artifact`] when the file is malformed, too large, has an
-/// invalid checksum, or contains inconsistent tensor metadata.
+/// unsupported version, or contains inconsistent tensor metadata.
 pub fn inspect_model_artifact(path: &Path) -> Result<ModelArtifactSummary> {
-    let bytes = read_artifact_bytes(path)?;
-    Ok(parse_model_artifact_bytes(&bytes)?.summary)
+    summarize_header(&Header::open(path, Kind::Model, MAX_ARTIFACT_BYTES)?)
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Metadata {
+    #[serde(with = "container::digest")]
+    source_sha256: [u8; 32],
+    config: ModelConfig,
+}
+
+fn writer(model: &ModelArtifactData, alignment: usize) -> Result<Writer<'_>> {
+    if model.source_sha256 == [0; 32] || model.tensors.is_empty() || model.tensors.len() > MAX_TENSOR_COUNT {
+        return Err(artifact_error("invalid model identity or tensor count"));
+    }
+    if let ModelConfig::TabIclV2(config) = &model.config {
+        config.validate()?;
+    }
+    let mut tensors: Vec<_> = model.tensors.iter().collect();
+    tensors.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    let metadata = Metadata {
+        source_sha256: model.source_sha256,
+        config: model.config.clone(),
+    };
+    let mut total = 0_u64;
+    for t in &tensors {
+        total = total
+            .checked_add(t.data.len() as u64)
+            .ok_or_else(|| artifact_error("model size overflow"))?;
+        if t.data.len() as u64 > MAX_TENSOR_BYTES || total > MAX_TOTAL_TENSOR_BYTES {
+            return Err(artifact_error("model tensor size exceeds limit"));
+        }
+    }
+    let writer = Writer::new(
+        Kind::Model,
+        alignment,
+        metadata,
+        tensors
+            .into_iter()
+            .map(|t| (t.name.clone(), t.dtype, t.dimensions.clone(), t.data.as_slice())),
+    )?;
+    if writer.len as u64 > MAX_ARTIFACT_BYTES {
+        return Err(artifact_error("model exceeds size limit"));
+    }
+    Ok(writer)
 }
 
 pub(crate) fn write_model_artifact(path: &Path, model: &ModelArtifactData) -> Result<ModelArtifactSummary> {
-    let bytes = encode_model_artifact(model)?;
-    let expected = parse_model_artifact_bytes(&bytes)?.summary;
-    let parent = usable_parent(path);
+    let parent = super::parent_dir(path);
     fs::create_dir_all(parent).map_err(artifact_error)?;
-    let mut file = tempfile::Builder::new()
-        .prefix(".ironicl-")
-        .suffix(".tmp")
-        .tempfile_in(parent)
-        .map_err(artifact_error)?;
-    file.write_all(&bytes).map_err(artifact_error)?;
-    file.as_file().sync_all().map_err(artifact_error)?;
-    let actual = inspect_model_artifact(file.path())?;
-    if actual != expected {
-        return Err(Error::Artifact(
-            "temporary artifact verification changed metadata".into(),
-        ));
-    }
-    crate::format::persist_atomic(file, path).map_err(artifact_error)?;
-    // On Unix, sync the parent directory so the rename is durable; Windows forbids opening a directory.
+    let actual = super::write_atomic(path, |file| {
+        writer(model, DISK_ALIGNMENT)?.write(file)?;
+        inspect_model_artifact(file.path())
+    })?;
     #[cfg(unix)]
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
+    fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
         .map_err(artifact_error)?;
     Ok(actual)
 }
 
 pub(crate) fn encode_model_artifact(model: &ModelArtifactData) -> Result<Vec<u8>> {
-    let (architecture, values) = model.config.header()?;
-    if model.source_sha256 == [0; 32] {
-        return Err(Error::Artifact("source checkpoint hash is empty".into()));
-    }
-    if model.tensors.is_empty() || model.tensors.len() > MAX_TENSOR_COUNT {
-        return Err(Error::Artifact(format!(
-            "model has {} tensors; expected 1..={MAX_TENSOR_COUNT}",
-            model.tensors.len()
-        )));
-    }
-
-    let mut tensors = model.tensors.iter().collect::<Vec<_>>();
-    tensors.sort_unstable_by(|left, right| left.name.cmp(&right.name));
-    let mut names = BTreeSet::new();
-    let mut directory = Vec::new();
-    let mut payload = Vec::new();
-    let mut parameter_count = 0_u64;
-    let mut tensor_bytes = 0_u64;
-    for tensor in tensors {
-        validate_tensor(tensor)?;
-        if !names.insert(tensor.name.as_str()) {
-            return Err(Error::Artifact(format!(
-                "duplicate tensor name '{}'",
-                tensor.name
-            )));
-        }
-        pad_to_alignment(&mut payload, TENSOR_ALIGNMENT)?;
-        let payload_offset = usize_to_u64(payload.len(), "tensor payload offset")?;
-        let byte_len = usize_to_u64(tensor.data.len(), "tensor byte length")?;
-        write_u32(
-            &mut directory,
-            usize_to_u32(tensor.name.len(), "tensor name length")?,
-        );
-        write_u16(
-            &mut directory,
-            u16::try_from(tensor.dimensions.len())
-                .map_err(|_| Error::Artifact("tensor rank exceeds u16".into()))?,
-        );
-        directory.push(tensor.dtype.id());
-        directory.push(0);
-        write_u64(&mut directory, payload_offset);
-        write_u64(&mut directory, byte_len);
-        for dimension in &tensor.dimensions {
-            write_u64(&mut directory, *dimension);
-        }
-        directory.extend_from_slice(tensor.name.as_bytes());
-        payload.extend_from_slice(&tensor.data);
-
-        let elements = checked_elements(&tensor.name, &tensor.dimensions)?;
-        parameter_count = parameter_count
-            .checked_add(elements)
-            .ok_or_else(|| Error::Artifact("model parameter count overflows u64".into()))?;
-        tensor_bytes = tensor_bytes
-            .checked_add(byte_len)
-            .ok_or_else(|| Error::Artifact("model tensor byte count overflows u64".into()))?;
-    }
-    if tensor_bytes > MAX_TOTAL_TENSOR_BYTES {
-        return Err(Error::Artifact(format!(
-            "model tensors are {tensor_bytes} bytes; limit is {MAX_TOTAL_TENSOR_BYTES}"
-        )));
-    }
-    if usize_to_u64(directory.len(), "model directory length")? > MAX_DIRECTORY_BYTES {
-        return Err(Error::Artifact("model tensor directory is too large".into()));
-    }
-
-    let mut bytes = Vec::with_capacity(
-        HEADER_BYTES
-            .checked_add(directory.len())
-            .and_then(|size| size.checked_add(TENSOR_ALIGNMENT))
-            .and_then(|size| size.checked_add(payload.len()))
-            .and_then(|size| size.checked_add(CHECKSUM_BYTES))
-            .ok_or_else(|| Error::Artifact("artifact size overflows usize".into()))?,
-    );
-    bytes.extend_from_slice(&MODEL_ARTIFACT_MAGIC);
-    write_u32(&mut bytes, MODEL_ARTIFACT_VERSION);
-    write_u32(&mut bytes, architecture);
-    bytes.extend_from_slice(&model.source_sha256);
-    write_u32(&mut bytes, usize_to_u32(model.tensors.len(), "tensor count")?);
-    write_u64(&mut bytes, parameter_count);
-    write_u64(&mut bytes, tensor_bytes);
-    for value in values {
-        write_u64(&mut bytes, value);
-    }
-    write_u64(&mut bytes, usize_to_u64(directory.len(), "directory length")?);
-    write_u64(&mut bytes, usize_to_u64(payload.len(), "payload length")?);
-    write_u32(&mut bytes, 0);
-    if bytes.len() != HEADER_BYTES {
-        return Err(Error::Artifact("internal artifact header size mismatch".into()));
-    }
-    bytes.extend_from_slice(&directory);
-    pad_to_alignment(&mut bytes, TENSOR_ALIGNMENT)?;
-    bytes.extend_from_slice(&payload);
-    let checksum = sha256(&bytes);
-    bytes.extend_from_slice(&checksum);
-    if usize_to_u64(bytes.len(), "artifact length")? > MAX_ARTIFACT_BYTES {
-        return Err(Error::Artifact(format!(
-            "artifact is {} bytes; limit is {MAX_ARTIFACT_BYTES}",
-            bytes.len()
-        )));
-    }
-    Ok(bytes)
+    writer(model, MEMORY_ALIGNMENT)?.bytes()
 }
 
-#[expect(clippy::too_many_lines, reason = "one pass over the format, field by field")]
-fn parse_model_artifact_bytes(bytes: &[u8]) -> Result<ParsedModelArtifact> {
-    if bytes.len() < HEADER_BYTES + CHECKSUM_BYTES {
-        return Err(Error::Artifact("artifact is truncated".into()));
+fn parse_model_artifact_bytes(bytes: &[u8]) -> Result<(Header<Metadata>, ModelArtifactSummary)> {
+    if bytes.len() as u64 > MAX_ARTIFACT_BYTES {
+        return Err(artifact_error("model exceeds size limit"));
     }
-    if usize_to_u64(bytes.len(), "artifact length")? > MAX_ARTIFACT_BYTES {
-        return Err(Error::Artifact(format!(
-            "artifact is {} bytes; limit is {MAX_ARTIFACT_BYTES}",
-            bytes.len()
-        )));
-    }
-    let checksum_offset = bytes.len() - CHECKSUM_BYTES;
-    if sha256(&bytes[..checksum_offset]).as_slice() != &bytes[checksum_offset..] {
-        return Err(Error::Artifact("artifact checksum does not match".into()));
-    }
+    let header = Header::from_bytes(bytes, Kind::Model)?;
+    let summary = summarize_header(&header)?;
+    Ok((header, summary))
+}
 
-    let mut header = ByteReader::new(&bytes[..HEADER_BYTES]);
-    if header.read_array::<8>()? != MODEL_ARTIFACT_MAGIC {
-        return Err(Error::Artifact("model artifact magic does not match".into()));
+fn summarize_header(header: &Header<Metadata>) -> Result<ModelArtifactSummary> {
+    let tensor_count = header.tensors.len();
+    let Metadata {
+        source_sha256,
+        config,
+    } = &header.metadata;
+    if *source_sha256 == [0; 32] || tensor_count == 0 {
+        return Err(artifact_error("invalid model identity or tensor count"));
     }
-    let version = header.read_u32()?;
-    if version != MODEL_ARTIFACT_VERSION {
-        return Err(Error::Artifact(format!(
-            "model artifact version {version} is unsupported; expected {MODEL_ARTIFACT_VERSION}"
-        )));
+    if let ModelConfig::TabIclV2(config) = config {
+        config.validate()?;
     }
-    let architecture = header.read_u32()?;
-    let source_sha256 = header.read_array::<32>()?;
-    if source_sha256 == [0; 32] {
-        return Err(Error::Artifact("source checkpoint hash is empty".into()));
-    }
-    let tensor_count = usize::try_from(header.read_u32()?)
-        .map_err(|_| Error::Artifact("tensor count exceeds usize".into()))?;
-    if tensor_count == 0 || tensor_count > MAX_TENSOR_COUNT {
-        return Err(Error::Artifact(format!(
-            "artifact has {tensor_count} tensors; expected 1..={MAX_TENSOR_COUNT}"
-        )));
-    }
-    let declared_parameters = header.read_u64()?;
-    let declared_tensor_bytes = header.read_u64()?;
-    let mut values = [0; 7];
-    for value in &mut values {
-        *value = header.read_u64()?;
-    }
-    let config = ModelConfig::from_header(architecture, values)?;
-    let directory_length = header.read_u64()?;
-    let payload_length = header.read_u64()?;
-    if header.read_u32()? != 0 || !header.is_empty() {
-        return Err(Error::Artifact(
-            "artifact header reserved bytes are invalid".into(),
-        ));
-    }
-    if directory_length > MAX_DIRECTORY_BYTES || payload_length > MAX_TOTAL_TENSOR_BYTES + 64 * 4096 {
-        return Err(Error::Artifact(
-            "artifact section length exceeds its limit".into(),
-        ));
-    }
-
-    let directory_end = HEADER_BYTES
-        .checked_add(u64_to_usize(directory_length, "directory length")?)
-        .ok_or_else(|| Error::Artifact("directory end overflows usize".into()))?;
-    let payload_start = align_up(directory_end, TENSOR_ALIGNMENT)?;
-    let payload_end = payload_start
-        .checked_add(u64_to_usize(payload_length, "payload length")?)
-        .ok_or_else(|| Error::Artifact("payload end overflows usize".into()))?;
-    if payload_end != checksum_offset || directory_end > payload_start {
-        return Err(Error::Artifact(
-            "artifact section offsets are inconsistent".into(),
-        ));
-    }
-    if bytes[directory_end..payload_start].iter().any(|byte| *byte != 0) {
-        return Err(Error::Artifact("artifact alignment padding is not zero".into()));
-    }
-
-    let mut directory = ByteReader::new(&bytes[HEADER_BYTES..directory_end]);
-    let mut previous_name: Option<String> = None;
-    let mut ranges = Vec::with_capacity(tensor_count);
-    let mut tensors = Vec::with_capacity(tensor_count);
     let mut parameter_count = 0_u64;
     let mut tensor_bytes = 0_u64;
     let mut dtype_counts = BTreeMap::new();
-    for _ in 0..tensor_count {
-        let name_length = usize::try_from(directory.read_u32()?)
-            .map_err(|_| Error::Artifact("tensor name length exceeds usize".into()))?;
-        if name_length == 0 || name_length > MAX_TENSOR_NAME_BYTES {
-            return Err(Error::Artifact(format!(
-                "invalid tensor name length {name_length}"
-            )));
+    for t in &header.tensors {
+        if t.bytes as u64 > MAX_TENSOR_BYTES || matches!(t.dtype, DType::I32 | DType::F8E4M3) {
+            return Err(artifact_error("invalid model tensor size or dtype"));
         }
-        let rank = usize::from(directory.read_u16()?);
-        if rank > MAX_TENSOR_RANK {
-            return Err(Error::Artifact(format!(
-                "tensor rank {rank} exceeds {MAX_TENSOR_RANK}"
-            )));
-        }
-        let dtype = ModelTensorDType::from_id(directory.read_u8()?)?;
-        if directory.read_u8()? != 0 {
-            return Err(Error::Artifact(
-                "tensor directory reserved byte is not zero".into(),
-            ));
-        }
-        let payload_offset = directory.read_u64()?;
-        let byte_length = directory.read_u64()?;
-        if byte_length > MAX_TENSOR_BYTES || payload_offset % TENSOR_ALIGNMENT as u64 != 0 {
-            return Err(Error::Artifact(
-                "tensor payload offset or length is invalid".into(),
-            ));
-        }
-        let mut dimensions = Vec::with_capacity(rank);
-        for _ in 0..rank {
-            dimensions.push(directory.read_u64()?);
-        }
-        let name = std::str::from_utf8(directory.read_bytes(name_length)?)
-            .map_err(|error| Error::Artifact(format!("tensor name is not UTF-8: {error}")))?
-            .to_owned();
-        if previous_name.as_ref().is_some_and(|previous| previous >= &name) {
-            return Err(Error::Artifact("tensor names are not unique and sorted".into()));
-        }
-        previous_name = Some(name.clone());
-
-        let elements = checked_elements(&name, &dimensions)?;
-        let expected_bytes = elements
-            .checked_mul(dtype.size_in_bytes())
-            .ok_or_else(|| Error::Artifact(format!("tensor '{name}' byte count overflows u64")))?;
-        if expected_bytes != byte_length {
-            return Err(Error::Artifact(format!(
-                "tensor '{name}' is {byte_length} bytes; expected {expected_bytes}"
-            )));
-        }
-        let start = u64_to_usize(payload_offset, "tensor payload offset")?;
-        let end = start
-            .checked_add(u64_to_usize(byte_length, "tensor byte length")?)
-            .ok_or_else(|| Error::Artifact(format!("tensor '{name}' payload end overflows usize")))?;
-        if end > u64_to_usize(payload_length, "payload length")? {
-            return Err(Error::Artifact(format!(
-                "tensor '{name}' exceeds the payload section"
-            )));
-        }
-        ranges.push((start, end));
-        let payload_range = payload_start
-            .checked_add(start)
-            .zip(payload_start.checked_add(end))
-            .ok_or_else(|| {
-                Error::Artifact(format!("tensor '{name}' absolute payload range overflows usize"))
-            })?;
-        tensors.push(ParsedTensor {
-            name,
-            dtype,
-            dimensions,
-            payload_range: payload_range.0..payload_range.1,
-        });
         parameter_count = parameter_count
-            .checked_add(elements)
-            .ok_or_else(|| Error::Artifact("model parameter count overflows u64".into()))?;
-        tensor_bytes = tensor_bytes
-            .checked_add(byte_length)
-            .ok_or_else(|| Error::Artifact("model tensor byte count overflows u64".into()))?;
-        *dtype_counts.entry(dtype.as_str().to_owned()).or_insert(0) += 1;
+            .checked_add(t.bytes as u64 / t.dtype.size_in_bytes() as u64)
+            .ok_or_else(|| artifact_error("parameter count overflow"))?;
+        tensor_bytes += t.bytes as u64;
+        *dtype_counts.entry(t.dtype.as_str().to_owned()).or_insert(0) += 1;
     }
-    if !directory.is_empty() {
-        return Err(Error::Artifact("tensor directory has trailing bytes".into()));
+    if tensor_bytes > MAX_TOTAL_TENSOR_BYTES {
+        return Err(artifact_error("model payload exceeds size limit"));
     }
-    ranges.sort_unstable();
-    for pair in ranges.windows(2) {
-        if pair[0].1 > pair[1].0 {
-            return Err(Error::Artifact("tensor payload ranges overlap".into()));
-        }
-    }
-    if parameter_count != declared_parameters || tensor_bytes != declared_tensor_bytes {
-        return Err(Error::Artifact(
-            "artifact aggregate tensor metadata does not match".into(),
-        ));
-    }
-
-    let profile = identify_profile(
-        &source_sha256,
-        &config,
+    let profile = identify_profile(source_sha256, config, tensor_count, parameter_count, tensor_bytes);
+    Ok(ModelArtifactSummary {
+        source_sha256: encode_sha256(source_sha256),
+        profile,
         tensor_count,
         parameter_count,
         tensor_bytes,
-    );
-    Ok(ParsedModelArtifact {
-        summary: ModelArtifactSummary {
-            source_sha256: encode_sha256(&source_sha256),
-            profile,
-            tensor_count,
-            parameter_count,
-            tensor_bytes,
-            dtype_counts,
-            config,
-        },
-        tensors,
+        dtype_counts,
+        config: config.clone(),
     })
 }
 
-fn validate_tensor(tensor: &ModelTensor) -> Result<()> {
-    if tensor.name.is_empty() || tensor.name.len() > MAX_TENSOR_NAME_BYTES {
-        return Err(Error::Artifact(format!("invalid tensor name '{}'", tensor.name)));
-    }
-    if tensor.dimensions.len() > MAX_TENSOR_RANK {
-        return Err(Error::Artifact(format!(
-            "tensor '{}' rank {} exceeds {MAX_TENSOR_RANK}",
-            tensor.name,
-            tensor.dimensions.len()
-        )));
-    }
-    let expected = checked_elements(&tensor.name, &tensor.dimensions)?
-        .checked_mul(tensor.dtype.size_in_bytes())
-        .ok_or_else(|| Error::Artifact(format!("tensor '{}' byte count overflows u64", tensor.name)))?;
-    let actual = usize_to_u64(tensor.data.len(), "tensor byte length")?;
-    if actual != expected || actual > MAX_TENSOR_BYTES {
-        return Err(Error::Artifact(format!(
-            "tensor '{}' is {actual} bytes; expected {expected} with limit {MAX_TENSOR_BYTES}",
-            tensor.name
-        )));
-    }
-    Ok(())
-}
-
-fn checked_elements(name: &str, dimensions: &[u64]) -> Result<u64> {
-    dimensions.iter().try_fold(1_u64, |product, dimension| {
-        product
-            .checked_mul(*dimension)
-            .ok_or_else(|| Error::Artifact(format!("tensor '{name}' element count overflows u64")))
-    })
-}
-
-fn validate_manifest(
-    tensors: &[ParsedTensor],
-    expected: &BTreeMap<String, Vec<u64>>,
-    task: TaskKind,
-) -> Result<()> {
+fn validate_manifest(tensors: &[Entry], expected: &BTreeMap<String, Vec<u64>>, task: TaskKind) -> Result<()> {
     if tensors.len() != expected.len() {
         return Err(Error::Artifact(format!(
             "official {task} has {} tensors; expected {}",
@@ -813,17 +455,17 @@ fn validate_manifest(
                 tensor.name
             )));
         };
-        if tensor.dtype != ModelTensorDType::F32 {
+        if tensor.dtype != DType::F32 {
             return Err(Error::Artifact(format!(
                 "official {task} tensor '{}' has dtype {}; expected f32",
                 tensor.name,
                 tensor.dtype.as_str()
             )));
         }
-        if tensor.dimensions != *dimensions {
+        if tensor.shape != *dimensions {
             return Err(Error::Artifact(format!(
                 "official {task} tensor '{}' has shape {:?}; expected {:?}",
-                tensor.name, tensor.dimensions, dimensions
+                tensor.name, tensor.shape, dimensions
             )));
         }
     }
@@ -986,33 +628,6 @@ fn identify_profile(
     }
 }
 
-fn read_artifact_bytes(path: &Path) -> Result<Vec<u8>> {
-    let file = File::open(path).map_err(artifact_error)?;
-    let length = file.metadata().map_err(artifact_error)?.len();
-    if length > MAX_ARTIFACT_BYTES {
-        return Err(Error::Artifact(format!(
-            "artifact is {length} bytes; limit is {MAX_ARTIFACT_BYTES}"
-        )));
-    }
-    let capacity = u64_to_usize(length, "artifact length")?;
-    let mut bytes = Vec::with_capacity(capacity);
-    file.take(MAX_ARTIFACT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(artifact_error)?;
-    if usize_to_u64(bytes.len(), "artifact length")? > MAX_ARTIFACT_BYTES {
-        return Err(Error::Artifact(
-            "artifact grew beyond its size limit while reading".into(),
-        ));
-    }
-    Ok(bytes)
-}
-
-fn usable_parent(path: &Path) -> &Path {
-    path.parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."))
-}
-
 fn required_config(value: Option<u64>, name: &str) -> Result<u64> {
     value.ok_or_else(|| Error::Artifact(format!("model configuration '{name}' is missing")))
 }
@@ -1026,7 +641,7 @@ mod tests {
     #[test]
     fn model_artifact_round_trips_and_detects_corruption() {
         let directory = tempdir().expect("temporary directory");
-        let path = directory.path().join("model.irmodel");
+        let path = directory.path().join("model.ir");
         let model = fixture_model();
 
         let written = write_model_artifact(&path, &model).expect("write model artifact");
@@ -1037,7 +652,7 @@ mod tests {
         assert_eq!(inspected.tensor_bytes, 24);
 
         let mut bytes = fs::read(&path).expect("read artifact");
-        bytes[HEADER_BYTES] ^= 1;
+        bytes[16] ^= 1;
         fs::write(&path, bytes).expect("corrupt artifact");
         assert!(inspect_model_artifact(&path).is_err());
     }
@@ -1046,15 +661,16 @@ mod tests {
     fn parsed_tensor_ranges_include_the_payload_section_offset() {
         let model = fixture_model();
         let bytes = encode_model_artifact(&model).expect("encode fixture");
-        let parsed = parse_model_artifact_bytes(&bytes).expect("parse fixture");
-        let tensor = parsed
+        let (header, _) = parse_model_artifact_bytes(&bytes).expect("parse fixture");
+        let tensor = header
             .tensors
             .iter()
             .find(|tensor| tensor.name == "a.weight")
             .expect("fixture tensor");
+        let range = header.range(tensor);
 
-        assert_eq!(&bytes[tensor.payload_range.clone()], &[0; 16]);
-        assert!(tensor.payload_range.start >= HEADER_BYTES);
+        assert_eq!(&bytes[range.clone()], &[0; 16]);
+        assert!(range.start >= MEMORY_ALIGNMENT);
     }
 
     #[test]
@@ -1083,14 +699,15 @@ mod tests {
         let manifest = tensor_manifest(TaskKind::Classifier);
         let mut tensors = manifest
             .into_iter()
-            .map(|(name, dimensions)| ParsedTensor {
+            .map(|(name, shape)| Entry {
                 name,
-                dtype: ModelTensorDType::F32,
-                dimensions,
-                payload_range: 0..0,
+                dtype: DType::F32,
+                shape,
+                offset: 0,
+                bytes: 0,
             })
             .collect::<Vec<_>>();
-        tensors[0].dimensions = vec![1];
+        tensors[0].shape = vec![1];
         assert!(
             validate_manifest(
                 &tensors,
@@ -1100,7 +717,7 @@ mod tests {
             .is_err()
         );
 
-        tensors[0].dimensions = tensor_manifest(TaskKind::Classifier)
+        tensors[0].shape = tensor_manifest(TaskKind::Classifier)
             .get(&tensors[0].name)
             .expect("known tensor")
             .clone();
@@ -1119,7 +736,7 @@ mod tests {
             .next()
             .expect("manifest has tensors")
             .clone();
-        tensors[0].dtype = ModelTensorDType::F64;
+        tensors[0].dtype = DType::F64;
         assert!(
             validate_manifest(
                 &tensors,
@@ -1150,14 +767,11 @@ mod tests {
     fn kumo_tabular_configs_round_trip_through_the_header() {
         for release in Release::ALL {
             let config = ModelConfig::KumoTabular(release);
-            let (architecture, values) = config.header().expect("header");
-            assert_eq!(
-                ModelConfig::from_header(architecture, values).expect("config"),
-                config
-            );
+            let mut data = fixture_model();
+            data.config = config.clone();
+            let bytes = encode_model_artifact(&data).unwrap();
+            assert_eq!(parse_model_artifact_bytes(&bytes).unwrap().1.config, config);
         }
-        assert!(ModelConfig::from_header(KUMO_TABULAR, [10, 0, 1, 2, 3, 4, 5]).is_err());
-        assert!(ModelConfig::from_header(3, [0; 7]).is_err());
     }
 
     fn fixture_model() -> ModelArtifactData {

@@ -54,12 +54,18 @@ fn inspect(args: &InspectArgs) -> Result<()> {
         return inspect_directory(path, &weights_dir(args.weights.as_ref())?);
     }
     let mut magic = [0; 8];
-    let is_model = std::fs::File::open(path)
+    let is_container = std::fs::File::open(path)
         .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut magic))
         .is_ok()
-        && magic == ironicl::format::model::MODEL_ARTIFACT_MAGIC;
-    if is_model {
-        inspect_model_file(path)
+        && magic == ironicl::format::container::MAGIC;
+    if is_container {
+        use ironicl::format::container::{self, Kind};
+        let (kind, alignment, count) = container::inspect(path)?;
+        if kind == Kind::Model {
+            return inspect_model_file(path);
+        }
+        println!("Ironicl {kind:?} container\ntensors:       {count}\nalignment:     {alignment} bytes");
+        Ok(())
     } else {
         inspect_checkpoint_file(path, args.model.map(ironicl::cli::Model::checkpoint_kind))
     }
