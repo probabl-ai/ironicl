@@ -4,7 +4,7 @@
 //! - `ironicl.json`: the metadata, written last, so a directory without it is
 //!   incomplete. `format` and `version` are checked; the rest describes the
 //!   model, and the other files stay the source of truth.
-//! - `preprocessing.irprep`: the fitted preprocessing with its training rows,
+//! - `preprocessing.ir`: the fitted preprocessing with its training rows,
 //!   or for Kumo-Tabular the training data, from which it fits its
 //!   preprocessing again.
 //! - `context.ircntxt`: the KV cache, optional. [`prepare`] builds it when it
@@ -27,13 +27,13 @@ use crate::{
     Result, StaticContextArtifact, TaskKind,
     format::{encode_sha256, model::load_model_artifact, preprocessor, read_bounded},
     memory::MemoryLimits,
-    models::kumo_tabular,
+    models::{ModelFamily, kumo_tabular},
 };
 
 pub use super::checkpoint_cache::default_weights_dir;
 
 pub const METADATA: &str = "ironicl.json";
-pub const PREPROCESSING: &str = "preprocessing.irprep";
+pub const PREPROCESSING: &str = "preprocessing.ir";
 pub const CONTEXT: &str = "context.ircntxt";
 /// The metadata's `format` and `version` for this layout.
 const FORMAT: &str = "ironicl-model";
@@ -97,7 +97,7 @@ pub fn write_kumo_tabular(dir: &Path, model: &kumo_tabular::fitted::Fitted, kv_c
         feature_names: training.feature_names.clone(),
         classes: model.classes().cloned(),
         weights: encode_sha256(&model.checkpoint_sha256()),
-        optimize: (model.optimize() != Optimize::Safe).then_some(model.optimize()),
+        optimize: Some(model.optimize()),
     };
     let context = |path: &Path| write_atomic(path, &model.context_bytes()?);
     write_files(dir, &model.to_bytes()?, kv_cache.then_some(context), &metadata)
@@ -160,7 +160,7 @@ impl Metadata {
             feature_names: preprocessor.feature_names.clone(),
             classes: preprocessor.classes().cloned(),
             weights: encode_sha256(&model.context.context_metadata().model_sha256),
-            optimize: None,
+            optimize: Some(model.context.context_metadata().optimize),
         }
     }
 }
@@ -189,11 +189,9 @@ pub fn read_metadata(dir: &Path) -> Result<Metadata> {
     }
 }
 
-/// The weights file in `weights` that the preprocessing `bytes` were fitted
-/// with.
-fn weights_path(bytes: &[u8], weights: &Path) -> Result<PathBuf> {
-    let sha256 = encode_sha256(&preprocessor::checkpoint_sha256(bytes)?);
-    Ok(weights.join(format!("{sha256}.ir")))
+/// Shared weights addressed by the source checkpoint, not the container bytes.
+fn weights_path(sha: &[u8; 32], weights: &Path) -> PathBuf {
+    weights.join(format!("{}.ir", encode_sha256(sha)))
 }
 
 fn executor(path: &Path) -> Result<Executor> {
@@ -386,8 +384,10 @@ pub(crate) fn load(
     let metadata = read_metadata(dir)?;
     let path = dir.join(PREPROCESSING);
     let bytes = read_bounded(&path, MAX_PREPROCESSING_BYTES).map_err(|error| artifact_error(&path, error))?;
-    let kumo = preprocessor::architecture(&bytes)? == preprocessor::KUMO_TABULAR;
-    if kumo && let Some(limit) = limits.host.or(limits.device) {
+    let identity = preprocessor::identity(&bytes)?;
+    if identity.family == ModelFamily::KumoTabular
+        && let Some(limit) = limits.host.or(limits.device)
+    {
         return Err(Error::InvalidArgument(format!(
             "Kumo-Tabular does not support memory limits ({} is set)",
             limit.source
@@ -413,71 +413,75 @@ pub(crate) fn load(
         .or(saved.as_ref().map(|context| context.metadata().optimize))
         .or(metadata.optimize)
         .unwrap_or_default();
-    let weights = weights_path(&bytes, weights)?;
-    if kumo {
-        let model = Arc::new(kumo_tabular::cpu::Model::with_optimize(
-            load_weights(&weights)?,
-            optimize,
-        )?);
-        if let Some(cache) = saved.filter(|c| c.metadata().optimize == optimize) {
-            match kumo_tabular::fitted::Fitted::from_artifact(
-                Arc::clone(&model),
-                &bytes,
-                Some(cache),
-                threads,
-            ) {
-                Ok(fitted) => {
-                    return Ok(Prepared {
-                        model: Fitted::KumoTabular(Box::new(fitted)),
-                        optimize,
-                        built: false,
-                        warning,
-                    });
-                }
-                Err(error) => {
-                    warning = Some(format!(
-                        "could not load the saved KV cache {}, so rebuilt it: {error}",
-                        path.display()
-                    ));
+    let weights = weights_path(&identity.checkpoint_sha256, weights);
+    match identity.family {
+        ModelFamily::KumoTabular => {
+            let model = Arc::new(kumo_tabular::cpu::Model::with_optimize(
+                load_weights(&weights)?,
+                optimize,
+            )?);
+            if let Some(cache) = saved.filter(|c| c.metadata().optimize == optimize) {
+                match kumo_tabular::fitted::Fitted::from_artifact(
+                    Arc::clone(&model),
+                    &bytes,
+                    Some(cache),
+                    threads,
+                ) {
+                    Ok(fitted) => {
+                        return Ok(Prepared {
+                            model: Fitted::KumoTabular(Box::new(fitted)),
+                            optimize,
+                            built: false,
+                            warning,
+                        });
+                    }
+                    Err(error) => {
+                        warning = Some(format!(
+                            "could not load the saved KV cache {}, so rebuilt it: {error}",
+                            path.display()
+                        ));
+                    }
                 }
             }
+            let fitted = kumo_tabular::fitted::Fitted::from_bytes(model, &bytes, None, threads)
+                .map_err(|error| artifact_error(&dir.join(PREPROCESSING), error))?;
+            Ok(Prepared {
+                model: Fitted::KumoTabular(Box::new(fitted)),
+                optimize,
+                built: true,
+                warning,
+            })
         }
-        let fitted = kumo_tabular::fitted::Fitted::from_bytes(model, &bytes, None, threads)
-            .map_err(|error| artifact_error(&dir.join(PREPROCESSING), error))?;
-        return Ok(Prepared {
-            model: Fitted::KumoTabular(Box::new(fitted)),
-            optimize,
-            built: true,
-            warning,
-        });
+        ModelFamily::TabIclV2 => {
+            let executor = executor(&weights)?;
+            let (preprocessed, _) = executor
+                .decode_preprocessed(&bytes)
+                .map_err(|error| artifact_error(&dir.join(PREPROCESSING), error))?;
+            let preprocessed = Arc::new(preprocessed);
+            if let Some(context) = saved
+                && *context.metadata() == executor.fitted_context_metadata(&preprocessed, optimize)?
+            {
+                let context = executor.load_context_artifact(context, optimize, threads, limits)?;
+                let model = Fitted::TabIclV2(FittedModel {
+                    preprocessed,
+                    context: Arc::new(context),
+                });
+                return Ok(Prepared {
+                    model,
+                    optimize,
+                    built: false,
+                    warning,
+                });
+            }
+            let model = executor.build_fitted(preprocessed, optimize, threads, limits, None)?;
+            Ok(Prepared {
+                model: Fitted::TabIclV2(model),
+                optimize,
+                built: true,
+                warning,
+            })
+        }
     }
-    let executor = executor(&weights)?;
-    let (_, preprocessed) = executor
-        .decode_preprocessed(&bytes)
-        .map_err(|error| artifact_error(&dir.join(PREPROCESSING), error))?;
-    let preprocessed = Arc::new(preprocessed);
-    if let Some(context) = saved
-        && *context.metadata() == executor.fitted_context_metadata(&preprocessed, optimize)?
-    {
-        let context = executor.load_context_artifact(context, optimize, threads, limits)?;
-        let model = Fitted::TabIclV2(FittedModel {
-            preprocessed,
-            context: Arc::new(context),
-        });
-        return Ok(Prepared {
-            model,
-            optimize,
-            built: false,
-            warning,
-        });
-    }
-    let model = executor.build_fitted(preprocessed, optimize, threads, limits, None)?;
-    Ok(Prepared {
-        model: Fitted::TabIclV2(model),
-        optimize,
-        built: true,
-        warning,
-    })
 }
 
 /// What `ironicl inspect` shows of a model directory.
@@ -498,8 +502,9 @@ pub struct Summary {
 pub fn inspect(dir: &Path, weights: &Path) -> Result<Summary> {
     let metadata = read_metadata(dir)?;
     let path = dir.join(PREPROCESSING);
-    let bytes = read_bounded(&path, MAX_PREPROCESSING_BYTES).map_err(|error| artifact_error(&path, error))?;
-    let weights = weights_path(&bytes, weights)?;
+    let identity = preprocessor::file_identity(&path, MAX_PREPROCESSING_BYTES)
+        .map_err(|error| artifact_error(&path, error))?;
+    let weights = weights_path(&identity.checkpoint_sha256, weights);
     let found = weights.is_file();
     let path = dir.join(CONTEXT);
     let cache = path.exists().then(|| {

@@ -139,14 +139,6 @@ pub(crate) fn write_u64(bytes: &mut Vec<u8>, value: u64) {
     bytes.extend_from_slice(&value.to_le_bytes());
 }
 
-pub(crate) fn usize_to_u32(value: usize, name: &str) -> Result<u32> {
-    u32::try_from(value).map_err(|_| artifact_error(format!("{name} exceeds u32")))
-}
-
-pub(crate) fn usize_to_u64(value: usize, name: &str) -> Result<u64> {
-    u64::try_from(value).map_err(|_| artifact_error(format!("{name} exceeds u64")))
-}
-
 pub(crate) fn u64_to_usize(value: u64, name: &str) -> Result<usize> {
     usize::try_from(value).map_err(|_| artifact_error(format!("{name} exceeds usize")))
 }
@@ -184,34 +176,6 @@ impl<'a> ByteReader<'a> {
 
     pub(crate) fn is_empty(&self) -> bool {
         self.position == self.bytes.len()
-    }
-
-    /// A u64 count as a usize.
-    pub(crate) fn read_count(&mut self, name: &str) -> Result<usize> {
-        u64_to_usize(self.read_u64()?, name)
-    }
-
-    /// `count` values of `width` bytes each, checked against the bytes left.
-    pub(crate) fn read_chunks(
-        &mut self,
-        count: usize,
-        width: usize,
-    ) -> Result<std::slice::ChunksExact<'a, u8>> {
-        let length = count
-            .checked_mul(width)
-            .ok_or_else(|| artifact_error("artifact length overflows usize"))?;
-        Ok(self.read_bytes(length)?.chunks_exact(width))
-    }
-
-    pub(crate) fn read_f64s(&mut self, count: usize) -> Result<Vec<f64>> {
-        Ok(self
-            .read_chunks(count, 8)?
-            .map(|bytes| f64::from_le_bytes(bytes.try_into().expect("eight bytes")))
-            .collect())
-    }
-
-    pub(crate) fn read_u8(&mut self) -> Result<u8> {
-        Ok(self.read_array::<1>()?[0])
     }
 
     pub(crate) fn read_u16(&mut self) -> Result<u16> {

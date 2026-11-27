@@ -50,6 +50,12 @@ class PrepareTest(unittest.TestCase):
         warnings = [line for line in result.stderr.splitlines() if line.startswith("warning:")]
         return result.stdout.splitlines()[0], "\n".join(warnings)
 
+    def test_prepare_without_cache_keeps_the_exported_level(self):
+        model = fitted(TabICLClassifier, optimize="fast", n_estimators=1)
+        model.export(self.directory / "model", kv_cache=False)
+        self.assertEqual(self.prepare(), ("Built the KV cache", ""))
+        self.assertEqual(self.prepare("--optimize", "fast"), ("Reused the KV cache", ""))
+
     def test_prepare_reuses_a_matching_cache_and_rebuilds_any_other(self):
         model = fitted(TabICLClassifier)
         path = self.directory / "model"

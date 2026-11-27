@@ -1024,6 +1024,8 @@ pub(crate) mod fixtures {
         /// The encoded `[rows, features]` matrix and which features are categorical.
         pub x: Vec<f64>,
         pub categorical: Vec<bool>,
+        /// Training-derived dictionaries used to encode `x`, including unknown codes.
+        pub categories: Vec<Option<Labels>>,
         pub features: usize,
         pub context: usize,
         pub labels: Labels,
@@ -1152,6 +1154,7 @@ pub(crate) mod fixtures {
             json,
             x,
             categorical,
+            categories,
             context,
             labels,
             draws,

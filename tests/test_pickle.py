@@ -81,6 +81,20 @@ class PickleTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "both"):
                 model.save(self.directory / "neither.pkl", save_training_data=False, save_kv_cache=False)
 
+    def test_context_from_another_fit_is_rejected_with_or_without_rows(self):
+        ckpt = checkpoint(TabICLClassifier)
+        x, y = data()
+
+        def fit(labels):
+            return TabICLClassifier(model_path=ckpt, n_estimators=1, cache_dir=False).fit(x, labels)
+
+        a, b = fit(y > 0), fit(y <= 0)
+        rust = _core.Model(ckpt)
+        context = b.fitted_.context_bytes()
+        for training in (False, True):
+            with self.subTest(training=training), self.assertRaisesRegex(RuntimeError, "does not match its preprocessing"):
+                rust.load_fitted(a.fitted_.preprocessor_bytes(training), "safe", None, context=context)
+
     def test_saved_model_weights_restore_a_missing_checkpoint(self):
         copy = self.directory / "checkpoint.ckpt"
         shutil.copyfile(checkpoint(TabICLClassifier), copy)
@@ -133,7 +147,7 @@ class PickleTest(unittest.TestCase):
                 model = fitted(estimator)
                 path = self.directory / estimator.__name__
                 model.export(path)
-                files = ["context.ircntxt", "ironicl.json", "preprocessing.irprep"]
+                files = ["context.ircntxt", "ironicl.json", "preprocessing.ir"]
                 self.assertEqual(sorted(file.name for file in path.iterdir()), files)
                 metadata = json.loads((path / "ironicl.json").read_text())
                 self.assertEqual(
@@ -145,7 +159,7 @@ class PickleTest(unittest.TestCase):
                         self.assertEqual((path / name).stat().st_mode & 0o777, 0o600, name)
                 # Rust loads it, with the cache or, without it, from the training rows.
                 rust = _core.Model(Path(model.checkpoint_path_))
-                preprocessor = (path / "preprocessing.irprep").read_bytes()
+                preprocessor = (path / "preprocessing.ir").read_bytes()
                 self.assertEqual(preprocessor, model.fitted_.preprocessor_bytes())
                 for context in ((path / "context.ircntxt").read_bytes(), None):
                     loaded = rust.load_fitted(preprocessor, "safe", None, context=context)
