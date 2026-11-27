@@ -471,13 +471,33 @@ impl Executor {
         let Some(context) = context else {
             return self.build_fitted(preprocessed, optimize, threads, limits, cache_dir);
         };
-        let artifact = StaticContextArtifact::from_bytes(context)?;
+        self.restore_fitted(
+            preprocessed,
+            saved_identity.as_deref(),
+            StaticContextArtifact::from_bytes(context)?,
+            optimize,
+            threads,
+            limits,
+        )
+    }
+
+    /// Validate the fit binding before placing the context on a device. Both
+    /// pickles and model directories use this path.
+    pub(crate) fn restore_fitted(
+        &self,
+        preprocessed: Arc<Preprocessed>,
+        saved_identity: Option<&str>,
+        artifact: StaticContextArtifact,
+        optimize: Optimize,
+        threads: Option<usize>,
+        limits: MemoryLimits,
+    ) -> Result<FittedModel> {
         let metadata = artifact.metadata();
         let matches = if preprocessed.has_training() {
             *metadata == self.fitted_context_metadata(&preprocessed, optimize)?
         } else {
             metadata.optimize == optimize
-                && matches_without_rows(&preprocessed.preprocessor, saved_identity.as_deref(), metadata)
+                && matches_without_rows(&preprocessed.preprocessor, saved_identity, metadata)
         };
         if !matches {
             return Err(Error::Artifact(
@@ -516,7 +536,7 @@ impl Executor {
     /// # Errors
     ///
     /// When the training rows were not kept, or as [`Self::build_context`].
-    pub(crate) fn fitted_context_metadata(
+    fn fitted_context_metadata(
         &self,
         preprocessed: &Preprocessed,
         optimize: Optimize,

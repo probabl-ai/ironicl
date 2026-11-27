@@ -418,6 +418,20 @@ impl StaticContextArtifact {
         })
     }
 
+    /// Seal pages from a writer whose backend does not check every output dtype.
+    #[cfg(any(test, feature = "cuda"))]
+    pub(crate) fn from_checked_pages(
+        metadata: StaticContextMetadata,
+        pages: PageAlignedTensors,
+    ) -> Result<Self> {
+        for (name, _, dtype, offset, bytes) in &pages.layout {
+            if !dtype.all_finite(&pages.mapping[*offset..][..*bytes])? {
+                return Err(artifact_error(format!("non-finite cache tensor '{name}'")));
+            }
+        }
+        Self::from_page_aligned(metadata, pages)
+    }
+
     /// The page-aligned memory holding every tensor, if the artifact has it.
     #[cfg_attr(
         not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
