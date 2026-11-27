@@ -4,7 +4,7 @@ Preprocessing runs in Rust. The fitted model, `models/tabicl_v2/fitted.rs`, hold
 the fitted preprocessing, with the class labels or the regressor's target scale,
 and the training context, so it predicts from raw features without Python. The
 Python estimators convert inputs and keep scikit-learn's interface; the planned
-prediction server uses the same fitted model, saved as `IRPREP` and `IRCNTXT`
+prediction server uses the same fitted model, saved as preprocessing and context containers
 ([artifact-format.md](artifact-format.md#fitted-models)).
 
 | Part | Where |
@@ -18,7 +18,7 @@ prediction server uses the same fitted model, saved as `IRPREP` and `IRCNTXT`
 | TabICL's pipeline: constant-feature mask, normalization groups | `src/models/tabicl_v2/preprocess.rs` |
 | TabICL's ensemble: members' groups, feature and class orders | `src/models/tabicl_v2/ensemble.rs` |
 | Fitting, context building, chunked prediction, saving | `src/models/tabicl_v2/fitted.rs` |
-| Fitted preprocessing as `IRPREP` bytes | `src/format/preprocessor.rs` ([artifact-format.md](artifact-format.md#fitted-models)) |
+| Fitted preprocessing container | `src/format/preprocessor.rs` ([artifact-format.md](artifact-format.md#fitted-models)) |
 | Input conversion, label types, scikit-learn's interface | `python/ironicl/base.py` |
 
 `src/preprocess/` forbids `unsafe`: it handles request data and, in the server,
@@ -82,7 +82,7 @@ columns, which its `SimpleImputer` fills. Ironicl does the same in Rust:
 - A value becomes its category's index, or -1 when it is missing or training
   never saw it. Integers and floats compare as numbers, so `2.0` finds the
   category `2`.
-- The preprocessor stores the categories per input feature in `IRPREP`, and
+- The preprocessor stores the categories per input feature in the preprocessing header, and
   moves categorical features first; from there, codes are numbers like any
   other: the constant-feature mask, normalization, and the ensemble treat them
   alike.

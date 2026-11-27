@@ -3,7 +3,7 @@
 (https://github.com/hatoo/oha).
 
 For each optimize level, it prepares the model directory's KV cache with
-`ironicl prepare` (replacing MODEL/context.ircntxt), then for each
+`ironicl prepare` (replacing MODEL/context.ir), then for each
 --max-batch-rows starts the server and runs oha for each request size at each
 client count, or with --rates, at each request rate. Request rows are random
 normal values, as many per row as the model has features. Latencies are of

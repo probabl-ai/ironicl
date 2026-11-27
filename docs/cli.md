@@ -23,9 +23,9 @@ with `export`.
 ## Model Directories and Weights
 
 A model directory holds one fitted model: its metadata (`ironicl.json`), its preprocessing with
-the training rows (`preprocessing.irprep`), and optionally its KV cache (`context.ircntxt`); see
+the training rows (`preprocessing.ir`), and optionally its KV cache (`context.ir`); see
 [python.md](python.md#exporting-for-the-server). It holds no weights. The weights stay in a shared
-folder as `<checkpoint SHA-256>.irmodel` files, so many models share one copy.
+folder as `<checkpoint SHA-256>.ir` files, so many models share one copy.
 
 `--weights DIR` names that folder. By default it is the folder that loading a checkpoint fills:
 `~/.cache/ironicl/models/v1`, or `$XDG_CACHE_HOME/ironicl/models/v1` when `XDG_CACHE_HOME` is set.
@@ -48,15 +48,16 @@ ironicl inspect my-model
 ironicl inspect tabicl-classifier-v2-20260212.ckpt
 ironicl inspect large-classifier.pt
 ironicl inspect large-classifier.pt --model kumo-tabular
-ironicl inspect ~/.cache/ironicl/models/v1/<sha256>.irmodel
+ironicl inspect ~/.cache/ironicl/models/v1/<sha256>.ir
 ```
 
 `inspect` tells what `PATH` is:
 
 - a model directory: its task, features and their names, classes, the weights it needs and
   whether they are in the weights folder, and the KV cache's level and size;
-- Ironicl weights (`IRMODEL`): full structural and checksum validation, then the source SHA-256,
-  profile, tensor and parameter counts, dtypes, and configuration;
+- Ironicl weights (`.ir`): header validation, source SHA-256, profile, tensor and
+  parameter counts, dtypes, and configuration;
+- a standalone preprocessing or context container: its kind, tensor count, and alignment;
 - a PyTorch ZIP checkpoint (`.ckpt`, `.pt`, `.pth`), parsed without executing pickle code: the
   same, with the source SHA-256 bound to the recognized official model for TabICLv2. A checkpoint
   with a config is TabICLv2's; one without is [Kumo-Tabular](kumo-tabular.md)'s, whose size and
@@ -67,7 +68,7 @@ ironicl inspect ~/.cache/ironicl/models/v1/<sha256>.irmodel
 
 ```bash
 ironicl import tabicl-classifier-v2-20260212.ckpt
-ironicl import tabicl-classifier-v2-20260212.ckpt --model tabicl -o classifier.irmodel
+ironicl import tabicl-classifier-v2-20260212.ckpt --model tabicl -o classifier.ir
 ironicl import large-classifier.pt --model kumo-tabular
 ```
 
@@ -75,7 +76,7 @@ ironicl import large-classifier.pt --model kumo-tabular
 tensors must match one release and determine its size and task.
 
 `import` validates the checkpoint, keeps its source identity, copies the tensors into a
-deterministic, 64-byte-aligned portable layout, writes atomically, and verifies the complete
+deterministic, 16 KiB-aligned portable layout, writes atomically, and verifies the complete
 weights before it returns. Without `-o`, it writes into the shared weights folder, where `prepare`
 and `serve` look; an import that is already there is kept. The weights hold no preprocessing state
 and no dataset-specific caches; see [artifact-format.md](artifact-format.md).
@@ -86,10 +87,10 @@ and no dataset-specific caches; see [artifact-format.md](artifact-format.md).
 ironicl prepare my-model --optimize auto
 ```
 
-`prepare` makes sure that `my-model/context.ircntxt` is the KV cache this model builds at the
+`prepare` makes sure that `my-model/context.ir` is the KV cache this model builds at the
 level: it reuses a saved cache that is exactly that one, and otherwise builds it from the training
 rows on this machine's device and replaces the file atomically. A saved cache that cannot be read
-is rebuilt too, with a warning. The level defaults to the saved cache's, else `safe`. Running it
+is rebuilt too, with a warning. The level defaults to the saved cache's or, without one, the exported fit's. Running it
 twice does nothing the second time. Use it on the serving machine,
 for example in a container build, so that `serve` starts at once. If the cache cannot be saved,
 `prepare` exits with an error. `serve` instead logs a warning and serves the in-memory model.

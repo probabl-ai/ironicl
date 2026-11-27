@@ -1,6 +1,7 @@
 """The context cache: cache_info, clear_cache, and how fit uses entries."""
 
 import filecmp
+import json
 import os
 import shutil
 import tempfile
@@ -25,9 +26,20 @@ class CacheTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.directory)
         now = time.time()
         # Oldest first: 3, 2, and 1 day since last use.
-        for name, size, age in (("a", 10, 3), ("b", 20, 2), ("c", 30, 1)):
-            path = self.directory / f"{name}.irctx"
-            path.write_bytes(b"x" * size)
+        self.sizes = {}
+        for name, age in (("a", 3), ("b", 2), ("c", 1)):
+            digest = name * 64
+            path = self.directory / f"{digest}.ir"
+            header = json.dumps({
+                "format": 1, "kind": "context", "alignment": 64,
+                "metadata": {"architecture": "tabicl_v2", "checkpoint_sha256": "1" * 64, "identity": digest,
+                             "ensemble_count": 1, "training_rows": 1, "feature_count": 1, "class_count": 0,
+                             "class_permutations": [], "feature_permutations": [0], "optimize": "safe"},
+                "tensors": [{"name": "cache", "dtype": "f32", "shape": [1], "offset": 0, "bytes": 4}],
+            }).encode()
+            prefix = b"IRONICL\0" + len(header).to_bytes(8, "little") + header
+            path.write_bytes(prefix + bytes(-len(prefix) % 64 + 64))
+            self.sizes[name] = path.stat().st_size
             os.utime(path, (now - age * DAY, now - age * DAY))
         self.stale = self.directory / ".ironicl-1-1.tmp"
         self.stale.write_bytes(b"x")
@@ -36,12 +48,12 @@ class CacheTest(unittest.TestCase):
         self.writing.write_bytes(b"x")
 
     def names(self, info):
-        return [entry.path.stem for entry in info.entries]
+        return [entry.path.stem[0] for entry in info.entries]
 
     def test_info_lists_contexts_most_recently_used_first(self):
         info = cache_info(self.directory)
         self.assertEqual(self.names(info), ["c", "b", "a"])
-        self.assertEqual(info.size_bytes, 60)
+        self.assertEqual(info.size_bytes, sum(self.sizes.values()))
         self.assertIn("3 contexts", str(info))
         self.assertEqual(cache_info(self.directory / "missing").entries, ())
         with self.assertRaises(ValueError):
@@ -53,17 +65,31 @@ class CacheTest(unittest.TestCase):
         self.assertEqual(self.names(cache_info(self.directory)), ["c"])
 
     def test_max_size_removes_the_least_recently_used(self):
-        self.assertEqual(clear_cache(self.directory, max_size="1K").entries, ())
-        removed = clear_cache(self.directory, max_size=35)
+        self.assertEqual(clear_cache(self.directory, max_size="1M").entries, ())
+        removed = clear_cache(self.directory, max_size=self.sizes["c"])
         self.assertEqual(self.names(removed), ["b", "a"])
         with self.assertRaises(ValueError):
             clear_cache(self.directory, max_size=-1)
 
     def test_clear_removes_everything_and_stale_temporary_files(self):
-        self.assertEqual(clear_cache(self.directory).size_bytes, 60)
+        self.assertEqual(clear_cache(self.directory).size_bytes, sum(self.sizes.values()))
         self.assertEqual(cache_info(self.directory).entries, ())
         self.assertFalse(self.stale.exists())
         self.assertTrue(self.writing.exists())  # May still be written.
+
+    def test_clear_preserves_other_ir_files(self):
+        original = (self.directory / ("a" * 64 + ".ir")).read_bytes()
+        others = {
+            "context.ir": original,  # An exported context, not an automatic cache entry.
+            "d" * 64 + ".ir": original,  # Valid context under another name.
+            "e" * 64 + ".ir": original.replace(b'"context"', b'"model"  '),
+            "f" * 64 + ".ir": b"unrelated",
+        }
+        for name, contents in others.items():
+            (self.directory / name).write_bytes(contents)
+        clear_cache(self.directory)
+        for name, contents in others.items():
+            self.assertEqual((self.directory / name).read_bytes(), contents)
 
     def test_a_cache_hit_marks_the_entry_used(self):
         checkpoint(TabICLClassifier)

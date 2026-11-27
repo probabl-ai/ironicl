@@ -18,7 +18,7 @@ Each level must pass before the next level is used for performance conclusions.
 - rejection of unknown or missing tensors.
 
 Set `IRONICL_CHECKPOINT_FIXTURES` to a directory containing both official v2
-checkpoint files and the imported classifier `tabicl-classifier-v2.irmodel` to
+checkpoint files and the imported classifier `tabicl-classifier-v2.ir` to
 enable the fixture-backed Rust integration tests; see
 [CONTRIBUTING.md](../CONTRIBUTING.md). They are ignored by default.
 

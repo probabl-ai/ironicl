@@ -21,21 +21,21 @@ encoding and imputation come next.
 
 `Executor::build_context` runs the preprocessed training rows through the column, row, and ICL
 stages once, on the CPU, Metal, or CUDA, and keeps each stage's attention keys and values as a
-static context (`IRCNTXT`). `optimize` selects their storage precision. With a cache directory, it
+static context. `optimize` selects their storage precision. With a cache directory, it
 reuses a context with the same identity or writes the new one atomically
 ([artifact-format.md](artifact-format.md#static-context)).
 
 ### Artifact Loader
 
 The loader validates format version, dimensions, identities, tensor names, dtypes, offsets,
-alignment, finite values, and the trailing whole-file checksum. It keeps read-only, memory-mapped
-tensor views and prefaults the mapping. Per-section checksums are not implemented.
+alignment, and finite values for execution. It keeps read-only, memory-mapped tensor views.
+The separate streaming reader validates the layout without scanning the payload.
 
 ### Portable Model Cache
 
 Loading a checkpoint hashes it and resolves a versioned, content-addressed portable model
-(`IRMODEL`). A cache miss performs the same checked conversion as `ironicl import`; a hit verifies
-the model checksum and source hash without reparsing pickle. The model cache is separate from the
+(`.ir`). A cache miss performs the same checked conversion as `ironicl import`; a hit checks
+the model directory and source identity without reparsing pickle. The model cache is separate from the
 dataset-specific context cache.
 
 ### Command Interface
@@ -85,12 +85,12 @@ quantiles. `FittedModel` pairs it with the fitted preprocessing, so callers pass
 ## Fit Lifecycle
 
 ```text
-checkpoint -> content-addressed IRMODEL -> Executor
+checkpoint -> content-addressed weights -> Executor
                                              |
-raw X_train, y_train -> Rust preprocessing (IRPREP) -> transformed rows per estimator
+raw X_train, y_train -> Rust preprocessing (.ir) -> transformed rows per estimator
                                              |
                                              v
-                      build_context (CPU, Metal, or CUDA) -> static context (IRCNTXT)
+                      build_context (CPU, Metal, or CUDA) -> static context (.ir)
                                              |
                                              v
                             optional atomic write to the context cache

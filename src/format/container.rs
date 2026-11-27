@@ -13,6 +13,8 @@ use std::{
     path::Path,
 };
 
+#[cfg(unix)]
+use memmap2::Advice;
 use memmap2::{Mmap, MmapOptions};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -280,6 +282,44 @@ pub(crate) fn map_immutable(path: &Path, max: u64) -> Result<Mmap> {
             .map(&file)
     }
     .map_err(artifact_error)
+}
+
+/// Copy an in-memory container into a read-only, page-aligned anonymous mapping.
+pub(crate) fn map_bytes(bytes: &[u8], max: usize) -> Result<Mmap> {
+    if !(16..=max).contains(&bytes.len()) {
+        return Err(artifact_error("artifact length is outside the resource limit"));
+    }
+    let mut mapping = MmapOptions::new()
+        .len(bytes.len())
+        .map_anon()
+        .map_err(artifact_error)?;
+    mapping.copy_from_slice(bytes);
+    mapping.make_read_only().map_err(artifact_error)
+}
+
+/// Best-effort OS read-ahead hint so the first read runs at RAM speed.
+pub(crate) fn prefault(mapping: &Mmap) {
+    #[cfg(unix)]
+    let _ = mapping.advise(Advice::WillNeed);
+    #[cfg(windows)]
+    prefetch_windows(mapping);
+    #[cfg(not(any(unix, windows)))]
+    let _ = mapping;
+}
+
+#[cfg(windows)]
+#[expect(unsafe_code, reason = "One Win32 call; memmap2 does not expose it")]
+fn prefetch_windows(mapping: &Mmap) {
+    use windows_sys::Win32::System::{
+        Memory::{PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY},
+        Threading::GetCurrentProcess,
+    };
+    let range = WIN32_MEMORY_RANGE_ENTRY {
+        VirtualAddress: mapping.as_ptr().cast_mut().cast(),
+        NumberOfBytes: mapping.len(),
+    };
+    // SAFETY: `range` describes this process's live mapping for the duration of the call.
+    let _ = unsafe { PrefetchVirtualMemory(GetCurrentProcess(), 1, &raw const range, 0) };
 }
 
 /// Payload slices stay with the caller; only the header and directory are buffered.

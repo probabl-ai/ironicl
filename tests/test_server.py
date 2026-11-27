@@ -67,7 +67,7 @@ class PrepareTest(unittest.TestCase):
         self.assertEqual(self.prepare("--optimize", "auto"), reused)
         model.export(path, kv_cache=False)
         self.assertEqual(self.prepare(), built)
-        (path / "context.ircntxt").write_bytes(b"not a KV cache")
+        (path / "context.ir").write_bytes(b"not a KV cache")
         line, warning = self.prepare()
         self.assertEqual(line, built[0])
         self.assertIn("warning: could not read the saved KV cache", warning)
@@ -160,7 +160,7 @@ class ServerTest(unittest.TestCase):
         model = fitted(TabICLClassifier)
         path = self.directory / type(model).__name__
         model.export(path, kv_cache=False)
-        (path / "context.ircntxt").mkdir()  # Cannot replace a directory, even as root.
+        (path / "context.ir").mkdir()  # Cannot replace a directory, even as root.
         result = subprocess.run([os.environ["IRONICL_BIN"], "prepare", str(path)], capture_output=True, text=True)
         self.assertNotEqual(result.returncode, 0)
         self.assertNotIn("Built the KV cache", result.stdout)

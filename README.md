@@ -63,8 +63,8 @@ clf.export("my-model")
 ```text
 my-model/
 ├── ironicl.json           what the model is: task, features, classes
-├── preprocessing.irprep   the fitted preprocessing and training data
-└── context.ircntxt        the KV cache, ready to serve
+├── preprocessing.ir   the fitted preprocessing and training data
+└── context.ir        the KV cache, ready to serve
 ```
 
 The weights are not copied: every model directory uses the one copy in

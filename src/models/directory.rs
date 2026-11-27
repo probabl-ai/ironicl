@@ -7,7 +7,7 @@
 //! - `preprocessing.ir`: the fitted preprocessing with its training rows,
 //!   or for Kumo-Tabular the training data, from which it fits its
 //!   preprocessing again.
-//! - `context.ircntxt`: the KV cache, optional. [`prepare`] builds it when it
+//! - `context.ir`: the KV cache, optional. [`prepare`] builds it when it
 //!   is missing or describes another context.
 //!
 //! The weights stay out of it, in a shared folder of `<checkpoint
@@ -34,7 +34,7 @@ pub use super::checkpoint_cache::default_weights_dir;
 
 pub const METADATA: &str = "ironicl.json";
 pub const PREPROCESSING: &str = "preprocessing.ir";
-pub const CONTEXT: &str = "context.ircntxt";
+pub const CONTEXT: &str = "context.ir";
 /// The metadata's `format` and `version` for this layout.
 const FORMAT: &str = "ironicl-model";
 const VERSION: u64 = 1;
@@ -99,7 +99,7 @@ pub fn write_kumo_tabular(dir: &Path, model: &kumo_tabular::fitted::Fitted, kv_c
         weights: encode_sha256(&model.checkpoint_sha256()),
         optimize: Some(model.optimize()),
     };
-    let context = |path: &Path| write_atomic(path, &model.context_bytes()?);
+    let context = |path: &Path| model.context_artifact()?.write(path);
     write_files(dir, &model.to_bytes()?, kv_cache.then_some(context), &metadata)
 }
 
@@ -333,16 +333,16 @@ impl Fitted {
 pub struct Prepared {
     pub model: Fitted,
     pub optimize: Optimize,
-    /// Whether the KV cache was built, rather than loaded from `context.ircntxt`.
+    /// Whether the KV cache was built, rather than loaded from `context.ir`.
     pub built: bool,
     /// Warnings from loading the model or rebuilding its cache.
     pub warning: Option<String>,
 }
 
 /// Load the model directory `dir` with the weights in `weights`, and its KV
-/// cache at `optimize`, by default the level of the saved cache, else `safe`.
+/// cache at `optimize`, by default the saved cache's level, then the exported fit's.
 /// A saved cache that is not exactly the one this model builds at that level
-/// is rebuilt on this machine's device and replaces `context.ircntxt`.
+/// is rebuilt on this machine's device and replaces `context.ir`.
 ///
 /// # Errors
 ///
@@ -368,7 +368,7 @@ impl Prepared {
         let path = dir.join(CONTEXT);
         match &self.model {
             Fitted::TabIclV2(model) => model.context.save_context(&path),
-            Fitted::KumoTabular(model) => write_atomic(&path, &model.context_bytes()?),
+            Fitted::KumoTabular(model) => model.context_artifact()?.write(&path),
         }
     }
 }
@@ -508,12 +508,8 @@ pub fn inspect(dir: &Path, weights: &Path) -> Result<Summary> {
     let found = weights.is_file();
     let path = dir.join(CONTEXT);
     let cache = path.exists().then(|| {
-        StaticContextArtifact::read_mapped_prefault(&path).map(|context| {
-            (
-                context.metadata().optimize,
-                std::fs::metadata(&path).map_or(0, |file| file.len()),
-            )
-        })
+        crate::format::static_context::ContextHeader::open(&path)
+            .map(|header| (header.metadata.optimize, header.file_len))
     });
     Ok(Summary {
         metadata,

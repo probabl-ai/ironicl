@@ -286,7 +286,7 @@ class FitTest(unittest.TestCase):
             output = subprocess.run(command, capture_output=True, text=True, check=True).stdout
             self.assertIn("KV cache:      safe", output)
             self.model.export(Path(directory) / "refits", kv_cache=False)
-            self.assertFalse((Path(directory) / "refits" / "context.ircntxt").exists())
+            self.assertFalse((Path(directory) / "refits" / "context.ir").exists())
 
 
 @unittest.skipUnless(REGRESSOR.exists(), f"needs {REGRESSOR}")

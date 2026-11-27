@@ -34,7 +34,10 @@ use crate::kernels::metal::{
 };
 use crate::{
     Result,
-    format::static_context::{PageAlignedTensors, TENSOR_PAGE_BYTES, TensorStorage},
+    format::{
+        container::DType,
+        static_context::{PageAlignedTensors, TENSOR_PAGE_BYTES},
+    },
     models::tabicl_v2::cpu::{
         COLUMN_BLOCKS, COLUMN_DIM, HEADS, ICL_BLOCKS, ICL_DIM, INDUCING, QUERY_CHUNK_ROWS, RESERVED,
         rope_tables,
@@ -352,7 +355,7 @@ impl PredictGraph {
         shape: Shape,
         column_keys: &[&[f32]],
         column_values: &[&[f32]],
-        icl: (&[&[u8]], &[&[u8]], TensorStorage),
+        icl: (&[&[u8]], &[&[u8]], DType),
         base_scales: &[Vec<f32>],
         storage: Option<std::sync::Arc<memmap2::Mmap>>,
     ) -> Result<Self> {
@@ -618,7 +621,7 @@ pub(crate) fn build_context(
     grouped: &[f32],
     column_labels: &[f32],
     icl_labels: &[f32],
-    icl_storage: TensorStorage,
+    icl_storage: DType,
     outputs: &mut PageAlignedTensors,
 ) -> Result<()> {
     let gpu = model.gpu();

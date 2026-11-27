@@ -140,9 +140,9 @@ impl Model {
         .map(FittedModel)
     }
 
-    /// Load a fitted model from `FittedModel.preprocessor_bytes` (`IRPREP`) and
+    /// Load a fitted model from `FittedModel.preprocessor_bytes` and
     /// `context`, the bytes of `FittedModel.context_bytes`; without a context,
-    /// it is built from the training rows in the `IRPREP` bytes, as `build`
+    /// it is built from the training rows in the preprocessing bytes, as `build`
     /// builds it. The other arguments are as for `build`.
     #[expect(clippy::too_many_arguments, reason = "mirrors the Python call's parameters")]
     #[pyo3(signature = (
@@ -266,6 +266,15 @@ fn plan_memory<'py>(
 #[pyfunction]
 fn cache_dir() -> PyResult<PathBuf> {
     crate::default_cache_dir().map_err(py_error)
+}
+
+/// Recognize an automatic context cache entry by its header and filename, not just `.ir`.
+#[pyfunction]
+fn is_cached_context(path: PathBuf) -> bool {
+    crate::format::static_context::ContextHeader::open(&path).is_ok_and(|context| {
+        let identity = crate::format::encode_sha256(&context.metadata.context_sha256);
+        path.file_stem().and_then(|s| s.to_str()) == Some(identity.as_str())
+    })
 }
 
 /// A size such as `"16G"` in bytes, as the memory limits read it.
@@ -742,7 +751,7 @@ impl FittedModel {
         self.0.batch_rows()
     }
 
-    /// The fitted preprocessing as `IRPREP` bytes, for `Model.load_fitted`, with
+    /// The fitted preprocessing as bytes, for `Model.load_fitted`, with
     /// the training rows when `training` is set and they were kept.
     #[pyo3(signature = (training=true))]
     fn preprocessor_bytes<'py>(&self, py: Python<'py>, training: bool) -> PyResult<Bound<'py, PyBytes>> {
@@ -765,7 +774,7 @@ impl FittedModel {
         .map_err(py_error)
     }
 
-    /// The training context as `IRCNTXT` bytes, for `Model.load_fitted`.
+    /// The training context as bytes, for `Model.load_fitted`.
     fn context_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         context_bytes(py, &self.0.context)
     }
@@ -942,7 +951,7 @@ impl KumoFitted {
         .map_err(py_error)
     }
 
-    /// The `IRCNTXT` bytes of the contexts `KumoTabular.load` loads, streamed
+    /// The context bytes `KumoTabular.load` loads, streamed
     /// straight into Python bytes without an intermediate copy.
     fn context_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         let artifact = py.detach(|| self.0.context_artifact()).map_err(py_error)?;
@@ -994,7 +1003,7 @@ impl KumoFitted {
             .collect())
     }
 
-    /// The `IRPREP` bytes `KumoTabular.load` loads.
+    /// The preprocessing bytes `KumoTabular.load` loads.
     fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
         Ok(PyBytes::new(py, &self.0.to_bytes().map_err(py_error)?))
     }
@@ -1011,6 +1020,7 @@ fn core_module(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(preprocess, module)?)?;
     module.add_function(wrap_pyfunction!(parse_size, module)?)?;
     module.add_function(wrap_pyfunction!(cache_dir, module)?)?;
+    module.add_function(wrap_pyfunction!(is_cached_context, module)?)?;
     module.add_function(wrap_pyfunction!(system_info, module)?)?;
     module.add_function(wrap_pyfunction!(profile_report, module)?)?;
     module.add_function(wrap_pyfunction!(profile_reset, module)?)?;

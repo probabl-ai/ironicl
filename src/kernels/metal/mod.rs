@@ -22,14 +22,15 @@ use objc2_metal_performance_shaders_graph::{
     MPSGraphExecutionDescriptor, MPSGraphOptimization, MPSGraphTensor, MPSGraphTensorData,
 };
 
-use crate::{Error, Result, format::static_context::TensorStorage};
+use crate::{Error, Result, format::container::DType};
 
 /// The `MPSGraph` element type for a stored tensor type.
-pub(crate) fn kind(storage: TensorStorage) -> MPSDataType {
+pub(crate) fn kind(storage: DType) -> MPSDataType {
     match storage {
-        TensorStorage::Fp32 => FLOAT,
-        TensorStorage::F16 => MPSDataType::Float16,
-        TensorStorage::Bf16 => MPSDataType::BFloat16,
+        DType::F32 => FLOAT,
+        DType::F16 => MPSDataType::Float16,
+        DType::Bf16 => MPSDataType::BFloat16,
+        other => unreachable!("Metal admission excludes {}", other.as_str()),
     }
 }
 

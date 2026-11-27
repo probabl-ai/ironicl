@@ -247,7 +247,7 @@ class TabICLBase(SavedEstimator, BaseEstimator):
             return model.build(preprocessed, *arguments, progress=progress, cache_dir=_cache_dir(self.cache_dir))
 
     def _load(self, checkpoint: Path, preprocessor: bytes, context: bytes | None, optimize, limits):
-        """Load the fitted model from its ``IRPREP`` and ``IRCNTXT`` bytes, or
+        """Load the fitted model from its preprocessing and context bytes, or
         without the context, build it from the training data as ``_build`` does."""
         model = self._task_model(checkpoint)
         with self._progress("Building context", "estimator") as progress:
@@ -281,8 +281,8 @@ class TabICLBase(SavedEstimator, BaseEstimator):
         """Export the fitted model to the directory ``path`` for ``ironicl serve``.
 
         It holds the fitted preprocessing with its training rows
-        (``preprocessing.irprep``), the KV cache built at this fit's ``optimize``
-        level when ``kv_cache`` is set (``context.ircntxt``), and last the
+        (``preprocessing.ir``), the KV cache built at this fit's ``optimize``
+        level when ``kv_cache`` is set (``context.ir``), and last the
         metadata (``ironicl.json``), which marks the directory complete. The
         weights stay in the shared weights folder, into which this imports the
         checkpoint when it is not there. Each file replaces the old one whole and

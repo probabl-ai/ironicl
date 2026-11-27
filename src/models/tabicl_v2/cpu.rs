@@ -9,8 +9,9 @@ use crate::progress::Stage;
 use crate::{
     Error, ModelArtifact, QueryRequest, RegressionOutput, Request, Result, StaticContextArtifact,
     StaticContextMetadata, TaskKind,
-    format::static_context::{
-        PageAlignedTensors, StaticContextTensor, StaticContextTensorData, TensorStorage,
+    format::{
+        container::DType,
+        static_context::{PageAlignedTensors, StaticContextTensor, StaticContextTensorData},
     },
     kernels::reference::{
         OnlineAttentionScratch, QassMaxWeights, affine_f32, affine_input3_transposed_f32, gelu_f32,
@@ -337,10 +338,10 @@ impl Executor {
         limits: MemoryLimits,
     ) -> Result<Option<PageAlignedTensors>> {
         let icl_storage = match optimize {
-            Optimize::Safe => TensorStorage::Fp32,
+            Optimize::Safe => DType::F32,
             // BF16 had no native GPU arithmetic on an M1 Max: slower and less
             // accurate than FP16, so `Fast` uses FP16 until it gets more.
-            Optimize::Auto | Optimize::Fast => TensorStorage::F16,
+            Optimize::Auto | Optimize::Fast => DType::F16,
         };
         if n < crate::models::tabicl_v2::metal::GPU_MIN_BUILD_ROWS {
             return Ok(None);
@@ -459,7 +460,7 @@ impl Executor {
     /// memory the build plans its estimator groups for; pass
     /// `MemoryLimits::resolve(None, None)?` to read them from the environment.
     ///
-    /// With `cache_dir`, the context is loaded from `<identity>.irctx` there
+    /// With `cache_dir`, the context is loaded from `<identity>.ir` there
     /// when that file holds exactly this context, and otherwise built and
     /// written there. The identity covers the Ironicl version, the model,
     /// `optimize`, and the inputs. A missing, invalid, or mismatched entry is
@@ -500,7 +501,7 @@ impl Executor {
             return self.build_uncached(metadata, shape, x, y_train, optimize, threads, limits);
         };
         let path = directory.join(format!(
-            "{}.irctx",
+            "{}.ir",
             crate::format::encode_sha256(&metadata.context_sha256)
         ));
         if let Some(context) = StaticContextArtifact::read_cached(&path, &metadata)
@@ -567,7 +568,7 @@ impl Executor {
             let values = |name: &str| name.starts_with("icl.") && name.rsplit('.').next() == Some("value");
             let context = StaticContextArtifact::from_page_aligned(
                 metadata,
-                page_aligned(&tensors, values, TensorStorage::Bf16)?,
+                page_aligned(&tensors, values, DType::Bf16)?,
             )?;
             return StaticExecutor::with_executor(self.clone(), context, optimize, threads, limits);
         }
@@ -1659,21 +1660,21 @@ impl StaticExecutor {
         };
         // The ICL caches as raw bytes, in FP32 or FP16 as stored. A context
         // with BF16 values (and FP32 keys) stays on the CPU.
-        let icl = |kind: &str| -> Option<(Vec<&[u8]>, crate::format::static_context::TensorStorage)> {
-            use crate::format::static_context::TensorStorage;
+        let icl = |kind: &str| -> Option<(Vec<&[u8]>, DType)> {
             let mut storage = None;
             let blocks = (0..ICL_BLOCKS)
                 .map(|block| {
-                    let (bytes, block_storage) =
-                        match self.context.tensor(&format!("icl.{block}.{kind}"))?.data {
-                            StaticContextTensorData::Fp32(values) => {
-                                (bytemuck::cast_slice(values), TensorStorage::Fp32)
-                            }
-                            StaticContextTensorData::F16(values) => {
-                                (bytemuck::cast_slice(values), TensorStorage::F16)
-                            }
-                            StaticContextTensorData::Bf16(_) => return None,
-                        };
+                    let (bytes, block_storage) = match self
+                        .context
+                        .tensor(&format!("icl.{block}.{kind}"))?
+                        .data
+                    {
+                        StaticContextTensorData::Fp32(values) => (bytemuck::cast_slice(values), DType::F32),
+                        StaticContextTensorData::F16(values) => (bytemuck::cast_slice(values), DType::F16),
+                        StaticContextTensorData::Bf16(_) | StaticContextTensorData::F8E4M3(_) => {
+                            return None;
+                        }
+                    };
                     (*storage.get_or_insert(block_storage) == block_storage).then_some(bytes)
                 })
                 .collect::<Option<Vec<_>>>()?;
@@ -2899,15 +2900,9 @@ fn model_hash_matches(model_hash: &[u8], context_hash: &[u8; 32]) -> bool {
 fn page_aligned(
     tensors: &[StaticContextTensor],
     reduced: impl Fn(&str) -> bool,
-    storage: TensorStorage,
+    storage: DType,
 ) -> Result<PageAlignedTensors> {
-    let storage_of = |name: &str| {
-        if reduced(name) {
-            storage
-        } else {
-            TensorStorage::Fp32
-        }
-    };
+    let storage_of = |name: &str| if reduced(name) { storage } else { DType::F32 };
     let mut page = PageAlignedTensors::new(
         tensors
             .iter()
@@ -2923,9 +2918,10 @@ fn page_aligned(
     for (index, tensor) in tensors.iter().enumerate() {
         let storage = storage_of(&tensor.name);
         let holds = |value: &f32| match storage {
-            TensorStorage::Fp32 => value.is_finite(),
-            TensorStorage::Bf16 => crate::kernels::cpu::f32_to_bf16_finite(*value).is_some(),
-            TensorStorage::F16 => value.is_finite() && value.abs() <= 65504.0,
+            DType::F32 => value.is_finite(),
+            DType::Bf16 => crate::kernels::cpu::f32_to_bf16_finite(*value).is_some(),
+            DType::F16 => value.is_finite() && value.abs() <= 65504.0,
+            _ => false,
         };
         if !tensor.values.iter().all(holds) {
             return Err(Error::InvalidArgument(format!(
@@ -2935,13 +2931,14 @@ fn page_aligned(
         }
         let values = tensor.values.iter().copied();
         let bytes: Vec<u8> = match storage {
-            TensorStorage::Fp32 => values.flat_map(f32::to_le_bytes).collect(),
-            TensorStorage::Bf16 => values
+            DType::F32 => values.flat_map(f32::to_le_bytes).collect(),
+            DType::Bf16 => values
                 .flat_map(|value| crate::kernels::cpu::f32_to_bf16_rne(value).to_le_bytes())
                 .collect(),
-            TensorStorage::F16 => values
+            DType::F16 => values
                 .flat_map(|value| half::f16::from_f32(value).to_bits().to_le_bytes())
                 .collect(),
+            _ => return Err(Error::Artifact("unsupported scalar cache conversion".into())),
         };
         page.fill(index, &bytes);
     }
@@ -2951,11 +2948,11 @@ fn page_aligned(
 /// How a context for the CUDA GPU at `precision` stores its ICL keys and
 /// values: as the GPU caches them, FP32 for `safe` and FP16 otherwise.
 #[cfg(feature = "cuda")]
-const fn cuda_icl_storage(precision: crate::models::tabicl_v2::cuda::Precision) -> TensorStorage {
+const fn cuda_icl_storage(precision: crate::models::tabicl_v2::cuda::Precision) -> DType {
     match precision {
-        crate::models::tabicl_v2::cuda::Precision::Fp32 => TensorStorage::Fp32,
+        crate::models::tabicl_v2::cuda::Precision::Fp32 => DType::F32,
         crate::models::tabicl_v2::cuda::Precision::Split
-        | crate::models::tabicl_v2::cuda::Precision::Half => TensorStorage::F16,
+        | crate::models::tabicl_v2::cuda::Precision::Half => DType::F16,
     }
 }
 
@@ -2965,16 +2962,12 @@ const fn cuda_icl_storage(precision: crate::models::tabicl_v2::cuda::Precision) 
     feature = "cuda",
     all(feature = "metal", target_os = "macos", target_arch = "aarch64")
 ))]
-fn context_page(b: usize, n: usize, h: usize, icl: TensorStorage) -> Result<PageAlignedTensors> {
+fn context_page(b: usize, n: usize, h: usize, icl: DType) -> Result<PageAlignedTensors> {
     PageAlignedTensors::new(
         context_tensors(b, n, h)
             .into_iter()
             .map(|(name, dimensions)| {
-                let storage = if name.starts_with("icl.") {
-                    icl
-                } else {
-                    TensorStorage::Fp32
-                };
+                let storage = if name.starts_with("icl.") { icl } else { DType::F32 };
                 (name, dimensions, storage)
             })
             .collect(),
@@ -3046,6 +3039,11 @@ fn validate_static_cache_contract(context: &StaticContextArtifact) -> Result<()>
         metadata.feature_count,
     ) {
         let tensor = context.check_tensor(&name, &expected_shape)?;
+        if matches!(tensor.data, StaticContextTensorData::F8E4M3(_)) {
+            return Err(Error::UnsupportedBackend(
+                "FP8 context execution is unsupported".into(),
+            ));
+        }
         // Only the removed Python exporter wrote BF16 ICL keys.
         if name.starts_with("icl.")
             && name.rsplit('.').next() == Some("key")
@@ -3720,7 +3718,7 @@ impl ContextIcl {
             StaticContextTensorData::F16(values) => {
                 Some(crate::models::tabicl_v2::cuda::IclValues::F16(values))
             }
-            StaticContextTensorData::Bf16(_) => None,
+            StaticContextTensorData::Bf16(_) | StaticContextTensorData::F8E4M3(_) => None,
         };
         Some((tensor("key")?, tensor("value")?))
     }
@@ -3811,12 +3809,8 @@ mod tests {
         let with_bf16 = |kind| {
             StaticContextArtifact::from_page_aligned(
                 valid.metadata().clone(),
-                page_aligned(
-                    &tensors,
-                    icl(kind),
-                    crate::format::static_context::TensorStorage::Bf16,
-                )
-                .expect("page-aligned tensors"),
+                page_aligned(&tensors, icl(kind), crate::format::container::DType::Bf16)
+                    .expect("page-aligned tensors"),
             )
             .expect("page-aligned context")
         };
