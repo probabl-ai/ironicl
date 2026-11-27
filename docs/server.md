@@ -38,14 +38,14 @@ cargo build --release --features server          # add metal on Apple Silicon, c
    ```
 
 The server finds the model's weights by its checkpoint's SHA-256, loads the preprocessing, and
-prepares the KV cache as `ironicl prepare` does: it reuses `context.ircntxt` when it is exactly
+prepares the KV cache as `ironicl prepare` does: it reuses `context.ir` when it is exactly
 the cache this model builds at the level, and otherwise builds it and replaces the file. It then
 predicts a full batch before it opens the port, so any answer means it is ready.
 
 | Option | Default |
 |---|---|
 | `--weights DIR` | the shared weights folder ([cli.md](cli.md#model-directories-and-weights)) |
-| `--optimize safe\|auto\|fast` | the saved cache's level, else `safe` |
+| `--optimize safe\|auto\|fast` | the saved cache's level, else the exported fit's |
 | `--bind ADDR` | `127.0.0.1:8080` |
 | `--max-request-rows N` | `10000` rows per request |
 | `--max-body SIZE` | `16M` |

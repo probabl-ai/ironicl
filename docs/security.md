@@ -13,7 +13,7 @@ unless their source and hash are verified.
 - Verify that sections remain inside the file and do not overlap illegally.
 - Bound tensor rank and dimension counts.
 - Verify payload length against dtype and physical layout.
-- Verify checksums before exposing tensor data.
+- The container has no internal checksum. Verify an independently trusted file digest when integrity is required.
 - Reject duplicate mandatory tensor IDs.
 - Reject NaN or invalid quantization scales.
 - Do not execute embedded code or deserialize Python pickle objects in Rust.
@@ -35,18 +35,18 @@ tensor names, shapes, dtypes, byte counts, and checkpoint hash. Released model
 profiles require the pinned official hashes. The official Python loader remains
 an independent comparison oracle only.
 
-Portable model writes use a sibling temporary file, `fsync`, complete reader
-verification, atomic rename, and parent-directory `fsync`. Cache entries are
-addressed by checkpoint SHA-256 and artifact format version. Cache hits verify
-the complete model checksum and embedded source hash before reuse.
+Portable model writes use a sibling temporary file, `fsync`, header validation,
+atomic rename, and parent-directory `fsync` on Unix. Cache entries are
+addressed by checkpoint SHA-256 and artifact format version. Cache hits check
+the directory, embedded source identity, and profile; these checks do not authenticate the payload.
 
 The serving process reads only the Ironicl artifact format.
 
 ## Preprocessing and Fitted Models
 
 Preprocessing runs in Rust on request data, and the server loads fitted
-preprocessing (`IRPREP`) from outside, so `src/preprocess/` forbids `unsafe`.
-`IRPREP` decodes as untrusted input; see
+preprocessing from outside, so `src/preprocess/` forbids `unsafe`.
+The loader treats preprocessing bytes as untrusted input; see
 [artifact-format.md](artifact-format.md#fitted-models). Python pickles hold the
 fitted model in these formats rather than as Python objects, but unpickling an
 estimator still runs Python's pickle: load pickles only from trusted sources.
@@ -54,8 +54,8 @@ estimator still runs Python's pickle: load pickles only from trusted sources.
 ## Data Handling
 
 Static artifacts encode information derived from the complete training set and
-targets. They are sensitive data even if raw rows are omitted. `IRPREP` with its
-training section holds the preprocessed training rows and targets themselves;
+targets. They are sensitive data even if raw rows are omitted. Preprocessing with
+training tensors holds the preprocessed training rows and targets themselves;
 `export` and the context writer create their files readable only by their owner
 on Unix.
 

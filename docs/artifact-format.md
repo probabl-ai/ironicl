@@ -1,212 +1,129 @@
 # Artifact Format
 
-Ironicl writes three binary formats:
+Weights, fitted preprocessing, and the optional static context use one tensor container,
+implemented in [`src/format/container.rs`](../src/format/container.rs). Each file embeds its
+own JSON header. The separate `ironicl.json` describes the exported directory; it is not a
+sidecar for tensor offsets or shapes. Every binary artifact uses `.ir`; its header identifies
+its kind. The directory layout and lookup rules stay the same:
 
-| Format | Magic | Holds | Source |
-|---|---|---|---|
-| model | `IRMODEL\0` v1 | checkpoint weights, TabICLv2 or Kumo-Tabular | `src/format/model.rs` |
-| preprocessor | `IRPREP\0\0` v1 | fitted preprocessing | `src/format/preprocessor.rs` |
-| static context | `IRCNTXT\0` v1 and v2 | the training rows' attention keys and values | `src/format/static_context.rs` |
+```text
+<cache-root>/ironicl/
+├── models/v1/<checkpoint-sha256>.ir   # shared weights
+└── contexts/<fit-identity>.ir         # optional automatic context cache
 
-Every format is little-endian, uses fixed-width fields, and ends with a SHA-256 of all preceding
-bytes. None uses native Rust struct serialization.
+my-model/
+├── ironicl.json
+├── preprocessing.ir
+└── context.ir                   # optional; rebuildable from preprocessing and weights
+```
+
+This pre-release format is incompatible with the old `IRMODEL`, `IRPREP`, and `IRCNTXT` magic
+bytes. Reimport weights from the original checkpoint. Re-export fitted models with the new
+version (or refit from training data); the new reader cannot convert old exports or pickles.
+Legacy automatic weight and context cache entries are misses and can be rebuilt. Renaming a
+legacy file to `.ir` does not convert it. `<cache-root>` defaults to `$XDG_CACHE_HOME` or
+`~/.cache`. `--weights` and `cache_dir` can select different weights and context directories.
+
+## Layout
+
+| Region | Encoding |
+|---|---|
+| Bytes 0–7 | ASCII `IRONICL` followed by a zero byte |
+| Bytes 8–15 | JSON header length in bytes, little-endian `u64` |
+| Header | Exactly that many UTF-8 bytes, at most 16 MiB |
+| Header padding | Zero bytes up to `alignment`; the next offset is `data_start` |
+| Tensor data | Named, contiguous, row-major, little-endian payloads in directory order, each padded to `alignment`, including the last |
+
+The JSON object has five fields: `format` (currently `1`), `kind` (`model`, `preprocessing`, or
+`context`), `alignment` in bytes, kind-specific `metadata`, and an ordered `tensors` array.
+For example, an entry for the key of ICL layer 0 can have `dtype: "f16"` and
+`shape: [1, 8, 50000, 64]`, with `bytes: 51200000`. An entry's `name` identifies it; `offset`
+is **relative to `data_start`**, not the beginning of the file. The first offset is zero. Each
+subsequent offset equals the aligned end of the preceding payload.
+
+The envelope recognizes `u8`, `i32`, `i64`, `f8_e4m3`, `f16`, `bf16`, `f32`, and `f64`.
+Each loader accepts only the types its model supports. Writers use 16 KiB alignment for weights
+and contexts on disk, and 64 bytes for preprocessing and compact in-memory encodings. Readers
+accept power-of-two alignments from 64 bytes through 2 MiB. They check unique names, rank,
+shape × element size, offsets, and the exact padded file length with checked arithmetic. The
+directory is limited to 4,096 tensors, 16 dimensions per tensor and 4,096 bytes per name.
+
+There is **no payload checksum or signature**. A SHA-256 identity identifies inputs, not the
+serialized bytes. A structurally valid change to a finite tensor value can go undetected. For
+integrity across storage or transport, verify the complete file against an independently trusted
+digest before deployment. Publish immutable files by atomic replacement, never by modifying or
+truncating a file that readers may have mapped.
 
 ## Model
 
-`ironicl import` and the content-addressed checkpoint cache write `IRMODEL` v1. It stores the
-validated logical checkpoint tensors in a deterministic, 64-byte-aligned layout, with the source
-checkpoint's SHA-256 as the model's identity. The header names the architecture, 1 for TabICLv2 or
-2 for [Kumo-Tabular](kumo-tabular.md), and seven of its values: TabICLv2's classes, quantiles,
-widths, and block counts, or Kumo-Tabular's classes, quantiles, cell channels, column and row
-layers, inducing points, ICL channels, and ICL layers, which identify its size. A file holds at
-most 1 GiB, for Kumo-Tabular large. It is portable rather than kernel-packed: kernels pack weights
-at load time. A packed format can take a new version without changing the CLI or the
-cache.
+`kind: "model"` stores logical checkpoint tensors, not kernel-packed weights. `metadata` records
+the source checkpoint SHA-256 and the architecture configuration: named TabICLv2 dimensions or
+Kumo-Tabular's size and task. Inspection needs only the header. Loading an executable model also
+checks its expected manifest, configuration and tensor values. On native little-endian hosts,
+FP32 weights can borrow their immutable mapping; kernels may still pack or upload them. The model
+file is limited to 1 GiB.
 
 ## Fitted Models
 
-A fitted model is three files, linked by the checkpoint's SHA-256: the weights (`IRMODEL`), the
-fitted preprocessing with its training rows (`IRPREP`), and optionally the training context
-(`IRCNTXT`). Pickling and `save` store the last two as bytes, not as Python objects. `export`
-writes them as a model directory, with the weights in a shared folder
-([cli.md](cli.md#model-directories-and-weights)).
+`kind: "preprocessing"` records `metadata.model` (`tabicl_v2` or `kumo_tabular`), the checkpoint
+SHA-256 and the fitted `state`. The model family selects the loader; unknown families are rejected.
+The weights, preprocessing, and optional context stay separate so fitted models can share weights
+and discard a large cache without losing the training state.
 
-`IRPREP` v1 starts with the architecture, as `IRMODEL` names it. For TabICLv2 (1) it holds the
-checkpoint's SHA-256 (32 bytes, as `IRCNTXT` stores it), the feature mask,
-each input feature's categories (none for a numeric feature),
-the normalization groups, each member's group and feature and class order, the class labels
-(integers, floats, booleans, or UTF-8 text) with the classifier's `softmax_temperature` and
-`average_logits`, or the regressor's target mean and scale, the feature names when the training
-data had them, each kept feature's training mean, which replaces its missing values, per group each kept feature's statistics as `f64` (mean, scale, range, outlier
-bounds, and for the power group its lambda and standardization), and optionally the preprocessed
-training rows a context is built from: each group's `[rows, features]` matrix and each row's
-target (a class index or the standardized value), as `f32`. Decoding checks every length against
-the bytes left before it allocates, then the preprocessing's invariants, finite training values,
-and class indices in range.
-
-Loading refuses an `IRPREP` fitted with another checkpoint. With a context, it checks that the
-context matches the preprocessing: checkpoint, `B`, `H`, class count, and each member's
-permutations. Without one, it builds the context from the training rows that `IRPREP` holds, as
-fitting does, so the same context.
-
-For Kumo-Tabular (2), `IRPREP` holds the checkpoint's SHA-256, the members and the seed, the
-feature names, each input feature's categories, and the training data: the encoded `[rows,
-features]` matrix as `f64` (NaN for a missing number, -1 for a missing category) and each row's
-label, a regressor's as a float. Loading fits the preprocessing again from them, and the contexts
-too unless `IRCNTXT` holds them, which gives the same model.
-Decoding checks every length against the bytes left, and that each category code is -1 or one of
-its feature's categories.
-
-Neither `IRPREP` nor `IRCNTXT` is signed yet: the digests detect corruption, not tampering.
+- **TabICLv2:** The state records the feature mask, typed category dictionaries, normalization
+  statistics, member groups and permutations, and the classifier's labels and aggregation or the
+  regressor's target scale. Optional training tensors are `group.{i}.x` (`f32`, `[rows, features]`)
+  and `y` (`f32`, `[rows]`). They are needed to rebuild a missing context. When a pickle omits
+  those rows, `metadata.context_identity` binds its preprocessing to the saved context. Decoding checks fitted
+  invariants, finite transformed values and valid class indices.
+- **Kumo-Tabular:** The state records members, seed, feature names and typed category dictionaries.
+  Loading refits preprocessing from `x` (`f64`, `[rows, features]`, permitting NaN for missing
+  numeric values and −1 for missing categories). `y` stores integers, floats or booleans in a
+  typed tensor. Text targets use `y.lengths` (`i64` byte counts) and `y.utf8` (`u8` bytes).
 
 ## Static Context
 
-Most of the work in repeated TabICLv2 inference depends only on the training rows. A static
-context stores that work once: the column stage's keys and values for the three induced-attention
-blocks, and the ICL keys and values for all twelve layers. A prediction then runs only the query
-rows, attending to the stored keys and values. Softmax rules out compressing them into a small
-summary, so a prediction scans the whole ICL cache.
+`kind: "context"` records architecture, checkpoint SHA-256, fit identity, ensemble count, training
+rows, features, classes, permutations and the `optimize` level. The filename does not select the
+device or optimization policy. Loading checks compatibility against the model and fitted state.
 
-### Build Path
+- **TabICLv2:** `column.{0..2}.{key,value}` (`f32`, `[B,H+4,8,128,16]`) precede
+  `icl.{0..11}.{key,value}` (`[B,8,N,64]`). Layers are in numeric order, key then value. The
+  arithmetic policy and device determine whether ICL tensors use FP32, FP16 or BF16. Here `B`
+  is the estimator count, `H` the retained feature count, and `N` the number of training rows.
+- **Kumo-Tabular:** Each `{member}.{task}` has `means`, `categorical`, `columns.key`,
+  `columns.value`, `icl.key`, and `icl.value`. Column and ICL tensors group layers along the
+  leading dimension. The context identity is the SHA-256 of its preprocessing bytes.
 
-The Rust engine builds every context:
+The context container also round-trips already encoded `f8_e4m3` tensors verbatim. The two
+E4M3 NaN encodings (`0x7f`, `0xff`) are invalid cache values. Scales, when required by a
+model, are separate tensors. Format support alone does not enable execution at that precision.
 
-1. `Preprocessed::fit` fits the preprocessing on the raw training rows and produces each
-   estimator's transformed rows and permutations.
-2. `Executor::build_fitted` passes them to `Executor::build_context`, which runs the training rows
-   through the model on the CPU, Metal, or CUDA and keeps the caches.
-3. The resulting `StaticExecutor` predicts query rows, which `FittedModel` preprocesses first,
-   and undoes each estimator's class order when it aggregates probabilities.
+### Validation and loading
 
-`optimize` selects the cache storage: FP32 at `"safe"`; FP16 ICL keys and values on the GPUs at
-`"auto"` and `"fast"`; BF16 ICL values with FP32 keys on a BF16-capable CPU at `"fast"`. Column
-caches stay FP32.
+`StaticContextArtifact::write` streams the payloads of an already-built context to a sibling
+owner-only temporary file, syncs it, then publishes it by rename. `read_mapped_prefault` hints
+that pages will be needed and checks finite values before exposing typed views. A page-aligned,
+page-padded mapping is eligible for the existing Metal buffer-wrapping path. `from_bytes` owns
+its backing storage, so a pickled model need not retain the caller's byte buffer.
 
-With a cache directory, `build_context` loads `<identity>.irctx` when that file holds exactly this
-context, and otherwise builds the context and writes it there. The identity is a SHA-256 over the
-Ironicl version, the source checkpoint's SHA-256, `optimize`, `B`, `N`, `H`, the transformed
-training rows and targets, and both permutations. A missing, invalid, or mismatched entry is
-rebuilt; a failed write leaves the context in memory only. `Executor::load_context` loads a
-context file directly.
+`ContextHeader::open` reads only the prefix and header and checks the directory against the file
+length. It does not load or validate tensor values.
 
-Writes are atomic: the encoder streams into a new owner-only temporary file in the same directory,
-syncs it, and renames it into place. A reader never sees a partial file.
+## Inspection
 
-Any change to the training data builds a new context. Incremental updates are out of scope: each
-layer's training representation depends on all of the previous layer's keys and values, so an
-insertion is not local.
+`ironicl inspect FILE` recognizes the container by its magic. To inspect a header independently:
 
-### Versions
+```python
+import json
+from pathlib import Path
 
-| Version | Tensor storage | ICL K layout |
-|---|---|---|
-| 1 | FP32 only | logical row-major |
-| 2 | explicit FP32, BF16, or FP16 per tensor | logical row-major |
-| 3 | removed; the reader rejects it | source-tile, dimension-major |
-
-The writer uses version 1 when every tensor is FP32 and version 2 otherwise. A context with BF16
-ICL keys is rejected when it is loaded. Only the removed Python exporter wrote version 3 and BF16
-keys; see [removed-experiments.md](removed-experiments.md#ircntxt-v3-pre-packed-keys) and
-[removed-experiments.md](removed-experiments.md#bf16-attention-keys). Contexts hold no model
-weights.
-
-### Layout
-
-The fixed header holds the source checkpoint's SHA-256, the context identity, `B`, `N`, `H`, the
-class count, and the required TabICLv2 architecture values: 3 column layers, 12 ICL layers,
-8 heads, column head dimension 16, and ICL head dimension 64. Estimator-major class `[B,C]` and
-feature `[B,H]` permutations follow, then a sorted tensor directory, 64-byte-aligned payloads, and
-the trailing SHA-256. A regression context stores class count 0 and no class permutations. The
-header's last field records the `optimize` level the context was built at: 1 `safe`, 2 `auto`,
-or 3 `fast`.
-
-Each directory entry holds the tensor's UTF-8 name, rank, dimensions, payload offset, byte length,
-and, in version 2, its dtype. The executor requires exactly these tensors:
-
-- `column.{0..2}.{key,value}`, FP32, `[B,H+4,8,128,16]`;
-- `icl.{0..11}.{key,value}`, `[B,8,N,64]`: FP32 keys and values, FP32 keys with BF16 values, or
-  FP16 keys and values.
-
-Tensor dimensions are logical. The CPU attention kernels pack each key tile in dimension-major
-order into scratch, so one AVX-512 vector holds source lanes while a query dimension is
-broadcast. Values stay source-major, so one sequential value row updates all query accumulators.
-
-A Kumo-Tabular context has header kind 2, and in place of TabICLv2's architecture values its
-cell width, column layers, inducing points, ICL width, and outputs (10 or 999), which name the
-release. It has no permutations, class count 0, and the `optimize` level used to build it.
-The level records the arithmetic policy, not the tensors' file type. `B` counts its contexts,
-one per member and codebook task, named `{member}.{task}`; `N` and `H` are the training rows and
-the training data's features. A member keeps `C` of its preprocessed columns, which loading checks
-against the preprocessing it fits from `IRPREP`. Each context holds exactly these FP32 tensors,
-which loading checks by shape:
-
-- `{member}.{task}.means` and `.categorical`, `[C]`: the imputation means and the columns'
-  kinds (1 for category codes);
-- `{member}.{task}.columns.{key,value}`, `[layers, C, heads, inducing points, head dim]`;
-- `{member}.{task}.icl.{key,value}`, `[layers, 1, 2 or heads, N, head dim]`.
-
-Its identity is the SHA-256 of the model's `IRPREP`, so it loads only with that fit.
-
-Ironicl no longer reads the optional `icl.index.*` sparse-attention tensors; a context that has
-them loads with them ignored. See
-[removed-experiments.md](removed-experiments.md#sparse-icl-attention-sparse-attention).
-
-### Validation and Loading
-
-Tensor names must be strictly sorted and unique, and every dimension and byte calculation is
-checked. Loaders reject non-finite FP32 and BF16 values, invalid permutations, bad offsets,
-overlaps, changed padding, unknown versions, malformed headers, and every resource-limit
-violation. The executor also checks the context's checkpoint SHA-256 and class count against the
-model.
-
-`StaticContextArtifact::read_mapped_prefault` verifies the whole file and keeps read-only,
-memory-mapped tensor views. It asks the OS to read the pages ahead, so the first prediction runs
-at RAM speed. A mapped file must not change while it is loaded; contexts are written once and
-replaced by rename, never edited in place. `from_bytes` decodes an owned copy, which `FittedModel`
-uses for pickled models.
-
-## Current Guarantees
-
-- Little-endian, fixed-width scalar metadata.
-- An explicit format version and artifact kind.
-- No native Rust struct serialization or architecture-dependent padding.
-- Checked `u64` offsets and lengths.
-- 64-byte tensor alignment.
-- One trailing whole-file SHA-256.
-- SHA-256 identities for the source checkpoint and static context.
-- Checked tensor names, shapes, dtypes, offsets, lengths, and finite values.
-- Read-only, memory-mapped context loading after whole-file verification.
-
-## Future Format Requirements
-
-- Explicit minimum-reader versions and a mandatory/optional section policy.
-- Optional 4 KiB and 2 MiB section alignment for mapping experiments.
-- Independent metadata and tensor-section checksums.
-- Explicit arithmetic-policy and quantization metadata.
-- Signed artifacts, so a server can reject tampered files.
-
-A single serving artifact could combine sections like these:
-
-```text
-fixed header
-metadata directory
-model configuration
-feature schema
-preprocessing state
-ensemble configuration
-portable packed weights
-Zen 5 packed weights (optional)
-column K/V cache
-ICL K/V cache
-quantization metadata (optional)
-checksum table
+with Path("my-model/context.ir").open("rb") as f:
+    if f.read(8) != b"IRONICL\0":
+        raise ValueError("not an Ironicl container")
+    size = int.from_bytes(f.read(8), "little")
+    if not 0 < size <= 16 << 20:
+        raise ValueError("invalid header size")
+    header = json.loads(f.read(size))
+print(header["kind"], header["alignment"], len(header["tensors"]))
 ```
-
-Every tensor entry then needs a stable semantic ID, logical shape, physical tile shape and strides,
-storage dtype, arithmetic policy ID, section offset and byte length, required alignment,
-quantization scale granularity and offset, and a checksum. Checkpoint tensor names alone are
-useful for diagnostics but are not a compact serving contract.
-
-The context identity does not yet cover original feature names, logical types, or preprocessing
-algorithm versions; the preprocessing is checked separately when a fitted model loads. A combined
-artifact's identity must cover them too.

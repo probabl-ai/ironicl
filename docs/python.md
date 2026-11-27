@@ -82,13 +82,14 @@ once; with a cache it is written to disk and reused when the same data, model, a
 | str or `Path` | cache in that directory |
 
 Entries are content-addressed by the Ironicl version, the model identity, the
-preprocessed inputs, and `optimize`, with a `.irctx` name. Each entry records that
+preprocessed inputs, and `optimize`, with a `.ir` name. Each entry records that
 identity, and a load uses an entry only when it matches; a corrupt or mismatched
 entry is silently rebuilt, and a write failure never fails `fit`. A load
 prefaults the mapping so prediction runs at RAM speed from the first query. On
 Unix, entries are readable only by their owner, because they encode the training
-data. Entries from other Ironicl versions are not reused; `clear_cache` removes
-them. Each entry records its last use, when `fit` built or loaded it.
+data. Each entry records its last use, when `fit` built or loaded it. Cache management
+recognizes automatic entries by their context header and matching `<fit-identity>.ir` name.
+It leaves shared weights, exported files, and legacy `.irctx` files alone.
 
 Nothing is evicted automatically. `ironicl.cache_info()` lists the entries,
 most recently used first, and `ironicl.clear_cache()` removes them: all by
@@ -101,8 +102,8 @@ interrupted writes left behind:
 ```python
 >>> print(ironicl.cache_info())
 ~/.cache/ironicl/contexts: 2 contexts, 1.73 GiB
-       1.04 GiB  last used 2026-11-08 21:40  3f2a....irctx
-       0.69 GiB  last used 2026-11-07 10:12  9c1e....irctx
+       1.04 GiB  last used 2026-11-08 21:40  3f2a....ir
+       0.69 GiB  last used 2026-11-07 10:12  9c1e....ir
 >>> ironicl.clear_cache(max_size="1.5G").size_bytes
 740800512
 ```
@@ -173,8 +174,8 @@ clf.export("my-model", kv_cache=False)  # without it, for another machine
 | File | Contents |
 |---|---|
 | `ironicl.json` | the metadata, written last: `format` (`"ironicl-model"`) and `version` (1), which `prepare` and `serve` check, and for people and tools the Ironicl version, `task`, `n_features`, `feature_names`, `classes`, and the weights' SHA-256 |
-| `preprocessing.irprep` | the fitted preprocessing (labels or target scale, feature names, the classifier's `softmax_temperature` and `average_logits`) with the preprocessed training rows |
-| `context.ircntxt` | the KV cache at this fit's `optimize` level, unless `kv_cache=False` |
+| `preprocessing.ir` | the fitted preprocessing (labels or target scale, feature names, the classifier's `softmax_temperature` and `average_logits`) with the preprocessed training rows |
+| `context.ir` | the KV cache at this fit's `optimize` level, unless `kv_cache=False` |
 
 The weights are not in it. `export` makes sure the shared weights folder has
 the estimator's checkpoint, importing it once when needed. A directory without

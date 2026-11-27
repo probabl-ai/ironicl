@@ -71,10 +71,10 @@ src/
 │       ├── ensemble.rs            its ensemble: groups, feature and class orders
 │       └── fitted.rs              the fitted model
 ├── format/
-│   ├── mod.rs                     container primitives
-│   ├── model.rs                   model artifacts (IRMODEL)
-│   ├── static_context.rs          static contexts (IRCNTXT)
-│   └── preprocessor.rs            fitted preprocessing (IRPREP)
+│   ├── container.rs               shared header, directory checks, mapping and encoding
+│   ├── model.rs                   weights and executable manifests
+│   ├── static_context.rs          static contexts and bounded tensor reads
+│   └── preprocessor.rs            fitted preprocessing and training tensors
 ├── preprocess/                    what must reproduce Python exactly; no `unsafe`:
 │                                  python_random, scale, yeo_johnson, labels, columns
 └── server/                        `ironicl serve` (`server` feature, off by default):

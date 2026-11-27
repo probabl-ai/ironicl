@@ -92,7 +92,7 @@ ironicl import large-classifier.pt --model kumo-tabular
 
 Import checks that a checkpoint holds exactly one release's tensors, by name and shape, takes that
 release's size and task, and stores
-them as `IRMODEL` with architecture 2 ([artifact-format.md](artifact-format.md#model)). The label
+them as a `model` container with the Kumo-Tabular release configuration ([artifact-format.md](artifact-format.md#model)). The label
 embeddings are saved transposed; import copies them into row-major order.
 
 ## How it runs
@@ -142,9 +142,9 @@ orders, and the codebooks from CPython's `random.Random(random_state)`, in that 
 model on every machine. `random_state=None` is not supported.
 
 Saving: `save`, pickling, and `export` work as for TabICL. They store the training data and the
-seed as `IRPREP` with architecture 2 ([artifact-format.md](artifact-format.md#fitted-models)),
+seed in a `preprocessing` container for `kumo_tabular` ([artifact-format.md](artifact-format.md#fitted-models)),
 from which loading fits the preprocessing again, and by default the members' contexts as
-`IRCNTXT` of kind 2 ([artifact-format.md](artifact-format.md#layout)). Without the contexts
+a `context` container ([artifact-format.md](artifact-format.md#static-context)). Without the contexts
 (`save_kv_cache=False`, `export(kv_cache=False)`), loading fits them again, one forward pass over
 the training rows, which gives the same model. The contexts are large: about 3 MB per column
 and 25 KB per training row per member for size large, against a few bytes per value of

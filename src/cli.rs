@@ -84,7 +84,7 @@ pub struct ImportArgs {
 /// Build a model directory's KV cache.
 ///
 /// It builds the cache on this machine's device and writes it to
-/// DIR/context.ircntxt, unless the saved cache is already the one this model
+/// DIR/context.ir, unless the saved cache is already the one this model
 /// builds at the level. A saved cache that cannot be read is rebuilt, with a
 /// warning.
 #[derive(Debug, Clone, PartialEq, Eq, Args)]

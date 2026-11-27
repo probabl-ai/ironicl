@@ -128,7 +128,7 @@ with a public PyTorch `predict_proba()` timing.
 | Supported scope | General released classifier configuration and input handling | Validated TabICLv2 static classifier path, with 2 through 10 classes |
 | Cache lifecycle | `fit()` creates Python `TabICLCache` objects | Offline export creates a restart-safe static-context artifact |
 | Cache storage | Torch tensors in their normal operator layouts | Checked tensor manifest with explicit dtype and packed layouts |
-| Loading | Python/Torch allocations reconstruct model and cache state | Model and context payloads are checksummed and memory-mapped |
+| Loading | Python/Torch allocations reconstruct model and cache state | Model and context tensors are validated and memory-mapped |
 | Attention | `torch.nn.functional.scaled_dot_product_attention` | Tiled online attention with explicit score, softmax, value, and finalize kernels |
 | ICL K layout | Determined by Torch tensor strides and operators | Source tiles are packed dimension-major so source rows become SIMD lanes |
 | Dense operations | ATen linear, LayerNorm, GELU, and tensor operators | Portable and AVX-512 affine, LayerNorm, GELU, QASS, RoPE, and residual kernels |

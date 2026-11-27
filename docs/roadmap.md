@@ -59,7 +59,7 @@ Completed:
   ([removed-experiments.md](removed-experiments.md#python-static-context-exporter-irquery-irlogits-and-irtrace));
 - Rust context builder on the CPU, Metal, and CUDA, with a content-addressed
   context cache;
-- full-KV artifact reader/writer and whole-file checksum;
+- full-KV artifact reader/writer and validated tensor directory;
 - cached inference for one query row or many;
 - online stable attention;
 - mmap-backed static-context loading;
@@ -155,7 +155,7 @@ Exit gate: one harness reports every engine on the same datasets and hosts.
 ## Phase 9: Raw-Row CLI
 
 - `ironicl` commands that fit and predict from raw rows, as the estimators do;
-- the fitted model's three files (`IRMODEL`, `IRPREP`, `IRCNTXT`) as their
+- the fitted model's three artifacts (weights, preprocessing, context) as their
   inputs and outputs.
 
 Exit gate: CLI predictions match the Python estimators byte for byte.

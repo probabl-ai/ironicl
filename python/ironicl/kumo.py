@@ -125,8 +125,8 @@ class _KumoTabular(SavedEstimator, BaseEstimator):
         """Export the fitted model to the directory ``path`` for ``ironicl serve``,
         as ``TabICLClassifier.export`` does.
 
-        It holds the training data (``preprocessing.irprep``), the members'
-        contexts when ``kv_cache`` is set (``context.ircntxt``; without them the
+        It holds the training data (``preprocessing.ir``), the members'
+        contexts when ``kv_cache`` is set (``context.ir``; without them the
         server fits them again), and the metadata (``ironicl.json``). The weights
         go to the shared weights folder.
         """

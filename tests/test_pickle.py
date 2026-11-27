@@ -147,7 +147,7 @@ class PickleTest(unittest.TestCase):
                 model = fitted(estimator)
                 path = self.directory / estimator.__name__
                 model.export(path)
-                files = ["context.ircntxt", "ironicl.json", "preprocessing.ir"]
+                files = ["context.ir", "ironicl.json", "preprocessing.ir"]
                 self.assertEqual(sorted(file.name for file in path.iterdir()), files)
                 metadata = json.loads((path / "ironicl.json").read_text())
                 self.assertEqual(
@@ -161,7 +161,7 @@ class PickleTest(unittest.TestCase):
                 rust = _core.Model(Path(model.checkpoint_path_))
                 preprocessor = (path / "preprocessing.ir").read_bytes()
                 self.assertEqual(preprocessor, model.fitted_.preprocessor_bytes())
-                for context in ((path / "context.ircntxt").read_bytes(), None):
+                for context in ((path / "context.ir").read_bytes(), None):
                     loaded = rust.load_fitted(preprocessor, "safe", None, context=context)
                     self.assertEqual(loaded.preprocessor_bytes(), preprocessor)
                 # Again, over the first export, without the cache.

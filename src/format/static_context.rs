@@ -1,48 +1,21 @@
-//! Checked static-context artifacts: a fitted model's cache tensors, `TabICLv2`'s
-//! or Kumo-Tabular's.
-//!
-//! The format is separate from model artifacts. It stores fixed context metadata,
-//! class and feature permutations (`TabICLv2` only), named little-endian cache
-//! tensors, and a trailing SHA-256 digest. The header's kind is 1 for
-//! `TabICLv2`, 2 for Kumo-Tabular. Version 1 stores FP32. Version 2 tags each tensor
-//! FP32, BF16, or FP16. Version 3, with pre-packed ICL keys, is rejected.
+//! Fitted cache tensors backed by owned values, anonymous pages, or an immutable file.
 
-use std::{collections::BTreeMap, fs::File, path::Path, sync::Arc};
+use std::{collections::BTreeMap, path::Path, sync::Arc};
 
-#[cfg(unix)]
-use memmap2::Advice;
 use memmap2::{Mmap, MmapMut, MmapOptions};
 
 use crate::{
     Optimize,
-    config::StorageDType,
     error::{Error, Result},
-    format::{
-        ByteReader, CHECKSUM_BYTES, TENSOR_ALIGNMENT, align_up, pad_to_alignment, sha256, write_u16,
-        write_u32, write_u64,
+    format::container::{
+        self, DISK_ALIGNMENT, DType, Entry, Header, Kind, MAX_TENSOR_COUNT, MAX_TENSOR_NAME_BYTES,
+        MAX_TENSOR_RANK, MEMORY_ALIGNMENT, Writer,
     },
     models::kumo_tabular::Release,
 };
 
-/// Magic bytes at the start of a static-context artifact.
-pub const STATIC_CONTEXT_MAGIC: [u8; 8] = *b"IRCNTXT\0";
-/// Latest supported static-context artifact format version.
-pub const STATIC_CONTEXT_VERSION: u32 = 2;
-
-const STATIC_CONTEXT_KIND: u32 = 1;
-const KUMO_TABULAR_CONTEXT_KIND: u32 = 2;
-/// `TabICLv2`'s architecture values: column, row, and ICL blocks, heads, and
-/// the head width.
-const TABICL_V2_VALUES: [u32; 5] = [3, 12, 8, 16, 64];
-const STATIC_CONTEXT_FP32_VERSION: u32 = 1;
-/// Pre-packed ICL keys, written only by the removed Python exporter.
-const STATIC_CONTEXT_PACKED_KEYS_VERSION: u32 = 3;
-const HEADER_BYTES: usize = 164;
+pub use container::{MAGIC as STATIC_CONTEXT_MAGIC, VERSION as STATIC_CONTEXT_VERSION};
 const MAX_ARTIFACT_BYTES: usize = byte_limit(48 << 30);
-const MAX_DIRECTORY_BYTES: usize = 4 * 1024 * 1024;
-const MAX_TENSOR_COUNT: usize = 4096;
-const MAX_TENSOR_RANK: usize = 16;
-const MAX_TENSOR_NAME_BYTES: usize = 4096;
 const MAX_TENSOR_BYTES: usize = byte_limit(4 << 30);
 const MAX_TOTAL_TENSOR_BYTES: usize = byte_limit(48 << 30);
 const MAX_ENSEMBLE_COUNT: usize = 4096;
@@ -63,54 +36,27 @@ const fn byte_limit(bytes: u64) -> usize {
 }
 
 /// The model a static context is for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ContextArchitecture {
+    #[serde(rename = "tabicl_v2")]
     TabIclV2,
     /// Kumo-Tabular: no permutations, one context per
     /// member and codebook task.
     KumoTabular(Release),
 }
 
-impl ContextArchitecture {
-    /// The header's kind and its five architecture values: for Kumo-Tabular
-    /// the cell width, column layers, inducing points, ICL width, and outputs.
-    fn header(self) -> (u32, [u32; 5]) {
-        match self {
-            Self::TabIclV2 => (STATIC_CONTEXT_KIND, TABICL_V2_VALUES),
-            Self::KumoTabular(release) => {
-                let config = release.size.config();
-                let value = |value: u64| u32::try_from(value).expect("Kumo-Tabular values fit in u32");
-                (
-                    KUMO_TABULAR_CONTEXT_KIND,
-                    [
-                        value(config.cell_channels),
-                        value(config.embedding_layers),
-                        value(config.inducing_points),
-                        value(config.icl_channels),
-                        value(release.outputs()),
-                    ],
-                )
-            }
-        }
-    }
-
-    fn from_header(kind: u32, values: [u32; 5]) -> Result<Self> {
-        [Self::TabIclV2]
-            .into_iter()
-            .chain(Release::ALL.map(Self::KumoTabular))
-            .find(|architecture| architecture.header() == (kind, values))
-            .ok_or_else(|| artifact_error("static context architecture metadata is unsupported"))
-    }
-}
-
 /// Metadata that identifies and describes one static training context.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StaticContextMetadata {
     /// The model the context is for.
     pub architecture: ContextArchitecture,
     /// SHA-256 of the source checkpoint recorded by the model artifact.
+    #[serde(rename = "checkpoint_sha256", with = "container::digest")]
     pub model_sha256: [u8; 32],
     /// SHA-256 identity of the source static context and export inputs.
+    #[serde(rename = "identity", with = "container::digest")]
     pub context_sha256: [u8; 32],
     /// Ensemble count `B`.
     pub ensemble_count: usize,
@@ -143,13 +89,25 @@ pub enum StaticContextTensorData<'a> {
     Bf16(&'a [u16]),
     /// IEEE half precision, written by GPU-built contexts under `optimize="auto"`.
     F16(&'a [u16]),
+    /// Finite-number E4M3, stored verbatim; any scales are separate tensors.
+    F8E4M3(&'a [u8]),
 }
 
-impl StaticContextTensorData<'_> {
+impl<'a> StaticContextTensorData<'a> {
+    pub(crate) fn encoded(self) -> (DType, &'a [u8]) {
+        match self {
+            Self::Fp32(v) => (DType::F32, bytemuck::cast_slice(v)),
+            Self::Bf16(v) => (DType::Bf16, bytemuck::cast_slice(v)),
+            Self::F16(v) => (DType::F16, bytemuck::cast_slice(v)),
+            Self::F8E4M3(v) => (DType::F8E4M3, v),
+        }
+    }
+
     #[must_use]
     pub const fn len(self) -> usize {
         match self {
             Self::Fp32(values) => values.len(),
+            Self::F8E4M3(values) => values.len(),
             Self::Bf16(values) | Self::F16(values) => values.len(),
         }
     }
@@ -165,6 +123,7 @@ impl StaticContextTensorData<'_> {
             Self::Fp32(values) => Self::Fp32(&values[start..][..length]),
             Self::Bf16(values) => Self::Bf16(&values[start..][..length]),
             Self::F16(values) => Self::F16(&values[start..][..length]),
+            Self::F8E4M3(values) => Self::F8E4M3(&values[start..][..length]),
         }
     }
 }
@@ -182,7 +141,7 @@ impl<'a> StaticContextTensorRef<'a> {
     pub const fn fp32_values(self) -> Option<&'a [f32]> {
         match self.data {
             StaticContextTensorData::Fp32(values) => Some(values),
-            StaticContextTensorData::Bf16(_) | StaticContextTensorData::F16(_) => None,
+            _ => None,
         }
     }
 }
@@ -190,9 +149,7 @@ impl<'a> StaticContextTensorRef<'a> {
 #[derive(Debug, Clone, PartialEq)]
 enum StaticContextTensorValues {
     Owned(Vec<f32>),
-    MappedFp32 { byte_offset: usize, byte_length: usize },
-    MappedBf16 { byte_offset: usize, byte_length: usize },
-    MappedF16 { byte_offset: usize, byte_length: usize },
+    Mapped(DType, std::ops::Range<usize>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -205,7 +162,7 @@ struct StaticContextTensorRecord {
 enum StaticContextStorage {
     Owned,
     Mapped(Arc<Mmap>),
-    /// Anonymous memory where every tensor starts on a page and is padded to a
+    /// A mapping where every tensor starts on a page and is padded to a
     /// page multiple, so a GPU can wrap each tensor without copying it.
     #[cfg_attr(
         not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
@@ -220,7 +177,7 @@ enum StaticContextStorage {
     not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
     allow(dead_code, reason = "only the Metal build uses page-aligned storage")
 )]
-pub(crate) const TENSOR_PAGE_BYTES: usize = 16 * 1024;
+pub(crate) const TENSOR_PAGE_BYTES: usize = DISK_ALIGNMENT;
 
 /// FP32, FP16, or BF16 tensors being written into page-aligned anonymous memory, for
 /// [`StaticContextArtifact::from_page_aligned`].
@@ -231,32 +188,23 @@ pub(crate) const TENSOR_PAGE_BYTES: usize = 16 * 1024;
 pub(crate) struct PageAlignedTensors {
     mapping: MmapMut,
     /// Name, dimensions, element type, byte offset, and byte length of each tensor.
-    layout: Vec<(String, Vec<u64>, TensorStorage, usize, usize)>,
+    layout: Vec<(String, Vec<u64>, DType, usize, usize)>,
 }
 
-/// The element type of a page-aligned tensor.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(
-    not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
-    allow(dead_code, reason = "only the Metal build uses page-aligned storage")
-)]
-pub(crate) enum TensorStorage {
-    Fp32,
-    F16,
-    Bf16,
+const fn is_cache_dtype(dtype: DType) -> bool {
+    matches!(dtype, DType::F32 | DType::F16 | DType::Bf16 | DType::F8E4M3)
 }
 
-#[cfg_attr(
-    not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
-    allow(dead_code, reason = "only the Metal build uses page-aligned storage")
-)]
-impl TensorStorage {
-    pub(crate) const fn bytes(self) -> usize {
-        match self {
-            Self::Fp32 => 4,
-            Self::F16 | Self::Bf16 => 2,
+fn view_cache(dtype: DType, bytes: &[u8]) -> Result<StaticContextTensorData<'_>> {
+    Ok(match dtype {
+        DType::F32 => StaticContextTensorData::Fp32(bytemuck::try_cast_slice(bytes).map_err(artifact_error)?),
+        DType::Bf16 => {
+            StaticContextTensorData::Bf16(bytemuck::try_cast_slice(bytes).map_err(artifact_error)?)
         }
-    }
+        DType::F16 => StaticContextTensorData::F16(bytemuck::try_cast_slice(bytes).map_err(artifact_error)?),
+        DType::F8E4M3 => StaticContextTensorData::F8E4M3(bytes),
+        _ => return Err(artifact_error("invalid cache dtype")),
+    })
 }
 
 #[cfg_attr(
@@ -264,15 +212,21 @@ impl TensorStorage {
     allow(dead_code, reason = "only the Metal build uses page-aligned storage")
 )]
 impl PageAlignedTensors {
-    /// Reserve zeroed, page-aligned space for each `(name, dimensions, storage)`.
-    pub(crate) fn new(specs: Vec<(String, Vec<u64>, TensorStorage)>) -> Result<Self> {
+    /// Reserve zeroed, page-aligned space for each `(name, dimensions, dtype)`.
+    pub(crate) fn new(specs: Vec<(String, Vec<u64>, DType)>) -> Result<Self> {
         let mut layout = Vec::with_capacity(specs.len());
         let mut offset = 0_usize;
-        for (name, dimensions, storage) in specs {
+        for (name, dimensions, dtype) in specs {
+            if !is_cache_dtype(dtype) {
+                return Err(artifact_error("invalid cache dtype"));
+            }
             let bytes = checked_elements(&dimensions)?
-                .checked_mul(storage.bytes())
+                .checked_mul(dtype.size_in_bytes())
                 .ok_or_else(|| artifact_error("tensor byte length overflows usize"))?;
-            layout.push((name, dimensions, storage, offset, bytes));
+            if bytes > MAX_TENSOR_BYTES {
+                return Err(artifact_error("tensor exceeds size limit"));
+            }
+            layout.push((name, dimensions, dtype, offset, bytes));
             offset = offset
                 .checked_add(bytes.next_multiple_of(TENSOR_PAGE_BYTES))
                 .ok_or_else(|| artifact_error("total tensor byte length overflows usize"))?;
@@ -444,23 +398,10 @@ impl StaticContextArtifact {
             return Err(artifact_error("static context tensor count is invalid"));
         }
         let mut named = BTreeMap::new();
-        for (name, dimensions, storage, byte_offset, byte_length) in tensors.layout {
-            let elements = byte_length / storage.bytes();
-            validate_tensor_shape(&name, &dimensions, elements)?;
-            let values = match storage {
-                TensorStorage::Fp32 => StaticContextTensorValues::MappedFp32 {
-                    byte_offset,
-                    byte_length,
-                },
-                TensorStorage::F16 => StaticContextTensorValues::MappedF16 {
-                    byte_offset,
-                    byte_length,
-                },
-                TensorStorage::Bf16 => StaticContextTensorValues::MappedBf16 {
-                    byte_offset,
-                    byte_length,
-                },
-            };
+        for (name, dimensions, dtype, byte_offset, byte_length) in tensors.layout {
+            let elements = byte_length / dtype.size_in_bytes();
+            validate_tensor_shape(&name, &dimensions, elements, dtype.size_in_bytes())?;
+            let values = StaticContextTensorValues::Mapped(dtype, byte_offset..byte_offset + byte_length);
             if named
                 .insert(name, StaticContextTensorRecord { dimensions, values })
                 .is_some()
@@ -489,24 +430,16 @@ impl StaticContextArtifact {
         }
     }
 
-    /// Decode and verify a complete static-context artifact of any version,
+    /// Decode and verify a complete static-context artifact,
     /// copied into anonymous memory.
     ///
     /// # Errors
     ///
     /// Returns [`Error::Artifact`] for malformed, corrupt, or invalid input.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        if !(HEADER_BYTES + CHECKSUM_BYTES..=MAX_ARTIFACT_BYTES).contains(&bytes.len()) {
-            return Err(artifact_error(
-                "static context length is outside the resource limit",
-            ));
-        }
-        let mut mapping = MmapOptions::new()
-            .len(bytes.len())
-            .map_anon()
-            .map_err(artifact_error)?;
-        mapping.copy_from_slice(bytes);
-        Self::from_mapping(mapping.make_read_only().map_err(artifact_error)?)
+        let mapping = container::map_bytes(bytes, MAX_ARTIFACT_BYTES)?;
+        let header = context_header(&mapping)?;
+        Self::from_mapping(mapping, header)
     }
 
     /// Map, verify, and borrow tensors directly from an immutable artifact.
@@ -523,484 +456,89 @@ impl StaticContextArtifact {
     /// # Errors
     ///
     /// Returns [`Error::Artifact`] when the file or mapped tensor layout is invalid.
-    #[expect(
-        unsafe_code,
-        reason = "memory-maps the artifact file; see the SAFETY comments"
-    )]
     pub fn read_mapped_prefault(path: &Path) -> Result<Self> {
-        let file = File::open(path).map_err(artifact_error)?;
-        let length = to_usize(
-            file.metadata().map_err(artifact_error)?.len(),
-            "static context length",
-        )?;
-        if !(HEADER_BYTES + CHECKSUM_BYTES..=MAX_ARTIFACT_BYTES).contains(&length) {
-            return Err(artifact_error(
-                "static context length is outside the resource limit",
-            ));
-        }
-        // SAFETY: `Mmap::map` requires that no one modifies or truncates the file while it is
-        // mapped; this crate never writes it, and serving artifacts must stay immutable (an
-        // outside writer breaks `&[u8]` immutability; truncation raises SIGBUS). The `Mmap` is
-        // owned by the artifact (`Arc`), so every tensor borrow ends before it is unmapped.
-        let mapping = unsafe { MmapOptions::new().map(&file) }.map_err(artifact_error)?;
-        // Start reading the pages in now so the first prediction runs at RAM
-        // speed. Advisory only; elsewhere the checksum below reads every page anyway.
-        #[cfg(unix)]
-        let _ = mapping.advise(Advice::WillNeed);
-        #[cfg(windows)]
-        prefetch(&mapping);
-        Self::from_mapping(mapping)
+        let mapping = container::map_immutable(path, MAX_ARTIFACT_BYTES as u64)?;
+        let header = context_header(&mapping)?;
+        container::prefault(&mapping);
+        Self::from_mapping(mapping, header)
     }
 
-    /// Verify and decode a mapped artifact, borrowing its tensors from `mapping`.
-    #[expect(clippy::too_many_lines, reason = "one pass over the format, field by field")]
-    fn from_mapping(mapping: Mmap) -> Result<Self> {
+    fn from_mapping(mapping: Mmap, header: Header<StaticContextMetadata>) -> Result<Self> {
         if !cfg!(target_endian = "little") {
-            return Err(artifact_error(
-                "mapped FP32 contexts require a little-endian host",
-            ));
+            return Err(artifact_error("mapped contexts require a little-endian host"));
         }
-        // The file may have changed size since its metadata was read: check what was mapped.
-        if !(HEADER_BYTES + CHECKSUM_BYTES..=MAX_ARTIFACT_BYTES).contains(&mapping.len()) {
-            return Err(artifact_error(
-                "static context length is outside the resource limit",
-            ));
-        }
-        let checksum_offset = mapping.len() - CHECKSUM_BYTES;
-        if sha256(&mapping[..checksum_offset]).as_slice() != &mapping[checksum_offset..] {
-            return Err(artifact_error("static context checksum does not match"));
-        }
-        let mut header = ByteReader::new(&mapping[..HEADER_BYTES]);
-        if header.read_array::<8>()? != STATIC_CONTEXT_MAGIC {
-            return Err(artifact_error("static context magic does not match"));
-        }
-        let version = header.read_u32()?;
-        if version == STATIC_CONTEXT_PACKED_KEYS_VERSION {
-            return Err(artifact_error(
-                "static context version 3 (pre-packed ICL keys) is no longer supported; rebuild the context",
-            ));
-        }
-        if !matches!(version, STATIC_CONTEXT_FP32_VERSION | STATIC_CONTEXT_VERSION) {
-            return Err(artifact_error(format!(
-                "static context version {version} is unsupported"
-            )));
-        }
-        let kind = header.read_u32()?;
-        let model_sha256 = header.read_array()?;
-        let context_sha256 = header.read_array()?;
-        let ensemble_count = to_usize(header.read_u64()?, "ensemble count")?;
-        let training_rows = to_usize(header.read_u64()?, "training rows")?;
-        let feature_count = to_usize(header.read_u64()?, "feature count")?;
-        let class_count = to_usize(header.read_u64()?, "class count")?;
-        let architecture = [
-            header.read_u32()?,
-            header.read_u32()?,
-            header.read_u32()?,
-            header.read_u32()?,
-            header.read_u32()?,
-        ];
-        let architecture = ContextArchitecture::from_header(kind, architecture)?;
-        let tensor_count = to_usize(u64::from(header.read_u32()?), "tensor count")?;
-        let class_permutation_count = to_usize(u64::from(header.read_u32()?), "class permutation count")?;
-        let feature_permutation_count = to_usize(u64::from(header.read_u32()?), "feature permutation count")?;
-        let directory_length = to_usize(header.read_u64()?, "directory length")?;
-        let payload_length = to_usize(header.read_u64()?, "payload length")?;
-        let optimize = match header.read_u32()? {
-            1 => Optimize::Safe,
-            2 => Optimize::Auto,
-            3 => Optimize::Fast,
-            _ => return Err(artifact_error("static context optimize level is invalid")),
-        };
-        if !header.is_empty() {
-            return Err(artifact_error("static context header has trailing bytes"));
-        }
-        if tensor_count == 0
-            || tensor_count > MAX_TENSOR_COUNT
-            || directory_length > MAX_DIRECTORY_BYTES
-            || payload_length > MAX_TOTAL_TENSOR_BYTES
-        {
-            return Err(artifact_error(
-                "static context section exceeds the resource limit",
-            ));
-        }
-        let permuted = architecture == ContextArchitecture::TabIclV2;
-        let expected_class_permutations = ensemble_count
-            .checked_mul(if permuted { class_count } else { 0 })
-            .ok_or_else(|| artifact_error("class permutation count overflows usize"))?;
-        let expected_feature_permutations = ensemble_count
-            .checked_mul(if permuted { feature_count } else { 0 })
-            .ok_or_else(|| artifact_error("feature permutation count overflows usize"))?;
-        if class_permutation_count != expected_class_permutations
-            || feature_permutation_count != expected_feature_permutations
-        {
-            return Err(artifact_error(
-                "static context permutation lengths do not match metadata",
-            ));
-        }
-        let permutation_bytes = class_permutation_count
-            .checked_add(feature_permutation_count)
-            .and_then(|count| count.checked_mul(8))
-            .ok_or_else(|| artifact_error("permutation length overflows usize"))?;
-        let permutations_end = HEADER_BYTES
-            .checked_add(permutation_bytes)
-            .ok_or_else(|| artifact_error("permutation section end overflows usize"))?;
-        let directory_end = permutations_end
-            .checked_add(directory_length)
-            .ok_or_else(|| artifact_error("directory end overflows usize"))?;
-        let payload_start = align_up(directory_end, TENSOR_ALIGNMENT)?;
-        let payload_end = payload_start
-            .checked_add(payload_length)
-            .ok_or_else(|| artifact_error("payload end overflows usize"))?;
-        if payload_end != checksum_offset || directory_end > payload_start {
-            return Err(artifact_error("static context section offsets are inconsistent"));
-        }
-        if mapping[directory_end..payload_start]
-            .iter()
-            .any(|byte| *byte != 0)
-        {
-            return Err(artifact_error("static context alignment padding is not zero"));
-        }
-        let mut permutations = ByteReader::new(&mapping[HEADER_BYTES..permutations_end]);
-        let class_permutations = read_permutation(&mut permutations, class_permutation_count)?;
-        let feature_permutations = read_permutation(&mut permutations, feature_permutation_count)?;
-        let metadata = StaticContextMetadata {
-            architecture,
-            model_sha256,
-            context_sha256,
-            ensemble_count,
-            training_rows,
-            feature_count,
-            class_count,
-            class_permutations,
-            feature_permutations,
-            optimize,
-        };
-        validate_metadata(&metadata)?;
-
-        let mut directory = ByteReader::new(&mapping[permutations_end..directory_end]);
-        let mut previous_name = None;
-        let mut ranges = Vec::with_capacity(tensor_count);
+        // Each range, including its page-rounded length, is inside this same mapping.
+        let page_aligned = header.alignment >= TENSOR_PAGE_BYTES
+            && mapping.as_ptr().addr().is_multiple_of(TENSOR_PAGE_BYTES);
         let mut tensors = BTreeMap::new();
-        let mut total_bytes = 0_usize;
-        for _ in 0..tensor_count {
-            let name_length = to_usize(u64::from(directory.read_u32()?), "tensor name length")?;
-            let rank = usize::from(directory.read_u16()?);
-            let dtype_tag = directory.read_u16()?;
-            if name_length == 0 || name_length > MAX_TENSOR_NAME_BYTES || rank == 0 || rank > MAX_TENSOR_RANK
-            {
-                return Err(artifact_error("static context tensor directory entry is invalid"));
+        for t in &header.tensors {
+            let range = header.range(t);
+            let slice = &mapping[range.clone()];
+            if !t.dtype.all_finite(slice)? {
+                return Err(artifact_error(format!("non-finite cache tensor '{}'", t.name)));
             }
-            // Version 1 stores FP32 with a zero tag; later versions tag each tensor.
-            // A context only ever stores FP32, BF16, or FP16 values.
-            let dtype = if version == STATIC_CONTEXT_FP32_VERSION {
-                if dtype_tag != 0 {
-                    return Err(artifact_error("static context tensor directory entry is invalid"));
-                }
-                StorageDType::Fp32
-            } else {
-                StorageDType::from_disk_tag(dtype_tag)
-                    .map_err(|_| artifact_error("static context tensor directory entry is invalid"))?
-            };
-            let offset = to_usize(directory.read_u64()?, "tensor payload offset")?;
-            let byte_length = to_usize(directory.read_u64()?, "tensor byte length")?;
-            if offset % TENSOR_ALIGNMENT != 0 || byte_length > MAX_TENSOR_BYTES {
-                return Err(artifact_error(
-                    "static context tensor offset or length is invalid",
-                ));
-            }
-            let mut dimensions = Vec::with_capacity(rank);
-            for _ in 0..rank {
-                dimensions.push(directory.read_u64()?);
-            }
-            let name = std::str::from_utf8(directory.read_bytes(name_length)?)
-                .map_err(|_| artifact_error("static context tensor name is not UTF-8"))?
-                .to_owned();
-            if previous_name
-                .as_ref()
-                .is_some_and(|previous: &String| previous >= &name)
-            {
-                return Err(artifact_error(
-                    "static context tensor names are not unique and sorted",
-                ));
-            }
-            previous_name = Some(name.clone());
-            let elements = checked_elements(&dimensions)?;
-            let element_bytes = to_usize(dtype.bytes_per_element(), "tensor element bytes")?;
-            let expected_bytes = elements
-                .checked_mul(element_bytes)
-                .ok_or_else(|| artifact_error("tensor byte length overflows usize"))?;
-            if byte_length != expected_bytes {
-                return Err(artifact_error(format!(
-                    "static context tensor '{name}' byte length does not match its shape"
-                )));
-            }
-            let end = offset
-                .checked_add(byte_length)
-                .ok_or_else(|| artifact_error("tensor payload end overflows usize"))?;
-            if end > payload_length {
-                return Err(artifact_error(format!(
-                    "static context tensor '{name}' exceeds the payload section"
-                )));
-            }
-            total_bytes = total_bytes
-                .checked_add(byte_length)
-                .ok_or_else(|| artifact_error("total tensor byte length overflows usize"))?;
-            ranges.push((offset, end));
-            let byte_offset = payload_start
-                .checked_add(offset)
-                .ok_or_else(|| artifact_error("absolute tensor payload start overflows usize"))?;
-            let bytes = mapping
-                .get(byte_offset..byte_offset + byte_length)
-                .ok_or_else(|| artifact_error("static context tensor payload is truncated"))?;
-            let values = match dtype {
-                StorageDType::Fp32 => {
-                    let values = bytemuck::try_cast_slice::<u8, f32>(bytes)
-                        .map_err(|_| artifact_error("mapped FP32 tensor alignment is invalid"))?;
-                    if values.iter().any(|value| !value.is_finite()) {
-                        return Err(artifact_error(
-                            "static context tensor contains a non-finite value",
-                        ));
-                    }
-                    StaticContextTensorValues::MappedFp32 {
-                        byte_offset,
-                        byte_length,
-                    }
-                }
-                StorageDType::Bf16 => {
-                    let values = bytemuck::try_cast_slice::<u8, u16>(bytes)
-                        .map_err(|_| artifact_error("mapped BF16 tensor alignment is invalid"))?;
-                    if values
-                        .iter()
-                        .any(|value| !f32::from_bits(u32::from(*value) << 16).is_finite())
-                    {
-                        return Err(artifact_error(
-                            "static context tensor contains a non-finite BF16 value",
-                        ));
-                    }
-                    StaticContextTensorValues::MappedBf16 {
-                        byte_offset,
-                        byte_length,
-                    }
-                }
-                StorageDType::F16 => {
-                    let values = bytemuck::try_cast_slice::<u8, u16>(bytes)
-                        .map_err(|_| artifact_error("mapped FP16 tensor alignment is invalid"))?;
-                    // IEEE half is non-finite exactly when every exponent bit is set.
-                    if values.iter().any(|value| value & 0x7c00 == 0x7c00) {
-                        return Err(artifact_error(
-                            "static context tensor contains a non-finite FP16 value",
-                        ));
-                    }
-                    StaticContextTensorValues::MappedF16 {
-                        byte_offset,
-                        byte_length,
-                    }
-                }
-            };
-            tensors.insert(name, StaticContextTensorRecord { dimensions, values });
+            // Verify alignment for typed borrowing before exposing the mapping.
+            view_cache(t.dtype, slice)?;
+            tensors.insert(
+                t.name.clone(),
+                StaticContextTensorRecord {
+                    dimensions: t.shape.clone(),
+                    values: StaticContextTensorValues::Mapped(t.dtype, range),
+                },
+            );
         }
-        if !directory.is_empty() {
-            return Err(artifact_error(
-                "static context tensor directory has trailing bytes",
-            ));
-        }
-        ranges.sort_unstable();
-        if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) || total_bytes > MAX_TOTAL_TENSOR_BYTES {
-            return Err(artifact_error("static context tensor payload ranges are invalid"));
-        }
+        let mapping = Arc::new(mapping);
         Ok(Self {
-            metadata,
+            metadata: header.metadata,
             tensors,
-            storage: StaticContextStorage::Mapped(Arc::new(mapping)),
+            storage: if page_aligned {
+                StaticContextStorage::PageAligned(mapping)
+            } else {
+                StaticContextStorage::Mapped(mapping)
+            },
         })
     }
 
-    /// Encode the artifact deterministically for tests and external exporters.
-    ///
+    /// Encode compact, deterministic bytes for an in-memory consumer.
     /// # Errors
-    ///
-    /// Returns [`Error::Artifact`] if a validated size cannot be encoded.
+    /// If a size or the host byte order is unsupported.
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        let mut bytes = Vec::with_capacity(self.encoded_len()?);
-        self.encode(&mut bytes)?;
-        Ok(bytes)
+        self.writer(MEMORY_ALIGNMENT)?.bytes()
     }
 
-    /// The length of [`Self::encode`]'s output.
-    ///
+    /// The exact size of [`Self::encode`]'s output.
     /// # Errors
-    ///
-    /// Returns [`Error::Artifact`] if a validated size cannot be encoded.
+    /// If the container exceeds a resource limit.
     pub fn encoded_len(&self) -> Result<usize> {
-        Ok(self.head()?.1)
+        Ok(self.writer(MEMORY_ALIGNMENT)?.len)
     }
 
-    /// Encode the artifact into `sink` in one pass, hashing as it writes, so
-    /// encoding needs no copy of the payload.
-    ///
+    /// Write compact bytes without buffering another copy of the tensors.
     /// # Errors
-    ///
-    /// Returns [`Error::Artifact`] if a validated size cannot be encoded, on a
-    /// big-endian host, or if writing fails.
+    /// If the container cannot be encoded or written.
     pub fn encode(&self, sink: &mut impl std::io::Write) -> Result<()> {
-        use sha2::{Digest as _, Sha256};
-        // The payload is the in-memory values verbatim, which must be little-endian.
-        if !cfg!(target_endian = "little") {
-            return Err(artifact_error(
-                "encoding a static context requires a little-endian host",
-            ));
-        }
-        let (head, _) = self.head()?;
-        let mut hasher = Sha256::new();
-        let mut write = |bytes: &[u8]| {
-            hasher.update(bytes);
-            sink.write_all(bytes).map_err(artifact_error)
-        };
-        write(&head)?;
-        let mut written = 0;
-        for tensor in self.tensors.values() {
-            let padding = align_up(written, TENSOR_ALIGNMENT)? - written;
-            write(&[0; TENSOR_ALIGNMENT][..padding])?;
-            let bytes: &[u8] = match self.tensor_data(tensor) {
-                StaticContextTensorData::Fp32(values) => bytemuck::cast_slice(values),
-                StaticContextTensorData::Bf16(values) | StaticContextTensorData::F16(values) => {
-                    bytemuck::cast_slice(values)
-                }
-            };
-            write(bytes)?;
-            written += padding + bytes.len();
-        }
-        sink.write_all(&hasher.finalize()).map_err(artifact_error)
+        self.writer(MEMORY_ALIGNMENT)?.write(sink)
     }
 
-    /// The header, permutations, tensor directory, and padding that precede
-    /// the payload, and the whole encoded length.
-    #[expect(clippy::too_many_lines, reason = "one pass over the format, field by field")]
-    fn head(&self) -> Result<(Vec<u8>, usize)> {
-        // Version 1 when every tensor is FP32; version 2 tags each tensor's dtype.
-        let version = if self
-            .tensors
-            .values()
-            .all(|tensor| matches!(self.tensor_data(tensor), StaticContextTensorData::Fp32(_)))
-        {
-            STATIC_CONTEXT_FP32_VERSION
-        } else {
-            STATIC_CONTEXT_VERSION
-        };
-        let mut directory = Vec::new();
-        let mut payload_length = 0_usize;
-        for (name, tensor) in &self.tensors {
-            let offset = align_up(payload_length, TENSOR_ALIGNMENT)?;
-            let (dtype, byte_length) = match self.tensor_data(tensor) {
-                StaticContextTensorData::Fp32(values) => (StorageDType::Fp32, size_of_val(values)),
-                StaticContextTensorData::Bf16(values) => (StorageDType::Bf16, size_of_val(values)),
-                StaticContextTensorData::F16(values) => (StorageDType::F16, size_of_val(values)),
-            };
-            payload_length = offset
-                .checked_add(byte_length)
-                .ok_or_else(|| artifact_error("static context payload length overflows usize"))?;
-            let dtype_tag = if version == STATIC_CONTEXT_FP32_VERSION {
-                0
-            } else {
-                dtype.on_disk_tag()
-            };
-            write_u32(
-                &mut directory,
-                u32::try_from(name.len()).map_err(|_| artifact_error("tensor name length exceeds u32"))?,
-            );
-            write_u16(
-                &mut directory,
-                u16::try_from(tensor.dimensions.len())
-                    .map_err(|_| artifact_error("tensor rank exceeds u16"))?,
-            );
-            write_u16(&mut directory, dtype_tag);
-            write_u64(
-                &mut directory,
-                u64::try_from(offset).map_err(|_| artifact_error("tensor offset exceeds u64"))?,
-            );
-            write_u64(
-                &mut directory,
-                u64::try_from(byte_length).map_err(|_| artifact_error("tensor byte length exceeds u64"))?,
-            );
-            for dimension in &tensor.dimensions {
-                write_u64(&mut directory, *dimension);
-            }
-            directory.extend_from_slice(name.as_bytes());
+    fn writer(&self, alignment: usize) -> Result<Writer<'_>> {
+        if !cfg!(target_endian = "little") {
+            return Err(artifact_error("encoding contexts requires a little-endian host"));
         }
-        if directory.len() > MAX_DIRECTORY_BYTES || payload_length > MAX_TOTAL_TENSOR_BYTES {
-            return Err(artifact_error(
-                "static context section exceeds the resource limit",
-            ));
+        let mut tensors: Vec<_> = self.tensors.iter().collect();
+        tensors.sort_by_cached_key(|(name, _)| execution_key(name));
+        let writer = Writer::new(
+            Kind::Context,
+            alignment,
+            &self.metadata,
+            tensors.into_iter().map(|(name, t)| {
+                let (dtype, bytes) = self.tensor_data(t).encoded();
+                (name.clone(), dtype, t.dimensions.clone(), bytes)
+            }),
+        )?;
+        if writer.len > MAX_ARTIFACT_BYTES {
+            return Err(artifact_error("context exceeds size limit"));
         }
-        let mut head = Vec::new();
-        head.extend_from_slice(&STATIC_CONTEXT_MAGIC);
-        let (kind, architecture) = self.metadata.architecture.header();
-        write_u32(&mut head, version);
-        write_u32(&mut head, kind);
-        head.extend_from_slice(&self.metadata.model_sha256);
-        head.extend_from_slice(&self.metadata.context_sha256);
-        for value in [
-            self.metadata.ensemble_count,
-            self.metadata.training_rows,
-            self.metadata.feature_count,
-            self.metadata.class_count,
-        ] {
-            write_u64(
-                &mut head,
-                u64::try_from(value).map_err(|_| artifact_error("metadata value exceeds u64"))?,
-            );
-        }
-        for value in architecture {
-            write_u32(&mut head, value);
-        }
-        write_u32(
-            &mut head,
-            u32::try_from(self.tensors.len()).map_err(|_| artifact_error("tensor count exceeds u32"))?,
-        );
-        write_u32(
-            &mut head,
-            u32::try_from(self.metadata.class_permutations.len())
-                .map_err(|_| artifact_error("class permutation count exceeds u32"))?,
-        );
-        write_u32(
-            &mut head,
-            u32::try_from(self.metadata.feature_permutations.len())
-                .map_err(|_| artifact_error("feature permutation count exceeds u32"))?,
-        );
-        write_u64(
-            &mut head,
-            u64::try_from(directory.len()).map_err(|_| artifact_error("directory length exceeds u64"))?,
-        );
-        write_u64(
-            &mut head,
-            u64::try_from(payload_length).map_err(|_| artifact_error("payload length exceeds u64"))?,
-        );
-        write_u32(
-            &mut head,
-            match self.metadata.optimize {
-                Optimize::Safe => 1,
-                Optimize::Auto => 2,
-                Optimize::Fast => 3,
-            },
-        );
-        debug_assert_eq!(head.len(), HEADER_BYTES);
-        for value in self
-            .metadata
-            .class_permutations
-            .iter()
-            .chain(&self.metadata.feature_permutations)
-        {
-            write_u64(&mut head, *value);
-        }
-        head.extend_from_slice(&directory);
-        pad_to_alignment(&mut head, TENSOR_ALIGNMENT)?;
-        let length = head
-            .len()
-            .checked_add(payload_length)
-            .and_then(|length| length.checked_add(CHECKSUM_BYTES))
-            .filter(|length| *length <= MAX_ARTIFACT_BYTES)
-            .ok_or_else(|| artifact_error("static context exceeds the resource limit"))?;
-        Ok((head, length))
+        Ok(writer)
     }
 
     /// Encode and write this context to `path` atomically: write a new temporary
@@ -1014,23 +552,12 @@ impl StaticContextArtifact {
     ///
     /// Returns [`Error::Artifact`] if encoding or any filesystem step fails.
     pub fn write(&self, path: &Path) -> Result<()> {
-        let directory = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        // A new file with a random name, owner-only on Unix, that is deleted if
-        // it is dropped before `persist`, even on panic. `ironicl.clear_cache`
-        // removes `.ironicl-*.tmp` files a killed process leaves behind.
-        let mut file = tempfile::Builder::new()
-            .prefix(".ironicl-")
-            .suffix(".tmp")
-            .tempfile_in(directory)
-            .map_err(artifact_error)?;
-        let mut writer = std::io::BufWriter::new(&mut file);
-        self.encode(&mut writer)?;
-        writer.into_inner().map_err(artifact_error)?;
-        file.as_file().sync_all().map_err(artifact_error)?;
-        crate::format::persist_atomic(file, path).map_err(artifact_error)
+        super::write_atomic(path, |file| {
+            use std::io::{BufWriter, Write};
+            let mut writer = BufWriter::new(file);
+            self.writer(DISK_ALIGNMENT)?.write(&mut writer)?;
+            writer.flush().map_err(artifact_error)
+        })
     }
 
     /// The verified artifact at `path`, prefaulted as by
@@ -1092,36 +619,85 @@ impl StaticContextArtifact {
             }
             (
                 StaticContextStorage::Mapped(mapping) | StaticContextStorage::PageAligned(mapping),
-                StaticContextTensorValues::MappedFp32 {
-                    byte_offset,
-                    byte_length,
-                },
-            ) => StaticContextTensorData::Fp32(
-                bytemuck::try_cast_slice(&mapping[*byte_offset..*byte_offset + *byte_length])
-                    .expect("mapped FP32 tensor alignment was validated"),
-            ),
-            (
-                StaticContextStorage::Mapped(mapping) | StaticContextStorage::PageAligned(mapping),
-                StaticContextTensorValues::MappedBf16 {
-                    byte_offset,
-                    byte_length,
-                },
-            ) => StaticContextTensorData::Bf16(
-                bytemuck::try_cast_slice(&mapping[*byte_offset..*byte_offset + *byte_length])
-                    .expect("mapped BF16 tensor alignment was validated"),
-            ),
-            (
-                StaticContextStorage::Mapped(mapping) | StaticContextStorage::PageAligned(mapping),
-                StaticContextTensorValues::MappedF16 {
-                    byte_offset,
-                    byte_length,
-                },
-            ) => StaticContextTensorData::F16(
-                bytemuck::try_cast_slice(&mapping[*byte_offset..*byte_offset + *byte_length])
-                    .expect("mapped FP16 tensor alignment was validated"),
-            ),
+                StaticContextTensorValues::Mapped(dtype, range),
+            ) => view_cache(*dtype, &mapping[range.clone()]).expect("validated tensor alignment and length"),
             _ => unreachable!("static context tensor storage must match artifact storage"),
         }
+    }
+}
+
+// Sort layer, member and task indices numerically. Keep K and V together per
+// stage, placing any scale tensor immediately after its tensor.
+fn execution_key(name: &str) -> (usize, usize, usize, usize, usize) {
+    let mut parts = name.split('.').peekable();
+    let mut index = || {
+        parts
+            .next_if(|s| s.parse::<usize>().is_ok())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    };
+    let member = index();
+    let task = index();
+    let stage = match parts.next() {
+        Some("means") => 0,
+        Some("categorical") => 1,
+        Some("column" | "columns") => 2,
+        Some("icl") => 3,
+        _ => 4,
+    };
+    let block = parts
+        .next_if(|s| s.parse::<usize>().is_ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    let kv = match parts.next() {
+        Some("key") => 0,
+        Some("key_scale") => 1,
+        Some("value") => 2,
+        Some("value_scale") => 3,
+        _ => 4,
+    };
+    (member, task, stage, block, kv)
+}
+
+fn context_header(bytes: &[u8]) -> Result<Header<StaticContextMetadata>> {
+    let header = Header::from_bytes(bytes, Kind::Context)?;
+    validate_header(&header)?;
+    Ok(header)
+}
+
+fn validate_header(header: &Header<StaticContextMetadata>) -> Result<()> {
+    validate_metadata(&header.metadata)?;
+    if header.tensors.is_empty()
+        || header.tensors.iter().any(|t| {
+            !is_cache_dtype(t.dtype)
+                || t.shape.is_empty()
+                || t.shape.contains(&0)
+                || t.bytes > MAX_TENSOR_BYTES
+        })
+    {
+        return Err(artifact_error("invalid cache tensor count, shape, size or dtype"));
+    }
+    Ok(())
+}
+
+/// Validated context metadata and tensor directory. Inspection never reads the payloads.
+pub struct ContextHeader {
+    pub metadata: StaticContextMetadata,
+    pub tensors: Vec<Entry>,
+    pub file_len: u64,
+}
+impl ContextHeader {
+    /// Open an immutable context and validate its metadata and physical layout.
+    /// # Errors
+    /// If the file cannot be opened or the header is invalid.
+    pub fn open(path: &Path) -> Result<Self> {
+        let header = Header::open(path, Kind::Context, MAX_ARTIFACT_BYTES as u64)?;
+        validate_header(&header)?;
+        Ok(Self {
+            metadata: header.metadata,
+            tensors: header.tensors,
+            file_len: header.file_len,
+        })
     }
 }
 
@@ -1206,7 +782,7 @@ fn validate_permutation(values: &[u64], expected_length: usize, name: &str) -> R
 
 fn validate_tensor(tensor: &StaticContextTensor) -> Result<()> {
     let name = &tensor.name;
-    validate_tensor_shape(name, &tensor.dimensions, tensor.values.len())?;
+    validate_tensor_shape(name, &tensor.dimensions, tensor.values.len(), 4)?;
     if tensor.values.iter().any(|value| !value.is_finite()) {
         return Err(artifact_error(format!(
             "static context tensor '{name}' has a non-finite value"
@@ -1215,7 +791,7 @@ fn validate_tensor(tensor: &StaticContextTensor) -> Result<()> {
     Ok(())
 }
 
-fn validate_tensor_shape(name: &str, dimensions: &[u64], length: usize) -> Result<()> {
+fn validate_tensor_shape(name: &str, dimensions: &[u64], length: usize, element_bytes: usize) -> Result<()> {
     if name.is_empty()
         || name.len() > MAX_TENSOR_NAME_BYTES
         || dimensions.is_empty()
@@ -1229,7 +805,7 @@ fn validate_tensor_shape(name: &str, dimensions: &[u64], length: usize) -> Resul
         )));
     }
     if length
-        .checked_mul(4)
+        .checked_mul(element_bytes)
         .ok_or_else(|| artifact_error("tensor byte length overflows usize"))?
         > MAX_TENSOR_BYTES
     {
@@ -1252,32 +828,11 @@ fn checked_elements(dimensions: &[u64]) -> Result<usize> {
     })
 }
 
-fn read_permutation(reader: &mut ByteReader<'_>, count: usize) -> Result<Vec<u64>> {
-    (0..count).map(|_| reader.read_u64()).collect()
-}
 fn to_usize(value: u64, name: &str) -> Result<usize> {
     usize::try_from(value).map_err(|_| artifact_error(format!("{name} exceeds usize")))
 }
 fn artifact_error(message: impl std::fmt::Display) -> Error {
     Error::Artifact(format!("static context: {message}"))
-}
-
-/// Ask Windows to start reading a mapping's pages, like `madvise(WILLNEED)`.
-/// A hint: failure is ignored. `PrefetchVirtualMemory` needs Windows 8 or later.
-#[cfg(windows)]
-#[expect(unsafe_code, reason = "One Win32 call; memmap2 does not expose it")]
-fn prefetch(mapping: &Mmap) {
-    use windows_sys::Win32::System::{
-        Memory::{PrefetchVirtualMemory, WIN32_MEMORY_RANGE_ENTRY},
-        Threading::GetCurrentProcess,
-    };
-    let range = WIN32_MEMORY_RANGE_ENTRY {
-        VirtualAddress: mapping.as_ptr().cast_mut().cast(),
-        NumberOfBytes: mapping.len(),
-    };
-    // SAFETY: `range` is one valid entry (count 1) describing this process's live mapping,
-    // which `mapping` keeps mapped for the call; the call only schedules reads of it.
-    let _ = unsafe { PrefetchVirtualMemory(GetCurrentProcess(), 1, &raw const range, 0) };
 }
 
 #[cfg(test)]
@@ -1318,12 +873,6 @@ mod tests {
         ]
     }
 
-    fn resign(bytes: &mut [u8]) {
-        let checksum_offset = bytes.len() - CHECKSUM_BYTES;
-        let checksum = sha256(&bytes[..checksum_offset]);
-        bytes[checksum_offset..].copy_from_slice(&checksum);
-    }
-
     #[test]
     fn round_trip_is_deterministic() {
         let artifact = fixture();
@@ -1339,6 +888,58 @@ mod tests {
                 .expect("FP32")[0]
                 .to_bits(),
             2.0_f32.to_bits()
+        );
+    }
+
+    #[test]
+    fn disk_layout_aligns_tensors_in_execution_order() {
+        let names = [
+            "icl.10.key",
+            "icl.2.value_scale",
+            "icl.2.value",
+            "column.1.key",
+            "icl.2.key_scale",
+            "icl.2.key",
+        ];
+        let tensors = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| StaticContextTensor {
+                name: (*name).into(),
+                dimensions: vec![2],
+                values: vec![0.0, f32::from(u8::try_from(i).unwrap())],
+            })
+            .collect();
+        let artifact = StaticContextArtifact::new(fixture().metadata().clone(), tensors).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("context.ir");
+        artifact.write(&path).unwrap();
+        let header = ContextHeader::open(&path).unwrap();
+        assert_eq!(&header.metadata, artifact.metadata());
+        assert_eq!(header.file_len, (7 * DISK_ALIGNMENT) as u64);
+        assert_eq!(
+            header.tensors.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            [
+                "column.1.key",
+                "icl.2.key",
+                "icl.2.key_scale",
+                "icl.2.value",
+                "icl.2.value_scale",
+                "icl.10.key",
+            ]
+        );
+        for (i, tensor) in header.tensors.iter().enumerate() {
+            assert_eq!(tensor.offset, i * DISK_ALIGNMENT);
+        }
+        let mapped = StaticContextArtifact::read_mapped_prefault(&path).unwrap();
+        assert_eq!(mapped, artifact);
+        // On 16 KiB-page Apple Silicon, disk-written files qualify for zero-copy Metal wrapping.
+        // 4 KiB-page hosts do not guarantee 16 KiB mmap base alignment.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        assert!(mapped.page_aligned_storage().is_some());
+        assert_eq!(
+            artifact.to_bytes().unwrap().len(),
+            artifact.encoded_len().unwrap()
         );
     }
 
@@ -1360,7 +961,7 @@ mod tests {
             artifact
         );
         let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("context.irctx");
+        let path = directory.path().join("context.ir");
         std::fs::write(&path, &bytes).expect("write context");
         assert_eq!(
             StaticContextArtifact::read_mapped_prefault(&path).expect("map context"),
@@ -1373,7 +974,7 @@ mod tests {
         let artifact = fixture();
         let bytes = artifact.to_bytes().expect("encode");
         let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("context.irctx");
+        let path = directory.path().join("context.ir");
         std::fs::write(&path, &bytes).expect("write context");
 
         let mapped = StaticContextArtifact::read_mapped_prefault(&path).expect("map context");
@@ -1393,11 +994,12 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_preserves_bf16_and_f16() {
+    fn round_trip_preserves_encoded_context_dtypes() {
         let specs = vec![
-            ("column.k.0".to_string(), vec![2, 8, 3, 16], TensorStorage::Fp32),
-            ("icl.k.0".to_string(), vec![2, 8, 3, 64], TensorStorage::Bf16),
-            ("icl.v.0".to_string(), vec![2, 8, 3, 64], TensorStorage::F16),
+            ("column.k.0".to_string(), vec![2, 8, 3, 16], DType::F32),
+            ("icl.k.0".to_string(), vec![2, 8, 3, 64], DType::Bf16),
+            ("icl.v.0".to_string(), vec![2, 8, 3, 64], DType::F16),
+            ("encoded".to_string(), vec![4], DType::F8E4M3),
         ];
         let mut tensors = PageAlignedTensors::new(specs).expect("page-aligned allocation");
         let fp32: Vec<f32> = (0..768u16).map(|i| f32::from(i) * 0.5).collect();
@@ -1406,18 +1008,14 @@ mod tests {
         tensors.fill(0, bytemuck::cast_slice(&fp32));
         tensors.fill(1, bytemuck::cast_slice(&bf16));
         tensors.fill(2, bytemuck::cast_slice(&f16));
+        let fp8 = [0, 0x80, 0x7e, 0xfe];
+        tensors.fill(3, &fp8);
         let artifact = StaticContextArtifact::from_page_aligned(fixture().metadata().clone(), tensors)
             .expect("page-aligned artifact");
 
         let bytes = artifact.to_bytes().expect("encode");
-        // A non-FP32 tensor forces a version-2 header.
-        assert_eq!(
-            u32::from_le_bytes(bytes[8..12].try_into().expect("version field")),
-            STATIC_CONTEXT_VERSION
-        );
-
         let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("mixed.irctx");
+        let path = directory.path().join("mixed.ir");
         std::fs::write(&path, &bytes).expect("write context");
         let decoded = StaticContextArtifact::read_mapped_prefault(&path).expect("map context");
 
@@ -1433,6 +1031,17 @@ mod tests {
             StaticContextTensorData::F16(values) => assert_eq!(values, f16.as_slice()),
             other => panic!("expected FP16, got {other:?}"),
         }
+        assert_eq!(
+            decoded.tensor("encoded").unwrap().data,
+            StaticContextTensorData::F8E4M3(&fp8)
+        );
+        let header = super::context_header(&bytes).unwrap();
+        let encoded = header.tensors.iter().find(|t| t.name == "encoded").unwrap();
+        for nan in [0x7f, 0xff] {
+            let mut bad = bytes.clone();
+            bad[header.range(encoded).start] = nan;
+            assert!(StaticContextArtifact::from_bytes(&bad).is_err());
+        }
         // Re-encoding the mapped context is byte-stable.
         assert_eq!(decoded.to_bytes().expect("re-encode"), bytes);
         let from_bytes = StaticContextArtifact::from_bytes(&bytes).expect("decode bytes");
@@ -1440,18 +1049,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_the_removed_packed_key_version() {
-        let mut bytes = fixture().to_bytes().expect("encode");
-        bytes[8..12].copy_from_slice(&STATIC_CONTEXT_PACKED_KEYS_VERSION.to_le_bytes());
-        resign(&mut bytes);
-        let error = StaticContextArtifact::from_bytes(&bytes).expect_err("version 3 is rejected");
-        assert!(error.to_string().contains("pre-packed ICL keys"), "{error}");
+    fn rejects_legacy_contexts() {
+        let mut bytes = fixture().to_bytes().unwrap();
+        bytes[..8].copy_from_slice(b"IRCNTXT\0");
+        assert!(StaticContextArtifact::from_bytes(&bytes).is_err());
     }
 
     #[test]
     fn rejects_corruption_and_invalid_shapes() {
         let mut corrupt = fixture().to_bytes().expect("encode");
-        corrupt[HEADER_BYTES] ^= 1;
+        corrupt[16] ^= 1;
         assert!(StaticContextArtifact::from_bytes(&corrupt).is_err());
         assert!(
             StaticContextArtifact::new(
@@ -1469,9 +1076,7 @@ mod tests {
     #[test]
     fn rejects_resource_and_directory_metadata() {
         let mut malformed = fixture().to_bytes().expect("encode");
-        let tensor_count_offset = 8 + 4 + 4 + 32 + 32 + 32 + 20;
-        malformed[tensor_count_offset..tensor_count_offset + 4].copy_from_slice(&0_u32.to_le_bytes());
-        resign(&mut malformed);
+        malformed.truncate(malformed.len() - 1);
         assert!(StaticContextArtifact::from_bytes(&malformed).is_err());
 
         let metadata = StaticContextMetadata {
@@ -1505,7 +1110,7 @@ mod tests {
     fn cached_read_accepts_only_the_expected_context() {
         let artifact = fixture();
         let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("context.irctx");
+        let path = directory.path().join("context.ir");
         assert!(StaticContextArtifact::read_cached(&path, artifact.metadata()).is_none());
 
         artifact.write(&path).expect("write context");
@@ -1530,7 +1135,7 @@ mod tests {
     fn concurrent_writes_leave_one_private_context() {
         let artifact = fixture();
         let directory = tempfile::tempdir().expect("temporary directory");
-        let path = directory.path().join("context.irctx");
+        let path = directory.path().join("context.ir");
         std::thread::scope(|scope| {
             for _ in 0..8 {
                 scope.spawn(|| artifact.write(&path).expect("write context"));
@@ -1556,7 +1161,7 @@ mod tests {
     fn failed_write_removes_its_temporary_file() {
         let directory = tempfile::tempdir().expect("temporary directory");
         // Renaming a file over a nonempty directory fails on every platform.
-        let path = directory.path().join("context.irctx");
+        let path = directory.path().join("context.ir");
         std::fs::create_dir(&path).expect("create directory");
         std::fs::write(path.join("kept"), b"kept").expect("write file");
         assert!(fixture().write(&path).is_err());

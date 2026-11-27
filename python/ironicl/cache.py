@@ -4,6 +4,7 @@ removing entries from it."""
 from __future__ import annotations
 
 import os
+import stat
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -11,7 +12,6 @@ from pathlib import Path
 
 from ironicl import _core
 
-SUFFIX = ".irctx"
 # An interrupted write leaves a temporary file; one older than this is not
 # still being written.
 STALE_TEMPORARY_SECONDS = 3600
@@ -69,11 +69,13 @@ def cache_info(cache_dir: str | os.PathLike | None = None) -> CacheInfo:
     if directory is None:
         raise ValueError("cache_dir=False disables caching; pass None or a directory")
     entries = []
-    for path in directory.glob(f"*{SUFFIX}") if directory.is_dir() else ():
+    for path in directory.glob("*.ir") if directory.is_dir() else ():
         try:
-            status = path.stat()
+            status = path.lstat()
         except OSError:
             continue  # Removed meanwhile.
+        if not stat.S_ISREG(status.st_mode) or not _core.is_cached_context(path):
+            continue
         entries.append(CacheEntry(path, status.st_size, datetime.fromtimestamp(status.st_mtime)))
     entries.sort(key=lambda entry: entry.last_used, reverse=True)
     return CacheInfo(directory, tuple(entries))
