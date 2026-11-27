@@ -155,7 +155,8 @@ impl Features<'_> {
 
 /// A fitted `PowerTransformer`: each feature's lambda, then the
 /// `StandardScaler` mean and scale of the transformed values.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PowerTransform {
     pub(crate) lambdas: Vec<f64>,
     pub(crate) mean: Vec<f64>,
@@ -164,7 +165,8 @@ pub(crate) struct PowerTransform {
 
 /// One group's fitted normalization, one value per kept feature in each
 /// statistic. Its method is `power` exactly when it has a power transform.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Normalization {
     /// `CustomStandardScaler`'s mean and scale.
     pub(crate) mean: Vec<f64>,
@@ -314,10 +316,12 @@ fn fit_feature(values: &[f64], methods: &[NormMethod], threshold: f64) -> Result
 }
 
 /// Fitted `TabICL` preprocessing. It keeps no training rows.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Preprocessor {
     /// Each input feature's sorted categories, or `None` for a numeric
     /// feature. A categorical feature's values are category indices or -1.
+    #[serde(with = "crate::format::preprocessor::categories")]
     pub(crate) categories: Vec<Option<Labels>>,
     /// Which features vary in training, categorical features first; the
     /// others are dropped.
@@ -856,12 +860,7 @@ mod tests {
                     assert_close(group, &matrix(expected), &format!("case {index} {key}"));
                 }
             }
-            let sha = [7; 32];
-            assert_eq!(
-                decode(&encode(&preprocessor, None, &sha).unwrap()).unwrap(),
-                (sha, preprocessor, None),
-                "case {index}"
-            );
+            assert_round_trip(&preprocessor);
         }
     }
 
@@ -929,11 +928,7 @@ mod tests {
             .transform(Features::F64(&query[..columns]), columns)
             .unwrap();
         assert_eq!(batch[0][..3], alone[0][..]);
-        let sha = [1; 32];
-        assert_eq!(
-            decode(&encode(&preprocessor, None, &sha).unwrap()).unwrap(),
-            (sha, preprocessor, None)
-        );
+        assert_round_trip(&preprocessor);
     }
 
     #[test]
@@ -990,11 +985,16 @@ mod tests {
         }
         let unsorted = vec![None, Some(Labels::Int(vec![2, 1])), None, None];
         assert!(Preprocessor::fit(&options(), Features::F64(&x), 4, unsorted, &labels).is_err());
-        let sha = [1; 32];
-        assert_eq!(
-            decode(&encode(&preprocessor, None, &sha).unwrap()).unwrap(),
-            (sha, preprocessor, None)
-        );
+        assert_round_trip(&preprocessor);
+    }
+
+    fn assert_round_trip(preprocessor: &Preprocessor) {
+        let bytes = encode(preprocessor, None, &[1; 32], &[2; 32]).unwrap();
+        let (sha, state, identity) = decode(&bytes).unwrap();
+        assert_eq!(sha, [1; 32]);
+        assert_eq!(&state.preprocessor, preprocessor);
+        assert!(!state.has_training());
+        assert_eq!(identity, Some(crate::format::encode_sha256(&[2; 32])));
     }
 
     #[test]

@@ -2,8 +2,8 @@
 //! member's context, and what turns the members' outputs into probabilities
 //! or the regressor's outputs.
 //!
-//! It saves as its training data in `IRPREP` (architecture 2) and, optionally,
-//! its contexts in `IRCNTXT` (kind 2). Loading fits the preprocessing again,
+//! It saves its training data in a preprocessing container and, optionally,
+//! its contexts in a context container. Loading fits the preprocessing again,
 //! and the contexts too when they were not saved; fitting is deterministic,
 //! so either way gives the same model.
 
@@ -433,7 +433,7 @@ impl Fitted {
         Ok(sums)
     }
 
-    /// The `IRPREP` bytes this model loads from.
+    /// The preprocessing bytes this model loads from.
     ///
     /// # Errors
     ///
@@ -464,7 +464,7 @@ impl Fitted {
         StaticContextArtifact::new(self.context_metadata(&self.to_bytes()?), tensors)
     }
 
-    /// The contexts as `IRCNTXT` bytes, one per member and codebook task,
+    /// The contexts in one container, one per member and codebook task,
     /// named `{member}.{task}`. Their identity is the SHA-256 of
     /// [`Self::to_bytes`], so they load only with this model's preprocessing.
     ///
@@ -475,7 +475,7 @@ impl Fitted {
         self.context_artifact()?.to_bytes()
     }
 
-    /// The `IRCNTXT` metadata of this model's contexts, given its `IRPREP` bytes.
+    /// The metadata of this model's contexts, given its preprocessing bytes.
     fn context_metadata(&self, preprocessing: &[u8]) -> StaticContextMetadata {
         let columns = self.training.categories.len();
         StaticContextMetadata {
@@ -649,11 +649,7 @@ mod tests {
 
     fn training(name: &str) -> (crate::models::kumo_tabular::preprocess::fixtures::Case, Training) {
         let case = case(name);
-        let categories = case
-            .categorical
-            .iter()
-            .map(|&categorical| categorical.then(|| crate::Labels::Int(Vec::new())))
-            .collect();
+        let categories = case.categories.clone();
         let training = Training {
             x: case.x[..case.context * case.features].to_vec(),
             categories,

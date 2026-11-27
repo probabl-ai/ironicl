@@ -95,7 +95,8 @@ impl std::str::FromStr for Optimize {
 }
 
 /// How ensemble logits become class probabilities, matching `TabICLClassifier`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ClassifierAggregation {
     /// Divides logits before softmax. Must be positive and finite.
     pub softmax_temperature: f32,

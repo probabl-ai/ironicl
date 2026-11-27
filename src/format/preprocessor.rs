@@ -1,516 +1,341 @@
-//! Fitted `TabICL` preprocessing as `IRPREP` bytes, optionally with the
-//! preprocessed training rows a context is built from: what pickling an
-//! estimator saves and what a model directory holds. The bytes may come from
-//! outside, so decoding checks the digest, checks every length against the
-//! bytes left before it allocates, and then checks the preprocessing's
-//! invariants.
-//!
-//! Little-endian, after the magic and version:
-//! - the architecture (u32): 1 for `TabICLv2`, laid out as below, or 2 for
-//!   Kumo-Tabular, laid out as [`encode_kumo_tabular`] says;
-//! - the checkpoint's SHA-256 (32 bytes, as `IRCNTXT` stores it);
-//! - input features (u64) and their mask (u8 each), in `TabICL`'s order,
-//!   categorical features first;
-//! - per input feature, in input order, its categories: a count (u64) and
-//!   labels as for the classes below, kind 0 and no values for a numeric
-//!   feature;
-//! - groups (u8) and their methods (u8: 0 none, 1 power);
-//! - members (u64), each one's group (u8), feature order (u64 each), and class
-//!   order (u64 each, for the class count below);
-//! - classes (u64) and their labels: a kind (u8: 0 none, 1 int, 2 float,
-//!   3 bool, 4 text), then i64, f64, u8, or u32-length UTF-8 values;
-//! - for a regressor (no labels), the target's mean and scale (f64 each);
-//!   for a classifier, its softmax temperature (f32) and whether it averages
-//!   logits (u8);
-//! - feature names (u64: 0, or one per input feature), each a u32-length UTF-8
-//!   string;
-//! - f64 per kept feature: the training mean that replaces a missing value;
-//! - per group, f64 per kept feature: mean, scale, minimum, maximum, lower and
-//!   upper bounds, and for a power group its lambdas, mean, and scale;
-//! - training rows (u64, 0 when absent), then per group the preprocessed rows
-//!   (f32 per row and kept feature), then each row's target (f32: a class
-//!   index, or the standardized value);
-//! - the SHA-256 of everything before it.
+//! Fitted preprocessing metadata and optional training tensors. Kumo keeps
+//! the encoded input table (including missing numeric values) to refit on load.
 
 use super::{
-    ByteReader, CHECKSUM_BYTES, artifact_error, sha256, u64_to_usize, usize_to_u32, usize_to_u64, write_u32,
-    write_u64,
+    artifact_error,
+    container::{self, DType, Header, Kind, MEMORY_ALIGNMENT, Writer, decode_le, native_bytes},
 };
-use crate::models::kumo_tabular;
-use crate::models::tabicl_v2::{
-    fitted::Training,
-    preprocess::{MAX_MEMBERS, NormMethod, Normalization, Preprocessor},
+use crate::{
+    Labels, Preprocessed, Result,
+    models::{
+        ModelFamily, kumo_tabular,
+        tabicl_v2::{
+            fitted::Training,
+            preprocess::{MAX_MEMBERS, Preprocessor},
+        },
+    },
 };
-use crate::preprocess::labels::Labels;
-use crate::{ClassifierAggregation, Result};
+use serde::{Deserialize, Serialize, de::IgnoredAny};
 
-pub const PREPROCESSOR_MAGIC: [u8; 8] = *b"IRPREP\0\0";
-pub const PREPROCESSOR_VERSION: u32 = 1;
-const TABICL_V2: u32 = 1;
-pub(crate) const KUMO_TABULAR: u32 = 2;
-/// More classes than any classifier fit makes, so a corrupt count fails early.
-const MAX_CLASSES: usize = 10;
+pub use container::{MAGIC as PREPROCESSOR_MAGIC, VERSION as PREPROCESSOR_VERSION};
 
-fn write_count(bytes: &mut Vec<u8>, count: usize) -> Result<()> {
-    write_u64(bytes, usize_to_u64(count, "a count")?);
-    Ok(())
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PreprocessingIdentity {
+    pub family: ModelFamily,
+    pub checkpoint_sha256: [u8; 32],
 }
 
-/// `preprocessor` and, when given, its `training` rows as `IRPREP` bytes, for
-/// the checkpoint whose SHA-256 is `checkpoint_sha256`.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Metadata<S> {
+    model: ModelFamily,
+    #[serde(with = "container::digest")]
+    checkpoint_sha256: [u8; 32],
+    /// Without training rows, this is the only way to identify the matching context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    context_identity: Option<String>,
+    state: S,
+}
+
+impl Metadata<IgnoredAny> {
+    fn identity(&self) -> PreprocessingIdentity {
+        PreprocessingIdentity {
+            family: self.model,
+            checkpoint_sha256: self.checkpoint_sha256,
+        }
+    }
+}
+
+pub(crate) fn identity(bytes: &[u8]) -> Result<PreprocessingIdentity> {
+    Ok(
+        Header::<Metadata<IgnoredAny>>::from_bytes(bytes, Kind::Preprocessing)?
+            .metadata
+            .identity(),
+    )
+}
+pub(crate) fn file_identity(path: &std::path::Path, max: u64) -> Result<PreprocessingIdentity> {
+    Ok(
+        Header::<Metadata<IgnoredAny>>::open(path, Kind::Preprocessing, max)?
+            .metadata
+            .identity(),
+    )
+}
+
 pub(crate) fn encode(
     preprocessor: &Preprocessor,
     training: Option<&Training>,
     checkpoint_sha256: &[u8; 32],
+    context_sha256: &[u8; 32],
 ) -> Result<Vec<u8>> {
-    let mut bytes = header(TABICL_V2, checkpoint_sha256);
-    write_count(&mut bytes, preprocessor.feature_mask.len())?;
-    bytes.extend(preprocessor.feature_mask.iter().map(|&kept| u8::from(kept)));
-    for categories in &preprocessor.categories {
-        write_count(&mut bytes, categories.as_ref().map_or(0, Labels::len))?;
-        write_labels(&mut bytes, categories.as_ref())?;
-    }
-    // A fit makes at most two groups, so each count and index fits in a byte.
-    bytes.push(
-        u8::try_from(preprocessor.normalizations.len()).map_err(|_| artifact_error("too many groups"))?,
-    );
-    bytes.extend(
-        preprocessor
-            .normalizations
-            .iter()
-            .map(|normalization| match normalization.method() {
-                NormMethod::None => 0,
-                NormMethod::Power => 1,
-            }),
-    );
-    write_count(&mut bytes, preprocessor.member_groups.len())?;
-    for &group in &preprocessor.member_groups {
-        bytes.push(u8::try_from(group).map_err(|_| artifact_error("too many groups"))?);
-    }
-    for &index in preprocessor.feature_permutations.iter().flatten() {
-        write_count(&mut bytes, index)?;
-    }
-    write_count(&mut bytes, preprocessor.classes.as_ref().map_or(0, Labels::len))?;
-    for &index in preprocessor.class_permutations.iter().flatten() {
-        write_count(&mut bytes, index)?;
-    }
-    write_labels(&mut bytes, preprocessor.classes.as_ref())?;
-    if let Some((mean, scale)) = preprocessor.target_scale {
-        bytes.extend(mean.to_le_bytes());
-        bytes.extend(scale.to_le_bytes());
-    }
-    if let Some(aggregation) = preprocessor.aggregation {
-        bytes.extend(aggregation.softmax_temperature.to_le_bytes());
-        bytes.push(u8::from(aggregation.average_logits));
-    }
-    let names = preprocessor.feature_names.as_deref().unwrap_or_default();
-    write_count(&mut bytes, names.len())?;
-    write_strings(&mut bytes, names)?;
-    for value in &preprocessor.imputer_statistics {
-        bytes.extend(value.to_le_bytes());
-    }
-    for normalization in &preprocessor.normalizations {
-        for value in normalization.statistics().into_iter().flatten() {
-            bytes.extend(value.to_le_bytes());
-        }
-    }
-    write_count(&mut bytes, training.map_or(0, |training| training.targets.len()))?;
+    preprocessor.validate()?;
+    let meta = Metadata {
+        model: ModelFamily::TabIclV2,
+        checkpoint_sha256: *checkpoint_sha256,
+        context_identity: training.is_none().then(|| super::encode_sha256(context_sha256)),
+        state: preprocessor,
+    };
+    let mut tensors = Vec::new();
     if let Some(training) = training {
-        for value in training.group_rows.iter().flatten().chain(&training.targets) {
-            bytes.extend(value.to_le_bytes());
+        let rows = training.targets.len() as u64;
+        for (group, x) in training.group_rows.iter().enumerate() {
+            tensors.push((
+                format!("group.{group}.x"),
+                DType::F32,
+                vec![rows, preprocessor.n_features_out() as u64],
+                native_bytes(x)?,
+            ));
         }
-    }
-    let digest = sha256(&bytes);
-    bytes.extend(digest);
-    Ok(bytes)
-}
-
-fn header(architecture: u32, checkpoint_sha256: &[u8; 32]) -> Vec<u8> {
-    let mut bytes = PREPROCESSOR_MAGIC.to_vec();
-    write_u32(&mut bytes, PREPROCESSOR_VERSION);
-    write_u32(&mut bytes, architecture);
-    bytes.extend(checkpoint_sha256);
-    bytes
-}
-
-/// Kumo-Tabular's training data as `IRPREP` bytes, from which loading fits
-/// again, as deterministic as fitting: after the header, the members (u64)
-/// and the seed (i128), the feature names as for `TabICLv2`, the input
-/// features (u64) and each one's categories, as for `TabICLv2`, the training
-/// rows (u64), the encoded `[rows, features]` matrix (f64), each row's label
-/// as the classes are written, and the SHA-256 of everything before it.
-pub(crate) fn encode_kumo_tabular(
-    training: &kumo_tabular::fitted::Training,
-    checkpoint_sha256: &[u8; 32],
-) -> Result<Vec<u8>> {
-    let mut bytes = header(KUMO_TABULAR, checkpoint_sha256);
-    write_count(&mut bytes, training.members)?;
-    bytes.extend(training.seed.to_le_bytes());
-    let names = training.feature_names.as_deref().unwrap_or_default();
-    write_count(&mut bytes, names.len())?;
-    write_strings(&mut bytes, names)?;
-    write_count(&mut bytes, training.categories.len())?;
-    for categories in &training.categories {
-        write_count(&mut bytes, categories.as_ref().map_or(0, Labels::len))?;
-        write_labels(&mut bytes, categories.as_ref())?;
-    }
-    write_count(&mut bytes, training.labels.len())?;
-    for value in &training.x {
-        bytes.extend(value.to_le_bytes());
-    }
-    write_labels(&mut bytes, Some(&training.labels))?;
-    let digest = sha256(&bytes);
-    bytes.extend(digest);
-    Ok(bytes)
-}
-
-/// The checkpoint's SHA-256 and the training data that
-/// [`encode_kumo_tabular`] wrote.
-pub(crate) fn decode_kumo_tabular(bytes: &[u8]) -> Result<([u8; 32], kumo_tabular::fitted::Training)> {
-    let (mut reader, checkpoint_sha256) = open(bytes, KUMO_TABULAR)?;
-    let members = reader.read_count("members")?;
-    if members == 0 || members > MAX_MEMBERS {
-        return Err(artifact_error("IRPREP has an invalid number of members"));
-    }
-    let seed = i128::from_le_bytes(reader.read_array()?);
-    let names = reader.read_count("feature names")?;
-    let feature_names = read_strings(&mut reader, names)?;
-    let features = reader.read_count("input features")?;
-    let categories: Vec<Option<Labels>> = (0..features)
-        .map(|_| {
-            let count = reader.read_count("categories")?;
-            read_labels(&mut reader, count)
-        })
-        .collect::<Result<_>>()?;
-    if features == 0 || (names != 0 && names != features) {
-        return Err(artifact_error("IRPREP has inconsistent features"));
-    }
-    // Encoding query rows searches each feature's categories, so they must be sorted and unique.
-    if categories
-        .iter()
-        .flatten()
-        .any(|categories| !categories.are_classes())
-    {
-        return Err(artifact_error(
-            "IRPREP has categories that are not sorted and unique",
+        tensors.push((
+            "y".into(),
+            DType::F32,
+            vec![rows],
+            native_bytes(&training.targets)?,
         ));
     }
-    let rows = reader.read_count("training rows")?;
-    let x = reader.read_f64s(
-        rows.checked_mul(features)
-            .ok_or_else(|| artifact_error("IRPREP length overflows usize"))?,
-    )?;
+    Writer::new(Kind::Preprocessing, MEMORY_ALIGNMENT, meta, tensors)?.bytes()
+}
+
+fn finite_f32s(
+    h: &Header<Metadata<Preprocessor>>,
+    bytes: &[u8],
+    index: usize,
+    name: &str,
+    shape: &[u64],
+) -> Result<Vec<f32>> {
+    let data = h.check_bytes(index, name, DType::F32, shape, bytes)?;
+    if !DType::F32.all_finite(data)? {
+        return Err(artifact_error("non-finite training value"));
+    }
+    Ok(decode_le(data, f32::from_le_bytes))
+}
+
+pub(crate) fn decode(bytes: &[u8]) -> Result<([u8; 32], Preprocessed, Option<String>)> {
+    let h = Header::<Metadata<Preprocessor>>::from_bytes(bytes, Kind::Preprocessing)?;
+    let p = &h.metadata.state;
+    if h.metadata.model != ModelFamily::TabIclV2 {
+        return Err(artifact_error("wrong preprocessing model"));
+    }
+    p.validate()?;
+    let training = if h.tensors.is_empty() {
+        None
+    } else {
+        let groups = p.normalizations.len();
+        let rows = h.tensors[0].shape.first().copied().unwrap_or(0);
+        if rows == 0 || h.tensors.len() != groups + 1 {
+            return Err(artifact_error("invalid training tensor count or rows"));
+        }
+        let features = p.n_features_out() as u64;
+        let group_rows = (0..groups)
+            .map(|i| finite_f32s(&h, bytes, i, &format!("group.{i}.x"), &[rows, features]))
+            .collect::<Result<_>>()?;
+        let targets = finite_f32s(&h, bytes, groups, "y", &[rows])?;
+        #[expect(clippy::cast_precision_loss, reason = "TabICL has at most ten classes")]
+        if let Some(classes) = &p.classes
+            && targets
+                .iter()
+                .any(|t| t.fract() != 0.0 || !(0.0..classes.len() as f32).contains(t))
+        {
+            return Err(artifact_error("invalid training class index"));
+        }
+        Some(Training { group_rows, targets })
+    };
+    Ok((
+        h.metadata.checkpoint_sha256,
+        Preprocessed {
+            preprocessor: h.metadata.state,
+            training,
+        },
+        h.metadata.context_identity,
+    ))
+}
+
+// Unlike the human-readable directory summary, a fitted category dictionary must
+// retain its type even when empty (all training values missing).
+pub(crate) mod categories {
+    use crate::Labels;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    #[derive(Serialize, Deserialize)]
+    #[serde(remote = "Labels", rename_all = "lowercase")]
+    enum Typed {
+        Int(Vec<i64>),
+        Float(Vec<f64>),
+        Bool(Vec<bool>),
+        Text(Vec<String>),
+    }
+    #[derive(Serialize)]
+    struct Borrowed<'a>(#[serde(with = "Typed")] &'a Labels);
+    #[derive(Deserialize)]
+    struct Owned(#[serde(with = "Typed")] Labels);
+    pub fn serialize<S: Serializer>(values: &[Option<Labels>], s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(values.iter().map(|v| v.as_ref().map(Borrowed)))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>, T: From<Vec<Option<Labels>>>>(d: D) -> Result<T, D::Error> {
+        Ok(Vec::<Option<Owned>>::deserialize(d)?
+            .into_iter()
+            .map(|v| v.map(|x| x.0))
+            .collect::<Vec<_>>()
+            .into())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KumoState<'a> {
+    #[serde(with = "categories")]
+    categories: std::borrow::Cow<'a, [Option<Labels>]>,
+    feature_names: Option<std::borrow::Cow<'a, [String]>>,
+    members: usize,
+    seed: i128,
+}
+
+pub(crate) fn encode_kumo_tabular(t: &kumo_tabular::fitted::Training, sha: &[u8; 32]) -> Result<Vec<u8>> {
+    let rows = t.labels.len() as u64;
+    let meta = Metadata {
+        model: ModelFamily::KumoTabular,
+        checkpoint_sha256: *sha,
+        context_identity: None,
+        state: KumoState {
+            categories: t.categories.as_slice().into(),
+            feature_names: t.feature_names.as_deref().map(Into::into),
+            members: t.members,
+            seed: t.seed,
+        },
+    };
+    let mut tensors = vec![(
+        "x".into(),
+        DType::F64,
+        vec![rows, t.categories.len() as u64],
+        native_bytes(&t.x)?,
+    )];
+    let (flags, lengths, text);
+    match &t.labels {
+        Labels::Int(v) => tensors.push(("y".into(), DType::I64, vec![rows], native_bytes(v)?)),
+        Labels::Float(v) => tensors.push(("y".into(), DType::F64, vec![rows], native_bytes(v)?)),
+        Labels::Bool(v) => {
+            flags = v.iter().copied().map(u8::from).collect::<Vec<_>>();
+            tensors.push(("y".into(), DType::U8, vec![rows], &flags));
+        }
+        Labels::Text(v) => {
+            lengths = v
+                .iter()
+                .map(|s| i64::try_from(s.len()).map_err(artifact_error))
+                .collect::<Result<Vec<_>>>()?;
+            text = v.concat();
+            tensors.push((
+                "y.lengths".into(),
+                DType::I64,
+                vec![rows],
+                native_bytes(&lengths)?,
+            ));
+            tensors.push((
+                "y.utf8".into(),
+                DType::U8,
+                vec![text.len() as u64],
+                text.as_bytes(),
+            ));
+        }
+    }
+    Writer::new(Kind::Preprocessing, MEMORY_ALIGNMENT, meta, tensors)?.bytes()
+}
+
+pub(crate) fn decode_kumo_tabular(bytes: &[u8]) -> Result<([u8; 32], kumo_tabular::fitted::Training)> {
+    let h = Header::<Metadata<KumoState<'_>>>::from_bytes(bytes, Kind::Preprocessing)?;
+    let state = &h.metadata.state;
+    let features = state.categories.len();
+    let rows = h
+        .tensors
+        .first()
+        .and_then(|t| t.shape.first())
+        .copied()
+        .unwrap_or(0);
+    if h.metadata.model != ModelFamily::KumoTabular
+        || rows == 0
+        || features == 0
+        || !(1..=MAX_MEMBERS).contains(&state.members)
+        || state.feature_names.as_ref().is_some_and(|v| v.len() != features)
+        || !state.categories.iter().flatten().all(Labels::are_classes)
+    {
+        return Err(artifact_error("invalid Kumo preprocessing metadata"));
+    }
+    let x = decode_le(
+        h.check_bytes(0, "x", DType::F64, &[rows, features as u64], bytes)?,
+        f64::from_le_bytes,
+    );
     #[expect(
         clippy::cast_precision_loss,
         clippy::float_cmp,
-        reason = "Category counts stay far below 2^53, and codes are exact"
+        reason = "category codes are exact integers"
     )]
-    let codes_valid = x.chunks(features).all(|row| {
-        row.iter().zip(&categories).all(|(&value, categories)| {
-            categories.as_ref().is_none_or(|categories| {
-                value == -1.0 || (value.fract() == 0.0 && (0.0..categories.len() as f64).contains(&value))
-            })
+    if x.chunks_exact(features).any(|row| {
+        row.iter().zip(state.categories.iter()).any(|(&v, c)| {
+            // Kumo's numeric preprocessing defines clipping for +/-infinity
+            // and missing-value handling for NaN. Preserve those raw inputs;
+            // only encoded categorical codes have a finite integer contract.
+            c.as_ref()
+                .is_some_and(|cats| v != -1.0 && (v.fract() != 0.0 || !(0.0..cats.len() as f64).contains(&v)))
         })
-    });
-    let labels = read_labels(&mut reader, rows)?.ok_or_else(|| artifact_error("IRPREP has no labels"))?;
-    if rows == 0 || !codes_valid || !reader.is_empty() {
-        return Err(artifact_error("IRPREP has invalid training data"));
+    }) {
+        return Err(artifact_error("invalid Kumo training feature"));
     }
-    let training = kumo_tabular::fitted::Training {
-        x,
+    let labels = kumo_labels(&h, bytes, rows)?;
+    let KumoState {
         categories,
-        labels,
+        feature_names,
         members,
         seed,
-        feature_names: (names != 0).then_some(feature_names),
-    };
-    Ok((checkpoint_sha256, training))
+    } = h.metadata.state;
+    Ok((
+        h.metadata.checkpoint_sha256,
+        kumo_tabular::fitted::Training {
+            x,
+            categories: categories.into_owned(),
+            labels,
+            members,
+            seed,
+            feature_names: feature_names.map(std::borrow::Cow::into_owned),
+        },
+    ))
 }
 
-/// The architecture of the `IRPREP` `bytes`, from their header alone.
-pub(crate) fn architecture(bytes: &[u8]) -> Result<u32> {
-    let mut reader = ByteReader::new(bytes);
-    if reader.read_array::<8>()? != PREPROCESSOR_MAGIC {
-        return Err(artifact_error("not fitted preprocessing (IRPREP)"));
-    }
-    reader.read_u32()?;
-    reader.read_u32()
-}
-
-/// A reader after the checked header of `bytes`, which must be for
-/// `architecture`, and the checkpoint's SHA-256.
-fn open(bytes: &[u8], expected: u32) -> Result<(ByteReader<'_>, [u8; 32])> {
-    let header = PREPROCESSOR_MAGIC.len() + 4 + 4 + 32;
-    if bytes.len() < header + CHECKSUM_BYTES {
-        return Err(artifact_error("IRPREP is truncated"));
-    }
-    let (body, digest) = bytes.split_at(bytes.len() - CHECKSUM_BYTES);
-    if sha256(body) != digest {
-        return Err(artifact_error("IRPREP checksum mismatch"));
-    }
-    let mut reader = ByteReader::new(body);
-    if reader.read_array::<8>()? != PREPROCESSOR_MAGIC {
-        return Err(artifact_error("not fitted preprocessing (IRPREP)"));
-    }
-    let version = reader.read_u32()?;
-    if version != PREPROCESSOR_VERSION {
-        return Err(artifact_error(format!(
-            "unsupported IRPREP version {version}; expected {PREPROCESSOR_VERSION}"
-        )));
-    }
-    if reader.read_u32()? != expected {
-        return Err(artifact_error("IRPREP is for another model"));
-    }
-    let checkpoint_sha256 = reader.read_array::<32>()?;
-    Ok((reader, checkpoint_sha256))
-}
-
-/// `labels`' kind and values, without their count.
-fn write_labels(bytes: &mut Vec<u8>, labels: Option<&Labels>) -> Result<()> {
-    match labels {
-        None => bytes.push(0),
-        Some(Labels::Int(values)) => {
-            bytes.push(1);
-            for value in values {
-                bytes.extend(value.to_le_bytes());
+fn kumo_labels(h: &Header<Metadata<KumoState<'_>>>, bytes: &[u8], rows: u64) -> Result<Labels> {
+    match &h.tensors[..] {
+        [_, y] => {
+            let data = h.check_bytes(1, "y", y.dtype, &[rows], bytes)?;
+            match y.dtype {
+                DType::I64 => Ok(Labels::Int(decode_le(data, i64::from_le_bytes))),
+                DType::F64 => {
+                    if !DType::F64.all_finite(data)? {
+                        return Err(artifact_error("non-finite Kumo target"));
+                    }
+                    Ok(Labels::Float(decode_le(data, f64::from_le_bytes)))
+                }
+                DType::U8 if data.iter().all(|&v| v <= 1) => {
+                    Ok(Labels::Bool(data.iter().map(|&v| v == 1).collect()))
+                }
+                _ => Err(artifact_error("invalid target dtype or boolean")),
             }
         }
-        Some(Labels::Float(values)) => {
-            bytes.push(2);
-            for value in values {
-                bytes.extend(value.to_le_bytes());
+        [_, _, text] => {
+            let lengths = decode_le(
+                h.check_bytes(1, "y.lengths", DType::I64, &[rows], bytes)?,
+                i64::from_le_bytes,
+            );
+            let mut data = h.check_bytes(2, "y.utf8", DType::U8, &[text.bytes as u64], bytes)?;
+            let mut labels = Vec::with_capacity(lengths.len());
+            for len in lengths {
+                let n = usize::try_from(len).map_err(artifact_error)?;
+                let s = data
+                    .split_off(..n)
+                    .ok_or_else(|| artifact_error("invalid label length"))?;
+                labels.push(std::str::from_utf8(s).map_err(artifact_error)?.to_owned());
             }
+            if !data.is_empty() {
+                return Err(artifact_error("extra text label bytes"));
+            }
+            Ok(Labels::Text(labels))
         }
-        Some(Labels::Bool(values)) => {
-            bytes.push(3);
-            bytes.extend(values.iter().map(|&value| u8::from(value)));
-        }
-        Some(Labels::Text(values)) => {
-            bytes.push(4);
-            write_strings(bytes, values)?;
-        }
+        _ => Err(artifact_error("invalid Kumo training tensors")),
     }
-    Ok(())
-}
-
-fn write_strings(bytes: &mut Vec<u8>, values: &[String]) -> Result<()> {
-    for value in values {
-        write_u32(bytes, usize_to_u32(value.len(), "a string's length")?);
-        bytes.extend(value.as_bytes());
-    }
-    Ok(())
-}
-
-fn read_strings(reader: &mut ByteReader<'_>, count: usize) -> Result<Vec<String>> {
-    (0..count)
-        .map(|_| {
-            let length = reader.read_u32()? as usize;
-            String::from_utf8(reader.read_bytes(length)?.to_vec())
-                .map_err(|_| artifact_error("IRPREP has a string that is not UTF-8"))
-        })
-        .collect()
-}
-
-fn read_flags(reader: &mut ByteReader<'_>, count: usize) -> Result<Vec<bool>> {
-    reader
-        .read_chunks(count, 1)?
-        .map(|byte| match byte[0] {
-            0 => Ok(false),
-            1 => Ok(true),
-            _ => Err(artifact_error("IRPREP has an invalid flag")),
-        })
-        .collect()
-}
-
-fn read_f32s(reader: &mut ByteReader<'_>, count: usize) -> Result<Vec<f32>> {
-    let values: Vec<f32> = reader
-        .read_chunks(count, 4)?
-        .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four bytes")))
-        .collect();
-    if !values.iter().all(|value| value.is_finite()) {
-        return Err(artifact_error("IRPREP has a training value that is not finite"));
-    }
-    Ok(values)
-}
-
-/// The training rows: each group's `[rows, features]` matrix and each row's
-/// target, a class index below `classes` for a classifier.
-fn read_training(
-    reader: &mut ByteReader<'_>,
-    groups: usize,
-    features: usize,
-    classes: usize,
-) -> Result<Option<Training>> {
-    let rows = reader.read_count("training rows")?;
-    if rows == 0 {
-        return Ok(None);
-    }
-    let values = rows
-        .checked_mul(features)
-        .ok_or_else(|| artifact_error("IRPREP length overflows usize"))?;
-    let group_rows = (0..groups)
-        .map(|_| read_f32s(reader, values))
-        .collect::<Result<_>>()?;
-    let targets = read_f32s(reader, rows)?;
-    #[expect(clippy::cast_precision_loss, reason = "Class counts are below ten")]
-    if classes > 0
-        && !targets
-            .iter()
-            .all(|&target| target.fract() == 0.0 && (0.0..classes as f32).contains(&target))
-    {
-        return Err(artifact_error("IRPREP has a training target that is not a class"));
-    }
-    Ok(Some(Training { group_rows, targets }))
-}
-
-fn read_orders(reader: &mut ByteReader<'_>, members: usize, length: usize) -> Result<Vec<Vec<usize>>> {
-    let total = members
-        .checked_mul(length)
-        .ok_or_else(|| artifact_error("IRPREP length overflows usize"))?;
-    let indices = reader
-        .read_chunks(total, 8)?
-        .map(|bytes| {
-            u64_to_usize(
-                u64::from_le_bytes(bytes.try_into().expect("eight bytes")),
-                "an index",
-            )
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(if length == 0 {
-        vec![Vec::new(); members]
-    } else {
-        indices.chunks_exact(length).map(<[usize]>::to_vec).collect()
-    })
-}
-
-/// The SHA-256 of the checkpoint that the `IRPREP` `bytes` were fitted with,
-/// from their header alone: [`decode`] checks the rest.
-pub(crate) fn checkpoint_sha256(bytes: &[u8]) -> Result<[u8; 32]> {
-    let mut reader = ByteReader::new(bytes);
-    if reader.read_array::<8>()? != PREPROCESSOR_MAGIC {
-        return Err(artifact_error("not fitted preprocessing (IRPREP)"));
-    }
-    reader.read_u32()?;
-    reader.read_u32()?;
-    reader.read_array()
-}
-
-/// The checkpoint's SHA-256, the preprocessor, and the training rows, when
-/// they were written, that `encode` wrote.
-pub(crate) fn decode(bytes: &[u8]) -> Result<([u8; 32], Preprocessor, Option<Training>)> {
-    let (mut reader, checkpoint_sha256) = open(bytes, TABICL_V2)?;
-    let features_in = reader.read_count("input features")?;
-    let feature_mask = read_flags(&mut reader, features_in)?;
-    let categories = (0..features_in)
-        .map(|_| {
-            let count = reader.read_count("categories")?;
-            read_labels(&mut reader, count)
-        })
-        .collect::<Result<_>>()?;
-    let features = feature_mask.iter().filter(|kept| **kept).count();
-    let group_count = usize::from(reader.read_u8()?);
-    let groups = reader
-        .read_chunks(group_count, 1)?
-        .map(|byte| match byte[0] {
-            0 => Ok(NormMethod::None),
-            1 => Ok(NormMethod::Power),
-            _ => Err(artifact_error("IRPREP has an invalid method")),
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let members = reader.read_count("members")?;
-    if members > MAX_MEMBERS {
-        return Err(artifact_error("IRPREP has too many members"));
-    }
-    let member_groups = reader
-        .read_chunks(members, 1)?
-        .map(|byte| usize::from(byte[0]))
-        .collect();
-    let feature_permutations = read_orders(&mut reader, members, features)?;
-    let classes = reader.read_count("classes")?;
-    if classes > MAX_CLASSES {
-        return Err(artifact_error("IRPREP has too many classes"));
-    }
-    let class_permutations = read_orders(&mut reader, members, classes)?;
-    let labels = read_labels(&mut reader, classes)?;
-    let (target_scale, aggregation) = if labels.is_none() {
-        let values = reader.read_f64s(2)?;
-        (Some((values[0], values[1])), None)
-    } else {
-        let aggregation = ClassifierAggregation {
-            softmax_temperature: f32::from_le_bytes(reader.read_array()?),
-            average_logits: read_flags(&mut reader, 1)?[0],
-        };
-        (None, Some(aggregation))
-    };
-    let names = reader.read_count("feature names")?;
-    if names != 0 && names != features_in {
-        return Err(artifact_error("IRPREP has a name for some features only"));
-    }
-    let feature_names = (names != 0)
-        .then(|| read_strings(&mut reader, names))
-        .transpose()?;
-    let imputer_statistics = reader.read_f64s(features)?;
-    let normalizations = groups
-        .iter()
-        .map(|&method| read_normalization(&mut reader, method, features))
-        .collect::<Result<_>>()?;
-    let training = read_training(&mut reader, groups.len(), features, classes)?;
-    if !reader.is_empty() {
-        return Err(artifact_error("IRPREP has trailing bytes"));
-    }
-    let preprocessor = Preprocessor {
-        categories,
-        feature_mask,
-        imputer_statistics,
-        normalizations,
-        member_groups,
-        feature_permutations,
-        class_permutations,
-        classes: labels,
-        target_scale,
-        feature_names,
-        aggregation,
-    };
-    preprocessor.validate()?;
-    Ok((checkpoint_sha256, preprocessor, training))
-}
-
-/// Labels that `write_labels` wrote, `count` of them.
-fn read_labels(reader: &mut ByteReader<'_>, count: usize) -> Result<Option<Labels>> {
-    let labels = match reader.read_u8()? {
-        0 => None,
-        1 => Some(Labels::Int(
-            reader
-                .read_chunks(count, 8)?
-                .map(|bytes| i64::from_le_bytes(bytes.try_into().expect("eight bytes")))
-                .collect(),
-        )),
-        2 => Some(Labels::Float(reader.read_f64s(count)?)),
-        3 => Some(Labels::Bool(read_flags(reader, count)?)),
-        4 => Some(Labels::Text(read_strings(reader, count)?)),
-        _ => return Err(artifact_error("IRPREP has an invalid label kind")),
-    };
-    if labels.as_ref().map_or(0, Labels::len) != count {
-        return Err(artifact_error(
-            "IRPREP has a count that does not match its labels",
-        ));
-    }
-    Ok(labels)
-}
-
-fn read_normalization(
-    reader: &mut ByteReader<'_>,
-    method: NormMethod,
-    features: usize,
-) -> Result<Normalization> {
-    let count = match method {
-        NormMethod::None => 6,
-        NormMethod::Power => 9,
-    };
-    let statistics = (0..count)
-        .map(|_| reader.read_f64s(features))
-        .collect::<Result<_>>()?;
-    Ok(Normalization::from_statistics(method, statistics))
 }
 
 #[cfg(test)]
@@ -530,6 +355,28 @@ mod tests {
     }
 
     #[test]
+    fn unknown_model_family_is_not_routed_to_a_default_loader() {
+        let meta = serde_json::json!({"model":"other", "checkpoint_sha256":"01".repeat(32), "state":{}});
+        let bytes = super::Writer::new(super::Kind::Preprocessing, 64, meta, [])
+            .unwrap()
+            .bytes()
+            .unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &bytes).unwrap();
+        for result in [
+            super::identity(&bytes),
+            super::file_identity(file.path(), u64::MAX),
+        ] {
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("unknown variant `other`")
+            );
+        }
+    }
+
+    #[test]
     fn corrupt_or_inconsistent_bytes_are_rejected() {
         let sha = [9; 32];
         let regressor = fit(&Targets::Values((0..20_u8).map(f32::from).collect()));
@@ -539,12 +386,24 @@ mod tests {
             let (preprocessor, training) = (&fitted.preprocessor, fitted.training.as_ref());
             assert!(training.is_some());
             for training in [training, None] {
-                let bytes = encode(preprocessor, training, &sha).unwrap();
+                let bytes = encode(preprocessor, training, &sha, &[4; 32]).unwrap();
+                let id = super::identity(&bytes).unwrap();
+                assert_eq!(
+                    (id.family, id.checkpoint_sha256),
+                    (super::ModelFamily::TabIclV2, sha)
+                );
                 assert_eq!(
                     decode(&bytes).unwrap(),
-                    (sha, preprocessor.clone(), training.cloned())
+                    (
+                        sha,
+                        Preprocessed {
+                            preprocessor: preprocessor.clone(),
+                            training: training.cloned()
+                        },
+                        training.is_none().then(|| crate::format::encode_sha256(&[4; 32]))
+                    )
                 );
-                for index in [0, 9, 20, bytes.len() / 2, bytes.len() - 1] {
+                for index in [0, 9, 16] {
                     let mut corrupt = bytes.clone();
                     corrupt[index] ^= 1;
                     assert!(decode(&corrupt).is_err(), "byte {index}");
@@ -552,27 +411,85 @@ mod tests {
                 assert!(decode(&bytes[..bytes.len() - 1]).is_err());
             }
         }
-        // A classifier with a target scale, digest and all.
+        // A classifier cannot also carry a regression target scale.
         let mut inconsistent = classifier.preprocessor.clone();
         inconsistent.target_scale = Some((0.0, 1.0));
-        assert!(decode(&encode(&inconsistent, None, &sha).unwrap()).is_err());
+        assert!(
+            encode(&inconsistent, None, &sha, &[4; 32])
+                .and_then(|bytes| decode(&bytes))
+                .is_err()
+        );
         // Zero scale, inverted bounds, and a single-element NaN category must all fail validation.
         let mut zero_scale = classifier.preprocessor.clone();
         zero_scale.normalizations[0].scale[0] = 0.0;
-        assert!(decode(&encode(&zero_scale, None, &sha).unwrap()).is_err());
+        assert!(
+            encode(&zero_scale, None, &sha, &[4; 32])
+                .and_then(|bytes| decode(&bytes))
+                .is_err()
+        );
         let mut inverted = classifier.preprocessor.clone();
         inverted.normalizations[0].lower[0] = inverted.normalizations[0].upper[0] + 1.0;
-        assert!(decode(&encode(&inverted, None, &sha).unwrap()).is_err());
+        assert!(
+            encode(&inverted, None, &sha, &[4; 32])
+                .and_then(|bytes| decode(&bytes))
+                .is_err()
+        );
         let mut nan_category = classifier.preprocessor.clone();
         nan_category.categories[0] = Some(Labels::Float(vec![f64::NAN]));
-        assert!(decode(&encode(&nan_category, None, &sha).unwrap()).is_err());
+        assert!(
+            encode(&nan_category, None, &sha, &[4; 32])
+                .and_then(|bytes| decode(&bytes))
+                .is_err()
+        );
         // Training targets that are not classes, or values that are not finite.
         let mut training = classifier.training.clone().unwrap();
         training.targets[0] = 3.0;
-        assert!(decode(&encode(&classifier.preprocessor, Some(&training), &sha).unwrap()).is_err());
+        assert!(decode(&encode(&classifier.preprocessor, Some(&training), &sha, &[4; 32]).unwrap()).is_err());
         let mut training = classifier.training.unwrap();
         training.group_rows[1][0] = f32::NAN;
-        assert!(decode(&encode(&classifier.preprocessor, Some(&training), &sha).unwrap()).is_err());
+        assert!(decode(&encode(&classifier.preprocessor, Some(&training), &sha, &[4; 32]).unwrap()).is_err());
+    }
+
+    #[test]
+    fn kumo_keeps_typed_labels_empty_categories_and_large_seed() {
+        for labels in [
+            Labels::Bool(vec![true, false]),
+            Labels::Text(vec![String::new(), "é猫".into()]),
+            Labels::Float(vec![1.0, -0.5]),
+            Labels::Int(vec![i64::MIN, i64::MAX]),
+        ] {
+            let training = crate::models::kumo_tabular::fitted::Training {
+                x: vec![-1.0, -1.0],
+                categories: vec![Some(Labels::Text(vec![]))],
+                labels,
+                members: 1,
+                seed: i128::MIN,
+                feature_names: None,
+            };
+            let bytes = super::encode_kumo_tabular(&training, &[5; 32]).unwrap();
+            assert_eq!(super::decode_kumo_tabular(&bytes).unwrap().1, training);
+        }
+    }
+
+    #[test]
+    fn kumo_numeric_nonfinite_inputs_survive_serialization_but_category_codes_do_not() {
+        let mut training = crate::models::kumo_tabular::fitted::Training {
+            x: vec![f64::NAN, f64::INFINITY, f64::NEG_INFINITY],
+            categories: vec![None],
+            labels: Labels::Int(vec![0, 1, 0]),
+            members: 1,
+            seed: 0,
+            feature_names: None,
+        };
+        let bytes = super::encode_kumo_tabular(&training, &[5; 32]).unwrap();
+        let (_, decoded) = super::decode_kumo_tabular(&bytes).unwrap();
+        assert!(decoded.x[0].is_nan());
+        assert_eq!(decoded.x[1].to_bits(), f64::INFINITY.to_bits());
+        assert_eq!(decoded.x[2].to_bits(), f64::NEG_INFINITY.to_bits());
+        training.categories = vec![Some(Labels::Text(vec!["a".into()]))];
+        assert!(
+            super::decode_kumo_tabular(&super::encode_kumo_tabular(&training, &[5; 32]).unwrap()).is_err()
+        );
     }
 
     #[test]
@@ -588,6 +505,11 @@ mod tests {
         let sha = [5; 32];
         let sorted = training(Labels::Text(vec!["a".into(), "b".into()]));
         let bytes = super::encode_kumo_tabular(&sorted, &sha).unwrap();
+        let id = super::identity(&bytes).unwrap();
+        assert_eq!(
+            (id.family, id.checkpoint_sha256),
+            (super::ModelFamily::KumoTabular, sha)
+        );
         assert_eq!(super::decode_kumo_tabular(&bytes).unwrap().1, sorted);
         for bad in [
             Labels::Text(vec!["b".into(), "a".into()]),

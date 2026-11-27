@@ -106,6 +106,13 @@ pub(crate) fn decode_le<T, const N: usize>(bytes: &[u8], decode: fn([u8; N]) -> 
     bytes.as_chunks::<N>().0.iter().copied().map(decode).collect()
 }
 
+pub(crate) fn native_bytes<T: bytemuck::Pod>(values: &[T]) -> Result<&[u8]> {
+    if !cfg!(target_endian = "little") {
+        return Err(artifact_error("encoding tensors requires a little-endian host"));
+    }
+    Ok(bytemuck::cast_slice(values))
+}
+
 pub(crate) fn checked_tensor_bytes(dtype: DType, shape: &[u64]) -> Result<usize> {
     let bytes = shape
         .iter()
@@ -187,6 +194,22 @@ impl<M> Header<M> {
     pub const fn range(&self, entry: &Entry) -> Range<usize> {
         let start = self.data_start + entry.offset;
         start..start + entry.bytes
+    }
+
+    pub fn check_bytes<'a>(
+        &self,
+        index: usize,
+        name: &str,
+        dtype: DType,
+        shape: &[u64],
+        bytes: &'a [u8],
+    ) -> Result<&'a [u8]> {
+        let entry = self
+            .tensors
+            .get(index)
+            .filter(|t| t.name == name && t.dtype == dtype && t.shape == shape)
+            .ok_or_else(|| artifact_error(format!("unexpected container tensor: expected {name}")))?;
+        Ok(&bytes[self.range(entry)])
     }
 }
 

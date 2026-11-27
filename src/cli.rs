@@ -94,7 +94,7 @@ pub struct PrepareArgs {
     /// The folder of weights [default: the shared one]
     #[arg(long, value_name = "DIR")]
     pub weights: Option<PathBuf>,
-    /// safe, auto, or fast [default: the saved cache's, else safe]
+    /// safe, auto, or fast [default: the saved cache's level, else the exported fit's]
     #[arg(long, value_name = "LEVEL", value_parser = level)]
     pub optimize: Option<Optimize>,
 }
@@ -112,7 +112,7 @@ pub struct ServeArgs {
     /// The folder of weights [default: the shared one]
     #[arg(long, value_name = "DIR")]
     pub weights: Option<PathBuf>,
-    /// safe, auto, or fast [default: the saved cache's, else safe]
+    /// safe, auto, or fast [default: the saved cache's level, else the exported fit's]
     #[arg(long, value_name = "LEVEL", value_parser = level)]
     pub optimize: Option<Optimize>,
     /// The address to listen on.
