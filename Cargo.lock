@@ -1151,6 +1151,7 @@ dependencies = [
  "cuda-core",
  "cuda-device",
  "cuda-host",
+ "float8",
  "garde",
  "half",
  "libm",

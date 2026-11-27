@@ -15,6 +15,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
@@ -55,6 +56,21 @@ class PrepareTest(unittest.TestCase):
         model.export(self.directory / "model", kv_cache=False)
         self.assertEqual(self.prepare(), ("Built the KV cache", ""))
         self.assertEqual(self.prepare("--optimize", "fast"), ("Reused the KV cache", ""))
+
+    def test_cpu_auto_cache_does_not_change_the_serving_device(self):
+        path = self.directory / "model"
+        with patch.dict(os.environ, IRONICL_NO_CUDA="1", IRONICL_NO_METAL="1"):
+            model = fitted(TabICLClassifier, optimize="auto", n_estimators=1)
+            model.export(path)
+
+        def device():
+            output = subprocess.check_output([os.environ["IRONICL_BIN"], "prepare", path], text=True)
+            return next(line.split()[1] for line in output.splitlines() if line.startswith("device:"))
+
+        with_cache = device()
+        (path / "context.ir").unlink()
+        self.assertEqual(with_cache, device())
+        self.assertEqual(self.prepare("--optimize", "auto"), ("Reused the KV cache", ""))
 
     def test_prepare_reuses_a_matching_cache_and_rebuilds_any_other(self):
         model = fitted(TabICLClassifier)

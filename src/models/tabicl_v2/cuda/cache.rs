@@ -29,6 +29,8 @@ pub enum IclValues<'a> {
     F32(&'a [f32]),
     /// FP16 bits, for the tensor-core precisions.
     F16(&'a [u16]),
+    /// Already encoded E4M3 and its per-(estimator, head, channel) scales.
+    F8(&'a [u8], &'a [f32]),
 }
 
 impl<'a> IclValues<'a> {
@@ -36,6 +38,7 @@ impl<'a> IclValues<'a> {
         match self {
             Self::F32(values) => values.len(),
             Self::F16(values) => values.len(),
+            Self::F8(bytes, _) => bytes.len(),
         }
     }
 
@@ -43,6 +46,7 @@ impl<'a> IclValues<'a> {
         match self {
             Self::F32(values) => bytemuck::cast_slice(values),
             Self::F16(values) => bytemuck::cast_slice(values),
+            Self::F8(bytes, _) => bytes,
         }
     }
 
@@ -52,7 +56,9 @@ impl<'a> IclValues<'a> {
     pub const fn stored_at(self, precision: Precision) -> bool {
         matches!(
             (self, precision),
-            (Self::F32(_), Precision::Fp32) | (Self::F16(_), Precision::Split | Precision::Half)
+            (Self::F32(_), Precision::Fp32)
+                | (Self::F16(_), Precision::Split | Precision::Half)
+                | (Self::F8(..), Precision::Half)
         )
     }
 }
@@ -147,6 +153,26 @@ impl BuiltCache {
         self.scales.extend(scales);
     }
 
+    /// Copy a kept FP8 tensor to its final host representation.
+    pub(crate) fn write_fp8(
+        &self,
+        weights: &super::ModelWeights,
+        rows: usize,
+        block: usize,
+        key: bool,
+        out: &mut [u8],
+        scales: &mut [u8],
+    ) -> Result<()> {
+        let (b, s) = (&self.blocks[block], &self.scales[block]);
+        copy_fp8(
+            rows,
+            &weights.device.download(if key { &b.keys } else { &b.values })?,
+            out,
+            &weights.device.download(if key { &s.keys } else { &s.values })?,
+            scales,
+        )
+    }
+
     /// Device bytes the keys and values take.
     pub(super) fn bytes(&self) -> usize {
         self.blocks
@@ -238,6 +264,21 @@ impl IclCache {
                     keys: upload_padded(device, precision, keys, (pairs, rows))?,
                     values: upload_padded(device, precision, values, (pairs, rows))?,
                 }),
+                (Precision::Half, IclValues::F8(_, ks), IclValues::F8(_, vs)) => {
+                    if ks.len() != pairs * HEAD_DIM || vs.len() != ks.len() {
+                        return Err(Error::Artifact("FP8 scale shape mismatch".into()));
+                    }
+                    scales.push(Scales {
+                        keys: device.upload(ks)?,
+                        values: device.upload(vs)?,
+                    });
+                    if !streamed {
+                        blocks.push(KeyValues {
+                            keys: upload_padded(device, precision, keys, (pairs, rows))?,
+                            values: upload_padded(device, precision, values, (pairs, rows))?,
+                        });
+                    }
+                }
                 (Precision::Half, IclValues::F16(keys), IclValues::F16(values)) => {
                     let ((keys, key_scales), (values, value_scales)) = (
                         encode_fp8(device, keys, (pairs, rows))?,
@@ -253,15 +294,17 @@ impl IclCache {
                         blocks.push(KeyValues { keys, values });
                     }
                 }
-                (Precision::Half, ..) => unreachable!("checked: FP8 caches encode FP16 values"),
+                (Precision::Half, ..) => return Err(Error::Artifact("mixed ICL cache dtypes".into())),
             }
         }
-        let storage = match (precision, streamed) {
-            (_, false) => Storage::Resident(blocks),
-            (Precision::Fp32 | Precision::Split, true) => {
-                Storage::Streamed(Host::Context(Arc::clone(source)))
-            }
-            (Precision::Half, true) => Storage::Streamed(Host::Encoded(encoded)),
+        let storage = if !streamed {
+            Storage::Resident(blocks)
+        } else if encoded.is_empty() {
+            Storage::Streamed(Host::Context(Arc::clone(source)))
+        } else if encoded.len() == ICL_BLOCKS {
+            Storage::Streamed(Host::Encoded(encoded))
+        } else {
+            return Err(Error::Artifact("mixed ICL block dtypes".into()));
         };
         Ok(Self {
             precision,
@@ -271,6 +314,47 @@ impl IclCache {
             ones: ones(device, pairs)?,
             storage,
         })
+    }
+
+    /// Copy the exact cache used for inference, removing per-head row padding.
+    /// No quantization here: the bytes come from the resident or host-streamed cache.
+    pub(super) fn write_fp8(
+        &self,
+        device: &Device,
+        block: usize,
+        key: bool,
+        out: &mut [u8],
+        scales: &mut [u8],
+    ) -> Result<()> {
+        let downloaded;
+        let bytes: &[u8] = match &self.storage {
+            Storage::Resident(blocks) => {
+                let b = &blocks[block];
+                downloaded = device.download(if key { &b.keys } else { &b.values })?;
+                &downloaded
+            }
+            Storage::Streamed(Host::Encoded(blocks)) => {
+                let (k, v) = &blocks[block];
+                bytemuck::cast_slice(if key { k } else { v })
+            }
+            Storage::Streamed(Host::Context(_)) => {
+                return Err(Error::Artifact("context is already encoded".into()));
+            }
+        };
+        let s = &self.scales[block];
+        copy_fp8(
+            self.rows,
+            bytes,
+            out,
+            &device.download(if key { &s.keys } else { &s.values })?,
+            scales,
+        )
+    }
+
+    pub(super) fn use_packed_source(&mut self, source: Arc<dyn IclSource>) {
+        if self.streamed() {
+            self.storage = Storage::Streamed(Host::Context(source));
+        }
     }
 
     /// The cache a build left on the device for `pairs` pairs and `rows`
@@ -461,6 +545,22 @@ fn upload_padded(
     device.upload(&padded)
 }
 
+/// Unpad native E4M3 and check the per-channel scales, including the overflow
+/// marker produced by `fp8_peaks` for a non-finite FP16 input.
+fn copy_fp8(rows: usize, bytes: &[u8], out: &mut [u8], scales: &[f32], scale_out: &mut [u8]) -> Result<()> {
+    if !scales.iter().all(|&s| s.is_finite() && s > 0.0) {
+        return Err(Error::Artifact("invalid native FP8 scales".into()));
+    }
+    for (dst, src) in out
+        .chunks_exact_mut(rows * HEAD_DIM)
+        .zip(bytes.chunks_exact(padded_rows(rows) * HEAD_DIM))
+    {
+        dst.copy_from_slice(&src[..dst.len()]);
+    }
+    scale_out.copy_from_slice(bytemuck::cast_slice(scales));
+    Ok(())
+}
+
 /// FP16 keys or values `[pairs, rows, 64]` encoded as FP8 on the device, with
 /// their scales.
 fn encode_fp8(
@@ -532,5 +632,79 @@ impl UploadedBlock {
             key_scales: ones.clone(),
             value_scales: ones,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_fp8_context_streams_from_ram_without_reencoding() {
+        const ROWS: usize = 65;
+        const PAIRS: usize = 2;
+        struct Source {
+            blocks: Vec<Vec<u8>>,
+            scales: Vec<f32>,
+        }
+        impl IclSource for Source {
+            fn block(&self, block: usize) -> (IclValues<'_>, IclValues<'_>) {
+                (
+                    IclValues::F8(&self.blocks[block], &self.scales),
+                    IclValues::F8(&self.blocks[ICL_BLOCKS - 1 - block], &self.scales),
+                )
+            }
+        }
+        let Some(device) = Device::new().unwrap() else {
+            return;
+        };
+        let source: Arc<dyn IclSource> = Arc::new(Source {
+            blocks: (0..ICL_BLOCKS)
+                .map(|i| vec![u8::try_from(i + 1).unwrap(); PAIRS * ROWS * HEAD_DIM])
+                .collect(),
+            scales: vec![0.25; PAIRS * HEAD_DIM],
+        });
+        let cache = IclCache::new(&device, Precision::Half, &source, (PAIRS, ROWS), true).unwrap();
+        let mut slots = cache.slots(&device).unwrap();
+        for _ in 0..2 {
+            cache.begin(&device, &mut slots).unwrap();
+            for block in 0..ICL_BLOCKS {
+                let loaded = cache.acquire(&device, &slots, block).unwrap();
+                let (k, v) = source.block(block);
+                for (buffer, expected) in [(loaded.keys, k), (loaded.values, v)] {
+                    let bytes = device.download(buffer).unwrap();
+                    for pair in 0..PAIRS {
+                        let start = pair * padded_rows(ROWS) * HEAD_DIM;
+                        let len = ROWS * HEAD_DIM;
+                        assert_eq!(&bytes[start..][..len], &expected.bytes()[pair * len..][..len]);
+                    }
+                }
+                assert_eq!(
+                    device.download(loaded.key_scales).unwrap(),
+                    vec![0.25; PAIRS * HEAD_DIM]
+                );
+                cache.release(&device, &mut slots, block).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn native_fp8_export_rejects_nonfinite_sources_before_saturation() {
+        let Some(device) = Device::new().unwrap() else {
+            return;
+        };
+        for (bits, valid) in [(0x7bff, true), (0x7c00, false), (0xfc00, false), (0x7e00, false)] {
+            let mut source = vec![0; 257 * HEAD_DIM];
+            source[256 * HEAD_DIM] = bits; // check the reduction across peak chunks
+            let (bytes, scales) = encode_fp8(&device, &source, (1, 257)).unwrap();
+            let result = copy_fp8(
+                257,
+                &device.download(&bytes).unwrap(),
+                &mut vec![0; source.len()],
+                &device.download(&scales).unwrap(),
+                &mut [0; 4 * HEAD_DIM],
+            );
+            assert_eq!(result.is_ok(), valid);
+        }
     }
 }

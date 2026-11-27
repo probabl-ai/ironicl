@@ -44,6 +44,7 @@ mod workspace;
 // The device and the kernels live in crate::kernels::cuda.
 use crate::kernels::cuda::{self as device, kernels};
 
+pub(crate) use build::keeps_fp8;
 pub use build::{BuildInputs, BuildOutputs, build, context_bytes, fits};
 pub use cache::{BuiltCache, IclSource, IclValues};
 pub use device::{Arch, Device};

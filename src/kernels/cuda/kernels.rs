@@ -1134,7 +1134,13 @@ pub(crate) mod device {
         let mut peak = 0.0f32;
         for row in start..end {
             let value = f16::from_bits(values[(pair * stride as usize + row) * 64 + dim]) as f32;
-            peak = peak.max(value.abs());
+            // A non-finite FP16 source must not be hidden by saturating conversion.
+            // Propagate it to the channel's scale, checked on the host.
+            peak = if value.is_finite() {
+                peak.max(value.abs())
+            } else {
+                f32::INFINITY
+            };
         }
         // SAFETY: `i < len = peaks.len()` (the launcher); `i` is this thread's own.
         unsafe { *peaks.get_unchecked_mut(i) = peak };
