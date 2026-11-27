@@ -69,7 +69,8 @@ pub struct BuildOutputs<'a> {
     pub column: Vec<(&'a mut [f32], &'a mut [f32])>,
     /// Each ICL block's keys and values, `[B, 8, N, 64]`, as bytes of FP32
     /// values at [`Precision::Fp32`] and of FP16 ones otherwise (see
-    /// [`context_bytes`]).
+    /// [`context_bytes`]). May be empty for a kept FP8 cache: the caller copies
+    /// the returned native bytes and scales instead of keeping a second FP16 copy.
     pub icl: Vec<(&'a mut [u8], &'a mut [u8])>,
 }
 
@@ -166,6 +167,11 @@ pub fn fits(budget: usize, precision: Precision, shape: Shape) -> bool {
     shape.rows >= MIN_ROWS && plan(budget, precision, shape).is_some()
 }
 
+/// Whether the existing build plan retains the complete native FP8 cache.
+pub(crate) fn keeps_fp8(budget: usize, precision: Precision, shape: Shape) -> bool {
+    precision == Precision::Half && plan(budget, precision, shape).is_some_and(|p| p.keep)
+}
+
 /// Build a context's caches into `outputs`, with products at `precision`.
 /// Returns the ICL keys and values when they stay on the device, encoded for
 /// predictions at `precision`.
@@ -182,7 +188,9 @@ pub fn build(
     outputs: &mut BuildOutputs<'_>,
 ) -> Result<Option<BuiltCache>> {
     check(precision, inputs, outputs)?;
-    let Some(plan) = plan(inputs.budget, precision, inputs.shape) else {
+    let Some(plan) =
+        plan(inputs.budget, precision, inputs.shape).filter(|p| !outputs.icl.is_empty() || p.keep)
+    else {
         return Err(Error::InvalidArgument(
             "the context does not fit the CUDA device".into(),
         ));
@@ -226,7 +234,10 @@ fn check(precision: Precision, inputs: &BuildInputs<'_>, outputs: &BuildOutputs<
         rows: n,
         ..
     } = inputs.shape;
-    let consistent = inputs.x.len() == b * n * h
+    let consistent = b != 0
+        && n != 0
+        && h != 0
+        && inputs.x.len() == b * n * h
         && inputs.column_labels.len() == b * n * COLUMN_DIM
         && inputs.icl_labels.len() == b * n * ICL_DIM
         && inputs.inducing_queries.len() == COLUMN_BLOCKS
@@ -240,7 +251,7 @@ fn check(precision: Precision, inputs: &BuildInputs<'_>, outputs: &BuildOutputs<
         && outputs.column.iter().all(|(keys, values)| {
             keys.len() == b * (h + RESERVED) * COLUMN_CACHE && values.len() == keys.len()
         })
-        && outputs.icl.len() == ICL_BLOCKS
+        && (outputs.icl.len() == ICL_BLOCKS || precision == Precision::Half && outputs.icl.is_empty())
         && outputs.icl.iter().all(|(keys, values)| {
             keys.len() == b * n * ICL_DIM * context_bytes(precision) && values.len() == keys.len()
         });
@@ -513,14 +524,15 @@ impl Builder<'_> {
                 self.stages
                     .icl_block(work, &mut run.hidden, block, cache, (group, run.len, rows))?;
             }
-            let (keys_out, values_out) = &mut outputs.icl[block];
-            let size = context_bytes(precision);
-            for (out, cache) in [
-                (&mut **keys_out, &stored.keys),
-                (&mut **values_out, &stored.values),
-            ] {
-                let out = &mut out[first * rows * ICL_DIM * size..][..group * rows * ICL_DIM * size];
-                unpad(&device.download(cache)?, out, rows, size)?;
+            if let Some((keys_out, values_out)) = outputs.icl.get_mut(block) {
+                let size = context_bytes(precision);
+                for (out, cache) in [
+                    (&mut **keys_out, &stored.keys),
+                    (&mut **values_out, &stored.values),
+                ] {
+                    let out = &mut out[first * rows * ICL_DIM * size..][..group * rows * ICL_DIM * size];
+                    unpad(&device.download(cache)?, out, rows, size)?;
+                }
             }
             if let Some(built) = &mut built {
                 match fp8 {

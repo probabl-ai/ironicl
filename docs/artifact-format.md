@@ -89,8 +89,10 @@ device or optimization policy. Loading checks compatibility against the model an
 
 - **TabICLv2:** `column.{0..2}.{key,value}` (`f32`, `[B,H+4,8,128,16]`) precede
   `icl.{0..11}.{key,value}` (`[B,8,N,64]`). Layers are in numeric order, key then value. The
-  arithmetic policy and device determine whether ICL tensors use FP32, FP16 or BF16. Here `B`
-  is the estimator count, `H` the retained feature count, and `N` the number of training rows.
+  dtype depends on the backend and `optimize`. CUDA uses FP32 at `safe`, FP16 at `auto`, and
+  E4M3 at `fast` with one positive, finite FP32 scale per estimator, head and channel. Each
+  `icl.{block}.{key,value}_scale` has shape `[B,8,64]`. Here `B` counts estimators, `H` retained
+  features and `N` training rows. CPU and Metal keep their existing layouts.
 - **Kumo-Tabular:** Each `{member}.{task}` has `means`, `categorical`, `columns.key`,
   `columns.value`, `icl.key`, and `icl.value`. Column and ICL tensors group layers along the
   leading dimension. CUDA writes both K/V stages as FP16 for classifiers at `auto` or `fast`
@@ -98,9 +100,19 @@ device or optimization policy. Loading checks compatibility against the model an
   members, means and column kinds are always serialized as FP32. The context identity is the
   SHA-256 of its preprocessing bytes.
 
-The context container also round-trips already encoded `f8_e4m3` tensors verbatim. The two
-E4M3 NaN encodings (`0x7f`, `0xff`) are invalid cache values. Scales, when required by a
-model, are separate tensors. Format support alone does not enable execution at that precision.
+TabICLv2's native FP8 context requires a CUDA `fast` predictor. It uploads saved bytes without
+re-encoding. All-missing query rows now read that same cache on the CPU rather than a separate
+FP16 copy, so their `fast` outputs can differ from older releases. If the requested CUDA level
+cannot use the saved dtype (for example, CPU FP32 at `auto`), the loader rejects the cache
+rather than selecting the CPU. `ironicl prepare` rebuilds an incompatible directory cache from
+fitted preprocessing. To move a Python estimator to a
+non-CUDA backend, use `save(..., save_kv_cache=False)` and keep its training data. Existing
+unified FP16 CUDA contexts still load. The E4M3 encodings `0x7f` and `0xff` are NaNs and are
+invalid cache values.
+
+The change reduces eligible Kumo K/V payloads from four bytes per value to two and TabICLv2
+`fast` ICL payloads from two bytes to one plus scales. Neither ratio describes whole-file size
+or prediction latency. Prediction still loads the context into host memory.
 
 ### Validation and loading
 

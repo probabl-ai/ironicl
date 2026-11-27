@@ -170,7 +170,11 @@ impl Predictor {
         let block_bytes = 4 * units(precision, b * HEADS, n);
         let budget = match &built {
             Some(built) => context.budget + built.bytes(),
-            None if precision == Precision::Half => context.budget.saturating_sub(block_bytes),
+            None if precision == Precision::Half
+                && matches!(context.icl.block(0).0, super::IclValues::F16(_)) =>
+            {
+                context.budget.saturating_sub(block_bytes)
+            }
             None => context.budget,
         };
         let Some(plan) = plan(budget, (b, h), block_bytes) else {
@@ -201,6 +205,22 @@ impl Predictor {
             }),
             weights,
         }))
+    }
+
+    /// Copy the native FP8 cache into the host context, one key/value tensor at a time.
+    pub(crate) fn write_fp8(
+        &self,
+        block: usize,
+        key: bool,
+        values: &mut [u8],
+        scales: &mut [u8],
+    ) -> Result<()> {
+        self.icl
+            .write_fp8(&self.weights.device, block, key, values, scales)
+    }
+
+    pub(crate) fn use_packed_source(&mut self, source: Arc<dyn IclSource>) {
+        self.icl.use_packed_source(source);
     }
 
     /// Whether the ICL cache streams from the host on every pass.
