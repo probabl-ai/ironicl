@@ -713,33 +713,6 @@ pub(crate) mod device {
         unsafe { *x.get_unchecked_mut(i) += vectors[i % rows_width] };
     }
 
-    /// Packed queries `q[pairs, padded, 64]`, the first `dim` dims of each,
-    /// times `base[head, d]` and `1 + tanh(g)` for `g = gates[pair * padded +
-    /// row, d]` (`[pairs * padded, dim]`). One thread per value.
-    #[kernel]
-    pub fn scale_heads(
-        mut q: DisjointSlice<f32>,
-        base: &[f32],
-        gates: &[f32],
-        pairs: u32,
-        padded: u32,
-        heads: u32,
-        dim: u32,
-    ) {
-        let i = thread::index_1d().get();
-        let (padded, dim) = (padded as usize, dim as usize);
-        let d = i % 64;
-        if i >= pairs as usize * padded * 64 || d >= dim {
-            return;
-        }
-        let (row, pair) = ((i / 64) % padded, i / (64 * padded));
-        let scale = base[(pair % heads as usize) * dim + d]
-            * (1.0 + cuda_device::float::tanh_approx_f32(gates[(pair * padded + row) * dim + d]));
-        // SAFETY: `i < pairs * padded * 64`, the launcher's size of `q`; each thread touches
-        // its own `q[i]`.
-        unsafe { *q.get_unchecked_mut(i) *= scale };
-    }
-
     // ---------------------------------------------------------------------------
     // Kumo-Tabular: the cell embedding's features and the row stage's sequences.
     // ---------------------------------------------------------------------------
@@ -1873,6 +1846,8 @@ pub(crate) mod device {
     #[launch_bounds(128)]
     pub fn icl_attention_f32(
         q: &[f32],
+        gate_base: &[f32],
+        gates: &[f32],
         k: &[u8],
         v: &[u8],
         mut part: DisjointSlice<f32>,
@@ -1885,6 +1860,8 @@ pub(crate) mod device {
         scale_log2: f32,
         kv_share: u32,
         block0: u32,
+        gate_heads: u32,
+        dim: u32,
     ) {
         // Q and K rows padded to 68 values, so that rows four apart and keys
         // one apart start in different banks.
@@ -1921,9 +1898,23 @@ pub(crate) mod device {
             let index = tid + i * 128;
             let (row, c) = (index / 16, (index % 16) * 4);
             let value = if q0 + row < qp {
-                // SAFETY: `q0 + row < qp`, `c + 4 <= 64`, and `bh < pairs` by the grid: 16 aligned
-                // bytes inside `q` `[pairs, qp, 64]`.
-                unsafe { *q.as_ptr().add((bh * qp + q0 + row) * 64 + c).cast::<F32x4>() }
+                let token = bh * qp + q0 + row;
+                // SAFETY: token < pairs * qp and c + 4 <= 64. For a gated query, dim is a
+                // multiple of four and gate_heads > 0. The launcher checks the gate buffers'
+                // alignment and sizes, so c < dim covers both vectors.
+                unsafe {
+                    let mut v = *q.as_ptr().add(token * 64 + c).cast::<F32x4>();
+                    if c < dim as usize {
+                        let head = bh % gate_heads as usize;
+                        let b = *gate_base.as_ptr().add(head * dim as usize + c).cast::<F32x4>();
+                        let g = *gates.as_ptr().add(token * dim as usize + c).cast::<F32x4>();
+                        #[unroll]
+                        for j in 0..4 {
+                            v.0[j] *= b.0[j] * (1.0 + cuda_device::float::tanh_approx_f32(g.0[j]));
+                        }
+                    }
+                    v
+                }
             } else {
                 F32x4::splat(0.0)
             };

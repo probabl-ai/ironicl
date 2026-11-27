@@ -217,19 +217,6 @@ impl Device {
         DeviceBuffer::zeroed(&self.stream, len)
     }
 
-    /// Allocate on the kernel stream without waiting for the GPU. Drop frees in stream order.
-    ///
-    /// # Safety
-    /// Initialize every element on the same stream before reading it, including padding.
-    #[expect(unsafe_code, reason = "the caller initializes this stream-ordered allocation")]
-    pub(crate) unsafe fn scratch<T: DeviceCopy>(
-        &self,
-        len: usize,
-    ) -> std::result::Result<DeviceBuffer<T>, DriverError> {
-        // SAFETY: the caller is responsible for initialization.
-        unsafe { DeviceBuffer::uninitialized_async(&self.stream, len) }
-    }
-
     /// `values` copied to the device.
     pub(crate) fn upload<T: DeviceCopy>(&self, values: &[T]) -> Result<DeviceBuffer<T>> {
         DeviceBuffer::from_host(&self.stream, values).map_err(gpu_error)

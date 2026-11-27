@@ -109,19 +109,21 @@ embeddings are saved transposed; import copies them into row-major order.
   rows once and keeps each member's context: the column means that replace missing values, each
   column layer's keys and values of its inducing points, and each ICL layer's keys and values,
   in medium and large only the 2 heads query rows use. Predicting runs only the query rows.
-- `cuda.rs`: on an NVIDIA GPU, with the `cuda` feature, a member's whole forward pass runs on
+- `cuda/`: on an NVIDIA GPU, with the `cuda` feature, a member's whole forward pass runs on
   the device and its context stays there: the imputation means and each layer's column
   and ICL keys and values. Predicting uploads only the query rows and downloads only the outputs.
   The blocks chain the kernels TabICLv2's ICL stage uses (`kernels/cuda/launch.rs`): `RMSNorm`,
   products with their bias, GELU, and residual epilogues, heads packed with `RoPE`, the per-head
   norm, and query scaling, and split attention over the cached keys and values, which test rows
   of medium and large read through 2 heads. The small model's 32-wide heads are zero-padded to
-  the kernels' 64. Kumo-Tabular's own kernels build the cell embedding's features and the row
-  stage's sequences. The weights upload once per process. Buffers are allocated and freed in
-  stream order, so the CPU queues work without waiting for the GPU; it waits once 1 GiB has
-  been allocated since it last did, which bounds the memory of queued work. A context that does not fit in device
-  memory is built on the CPU, and `IRONICL_NO_CUDA` keeps everything there. When every member's
-  context is on the GPU, the contexts are stacked and one pass predicts all members, as
+  the kernels' 64. In the row stage, attention applies the gate as it loads queries into shared
+  memory rather than writing scaled queries back to device memory first. Kumo-Tabular's own
+  kernels build the cell embedding's features and the row stage's sequences. The weights upload
+  once per process. Each fit or prediction owns a workspace: layers and passes overwrite the same
+  buffers in stream order, growing them only for a larger shape. The call releases the workspace
+  without releasing the fitted contexts. If a context does not fit in device memory, Ironicl builds
+  it on the CPU. `IRONICL_NO_CUDA` keeps everything on the CPU. When every member's context is on
+  the GPU, Ironicl stacks the contexts and predicts all members in one pass, as
   TabICLv2's ensemble does: products and norms run on every member's rows at once, reading each
   weight once, and each member attends to its own keys and values. Saving copies a
   context to the host; loading copies it to the GPU, so a context saved on one device loads on
@@ -214,7 +216,7 @@ so it keeps the FP32-cache result in the table. On a wider table (100 features, 
 sampled peak process GPU memory was 4,638/4,594/4,128 MiB for `safe`/`auto`/`fast`. The weights
 and temporary buffers also consume memory, so halving the KV cache does not halve the peak.
 
-With the current CUDA kernels, on the same RTX 5080, the following comparison uses NVIDIA's
+The following comparison, measured on the same RTX 5080 before workspace reuse and row-gate fusion, uses NVIDIA's
 [eager PyTorch implementation](https://github.com/NVIDIA/structured-data-models/tree/3fdf108a1f1b719b1b983373b71bbba79fcab7e6)
 with FP16 autocast and `estimator_batch_size=None`. Both use the released weights, 1,000 training
 rows, 20 numeric features, and four members. Each entry is the median of three fresh-process
@@ -233,6 +235,11 @@ rather than assuming the two random generators select the same ensemble. Neither
 changed any of NVIDIA FP32's 500 classifier labels. Maximum probability differences from NVIDIA
 FP32 were `2.71e-4` (Ironicl) and `1.04e-3` (NVIDIA FP16). Across all 999 regression quantiles,
 the maximum differences were `3.29e-3` and `7.77e-3` training-target standard deviations.
+
+After workspace reuse and row-gate fusion, a separate large-classifier run on the same GPU measured
+3.9, 58.8, and 567.2 ms for 1, 1,000, and 10,000 query rows at `fast`. NVIDIA's stacked FP16 model
+measured 17.0, 59.7, and 607.3 ms. These are median host-to-host prediction times from three warm
+runs per size, with 1,000 training rows, 20 numeric features, and four members.
 
 To reproduce the timings with cached checkpoints, run each model separately. The `--nvidia-fp16`
 command requires the pinned `sdm` above, pandas, and CUDA-enabled PyTorch (measured with

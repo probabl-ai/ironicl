@@ -76,6 +76,7 @@ impl Device {
         self.attend_icl(
             precision,
             queries,
+            None,
             (&block.cache.keys, &block.cache.values),
             (&mut part, &mut lse, &mut out),
             (

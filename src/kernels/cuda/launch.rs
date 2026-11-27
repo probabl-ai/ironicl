@@ -557,10 +557,10 @@ impl Device {
         assert!(!matches!(packed, Output::Split { .. }) && dim <= HEAD_DIM && len <= padded);
         let mut unused = Unused::new(self)?;
         let (y, hi, _, format) = unused.outputs(Some(packed));
-        let config = config(threads(sequences * len * heads * 32), 256);
-        // SAFETY: one warp per (token, head) of `sequences * len * heads`, writing rows `row < len
-        // <= padded` of pair `sequence * heads + head` to the buffer `format` names, which callers
-        // size to `[sequences * heads, padded, 64]`; `x` holds `[sequences * len, heads * dim]`,
+        let config = config(threads(sequences * padded * heads * 32), 256);
+        // SAFETY: one warp per (row, head) of `sequences * padded * heads`, writing row `row <
+        // padded` of pair `sequence * heads + head` (zeros from `len`) to the buffer `format` names,
+        // which callers size to `[sequences * heads, padded, 64]`; `x` holds `[sequences * len, heads * dim]`,
         // `gate` is empty or `[sequences * len * heads, dim]`, `base` empty or `[heads, dim]`,
         // `key_scale` empty or `[sequences * heads, 64]`, and `frequencies` empty or `dim / 2`.
         let launch = unsafe {
@@ -625,10 +625,18 @@ impl Device {
     /// `values` `[pairs, padded_rows, 64]` (FP32 for `safe`, FP16 for `auto`,
     /// FP8 for `fast`), into `out` in FP32, through the chunks' partial
     /// outputs `part` and log-sum-exps `lse`.
+    /// FP32 row attention can apply a `(base, gates, head dimension)` gate
+    /// while loading the queries instead of rewriting them in global memory.
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "One shape check and chunk plan guard both the FP32 and tensor-core launches"
+    )]
     pub(crate) fn attend_icl(
         &self,
         precision: Precision,
         queries: Activation<'_>,
+        gate: Option<(&DeviceBuffer<f32>, &DeviceBuffer<f32>, usize)>,
         (keys, values): (&DeviceBuffer<u8>, &DeviceBuffer<u8>),
         (part, lse, out): (
             &mut DeviceBuffer<f32>,
@@ -638,6 +646,14 @@ impl Device {
         (pairs, padded_queries, rows, stride): (usize, usize, usize, usize),
         kv_share: usize,
     ) -> Result<()> {
+        if let Some((base, gates, dim)) = gate {
+            assert!(precision == Precision::Fp32 && dim > 0 && dim <= HEAD_DIM && dim.is_multiple_of(4));
+            assert!(
+                !base.is_empty() && base.len().is_multiple_of(dim) && pairs.is_multiple_of(base.len() / dim)
+            );
+            assert!(gates.len() >= pairs * padded_queries * dim);
+            assert!(base.cu_deviceptr().is_multiple_of(16) && gates.cu_deviceptr().is_multiple_of(16));
+        }
         let block_rows = icl_block_rows(precision, padded_queries);
         let (chunk_tiles, splits) = self.icl_split(precision, pairs, padded_queries, rows);
         // The kernels index the caches and the chunk outputs unchecked.
@@ -669,6 +685,12 @@ impl Device {
         let launch = unsafe {
             match (precision, queries) {
                 (Precision::Fp32, Activation::F32(queries)) => {
+                    assert!(queries.len() >= pairs * padded_queries * HEAD_DIM);
+                    // With dim = 0 the kernel does not read the gate inputs.
+                    let (base, gates, dim, gate_heads) = gate
+                        .map_or((queries, queries, 0, 0), |(base, gates, dim)| {
+                            (base, gates, dim, base.len() / dim)
+                        });
                     // Blocks past the grid's y limit run in further launches.
                     for first in (0..blocks).step_by(MAX_GRID_YZ) {
                         let grid = config((tiles, MAX_GRID_YZ.min(blocks - first), 1), 128);
@@ -677,6 +699,8 @@ impl Device {
                                 stream,
                                 grid,
                                 queries,
+                                base,
+                                gates,
                                 keys,
                                 values,
                                 &mut *dest,
@@ -689,6 +713,8 @@ impl Device {
                                 scale,
                                 n(kv_share),
                                 n(first),
+                                n(gate_heads),
+                                n(dim),
                             )
                             .map_err(gpu_error)?;
                     }
@@ -803,6 +829,62 @@ mod tests {
     }
 
     #[test]
+    fn fused_row_gate_matches_prescaled_queries() {
+        let Some(device) = Device::new().unwrap() else {
+            return;
+        };
+        let (pairs, heads, rows, keys) = (4, 2, 33, 17);
+        let data = |len, period| (0..len).map(|i| value(i, period)).collect::<Vec<_>>();
+        let cache = |period| {
+            device
+                .upload(&data(pairs * keys * HEAD_DIM, period))
+                .unwrap()
+                .cast_chunks::<u8>()
+                .ok()
+                .unwrap()
+        };
+        let (k, v) = (cache(71), cache(53));
+        let q = data(pairs * rows * HEAD_DIM, 37);
+        let queries = device.upload(&q).unwrap();
+        let (_, splits) = device.icl_split(Precision::Fp32, pairs, rows, keys);
+        let mut part = device.zeroed(q.len() * splits).unwrap();
+        let mut lse = device.zeroed(pairs * rows * splits).unwrap();
+        let mut out = device.zeroed(q.len()).unwrap();
+        let mut attend = |q: &_, gate: Option<(&_, &_, usize)>| {
+            device
+                .attend_icl(
+                    Precision::Fp32,
+                    Activation::F32(q),
+                    gate,
+                    (&k, &v),
+                    (&mut part, &mut lse, &mut out),
+                    (pairs, rows, keys, keys),
+                    1,
+                )
+                .unwrap();
+            device.download(&out).unwrap()
+        };
+        for dim in [32, 64] {
+            let base = data(heads * dim, 43);
+            // tanh(0), tanh(64), and tanh(-64) are exact in FP32.
+            let gates: Vec<_> = (0..pairs * rows * dim)
+                .map(|i| [0.0, 64.0, -64.0][i % 3])
+                .collect();
+            let mut scaled = q.clone();
+            for (token, row) in scaled.as_chunks_mut::<HEAD_DIM>().0.iter_mut().enumerate() {
+                let head = token / rows % heads;
+                for d in 0..dim {
+                    let i = token * dim + d;
+                    row[d] *= base[head * dim + d] * [1.0, 2.0, 0.0][i % 3];
+                }
+            }
+            let expected = attend(&device.upload(&scaled).unwrap(), None);
+            let (base, gates) = (device.upload(&base).unwrap(), device.upload(&gates).unwrap());
+            assert_eq!(attend(&queries, Some((&base, &gates, dim))), expected);
+        }
+    }
+
+    #[test]
     fn tiled_half_projections_match_row_major_with_a_partial_row_tile() {
         let Some(device) = Device::new().unwrap() else {
             return;
@@ -902,6 +984,7 @@ mod tests {
             .attend_icl(
                 Precision::Fp32,
                 Activation::F32(&query_buffer),
+                None,
                 (&k_bytes, &v_bytes),
                 (&mut part, &mut lse, &mut attended),
                 (pairs, qp, keys, np),
