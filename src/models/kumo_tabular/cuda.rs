@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use cuda_core::{DeviceBuffer, DeviceCopy};
 
 use super::Config;
-use super::cpu::{Kv, Scaling};
+use super::cpu::{Scaling, StageTensors};
 use crate::kernels::cuda::launch::{
     Activation, Dense, HEAD_DIM, Output, Precision, config, n, padded_query_rows, padded_rows, threads,
 };
@@ -825,18 +825,17 @@ impl Cuda {
     /// `context`'s column and ICL keys and values on the host, without their
     /// padding: per layer `[columns, heads, inducing points, head_dim]` and
     /// `[1, key heads, training rows, head_dim]`, as the CPU keeps them.
-    pub(super) fn download(&self, context: &Context) -> Result<(Vec<Kv>, Vec<Kv>)> {
-        let _guard = self.stream_lock.lock().unwrap_or_else(PoisonError::into_inner);
-        Ok(self.download_slots(&context.slots())?.remove(0))
+    pub(super) fn download(&self, context: &Context, out: &mut [&mut [u8]]) -> Result<()> {
+        self.download_slots(&context.slots(), out)
     }
 
-    /// Each slot's keys and values of `ensemble`, as [`Self::download`] gives them.
-    pub(super) fn download_ensemble(&self, ensemble: &Ensemble) -> Result<Vec<(Vec<Kv>, Vec<Kv>)>> {
-        let _guard = self.stream_lock.lock().unwrap_or_else(PoisonError::into_inner);
-        self.download_slots(&ensemble.slots())
+    /// As [`Self::download`], deinterleaving each ensemble slot into its own pages.
+    pub(super) fn download_ensemble(&self, ensemble: &Ensemble, out: &mut [&mut [u8]]) -> Result<()> {
+        self.download_slots(&ensemble.slots(), out)
     }
 
-    fn download_slots(&self, slots: &Slots<'_>) -> Result<Vec<(Vec<Kv>, Vec<Kv>)>> {
+    fn download_slots(&self, slots: &Slots<'_>, out: &mut [&mut [u8]]) -> Result<()> {
+        let _guard = self.stream_lock.lock().unwrap_or_else(PoisonError::into_inner);
         let config = self.config;
         let (heads, points) = (dim(config.embedding_heads), dim(config.inducing_points));
         let count = slots.inputs.len();
@@ -844,78 +843,52 @@ impl Cuda {
         let icl_heads = dim(config.icl_heads);
         let key_heads = config.query_key_value_heads.map_or(icl_heads, dim);
         let rows = slots.training_rows;
-        let floats = |bytes: &Bytes| -> Result<Vec<f32>> {
-            let bytes = self.device.download(bytes)?;
-            Ok(if self.cache_precision == Precision::Fp32 {
-                bytes
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|&w| f32::from_le_bytes(w))
-                    .collect()
-            } else {
-                bytes
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|&w| half::f16::from_le_bytes(w).to_f32())
-                    .collect()
-            })
+        let size = if self.cache_precision == Precision::Fp32 {
+            4
+        } else {
+            2
         };
-        // One slot's `[pairs, padded rows, 64]` values without their padding.
-        let unpad = |values: &[f32], (pairs, rows, head_dim): (usize, usize, usize)| -> Vec<f32> {
-            let padded = values.len() / (pairs * HEAD_DIM);
-            values
-                .chunks(padded * HEAD_DIM)
-                .flat_map(|pair| pair[..rows * HEAD_DIM].chunks(HEAD_DIM))
-                .flat_map(|row| &row[..head_dim])
-                .copied()
-                .collect()
-        };
-        let mut out: Vec<(Vec<Kv>, Vec<Kv>)> = (0..count).map(|_| (Vec::new(), Vec::new())).collect();
-        let cell_dim = dim(config.cell_channels) / heads;
-        for (key, value) in slots.columns {
-            let (keys, values) = (floats(key)?, floats(value)?);
-            // `[groups, slots, chunk]`: slot `s` is every group's chunk `s`.
-            let chunk = keys.len() / (groups * count);
-            let slot = |all: &[f32], s: usize| -> Vec<f32> {
-                let mine: Vec<f32> = all
-                    .chunks(chunk)
-                    .skip(s)
-                    .step_by(count)
-                    .flatten()
-                    .copied()
-                    .collect();
-                unpad(&mine, (groups * heads, points, cell_dim))
-            };
-            for (s, (columns, _)) in out.iter_mut().enumerate() {
-                columns.push(Kv {
-                    key: slot(&keys, s),
-                    value: super::cpu::Values::F32(slot(&values, s)),
-                    groups,
-                    heads,
-                    rows: points,
-                });
+        for (first, layers, groups, heads, rows, width) in [
+            (
+                2,
+                slots.columns,
+                groups,
+                heads,
+                points,
+                dim(config.cell_channels) / heads,
+            ),
+            (
+                4,
+                slots.icl,
+                1,
+                key_heads,
+                rows,
+                dim(config.icl_channels) / icl_heads,
+            ),
+        ] {
+            let len = groups * heads * rows * width * size;
+            for (layer, (key, value)) in layers.iter().enumerate() {
+                for (kind, src) in [key, value].into_iter().enumerate() {
+                    let bytes = self.device.download(src)?;
+                    // Device order: [group, slot, head, padded row, 64]. File order
+                    // within each slot: [layer, group, head, row, width].
+                    for (slot, tensors) in out.as_chunks_mut::<6>().0.iter_mut().enumerate() {
+                        let dest = &mut tensors[first + kind][layer * len..][..len];
+                        for (pair, dest) in dest.chunks_exact_mut(rows * width * size).enumerate() {
+                            let index = (pair / heads * count + slot) * heads + pair % heads;
+                            let source = &bytes[index * padded_rows(rows) * HEAD_DIM * size..];
+                            for (to, from) in dest
+                                .chunks_exact_mut(width * size)
+                                .zip(source.chunks_exact(HEAD_DIM * size))
+                            {
+                                to.copy_from_slice(&from[..to.len()]);
+                            }
+                        }
+                    }
+                }
             }
         }
-        let icl_dim = dim(config.icl_channels) / icl_heads;
-        for (key, value) in slots.icl {
-            let (keys, values) = (floats(key)?, floats(value)?);
-            let len = keys.len() / count;
-            for (s, (_, icl)) in out.iter_mut().enumerate() {
-                icl.push(Kv {
-                    key: unpad(&keys[s * len..][..len], (key_heads, rows, icl_dim)),
-                    value: super::cpu::Values::F32(unpad(
-                        &values[s * len..][..len],
-                        (key_heads, rows, icl_dim),
-                    )),
-                    groups: 1,
-                    heads: key_heads,
-                    rows,
-                });
-            }
-        }
-        Ok(out)
+        Ok(())
     }
 
     /// Whether stacking `contexts` fits in free device memory: stacking holds
@@ -1024,46 +997,61 @@ impl Cuda {
         })
     }
 
-    /// A device context from a host one with `training_rows` training rows,
-    /// its keys and values padded as [`Self::fit`] keeps them.
-    pub(crate) fn upload_context(
+    /// Upload the validated artifact views one layer at a time, padding rows and
+    /// head channels as the kernels read them. Native FP16 is never widened.
+    pub(super) fn upload_context(
         &self,
-        context: &super::cpu::Context,
+        means: &[f32],
+        kinds: &[f32],
+        [columns, icl]: [StageTensors<'_>; 2],
+        categorical: &[bool],
         training_rows: usize,
     ) -> Result<Context> {
+        use crate::format::static_context::StaticContextTensorData as Data;
         let _guard = self.stream_lock.lock().unwrap_or_else(PoisonError::into_inner);
-        let (columns, icl) = context.kvs();
-        let upload = |kvs: &[Kv]| {
-            kvs.iter()
-                .map(|kv| {
-                    let head_dim = kv.key.len() / (kv.groups * kv.heads * kv.rows).max(1);
-                    let padded = padded_rows(kv.rows);
-                    let pad = |values: &[f32]| -> Result<Bytes> {
-                        let mut out = vec![0.0_f32; kv.groups * kv.heads * padded * HEAD_DIM];
-                        for (pair, source) in values.chunks(kv.rows * head_dim).enumerate() {
-                            for (row, source) in source.chunks(head_dim).enumerate() {
-                                out[(pair * padded + row) * HEAD_DIM..][..head_dim].copy_from_slice(source);
-                            }
-                        }
-                        if self.cache_precision == Precision::Fp32 {
-                            Self::bytes(self.upload(&out)?)
-                        } else {
-                            Self::bytes(self.upload(&super::half_cache(&out)?)?)
-                        }
-                    };
-                    Ok((pad(&kv.key)?, pad(&kv.value.floats())?))
-                })
-                .collect::<Result<Vec<_>>>()
+        let upload_stage = |(k, v): StageTensors<'_>| -> Result<Vec<(Bytes, Bytes)>> {
+            let [layers, groups, heads, rows, width] = k.dimensions else {
+                unreachable!("validated K/V shape")
+            };
+            let (pairs, rows, width) = (dim(*groups) * dim(*heads), dim(*rows), dim(*width));
+            let len = pairs * rows * width;
+            let pad = |layer: usize, values: Data<'_>| -> Result<Bytes> {
+                let converted;
+                let (size, bytes): (usize, &[u8]) = match values.slice(layer * len, len) {
+                    Data::Fp32(v) if self.cache_precision == Precision::Fp32 => (4, bytemuck::cast_slice(v)),
+                    Data::Fp32(v) => {
+                        converted = super::half_cache(v)?;
+                        (2, bytemuck::cast_slice(&converted))
+                    }
+                    Data::F16(v) => (2, bytemuck::cast_slice(v)),
+                    _ => unreachable!("validated K/V dtype"),
+                };
+                let stride = padded_rows(rows) * HEAD_DIM * size;
+                let mut out = vec![0; pairs * stride];
+                for (dst, src) in out
+                    .chunks_exact_mut(stride)
+                    .zip(bytes.chunks_exact(rows * width * size))
+                {
+                    for (dst, src) in dst
+                        .chunks_exact_mut(HEAD_DIM * size)
+                        .zip(src.chunks_exact(width * size))
+                    {
+                        dst[..src.len()].copy_from_slice(src);
+                    }
+                }
+                self.upload(&out)
+            };
+            (0..dim(*layers))
+                .map(|layer| Ok((pad(layer, k.data)?, pad(layer, v.data)?)))
+                .collect()
         };
-        let (categorical, means) = context.columns_and_means();
-        let kinds: Vec<f32> = categorical.iter().map(|&c| f32::from(u8::from(c))).collect();
         Ok(Context {
             means: self.upload(means)?,
-            kinds: self.upload(&kinds)?,
+            kinds: self.upload(kinds)?,
             categorical: categorical.to_vec(),
             training_rows,
-            columns: upload(columns)?,
-            icl: upload(icl)?,
+            columns: upload_stage(columns)?,
+            icl: upload_stage(icl)?,
         })
     }
 

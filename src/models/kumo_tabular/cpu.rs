@@ -12,7 +12,9 @@
 use rayon::prelude::*;
 
 use super::{Config, Release};
-use crate::format::static_context::{StaticContextArtifact, StaticContextTensor, StaticContextTensorData};
+use crate::format::static_context::{
+    StaticContextArtifact, StaticContextTensor, StaticContextTensorData, StaticContextTensorRef,
+};
 use crate::kernels::reference::{
     OnlineAttentionScratch, affine_f32, gelu_f32, rope_non_interleaved_f32,
     source_major_online_attention_f32_key_bf16_value_with_backend_f32,
@@ -148,22 +150,6 @@ struct Block<'a> {
     scaling: Scaling,
 }
 
-/// The FP32 values and dimensions of the tensor `name` in `artifact`.
-fn read_tensor(artifact: &StaticContextArtifact, name: &str) -> Result<(Vec<f32>, Vec<usize>)> {
-    let tensor = artifact
-        .tensor(name)
-        .ok_or_else(|| Error::Artifact(format!("the saved context has no {name}")))?;
-    let StaticContextTensorData::Fp32(values) = tensor.data else {
-        return Err(Error::Artifact(format!("{name} is not FP32")));
-    };
-    let dimensions = tensor
-        .dimensions
-        .iter()
-        .map(|&n| usize::try_from(n).map_err(|_| Error::Artifact(format!("{name} is too large"))))
-        .collect::<Result<_>>()?;
-    Ok((values.to_vec(), dimensions))
-}
-
 /// Layers of keys and values of one shape, stacked as `{name}.key` and
 /// `{name}.value`, `[layers, groups, heads, rows, head_dim]`.
 fn stack(kvs: &[Kv], name: &str) -> [StaticContextTensor; 2] {
@@ -190,46 +176,40 @@ fn stack(kvs: &[Kv], name: &str) -> [StaticContextTensor; 2] {
     ]
 }
 
-/// The `layers` layers [`stack`] stored as `name`.
-fn unstack(artifact: &StaticContextArtifact, name: &str, layers: usize) -> Result<Vec<Kv>> {
-    let (keys, dimensions) = read_tensor(artifact, &format!("{name}.key"))?;
-    let (values, value_dimensions) = read_tensor(artifact, &format!("{name}.value"))?;
-    let [stacked, groups, heads, rows, _] = dimensions[..] else {
-        return Err(Error::Artifact(format!("{name}.key is not 5-dimensional")));
+/// Borrowed keys and values for all layers of one attention stage.
+pub(super) type StageTensors<'a> = (StaticContextTensorRef<'a>, StaticContextTensorRef<'a>);
+
+/// Copy a validated stage to the CPU representation, widening only FP16 layers.
+fn unstack((keys, values): StageTensors<'_>) -> Vec<Kv> {
+    let [layers, groups, heads, rows, _] = keys.dimensions else {
+        unreachable!("validated stage shape")
     };
-    if value_dimensions != dimensions || stacked != layers {
-        return Err(Error::Artifact(format!(
-            "{name} does not hold {layers} layers of keys and values"
-        )));
-    }
-    let size = keys.len() / layers.max(1);
-    Ok(keys
-        .chunks(size)
-        .zip(values.chunks(size))
-        .map(|(key, value)| Kv {
-            key: key.to_vec(),
-            value: Values::F32(value.to_vec()),
-            groups,
-            heads,
-            rows,
+    let size = keys.data.len() / Model::dim(*layers);
+    (0..Model::dim(*layers))
+        .map(|i| {
+            let floats = |data: StaticContextTensorData<'_>| match data.slice(i * size, size) {
+                StaticContextTensorData::Fp32(v) => v.to_vec(),
+                StaticContextTensorData::F16(v) => {
+                    v.iter().map(|&x| half::f16::from_bits(x).to_f32()).collect()
+                }
+                _ => unreachable!("validated stage dtype"),
+            };
+            Kv {
+                key: floats(keys.data),
+                value: Values::F32(floats(values.data)),
+                groups: Model::dim(*groups),
+                heads: Model::dim(*heads),
+                rows: Model::dim(*rows),
+            }
         })
-        .collect())
+        .collect()
 }
 
 impl Context {
     /// The column and ICL layers' keys and values on the host.
-    #[cfg(any(
-        feature = "cuda",
-        all(feature = "metal", target_os = "macos", target_arch = "aarch64")
-    ))]
+    #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
     pub(super) fn kvs(&self) -> (&[Kv], &[Kv]) {
         (&self.columns, &self.icl)
-    }
-
-    /// Each column's kind, true for category codes, and imputation mean.
-    #[cfg(feature = "cuda")]
-    pub(super) fn columns_and_means(&self) -> (&[bool], &[f32]) {
-        (&self.categorical, &self.means)
     }
 
     /// The context as named FP32 tensors under `prefix`: the imputation means
@@ -251,32 +231,6 @@ impl Context {
         tensors.extend(stack(&self.columns, &format!("{prefix}.columns")));
         tensors.extend(stack(&self.icl, &format!("{prefix}.icl")));
         tensors
-    }
-
-    /// The context [`Self::tensors`] stored under `prefix`, with
-    /// `column_layers` and `icl_layers` layers.
-    pub(crate) fn read(
-        artifact: &StaticContextArtifact,
-        prefix: &str,
-        (column_layers, icl_layers): (usize, usize),
-    ) -> Result<Self> {
-        let (means, _) = read_tensor(artifact, &format!("{prefix}.means"))?;
-        let (categorical, _) = read_tensor(artifact, &format!("{prefix}.categorical"))?;
-        if means.len() != categorical.len() {
-            return Err(Error::Artifact(format!(
-                "{prefix}'s means and kinds differ in length"
-            )));
-        }
-        Ok(Self {
-            categorical: categorical.iter().map(|&kind| kind != 0.0).collect(),
-            means,
-            columns: unstack(artifact, &format!("{prefix}.columns"), column_layers)?,
-            icl: unstack(artifact, &format!("{prefix}.icl"), icl_layers)?,
-            #[cfg(feature = "cuda")]
-            cuda: None,
-            #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-            metal: None,
-        })
     }
 }
 
@@ -458,7 +412,7 @@ impl Model {
     ///
     /// # Errors
     ///
-    /// When a tensor is missing, has other dimensions or kinds, or is not FP32.
+    /// When a tensor is missing or its shape, dtype, or column kinds do not match the fitted model.
     pub(crate) fn read_context(
         &self,
         artifact: &StaticContextArtifact,
@@ -466,53 +420,96 @@ impl Model {
         categorical: &[bool],
         training_rows: usize,
     ) -> Result<Context> {
-        let config = self.config;
-        let columns = categorical.len() as u64;
-        let heads = config.embedding_heads;
-        let query_heads = config.query_key_value_heads.unwrap_or(config.icl_heads);
-        let column = vec![
-            config.embedding_layers,
-            columns,
-            heads,
-            config.inducing_points,
-            config.cell_channels / heads,
-        ];
-        let icl = vec![
-            config.icl_layers,
-            1,
-            query_heads,
-            training_rows as u64,
-            config.icl_channels / config.icl_heads,
-        ];
-        for (name, dimensions) in [
-            ("means", vec![columns]),
-            ("categorical", vec![columns]),
-            ("columns.key", column.clone()),
-            ("columns.value", column),
-            ("icl.key", icl.clone()),
-            ("icl.value", icl),
-        ] {
-            artifact.check_tensor(&format!("{prefix}.{name}"), &dimensions)?;
-        }
-        let context = Context::read(artifact, prefix, self.layers())?;
-        if context.categorical != categorical {
+        let [means, kinds, ck, cv, ik, iv] =
+            self.context_shapes(categorical.len(), training_rows)
+                .map(|(name, dimensions)| {
+                    let tensor = artifact.check_tensor(&format!("{prefix}.{name}"), &dimensions)?;
+                    match tensor.data {
+                        StaticContextTensorData::Fp32(_) => Ok(tensor),
+                        StaticContextTensorData::F16(_)
+                            if dimensions.len() == 5 && self.release.half_kv(self.optimize) =>
+                        {
+                            Ok(tensor)
+                        }
+                        _ => Err(Error::Artifact(format!("unexpected dtype for {prefix}.{name}"))),
+                    }
+                });
+        let means = means?.fp32_values().expect("validated means");
+        let kinds = kinds?.fp32_values().expect("validated column kinds");
+        let stages = [(ck?, cv?), (ik?, iv?)];
+        if kinds
+            .iter()
+            .zip(categorical)
+            .any(|(&v, &c)| v.to_bits() != f32::from(u8::from(c)).to_bits())
+        {
             return Err(Error::Artifact(format!(
                 "{prefix}'s column kinds are not the model's"
             )));
         }
+        let mut context = Context {
+            means: means.to_vec(),
+            categorical: categorical.to_vec(),
+            columns: Vec::new(),
+            icl: Vec::new(),
+            #[cfg(feature = "cuda")]
+            cuda: None,
+            #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+            metal: None,
+        };
+        #[cfg(feature = "cuda")]
+        if let Some(cuda) = &self.cuda {
+            match cuda.upload_context(means, kinds, stages, categorical, training_rows) {
+                Ok(placed) => {
+                    context.cuda = Some(placed);
+                    return Ok(context);
+                }
+                Err(Error::UnsupportedBackend(message)) if message == super::cuda::OUT_OF_MEMORY => {}
+                Err(error) => return Err(error),
+            }
+        }
+        [context.columns, context.icl] = stages.map(unstack);
+        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
+        if let Some(metal) = &self.metal {
+            context.metal = Some(metal.upload_context(&context, training_rows)?);
+            context.columns = Vec::new();
+            context.icl = Vec::new();
+        }
+        if self.bf16_values() {
+            for kv in &mut context.icl {
+                kv.value.compress();
+            }
+        }
         Ok(context)
+    }
+
+    fn context_shapes(&self, columns: usize, rows: usize) -> [(&'static str, Vec<u64>); 6] {
+        let cfg = self.config;
+        let col = vec![
+            cfg.embedding_layers,
+            columns as u64,
+            cfg.embedding_heads,
+            cfg.inducing_points,
+            cfg.cell_channels / cfg.embedding_heads,
+        ];
+        let icl = vec![
+            cfg.icl_layers,
+            1,
+            cfg.query_key_value_heads.unwrap_or(cfg.icl_heads),
+            rows as u64,
+            cfg.icl_channels / cfg.icl_heads,
+        ];
+        [
+            ("means", vec![columns as u64]),
+            ("categorical", vec![columns as u64]),
+            ("columns.key", col.clone()),
+            ("columns.value", col),
+            ("icl.key", icl.clone()),
+            ("icl.value", icl),
+        ]
     }
 
     fn bf16_values(&self) -> bool {
         self.optimize == crate::Optimize::Fast && crate::kernels::cpu::bf16_storage_supported()
-    }
-
-    /// The column and ICL layers a context holds.
-    pub(crate) fn layers(&self) -> (usize, usize) {
-        (
-            Self::dim(self.config.embedding_layers),
-            Self::dim(self.config.icl_layers),
-        )
     }
 
     fn dim(value: u64) -> usize {
@@ -663,42 +660,12 @@ impl Model {
         Ok(context)
     }
 
-    /// `context` as named FP32 tensors under `prefix`, as
-    /// [`Context::tensors`] gives them, copied from the GPU when it lives there.
-    ///
-    /// # Errors
-    ///
-    /// When the copy from the GPU fails.
+    /// CPU or Metal context as named FP32 tensors. CUDA uses its native exporter.
     #[cfg_attr(
-        not(any(
-            feature = "cuda",
-            all(feature = "metal", target_os = "macos", target_arch = "aarch64")
-        )),
-        expect(clippy::unused_self, reason = "The GPU paths read it")
+        not(all(feature = "metal", target_os = "macos", target_arch = "aarch64")),
+        expect(clippy::unused_self, reason = "The Metal path reads it")
     )]
-    #[cfg_attr(
-        not(feature = "cuda"),
-        expect(clippy::unnecessary_wraps, reason = "The CUDA path can fail")
-    )]
-    pub(crate) fn context_tensors(
-        &self,
-        context: &Context,
-        prefix: &str,
-    ) -> Result<Vec<StaticContextTensor>> {
-        #[cfg(feature = "cuda")]
-        if let (Some(cuda), Some(fitted)) = (&self.cuda, &context.cuda) {
-            let (columns, icl) = cuda.download(fitted)?;
-            let host = Context {
-                categorical: context.categorical.clone(),
-                means: context.means.clone(),
-                columns,
-                icl,
-                cuda: None,
-                #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-                metal: None,
-            };
-            return Ok(host.tensors(prefix));
-        }
+    pub(crate) fn context_tensors(&self, context: &Context, prefix: &str) -> Vec<StaticContextTensor> {
         #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
         if let (Some(metal), Some(fitted)) = (&self.metal, &context.metal) {
             let (columns, icl) = metal.download(fitted, context.categorical.len());
@@ -711,54 +678,9 @@ impl Model {
                 cuda: None,
                 metal: None,
             };
-            return Ok(host.tensors(prefix));
+            return host.tensors(prefix);
         }
-        Ok(context.tensors(prefix))
-    }
-
-    /// The loaded `context` where this model predicts: on its GPU when it has
-    /// one and the context fits in device memory, else on the CPU.
-    ///
-    /// # Errors
-    ///
-    /// When the copy to the GPU fails for another reason.
-    #[cfg_attr(
-        not(any(
-            feature = "cuda",
-            all(feature = "metal", target_os = "macos", target_arch = "aarch64")
-        )),
-        expect(clippy::unnecessary_wraps, reason = "GPU placement can fail")
-    )]
-    pub(crate) fn place(&self, mut context: Context) -> Result<Context> {
-        #[cfg(feature = "cuda")]
-        if let Some(cuda) = &self.cuda {
-            let training_rows = context.icl.first().map_or(0, |kv| kv.rows);
-            match cuda.upload_context(&context, training_rows) {
-                Ok(fitted) => {
-                    context.cuda = Some(fitted);
-                    context.columns = Vec::new();
-                    context.icl = Vec::new();
-                }
-                Err(Error::UnsupportedBackend(message)) if message == super::cuda::OUT_OF_MEMORY => {}
-                Err(error) => return Err(error),
-            }
-        }
-        #[cfg(all(feature = "metal", target_os = "macos", target_arch = "aarch64"))]
-        if let Some(metal) = &self.metal
-            && context.metal.is_none()
-        {
-            let training_rows = context.icl.first().map_or(0, |kv| kv.rows);
-            context.metal = Some(metal.upload_context(&context, training_rows)?);
-            context.columns = Vec::new();
-            context.icl = Vec::new();
-        }
-        // Successful GPU placement emptied `icl`; a CPU fallback still owns its host values.
-        if self.bf16_values() {
-            for kv in &mut context.icl {
-                kv.value.compress();
-            }
-        }
-        Ok(context)
+        context.tensors(prefix)
     }
 
     /// The members' `contexts` stacked on the GPU so one pass predicts them
@@ -809,31 +731,61 @@ impl Model {
             .predict_ensemble(stack, xs, quantiles)
     }
 
-    /// The stacked slots as named FP32 tensors, under the prefix next to each
-    /// slot's `contexts`, as [`Self::context_tensors`] gives them.
-    ///
-    /// # Errors
-    ///
-    /// When the copy from the GPU fails.
+    /// Export native CUDA cache bytes. A member built on the CPU keeps its FP32 storage.
     #[cfg(feature = "cuda")]
-    pub(crate) fn stacked_tensors(
+    pub(super) fn cuda_artifact(
         &self,
-        stack: &super::cuda::Ensemble,
+        stack: Option<&super::cuda::Ensemble>,
         contexts: &[(&Context, String)],
-    ) -> Result<Vec<StaticContextTensor>> {
-        let cuda = self.cuda.as_ref().expect("a stack lives on its model's GPU");
-        let mut tensors = Vec::new();
-        for ((columns, icl), (context, prefix)) in cuda.download_ensemble(stack)?.into_iter().zip(contexts) {
-            let host = Context {
-                categorical: context.categorical.clone(),
-                means: context.means.clone(),
-                columns,
-                icl,
-                cuda: None,
-            };
-            tensors.extend(host.tensors(prefix));
+        metadata: &crate::StaticContextMetadata,
+    ) -> Result<Option<StaticContextArtifact>> {
+        use crate::format::{container::DType, static_context::PageAlignedTensors};
+        let Some(cuda) = &self.cuda else {
+            return Ok(None);
+        };
+        let specs = contexts
+            .iter()
+            .flat_map(|(c, p)| {
+                let half = (stack.is_some() || c.cuda.is_some()) && self.release.half_kv(self.optimize);
+                self.context_shapes(c.means.len(), metadata.training_rows)
+                    .map(|(name, dims)| {
+                        let dtype = if half && dims.len() == 5 {
+                            DType::F16
+                        } else {
+                            DType::F32
+                        };
+                        (format!("{p}.{name}"), dims, dtype)
+                    })
+            })
+            .collect();
+        let mut page = PageAlignedTensors::new(specs)?;
+        let mut tensors = page.tensors_mut();
+        for ((context, prefix), out) in contexts.iter().zip(tensors.as_chunks_mut::<6>().0) {
+            if stack.is_none() && context.cuda.is_none() {
+                for (tensor, dest) in context.tensors(prefix).into_iter().zip(out) {
+                    dest.copy_from_slice(bytemuck::cast_slice(&tensor.values));
+                }
+            } else {
+                out[0].copy_from_slice(bytemuck::cast_slice(&context.means));
+                for (dst, &src) in bytemuck::cast_slice_mut::<_, f32>(out[1])
+                    .iter_mut()
+                    .zip(&context.categorical)
+                {
+                    *dst = f32::from(u8::from(src));
+                }
+                if let Some(c) = &context.cuda {
+                    cuda.download(c, out)?;
+                }
+            }
         }
-        Ok(tensors)
+        if let Some(stack) = stack {
+            cuda.download_ensemble(stack, &mut tensors)?;
+        }
+        drop(tensors);
+        Ok(Some(StaticContextArtifact::from_checked_pages(
+            metadata.clone(),
+            page,
+        )?))
     }
 
     /// Whether `context` lives on the model's GPU: false on the CPU, or when
@@ -1380,6 +1332,76 @@ pub(crate) mod tests {
             layer.compress();
             assert!(matches!(layer, Values::F32(_)));
         }
+    }
+
+    #[test]
+    fn fp16_stage_unstacking_and_cache_policy_work_on_host() {
+        use crate::{
+            Optimize, TaskKind,
+            format::{
+                container::DType,
+                static_context::{
+                    ContextArchitecture, PageAlignedTensors, StaticContextArtifact, StaticContextMetadata,
+                },
+            },
+            models::kumo_tabular::{Release, Size},
+        };
+        let classifier = Release {
+            size: Size::Small,
+            task: TaskKind::Classifier,
+        };
+        let regressor = Release {
+            size: Size::Small,
+            task: TaskKind::Regressor,
+        };
+        assert!(!classifier.half_kv(Optimize::Safe));
+        assert!(classifier.half_kv(Optimize::Auto));
+        assert!(classifier.half_kv(Optimize::Fast));
+        assert!(!regressor.half_kv(Optimize::Safe));
+        assert!(!regressor.half_kv(Optimize::Auto));
+        assert!(regressor.half_kv(Optimize::Fast));
+
+        let metadata = StaticContextMetadata {
+            architecture: ContextArchitecture::KumoTabular(classifier),
+            model_sha256: [1; 32],
+            context_sha256: [2; 32],
+            ensemble_count: 1,
+            training_rows: 2,
+            feature_count: 1,
+            class_count: 0,
+            class_permutations: Vec::new(),
+            feature_permutations: Vec::new(),
+            optimize: Optimize::Auto,
+        };
+        let dims = vec![2, 1, 1, 2, 2];
+        let mut pages = PageAlignedTensors::new(vec![
+            ("0.0.icl.key".into(), dims.clone(), DType::F16),
+            ("0.0.icl.value".into(), dims.clone(), DType::F16),
+        ])
+        .unwrap();
+        let keys_f16: Vec<u16> = [0.5_f32, -1.0, 2.0, 0.25, -0.5, 1.5, 3.0, -4.0]
+            .map(|v| half::f16::from_f32(v).to_bits())
+            .to_vec();
+        let vals_f16: Vec<u16> = [1.0_f32, 2.0, 3.0, 4.0, -1.0, -2.0, -3.0, -4.0]
+            .map(|v| half::f16::from_f32(v).to_bits())
+            .to_vec();
+        pages.fill(0, bytemuck::cast_slice(&keys_f16));
+        pages.fill(1, bytemuck::cast_slice(&vals_f16));
+        let artifact = StaticContextArtifact::from_checked_pages(metadata.clone(), pages).unwrap();
+        let layers = super::unstack((
+            artifact.tensor("0.0.icl.key").unwrap(),
+            artifact.tensor("0.0.icl.value").unwrap(),
+        ));
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0].key, vec![0.5, -1.0, 2.0, 0.25]);
+        assert_eq!(&*layers[1].value.floats(), &[-1.0, -2.0, -3.0, -4.0]);
+
+        // Non-finite FP16 in downloaded pages is rejected by from_checked_pages.
+        let mut bad = PageAlignedTensors::new(vec![("0.0.icl.key".into(), dims, DType::F16)]).unwrap();
+        let mut bad_bits = keys_f16;
+        bad_bits[3] = 0x7c00; // +inf
+        bad.fill(0, bytemuck::cast_slice(&bad_bits));
+        assert!(StaticContextArtifact::from_checked_pages(metadata, bad).is_err());
     }
 
     /// The model of `IRONICL_CHECKPOINT_FIXTURES/kumo-tabular-<size>-<task>.pt`.

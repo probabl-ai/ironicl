@@ -449,19 +449,20 @@ impl Fitted {
     ///
     /// When the contexts do not fit the format.
     pub(crate) fn context_artifact(&self) -> Result<StaticContextArtifact> {
-        let mut tensors = Vec::new();
+        let metadata = self.context_metadata(&self.to_bytes()?);
+        let contexts: Vec<_> = self.slots().map(|(m, t, c)| (c, format!("{m}.{t}"))).collect();
         #[cfg(feature = "cuda")]
-        if let Some(stack) = &self.stack {
-            let contexts: Vec<(&Context, String)> =
-                self.slots().map(|(m, t, c)| (c, format!("{m}.{t}"))).collect();
-            tensors = self.model.stacked_tensors(stack, &contexts)?;
+        if let Some(artifact) = self
+            .model
+            .cuda_artifact(self.stack.as_ref(), &contexts, &metadata)?
+        {
+            return Ok(artifact);
         }
-        if tensors.is_empty() {
-            for (member, task, context) in self.slots() {
-                tensors.extend(self.model.context_tensors(context, &format!("{member}.{task}"))?);
-            }
-        }
-        StaticContextArtifact::new(self.context_metadata(&self.to_bytes()?), tensors)
+        let tensors = contexts
+            .into_iter()
+            .flat_map(|(c, p)| self.model.context_tensors(c, &p))
+            .collect();
+        StaticContextArtifact::new(metadata, tensors)
     }
 
     /// The contexts in one container, one per member and codebook task,
@@ -565,10 +566,7 @@ impl Fitted {
                 (0..count)
                     .map(|task| {
                         let prefix = format!("{member}.{task}");
-                        let context = fitted
-                            .model
-                            .read_context(&artifact, &prefix, &categorical, rows)?;
-                        fitted.model.place(context)
+                        fitted.model.read_context(&artifact, &prefix, &categorical, rows)
                     })
                     .collect::<Result<_>>()
             })
@@ -725,6 +723,77 @@ mod tests {
                 Fitted::from_bytes(Arc::clone(&model), &bytes, Some(&other), None).is_err(),
                 "{name}: another fit's contexts load"
             );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "needs official Kumo checkpoints and a CUDA GPU"]
+    fn native_cuda_cache_survives_reload() {
+        use crate::{
+            CheckpointKind, Optimize,
+            format::{container::DType, static_context::ContextHeader},
+        };
+        for (task, case_name) in [
+            ("classifier", "many_classes"),
+            ("regressor", "numeric_regression"),
+        ] {
+            let release = format!("small-{task}").parse().unwrap();
+            let path = std::path::PathBuf::from(std::env::var_os("IRONICL_CHECKPOINT_FIXTURES").unwrap())
+                .join(format!("kumo-tabular-small-{task}.pt"));
+            for opt in [Optimize::Safe, Optimize::Auto, Optimize::Fast] {
+                let model = || {
+                    Arc::new(
+                        super::Model::with_optimize(
+                            crate::load_checkpoint_model(&path, CheckpointKind::KumoTabular(Some(release)))
+                                .unwrap(),
+                            opt,
+                        )
+                        .unwrap(),
+                    )
+                };
+                let (case, train) = training(case_name);
+                let mut query = case.x[case.context * case.features..].to_vec();
+                query.extend(case.categorical.iter().map(|&c| if c { -1.0 } else { f64::NAN }));
+                let predict = |model: &Fitted| {
+                    if task == "classifier" {
+                        model.predict_proba(&query).unwrap()
+                    } else {
+                        model
+                            .predict_regression(&query, &[crate::RegressionOutput::RawQuantiles])
+                            .unwrap()
+                            .remove(0)
+                            .0
+                    }
+                };
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join(crate::models::directory::CONTEXT);
+                let (expected, prep) = {
+                    let fitted = Fitted::fit(model(), train, None).unwrap();
+                    assert_eq!((fitted.device(), fitted.cpu_members()), ("cuda", 0));
+                    let expected = predict(&fitted);
+                    fitted.context_artifact().unwrap().write(&path).unwrap();
+                    (expected, fitted.to_bytes().unwrap())
+                };
+                let half = opt == Optimize::Fast || opt == Optimize::Auto && task == "classifier";
+                for t in ContextHeader::open(&path).unwrap().tensors {
+                    let half = half && t.shape.len() == 5;
+                    assert_eq!(t.dtype, if half { DType::F16 } else { DType::F32 });
+                    assert_eq!(
+                        t.bytes as u64,
+                        t.shape.iter().product::<u64>() * if half { 2 } else { 4 }
+                    );
+                }
+                let reloaded = Fitted::from_artifact(
+                    model(),
+                    &prep,
+                    Some(StaticContextArtifact::read_mapped_prefault(&path).unwrap()),
+                    None,
+                )
+                .unwrap();
+                assert_eq!((reloaded.device(), reloaded.cpu_members()), ("cuda", 0));
+                assert_eq!(predict(&reloaded), expected);
+            }
         }
     }
 

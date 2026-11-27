@@ -373,6 +373,22 @@ impl Prepared {
     }
 }
 
+/// Missing contexts are normal. Report a present but unreadable cache before rebuilding it.
+fn saved_cache(path: &Path) -> (Option<StaticContextArtifact>, Option<String>) {
+    match StaticContextArtifact::read_mapped_prefault(path) {
+        Ok(cache) => (Some(cache), None),
+        Err(error) => (
+            None,
+            path.exists().then(|| {
+                format!(
+                    "could not read the saved KV cache {}, so rebuilt it: {error}",
+                    path.display()
+                )
+            }),
+        ),
+    }
+}
+
 /// Load a fitted model, rebuilding its cache in memory when necessary.
 pub(crate) fn load(
     dir: &Path,
@@ -394,62 +410,49 @@ pub(crate) fn load(
         )));
     }
     let path = dir.join(CONTEXT);
-    // A missing, unreadable, or invalid cache is rebuilt like a mismatched
-    // one; one that exists but cannot be read is reported.
-    let mut warning = None;
-    let saved = match StaticContextArtifact::read_mapped_prefault(&path) {
-        Ok(context) => Some(context),
-        Err(error) => {
-            if path.exists() {
-                warning = Some(format!(
-                    "could not read the saved KV cache {}, so rebuilt it: {error}",
-                    path.display()
-                ));
-            }
-            None
-        }
-    };
+    let (saved, mut warning) = saved_cache(&path);
     let optimize = optimize
         .or(saved.as_ref().map(|context| context.metadata().optimize))
         .or(metadata.optimize)
         .unwrap_or_default();
     let weights = weights_path(&identity.checkpoint_sha256, weights);
+    let prepare = |fit: &dyn Fn(Option<StaticContextArtifact>) -> Result<Fitted>| {
+        if let Some(cache) = saved.filter(|c| c.metadata().optimize == optimize) {
+            match fit(Some(cache)) {
+                Ok(model) => {
+                    return Ok(Prepared {
+                        model,
+                        optimize,
+                        built: false,
+                        warning,
+                    });
+                }
+                Err(error @ (Error::UnsupportedBackend(_) | Error::Artifact(_))) => {
+                    warning = Some(format!(
+                        "could not load the saved KV cache {}, so rebuilt it: {error}",
+                        path.display()
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(Prepared {
+            model: fit(None)?,
+            optimize,
+            built: true,
+            warning,
+        })
+    };
     match identity.family {
         ModelFamily::KumoTabular => {
             let model = Arc::new(kumo_tabular::cpu::Model::with_optimize(
                 load_weights(&weights)?,
                 optimize,
             )?);
-            if let Some(cache) = saved.filter(|c| c.metadata().optimize == optimize) {
-                match kumo_tabular::fitted::Fitted::from_artifact(
-                    Arc::clone(&model),
-                    &bytes,
-                    Some(cache),
-                    threads,
-                ) {
-                    Ok(fitted) => {
-                        return Ok(Prepared {
-                            model: Fitted::KumoTabular(Box::new(fitted)),
-                            optimize,
-                            built: false,
-                            warning,
-                        });
-                    }
-                    Err(error) => {
-                        warning = Some(format!(
-                            "could not load the saved KV cache {}, so rebuilt it: {error}",
-                            path.display()
-                        ));
-                    }
-                }
-            }
-            let fitted = kumo_tabular::fitted::Fitted::from_bytes(model, &bytes, None, threads)
-                .map_err(|error| artifact_error(&dir.join(PREPROCESSING), error))?;
-            Ok(Prepared {
-                model: Fitted::KumoTabular(Box::new(fitted)),
-                optimize,
-                built: true,
-                warning,
+            prepare(&|cache| {
+                let fitted =
+                    kumo_tabular::fitted::Fitted::from_artifact(Arc::clone(&model), &bytes, cache, threads)?;
+                Ok(Fitted::KumoTabular(Box::new(fitted)))
             })
         }
         ModelFamily::TabIclV2 => {
@@ -458,27 +461,13 @@ pub(crate) fn load(
                 .decode_preprocessed(&bytes)
                 .map_err(|error| artifact_error(&dir.join(PREPROCESSING), error))?;
             let preprocessed = Arc::new(preprocessed);
-            if let Some(context) = saved
-                && *context.metadata() == executor.fitted_context_metadata(&preprocessed, optimize)?
-            {
-                let context = executor.load_context_artifact(context, optimize, threads, limits)?;
-                let model = Fitted::TabIclV2(FittedModel {
-                    preprocessed,
-                    context: Arc::new(context),
-                });
-                return Ok(Prepared {
-                    model,
-                    optimize,
-                    built: false,
-                    warning,
-                });
-            }
-            let model = executor.build_fitted(preprocessed, optimize, threads, limits, None)?;
-            Ok(Prepared {
-                model: Fitted::TabIclV2(model),
-                optimize,
-                built: true,
-                warning,
+            prepare(&|cache| {
+                let state = Arc::clone(&preprocessed);
+                let fitted = match cache {
+                    Some(cache) => executor.restore_fitted(state, None, cache, optimize, threads, limits)?,
+                    None => executor.build_fitted(state, optimize, threads, limits, None)?,
+                };
+                Ok(Fitted::TabIclV2(fitted))
             })
         }
     }

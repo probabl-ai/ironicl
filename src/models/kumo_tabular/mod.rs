@@ -124,10 +124,6 @@ impl Release {
     }
 
     /// FP16 K/V misses the `auto` bound on regression quantile tails on both GPUs.
-    #[cfg(any(
-        feature = "cuda",
-        all(feature = "metal", target_os = "macos", target_arch = "aarch64")
-    ))]
     fn half_kv(self, optimize: crate::Optimize) -> bool {
         matches!(
             (optimize, self.task),

@@ -93,7 +93,10 @@ device or optimization policy. Loading checks compatibility against the model an
   is the estimator count, `H` the retained feature count, and `N` the number of training rows.
 - **Kumo-Tabular:** Each `{member}.{task}` has `means`, `categorical`, `columns.key`,
   `columns.value`, `icl.key`, and `icl.value`. Column and ICL tensors group layers along the
-  leading dimension. The context identity is the SHA-256 of its preprocessing bytes.
+  leading dimension. CUDA writes both K/V stages as FP16 for classifiers at `auto` or `fast`
+  and regressors at `fast`. Regression `auto` and all `safe` caches remain FP32. CPU-built
+  members, means and column kinds are always serialized as FP32. The context identity is the
+  SHA-256 of its preprocessing bytes.
 
 The context container also round-trips already encoded `f8_e4m3` tensors verbatim. The two
 E4M3 NaN encodings (`0x7f`, `0xff`) are invalid cache values. Scales, when required by a
